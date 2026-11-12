@@ -558,7 +558,79 @@ current one back if `min_agent` forces it) → write `state\pending` → exit 75
 Agent exit codes: 0 the user quit, 75 switch to `state\pending`, 76 hand over to the new
 `ZeroFarm.exe` (rev 3), anything else a crash (restart with backoff, 3 in 10 min → rollback).
 
+## 7. Signed definitions (rev 6)
+
+Everything a lease tells a friend's PC to download or run is fixed by a **definition** signed on the
+desktop with a **data key**. The coordinator only adds a few per-lease fields. The coordinator never
+holds a data key, so a compromised coordinator (or admin token) can withhold work but can no longer
+choose what a PC's worker reads (DESIGN 4; security review 2026-11-12, findings H2, H3, M2).
+
+**Keys.** Data keys are minisign keys like release keys, but in a separate trusted list
+(`agent/common/trusted_data_keys.txt`, plus the build-time variable `ZEROFARM_TRUSTED_DATA_KEYS`).
+A data key can only sign definitions; a release key can only sign manifests. Each check accepts only
+its own list. The first data key is `RWTImfGffZDbH0xWVxO/H563BYqds0G+D+hJLn79XEo9xU3sbl6lLp9D` (id 1FDB907D9FF199C8).
+
+**Definition** (`definition/1`, the bytes of `definition.json`, signed as
+`definition.json.minisig`):
+
+```json
+{
+  "definition": 1,
+  "kind": "run" | "campaign",
+  "id": "eoe2",                       // the run or campaign slug
+  "version": 7,                       // strictly increasing per (kind, id)
+  "created": 1794500000,
+  "expires": 1795100000 | null,       // agents refuse it after this time
+  "game": "mtg",
+  "builds": ["<worker build_id>", ...],             // workers allowed to run it
+  "runtime": "<runtime build_id>" | null,           // the runtime pack those builds load
+  "checkpoints": {"<gen>": {"model_sha256": "...", "model_size": 13421772,
+                            "reference_sha256": "...", "reference_size": 412000}},
+  "jobs": {                           // exact job templates; only per-lease fields are added
+    "selfplay": {"settings": {...}} | null,
+    "eval": {"settings": {...}, "seats": [Seat, ...], "paired": true} | null,
+    "fuzz": {"mode": "delver-games", "env": {"FUZZ_POOL": "delver"}} | null
+  }
+}
+```
+
+**Per-lease fields the coordinator may set** (everything else comes from the definition):
+self-play/eval `gid_base`, `games`, `seed`, plus which signed checkpoint gens the lease uses;
+fuzz `first`, `count`.
+
+**Lease.** Every lease for a run or campaign carries `"definition": {"key":
+"defs/<kind>/<id>/<version>/definition.json", "sha256": "..."}`, with the signature next to it
+(`.minisig`). The **agent**:
+1. downloads both through `/v1/artifact`;
+2. verifies the signature against the trusted data keys;
+3. checks `kind`/`id` against the lease's run/campaign, `expires`, and that `version` is at least
+   the highest it has seen for that (kind, id) (stored in its state, so no rollback);
+4. checks the lease's worker build is in `builds` and its runtime equals `runtime`, and that every
+   checkpoint file's size and sha256 equal the definition's;
+5. **builds the job line itself** from the definition's job template, plus only the per-lease fields
+   above, plus its own local paths (`models`, `model`, `reference`, `runtime_dir`, `out_dir`) and
+   tuning. It forwards **no other coordinator-supplied key**.
+A lease that fails any check is refused (done with `refused: "definition"`, reported once with crash
+kind `definition`), and the agent waits before asking again.
+
+**Coordinator.** `PUT /v1/admin/definition` registers an uploaded definition (`{"kind", "id",
+"version", "key", "sha256"}`), verifies its signature against the `DATA_PUBKEYS` var, and makes it
+current for that run/campaign. Leases are issued only for a run or campaign with a current
+definition, and only with builds, runtimes, checkpoints and job kinds it names. The run/campaign
+`job` objects the coordinator keeps are no longer sent to agents.
+
+**Desktop.** `farm-release define <definition.json> --key <data key> [--publish --url --token]`
+signs, uploads and registers a definition. `farm_h2h`, campaign creation and the trainer's pool
+remote produce a new version whenever builds, checkpoints or job settings change; self-play adds
+each new checkpoint gen.
+
+**Rollout.** The coordinator keeps serving legacy leases (without `definition`) only to agents
+older than the first definition-aware agent, until that agent is `min_agent` on both channels. After
+that, a lease without a definition is never issued, and a definition-aware agent never runs one.
+
 ## Changes
+- v1 rev 6 (2026-11-12): signed definitions (section 7): data keys, `definition/1`, the agent builds the job line
+  from the signed template, coordinator-settable fields limited, versions never roll back.
 - v1 rev 5 (2026-11-12): evaluation and head-to-heads (section 5.2): `checkpoints` on eval leases,
   eval batches name `checkpoints`, seats (`net`/`bot`), whole paired leases, `models` in the job
   line, per-gen `selftest`, `evals` result files and their row format. From building it
