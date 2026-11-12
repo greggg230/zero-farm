@@ -645,7 +645,8 @@ kept only for NVIDIA details. Options for temperature, in order:
    Manager's "GPU temperature" on recent drivers. To be confirmed on the AMD card.
 2. AMD's ADLX library (installed with the AMD driver): AMD only, and needs C++ interface bindings.
 3. No temperature gate (the driver's own thermal limits only).
-Decision pending (the user asked to be shown the choice).
+**Decided (user, 2026-11-12): option 1** (D3DKMT adapter performance data, vendor-neutral); if it gives
+no reading on a GPU, fall back to option 3 for that GPU.
 
 **Providers.** On Windows 11 24H2+: the Windows ML provider catalog (TensorRT-RTX, MIGraphX,
 OpenVINO). Its availability in an unpackaged per-user app is to be confirmed first. On Windows 10
@@ -656,7 +657,11 @@ identity decoding, GatherElements/ScatterElements, boolean-mask attention.
 **Self-play run.** Phase 3 needs a run to feed. Options: (a) a short throwaway run forked from an
 EoE checkpoint, with a desktop-only twin as an A/B; (b) joining EoE run 2 (`eoe2e`, live,
 managed by another session) at an iteration boundary; (c) resuming the paused Delver line with the
-pool added. The user decides.
+pool added. **Decided (user, 2026-11-12): (a)**, a short throwaway run forked from an EoE checkpoint with a
+desktop-only twin, to show that games from friends' PCs train the same as local ones.
+
+The double RTX 4080 on one friend's PC is a single card listed twice (confirmed by the user): the
+profile de-duplicates adapters by LUID.
 
 ## 9. Phases
 

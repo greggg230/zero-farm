@@ -230,9 +230,9 @@ mod tests {
         assert_eq!(r.redact("Gregorian calendar"), "Gregorian calendar", "a word that only contains the name");
         assert_eq!(r.redact("user Gregor"), "user <user>");
         // The profile folder's name counts even when %USERNAME% differs.
-        let r = Redactor::new(&[r"C:\Users\gk.LAB"], &["gk"]);
-        assert_eq!(r.redact(r"E:\work\gk.LAB\x"), r"E:\work\<user>\x");
-        assert_eq!(r.redact(r"E:\work\gk\x and gk said"), r"E:\work\<user>\x and gk said", "short names: path components only");
+        let r = Redactor::new(&[r"C:\Users\jo.LAB"], &["jo"]);
+        assert_eq!(r.redact(r"D:\work\jo.LAB\x"), r"D:\work\<user>\x");
+        assert_eq!(r.redact(r"D:\work\jo\x and jo said"), r"D:\work\<user>\x and jo said", "short names: path components only");
         // Non-ASCII names.
         let r = Redactor::new(&[r"C:\Users\Zoë"], &["Zoë"]);
         assert_eq!(r.redact(r"C:\USERS\ZOË\AppData and zoë"), r"%USERPROFILE%\AppData and <user>");
