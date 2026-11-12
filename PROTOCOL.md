@@ -280,8 +280,9 @@ agent waits before asking again. Blocked by policy (os error 4551
 ERROR_SYSTEM_INTEGRITY_POLICY_VIOLATION, 1260 ERROR_ACCESS_DISABLED_BY_POLICY, 225
 ERROR_VIRUS_INFECTED): a `blocked` crash report once per build per day, then 15 min, 1 h, 4 h,
 16 h and 24 h between lease requests (capped at 24 h), and the tray says Windows is blocking the
-job program; any other start failure: a `crash` report and 1 min doubling to 1 h. The backoff
-resets when a worker starts.
+job program; any other start failure (or a worker that dies before `hello`): a `crash` report and
+1 min doubling to 1 h. A lease whose files can't be downloaded, verified or set up waits the same
+way (no report). The backoff resets when a worker starts.
 
 `Stats` (per beat/done; all optional, counters since lease start):
 ```json
@@ -294,7 +295,7 @@ resets when a worker starts.
 ```
 `selftest` (rev 5): the worker's `selftest` result per network generation (an eval lease has one per
 checkpoint); `selftest_max_abs` is the largest `max_abs` among them. The coordinator keeps at most
-16 entries.
+16 entries, keyed by gen (other keys are dropped).
 `starved_ms` (rev 3): time the worker should have been running but got no CPU because other
 programs saturated the PC (it runs at idle priority); the agent samples this every 5 s. It counts
 toward the lease's slack like a pause: a lease that has been paused and/or starved for longer than
