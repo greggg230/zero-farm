@@ -637,7 +637,13 @@ pub fn github_release(
         a.extend(["--repo", &o.repo, "--clobber"]);
         gh_ok(&o.gh, &a)?;
         let pre = format!("--prerelease={prerelease}");
-        gh_ok(&o.gh, &["release", "edit", &tag, "--repo", &o.repo, "--title", &title, "--notes-file", &notes_s, &pre])?;
+        let mut a = vec!["release", "edit", tag.as_str(), "--repo", &o.repo, "--title", &title, "--notes-file", &notes_s, &pre];
+        // Promoting a canary release to stable must also move GitHub's "Latest" marker to it
+        // (an edit doesn't, and the marker otherwise stays on the previous stable release).
+        if !prerelease {
+            a.push("--latest");
+        }
+        gh_ok(&o.gh, &a)?;
         true
     } else if String::from_utf8_lossy(&view.stderr).to_ascii_lowercase().contains("not found") {
         let mut a = vec!["release", "create", tag.as_str()];
@@ -645,6 +651,8 @@ pub fn github_release(
         a.extend(["--repo", &o.repo, "--title", &title, "--notes-file", &notes_s]);
         if prerelease {
             a.push("--prerelease");
+        } else {
+            a.push("--latest");
         }
         gh_ok(&o.gh, &a)?;
         false
