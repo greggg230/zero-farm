@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = ["common", "launcher", "agent", "release", "fakeworker", "mockcoord"]
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+minisign-verify = "0.3"
+minisign = "0.10"
+scrypt = { version = "0.11", default-features = false }
+rpassword = "7"
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+windows-sys = "0.61"
+windows = "0.62"
+nvml-wrapper = "0.13"
+tiny_http = "0.12"
+semver = "1"
+base64 = "0.22"
+getrandom = "0.3"
+log = { version = "0.4", features = ["std"] }
+tempfile = "3"
+miniz_oxide = "0.9"
+
+# scrypt (farm-release export-key / import-key) is ~100x slower unoptimised; keep tests quick.
+[profile.dev.package.scrypt]
+opt-level = 3
+[profile.dev.package.salsa20]
+opt-level = 3
+[profile.dev.package.pbkdf2]
+opt-level = 3
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+strip = true

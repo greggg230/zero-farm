@@ -1,0 +1,43 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "zero-farm",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-01",
+
+  // Production, deployed 2026-11-11.
+  "routes": [{ "pattern": "farm.greggg230.com", "custom_domain": true }],
+
+  // builds/<build_id>/..., ckpt/<run>/<gen>/..., results/<run|campaign>/<lease_id>/<seq>,
+  // diag/<machine_id>/<t>-<name>. Never public: everything goes through the Worker.
+  "r2_buckets": [{ "binding": "BUCKET", "bucket_name": "zero-farm" }],
+
+  // Machines, invites, builds, runs, campaigns, leases, id pools, results (migrations/).
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "zero-farm",
+      "database_id": "095e93bc-c26c-4b69-ada1-d6293ed52041",
+      "migrations_dir": "migrations"
+    }
+  ],
+
+  // One instance per run / campaign ("run:<slug>", "campaign:<slug>", "diag"): it serialises
+  // every change to that scope's leases, id pools and quota counters. D1 holds the state.
+  "durable_objects": { "bindings": [{ "name": "LEASEBOOK", "class_name": "LeaseBook" }] },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["LeaseBook"] }],
+
+  // Per-beat performance samples (DESIGN 5.4). Summaries live in D1 for the dashboard.
+  "analytics_engine_datasets": [{ "binding": "TELEMETRY", "dataset": "zero_farm" }],
+
+  // Expire silent leases, delete acked results after 7 days.
+  "triggers": { "crons": ["* * * * *"] },
+
+  "vars": {
+    // minisign public keys (the base64 line of minisign.pub), comma separated. Empty = the
+    // coordinator only checks that a build's signature file is present, not that it verifies.
+    "RELEASE_PUBKEYS": "RWQAZVT770KTG1hmXk6yJ5i9pF1v5Q4lNLQ9C3fOUo8ynWWfamzJ2LpS"
+  },
+  // Secret: ADMIN_TOKEN (wrangler secret put ADMIN_TOKEN). Locally: .dev.vars.
+
+  "observability": { "enabled": true }
+}

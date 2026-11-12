@@ -1,0 +1,34 @@
+[package]
+name = "fakeworker"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Test worker that speaks aw/1 with scripted behaviours, plus scripted stand-ins for the agent, the launcher and the GitHub CLI"
+
+[[bin]]
+name = "fakeworker"
+path = "src/main.rs"
+
+[[bin]]
+name = "fakeagent"
+path = "src/bin/fakeagent.rs"
+
+[[bin]]
+name = "fakelauncher"
+path = "src/bin/fakelauncher.rs"
+
+[[bin]]
+name = "fakegh"
+path = "src/bin/fakegh.rs"
+
+[dependencies]
+serde_json.workspace = true
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_JobObjects"] }
+
+[build-dependencies]
+miniz_oxide.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,30 @@
+import { cloudflareTest, readD1Migrations } from "@cloudflare/vitest-pool-workers";
+import { defineConfig } from "vitest/config";
+
+// Tests run inside local workerd (Miniflare): D1, R2, the LeaseBook Durable Object and Analytics
+// Engine are all simulated. No Cloudflare account is involved.
+export default defineConfig(async () => {
+  const migrations = await readD1Migrations("./migrations");
+  return {
+    plugins: [
+      cloudflareTest({
+        wrangler: { configPath: "./wrangler.jsonc" },
+        miniflare: {
+          bindings: {
+            TEST_MIGRATIONS: migrations,
+            TEST_CLOCK: "1", // honour x-test-now (src/ctx.ts)
+            ADMIN_TOKEN: "test-admin-token",
+            // wrangler.jsonc carries the real release key; test builds carry fake signatures
+            // (signature checks have their own tests in units.test.ts).
+            RELEASE_PUBKEYS: "",
+          },
+        },
+      }),
+    ],
+    test: {
+      setupFiles: ["./test/setup.ts"],
+      testTimeout: 120_000,
+      hookTimeout: 60_000,
+    },
+  };
+});

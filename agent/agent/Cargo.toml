@@ -1,0 +1,46 @@
+[package]
+name = "farm-agent"
+version = "0.2.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "farm-agent.exe: the zero-farm app on a friend's PC"
+
+[lib]
+name = "farm_agent"
+path = "src/lib.rs"
+
+[[bin]]
+name = "farm-agent"
+path = "src/main.rs"
+
+[dependencies]
+zerofarm-common = { path = "../common", features = ["http", "dpapi"] }
+serde.workspace = true
+serde_json.workspace = true
+semver.workspace = true
+log.workspace = true
+nvml-wrapper.workspace = true
+getrandom.workspace = true
+base64.workspace = true
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation", "Win32_Security", "Win32_UI_WindowsAndMessaging", "Win32_UI_Shell",
+    "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Power", "Win32_System_SystemInformation",
+    "Win32_System_Threading", "Win32_System_JobObjects", "Win32_System_Registry",
+    "Win32_Storage_FileSystem", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader",
+    "Win32_System_Console", "Win32_UI_HiDpi", "Win32_System_Diagnostics_Debug", "Win32_System_Time",
+    "Win32_UI_Controls", "Win32_System_Com",
+] }
+# COM-only pieces: the Start-menu shortcut (IShellLinkW) and GPU enumeration (DXGI).
+windows = { workspace = true, features = [
+    "Win32_Foundation", "Win32_System_Com", "Win32_UI_Shell", "Win32_Graphics_Dxgi", "Win32_Graphics_Dxgi_Common",
+] }
+
+[build-dependencies]
+miniz_oxide.workspace = true
+
+[dev-dependencies]
+mockcoord = { path = "../mockcoord" }
+zerofarm-common = { path = "../common", features = ["http", "dpapi", "sign"] }
+tempfile.workspace = true

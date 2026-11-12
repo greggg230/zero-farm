@@ -1,0 +1,30 @@
+[package]
+name = "farm-release"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "farm-release.exe: desktop release tool (keygen, key backup, sign, verify, publish, release-agent, GitHub releases)"
+
+[lib]
+name = "farm_release"
+path = "src/lib.rs"
+
+[[bin]]
+name = "farm-release"
+path = "src/main.rs"
+
+[dependencies]
+zerofarm-common = { path = "../common", features = ["http", "dpapi", "sign"] }
+serde.workspace = true
+serde_json.workspace = true
+base64.workspace = true
+rpassword.workspace = true
+
+[dev-dependencies]
+mockcoord = { path = "../mockcoord" }
+tempfile.workspace = true
+minisign-verify.workspace = true
+minisign.workspace = true
+zerofarm-common = { path = "../common", features = ["http", "dpapi", "sign"] }

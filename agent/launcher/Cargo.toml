@@ -1,0 +1,29 @@
+[package]
+name = "zerofarm-launcher"
+version = "0.2.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "ZeroFarm.exe: starts the current farm-agent version, swaps to a verified pending version, rolls back"
+
+[[bin]]
+name = "ZeroFarm"
+path = "src/main.rs"
+
+[[bin]]
+name = "ZeroFarmSetup"
+path = "src/setup.rs"
+
+[dependencies]
+zerofarm-common = { path = "../common" }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading", "Win32_System_JobObjects", "Win32_Security", "Win32_UI_WindowsAndMessaging"] }
+
+[build-dependencies]
+miniz_oxide.workspace = true
+
+[dev-dependencies]
+mockcoord = { path = "../mockcoord" }
+zerofarm-common = { path = "../common", features = ["sign"] }
+tempfile.workspace = true
+serde_json.workspace = true

@@ -1,0 +1,258 @@
+# zero-farm coordinator
+
+The Cloudflare Worker that hands out work to invited friends' idle Windows PCs for zero-core
+training runs (MTG Zero first): enrollment, leases, the job mix per run, a signed-build index,
+result indexing for the trainer, fuzz campaigns, diagnostics, an admin dashboard, per-machine
+rate limits, and the public onboarding page (its download link redirects to GitHub Releases).
+
+- Wire contract: [`../PROTOCOL.md`](../PROTOCOL.md) sections 1-4 (and the coordinator side of 5-6).
+- Why it works this way: [`../DESIGN.md`](../DESIGN.md) sections 2, 3.4-3.5, 4, 5, 6, 7.
+
+Stack: Worker + D1 `zero-farm` + R2 `zero-farm` + Durable Object `LeaseBook` + Analytics Engine
+dataset `zero_farm`. Production is `farm.greggg230.com` (see "Deployed").
+
+```
+src/index.ts       router + cron entry
+src/friend.ts      friend API (enroll, lease + job choice and sizing, beat, result, done, artifact, ...)
+src/admin.ts       desktop API (invites, artifacts, builds, releases, runs, checkpoints, results, ...)
+src/book.ts        a scope's leases, id pool, claims and quota: runs inside LeaseBook
+src/leasebook.ts   the Durable Object: serialises every change to one run / campaign
+src/manifest.ts    build checks: manifest, file sizes/hashes, minisign (Ed25519, BLAKE2b prehash)
+src/telemetry.ts   Analytics Engine writer (no-op without the binding) + Stats sanitising
+src/admin_page.ts  the /admin dashboard (static HTML + JS)
+src/onboard.ts     the public pages: / (onboarding) and /download (302 to the installer on GitHub)
+src/ratelimit.ts   per-machine (and per-IP for enroll) rate limits: GCRA in D1, 429 + retry-after
+src/cron.ts        every minute: expire silent leases, delete acked results after 7 days, prune limits
+migrations/        D1 schema (numbered; `wrangler d1 migrations apply`)
+scripts/admin.ts   admin CLI
+test/              vitest in local workerd, including the simulated fleet
+```
+
+## Run locally
+
+```
+npm install                      # .npmrc sets legacy-peer-deps (npm 10 crashes on vitest 4's peers)
+npm run db:local                 # apply migrations to the local D1 in .wrangler/
+npm run dev                      # wrangler dev on 0.0.0.0:5400
+```
+
+`.dev.vars` (gitignored) holds `ADMIN_TOKEN=dev-admin-token` for local runs. The dashboard is
+[http://localhost:5400/admin](http://localhost:5400/admin) while `npm run dev` runs.
+
+Admin CLI (any base URL):
+
+```
+export FARM_URL=http://localhost:5400 FARM_ADMIN_TOKEN=dev-admin-token
+npm run admin -- help
+npm run admin -- invites --count 3 --note Sam
+npm run admin -- upload-build path/to/build-dir     # manifest.json + .minisig + files, then register
+npm run admin -- run eoe2 run.json
+npm run admin -- checkpoint eoe2 81 model.onnx reference.npz
+npm run admin -- campaign fuzz-delver campaign.json
+npm run admin -- agent-release 0.2.0 <build_id> canary 0.1.0 --github-url <installer asset URL>
+npm run admin -- stats
+```
+
+(`farm-release release-agent --github greggg230/zero-farm` in `../agent` does the agent release in
+one go: build, sign, publish the build, make the GitHub Release, then this release call with its
+`github_url`. `agent-release --github-url` here points a channel at an already-registered build
+and its GitHub installer, e.g. to promote a canary build to stable.)
+
+Commands: `invites`, `machines`, `machine`, `revoke`, `pause`/`resume`, `put`, `get`, `build`,
+`upload-build`, `agent-release`, `run`, `run-get`, `checkpoint`, `results`, `accept`, `ack`,
+`campaign`, `campaign-get`, `campaign-results`, `campaign-ack`, `failures`, `diag`, `diag-list`,
+`stats`. Files over 64 MB go up as R2 multipart uploads.
+
+Example run config (`PUT /v1/admin/run/<run>`):
+
+```json
+{"game": "mtg", "build_id": "<24 hex>", "runtime": null, "priority": 1.0, "state": "active",
+ "selfplay": {"quota": 600, "slack": 0.1, "max_stale": 1, "games_per_lease": "auto",
+              "gpu": "any", "needs": {"threads": 2, "ram_mb": 2000}, "job": {"settings": {}}},
+ "eval": null}
+```
+
+## Test
+
+```
+npm test          # vitest + @cloudflare/vitest-pool-workers: local workerd, no Cloudflare account
+npm run check     # wrangler types --check, tsc (src + test), tsc (scripts)
+```
+
+95 tests in 11 files (about 2 minutes; the fleet simulation is most of it):
+
+| File | Covers |
+|---|---|
+| `api.test.ts` | every endpoint's happy path and validation; auth failures on every route (no token, unknown token, admin token on friend routes, machine token on admin routes, revoked → 403); tokens stored only as sha256; builds (missing/mismatched files, missing signature, wrong id); releases; checkpoints; diag (logs via beats and lease answers, diag leases); crashes; stats (incl. availability, starvation, releases, diagnostics uploads, the admin page's columns) |
+| `ratelimit.test.ts` | 429 + `retry-after` after the burst; the 2026-11-11 hot loop (8 lease requests a second) gets exactly one answer per 5 s and is never locked out; a simulated day of a well-behaved agent (leases, beats, need_profile retries, wait_s, back-to-back leases at the limit's rate) is never limited; per machine; beats and crash reports; enroll per client IP (wrong codes count, the invite survives); the cron prunes |
+| `onboard.test.ts` | `/` without an installer (and its GitHub source link), with only canary (says "test build"), stable over canary, `?channel=`, an installer older than its channel's min_agent skipped; `/download` = 302 to the release's `github_url` (GET and HEAD, no bytes); `github_url` validation (GitHub release assets only), `setup` and `setup/` uploads refused; 426 `download` link per channel |
+| `diag.test.ts` | user-initiated uploads (`x-farm-diag: user`): no request needed, once an hour per machine, 20 MB (an oversize one doesn't use up the hour), requested uploads unchanged, a user upload answers open requests |
+| `lease.test.ts` | lifecycle: issue → beat → upload → done; expiry after 3 silent beats → reissue of exactly the unfinished ids; paused past slack → `give_back`; agent give-back; pause → `cancel`; new checkpoint through beats; `done` with missing results; job choice by priority, self-play → eval → fuzz backfill, GPU routing, needs/disk; lease sizing from measured and class rates; paused and starved (`starved_ms`) time not counted |
+| `quota.test.ts` | cap = quota × (1 + slack), trimmed last lease, in-flight = leased + unacked, rejected games freeing room, given-back ids reissued, checkpoint resets the count, expired leases stop counting |
+| `fuzz.test.ts` | cursor never rewinds (lower seed_base ignored, higher jumps), pool before cursor, failures parsed and deduped, campaign results/ack |
+| `results.test.ts` | idempotent uploads, conflicting hash → 409 (and the loser's bytes removed), hash/size/seq/ids checks, 32 MB limit, first copy wins across leases, late copies (pool and reissued ids), staleness, cursor paging, R2 deletion 7 days after ack |
+| `update.test.ts` | `{"update"}` for agents older than the channel's or a build's `min_agent`, no update loop for builds no release satisfies, `aw` mismatch, enroll → 426 |
+| `units.test.ts` | ranges, semver, sizing, BLAKE2b vectors, minisign (prehashed and legacy, tampering, wrong key, wrong trusted comment), telemetry adapter |
+| `fleet.test.ts` | 10 fake machines × 6 generations against the real Worker: random vanishing (some crash and lose games in progress, one dies for good holding a lease), pauses past the slack, late results, double and conflicting uploads, checkpoint switches, fuzz backfill; a fake trainer fills each generation by cursor. Asserts every game id and seed is claimed exactly once or back in the pool, every generation filled by exactly `quota` accepted games, accepted + in flight never over the cap, ≥ 3 machines per generation, the dead machine's games played by others |
+
+Test notes:
+- `TEST_CLOCK=1` (set only in `vitest.config.ts`) lets tests move time with an `x-test-now` header.
+  It is not in `wrangler.jsonc`, so a deployed Worker ignores the header.
+- `vitest.config.ts` sets `RELEASE_PUBKEYS` to empty: `wrangler.jsonc` carries the real release
+  key, and the test builds carry fake signatures (signature checks have their own unit tests).
+- Rate limits are on in every test. Tests that fire many requests at one frozen clock time space
+  them out with `advance()`; enroll is limited per `cf-connecting-ip`, which only the rate-limit
+  test sends.
+- The helpers call the Worker's `fetch` handler directly (with the real local bindings) instead of
+  `SELF.fetch`: in vitest-pool-workers 0.23 every `SELF` request wraps the entrypoint prototype in
+  one more `Proxy`, so the thousands of requests in the fleet test become quadratic and overflow the
+  stack. Durable Object calls still go through real stubs.
+- `@cloudflare/vitest-pool-workers` was renamed `@cloudflare/vitest-plugin` (1.x) upstream; 0.23
+  works with vitest 4.1 but gets no more updates. Moving is `npx @cloudflare/codemods
+  vitest:pool-workers-to-vitest-plugin`.
+- Analytics Engine is simulated by Miniflare (writes go nowhere); `src/telemetry.ts` is a no-op
+  without the binding, and `units.test.ts` checks the data points with a fake dataset.
+- `npm audit` flags sharp and undici under wrangler/miniflare: dev-only, nothing deployed.
+
+## Deployed (2026-11-11)
+
+Live at [https://farm.greggg230.com](https://farm.greggg230.com) (Worker `zero-farm`, custom domain).
+D1 `zero-farm` = 095e93bc-c26c-4b69-ada1-d6293ed52041 (WNAM), migration 0001 applied; R2 bucket
+`zero-farm` (private); Analytics Engine dataset `zero_farm`; cron every minute. `ADMIN_TOKEN` is a
+Worker secret; the owner keeps the only other copy in a local file outside the repo (never print
+it; `FARM_ADMIN_TOKEN="$(cat <that file>)"` for the CLI). Smoke-tested: admin auth and stats, invite ->
+enroll -> invite reuse refused -> lease (`no_work`) -> revoke -> lease refused (test rows deleted).
+`RELEASE_PUBKEYS` holds release key 1B9342EFFB546500 (step 6 done). Not done: step 9 (Cloudflare
+Access on `/admin`; optional, since the page shows nothing without the admin token).
+Redeploy: `npm run deploy` from this directory (migrations first, then code). The 11-12
+follow-ups add migration `0002_followups.sql` (rate limits, installers on releases, user
+diagnostics flag); `npm run deploy` applies it before the code that needs it. Rev 4 (installers
+on GitHub Releases) adds `0003_github_releases.sql` (`agent_releases.github_url`). After deploying
+rev 4, `/download` is 404 until a release names a `github_url` (`farm-release github-release`).
+
+## Deploy checklist (as originally written)
+
+1. `npx wrangler login` (or `CLOUDFLARE_API_TOKEN` with Workers, D1, R2 and Analytics Engine edit).
+2. D1: `npx wrangler d1 create zero-farm` and put the printed `database_id` in `wrangler.jsonc`
+   (it holds a placeholder of zeros).
+3. R2: `npx wrangler r2 bucket create zero-farm`. Keep it private (no public bucket, no r2.dev
+   URL): everything is served through the Worker.
+4. Analytics Engine: nothing to create; the `zero_farm` dataset appears on first write (Workers
+   Paid includes AE). Query it later with the SQL API.
+5. Secret: `npx wrangler secret put ADMIN_TOKEN` with a fresh random value, e.g.
+   `node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"`. Keep it in
+   the desktop's secret store for the trainer and the CLI.
+6. Release key: once the minisign key exists, put its public key (the base64 line of
+   `minisign.pub`; several comma-separated during a rotation) in `vars.RELEASE_PUBKEYS`. Until then
+   the coordinator only checks that each build's signature file is present (`sig_verified: false`);
+   agents verify signatures regardless.
+7. Custom domain: the `routes` entry for `farm.greggg230.com` in `wrangler.jsonc` (the zone must
+   be on the same Cloudflare account).
+8. `npm run deploy`: type-checks, applies D1 migrations remotely, deploys. Later schema changes are
+   new files in `migrations/`; apply them before deploying code that needs them.
+9. Cloudflare Access (Zero Trust → Access → Applications → Self-hosted): domain
+   `farm.greggg230.com`, path `admin`, policy = the user's email. Put Access only on `/admin`:
+   friends' agents (`/v1/*`) and the trainer/CLI (`/v1/admin/*`) authenticate with bearer tokens
+   and can't pass an Access login. To also put Access on `/v1/admin/*`, create a service token and
+   teach `scripts/admin.ts` / the pool remote to send `CF-Access-Client-Id` / `CF-Access-Client-Secret`
+   (not done).
+10. Smoke test: `FARM_URL=https://farm.greggg230.com FARM_ADMIN_TOKEN=... npm run admin -- stats`,
+    then open [https://farm.greggg230.com/admin](https://farm.greggg230.com/admin).
+11. For local development, run `npm install` and `npm run db:local` once, then `npm run dev`.
+
+## Design notes
+
+**Scopes and LeaseBook.** Each run (`run:<slug>`), campaign (`campaign:<id>`) and the diag queue
+(`diag`) is one `LeaseBook` Durable Object instance. All state lives in D1; the object only
+serialises. While a Durable Object awaits D1 or R2, other requests to it can start, so each method
+runs through a promise-chain lock, and each logical change (grant, credit, close) is one atomic
+`db.batch`. Expected errors cross the RPC boundary as values (`Outcome`), because RPC drops custom
+error fields.
+
+**Id accounting.** Game ids come from `runs.next_gid` (self-play and eval share it); seeds from
+`campaigns.cursor`, which only moves forward. Every id below the counter is exactly one of:
+claimed (`claims`: credited to the first result chunk that reported it), unclaimed inside an active
+lease's `[lo, hi)`, or pooled (`pool`). A lease is one contiguous range, from the lowest pooled
+range first, else fresh. Closing a lease (done, given back, expired, cancelled) puts
+`[lo, hi) − claims` back in the pool, so ids an agent never reported are reissued whatever its
+`unfinished` says. Results declare their ids in `x-ids` because the coordinator can't read records.
+A late chunk can claim ids that were reissued (the other lease's copy then counts as a duplicate
+and its `claimed` counter rises) or are back in the pool (they leave it). The fleet test checks
+that claims and pool tile every id handed out.
+
+**Quota.** For the current generation: accepted (the trainer's total, `quotas`) + in flight
+(unclaimed ids of active self-play leases + credited self-play games not yet acked) must stay
+within `floor(quota × (1 + slack))`; the last lease is trimmed to fit. A new checkpoint starts a new
+count, and leases already out carry over as in flight (they switch checkpoint at their next game
+boundary, told through beats). Late credits can't push the total past the cap: freed ids are
+reissued before any fresh id is.
+
+**Choosing and sizing.** Pull only. For a lease request: diag requests for that machine first;
+then each active run's self-play (needs a checkpoint and quota headroom) and eval (unissued batch
+ids), scored priority × fit ÷ (1 + active leases of that job), which shares machines by priority;
+then fuzz as the backfill. Fit: `gpu: required` excludes CPU-only PCs, `gpu: preferred` moves the
+run to the backfill tier at ×0.25 on them, fuzz is ×0.5 on GPU PCs, cached builds ×1.2, a cached
+checkpoint ×1.1; `needs` and disk must fit the caps. Size = ~450 s × the machine's rate for that
+(kind, scope), an EWMA of ids per running second (paused time excluded), else its hardware class's
+average, else defaults (16 games, 10 eval games, 20000 seeds), clamped. `games_per_lease` / `chunk`
+override.
+
+**Expiry.** A lease expires when it misses 3 beats (`expires_at` = last beat + 180 s). Expired leases
+are swept before every grant, beat, result and done of their scope, and by the minute cron.
+Paused leases keep beating; past `slack_s` the agent gives back, and the coordinator answers
+`give_back` too if it doesn't.
+
+**Results.** The Worker reads the body (≤ 32 MB), checks its sha256 and writes it to R2 *before*
+asking LeaseBook to commit: 32 MB doesn't fit through Durable Object RPC. The key carries the hash,
+so conflicting bodies for one seq never overwrite each other; whichever commits first wins and the
+Worker deletes the other's object. Retries of a stored chunk are answered from D1 without touching
+R2. Self-play chunks older than `max_stale` generations are refused (410) and their ids stay
+unclaimed, so they get reissued rather than lost. The trainer lists results by cursor per run or
+campaign. Each entry says which ids are first copies (`ids`) and which are duplicates (`dup_ids`).
+The trainer posts `accept` (its total for the generation) then `ack`. R2 objects are deleted 7 days
+after ack.
+
+**Rate limits.** One D1 row per (machine, bucket) holding a GCRA "theoretical arrival time":
+a request at `now` is allowed while `tat - now <= (burst - 1) * interval` and moves `tat` to
+`max(tat, now) + interval`, in one conditional upsert (`RETURNING` tells allowed from refused, so
+two concurrent requests can't both take the last slot); a refused request writes nothing.
+Buckets: lease 5 s × 6, beat 10 s × 12, crash 10 s × 30, user diagnostics 1 h × 1, enroll
+60 s × 10 per `cf-connecting-ip` (no header, as in local tools: not limited). A limited request
+costs one D1 batch (upsert + select) after auth, instead of the lease's dozen queries and Durable
+Object calls. The cron deletes rows whose `tat` is a day old.
+
+**Onboarding and installers.** `GET /` is a static page with the newest installer's version
+filled in and a link to the source code and releases on GitHub; `GET /download` answers 302 to
+the newest stable release's `github_url`, else canary's (`x-farm-channel` says which), skipping
+one older than its channel's `min_agent`. Installers live only on GitHub Releases (PROTOCOL
+2.1, rev 4): `POST /v1/admin/agent/release` names one with `github_url`, which must be a GitHub
+release asset URL. The coordinator stores and serves no installer bytes (rev 3's R2 `setup/`
+objects and `setup_*` columns are unused).
+
+**Diagnostics.** Requested uploads (`upload_diag`) are unchanged. A friend's "Send diagnostics"
+(`x-farm-diag: user`) needs no request: body ≤ 20 MB is read first (so an oversize upload doesn't
+use up the hour), then the hourly bucket is taken. `diag_uploads.user` marks them; the dashboard
+lists recent uploads with a download button.
+
+**Updates.** `/v1/lease` answers `{"update": {"min_agent"}}` when the agent is older than its
+channel's latest release's `min_agent`, or older than the `min_agent` of a build it could otherwise
+get, provided the channel's latest release satisfies it. Builds no release satisfies yet are
+skipped, so an agent is never sent into an update loop.
+
+**Telemetry and the dashboard.** Beats and `done` write a data point per Stats sample to Analytics
+Engine (index = machine; 20 doubles, the most AE takes, the last being `starved_ms`;
+`paused_ms` and `resume_ms_max` stay in D1). The dashboard reads D1 summaries via
+`/v1/admin/stats`: machines (last seen, work, busy/paused hours, availability as idle h/day of
+on h/day from the profile, yields, hours starved of CPU, give-backs, expiries, crashes),
+throughput, runs (quota, cap, accepted, in flight), campaigns, rates by hardware class, agent
+releases per channel (with the installer's GitHub link), recent diagnostics uploads, recent crashes and new
+fuzz failure sites. A Worker can write to AE but can only read it through the account's SQL API.
+
+**Not done / open:**
+- Eval jobs with several networks: a lease has one `checkpoint`, so eval opponents' models need a
+  protocol addition before phase 2.
+- `outside_hours` is agent-side only. There is no contributors page yet (DESIGN 5).
+- Result uploads and `done` are not rate-limited (a reconnecting agent may upload many chunks at
+  once); invite codes carry 60 bits and tokens 256.
+- The first-lease 60 s benchmark from DESIGN 5.1 isn't a separate job: rates come from real leases
+  (with hardware-class averages before that).

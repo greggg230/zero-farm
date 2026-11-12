@@ -1,0 +1,39 @@
+[package]
+name = "zerofarm-common"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "zero-farm shared pieces: protocol types, manifest/1, minisign verification, hashing, HTTP client"
+
+[features]
+default = []
+# The HTTP client (ureq + rustls/ring). The launcher leaves it off: it never downloads.
+http = ["dep:ureq", "dep:getrandom"]
+# DPAPI (CurrentUser) protect/unprotect.
+dpapi = ["windows-sys/Win32_Security_Cryptography", "windows-sys/Win32_Foundation", "windows-sys/Win32_System_Memory"]
+# minisign signing (desktop release tool and tests only).
+sign = ["dep:minisign", "dep:scrypt", "dep:getrandom"]
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+minisign-verify.workspace = true
+ureq = { workspace = true, optional = true }
+base64 = { workspace = true }
+getrandom = { workspace = true, optional = true }
+minisign = { workspace = true, optional = true }
+scrypt = { workspace = true, optional = true }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+minisign.workspace = true
+
+[build-dependencies]
+
+[[test]]
+name = "manifest_verify"
+required-features = ["sign"]

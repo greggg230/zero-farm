@@ -1,0 +1,8 @@
+# zero-farm release public keys, one per line (the base64 line of the minisign.pub that
+# `farm-release keygen` prints). Every agent and launcher build trusts exactly these keys plus any
+# in the build-time env var ZEROFARM_TRUSTED_KEYS.
+#
+# The zero-farm release key (key id 1B9342EFFB546500). A build with no trusted key refuses to run
+# anything, and `farm-release release-agent` refuses to sign an agent that does not trust the
+# signing key.
+RWQAZVT770KTG1hmXk6yJ5i9pF1v5Q4lNLQ9C3fOUo8ynWWfamzJ2LpS
