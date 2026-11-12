@@ -4,6 +4,11 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>`.
 
+## 0.2.4 (2026-11-12, canary)
+
+- Release-path check: no user-visible changes. 0.2.3 must update itself to it before 0.2.3 goes
+  to the stable channel.
+
 ## 0.2.3 (2026-11-12, canary)
 
 - **Evaluation jobs**: two or more trained networks play each other, for example to see whether a
