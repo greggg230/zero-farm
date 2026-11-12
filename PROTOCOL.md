@@ -628,7 +628,63 @@ each new checkpoint gen.
 older than the first definition-aware agent, until that agent is `min_agent` on both channels. After
 that, a lease without a definition is never issued, and a definition-aware agent never runs one.
 
+## 8. GPU inference contract (rev 7, phases 3-4)
+
+One worker-side function creates every inference session; the GPU work and the self-play work
+both build on it, and nothing else in a worker creates an ONNX Runtime session.
+
+**Worker API** (`zero_worker::session`, Rust; owned by the GPU work):
+
+```rust
+pub enum ProviderKind { Cpu, TensorRtRtx, Cuda, MiGraphX, OpenVino, DirectMl }
+pub struct GpuDevice { pub luid: u64, pub vendor: String, pub name: String }
+pub struct SessionSpec<'a> {
+    pub model: &'a Path,               // a zero-onnx/1 graph
+    pub reference: Option<&'a Path>,   // reference.npz; required to accept any GPU provider
+    pub providers: &'a [ProviderKind], // preference order from the job line; Cpu always last
+    pub device: Option<GpuDevice>,     // the adapter to use (job line `gpu`)
+    pub intra_threads: usize,
+}
+pub struct SelfTest { pub provider: ProviderKind, pub max_abs: f32, pub ok: bool,
+                      pub cpu_fallback_nodes: Vec<String> }
+pub fn create_session(spec: &SessionSpec) -> Result<InferenceSession, SessionError>;
+impl InferenceSession {
+    pub fn provider(&self) -> ProviderKind;
+    pub fn selftest(&self) -> &SelfTest;
+    pub fn eval(&mut self, batch: &LeafBatch) -> Result<Answer, SessionError>; // zero-onnx/1 in, the
+                                                // generic post-processed answer out (section 5)
+    pub fn release_device(&mut self);  // on `yield`: free all GPU memory; rebuilt on the next eval
+}
+```
+
+`create_session` tries `providers` in order. A provider is accepted only if its session builds and
+the self-test on `reference` passes: max abs difference at most 2e-5 against the reference answers
+on every output, run twice and bit-identical. Nodes the provider leaves to the CPU are listed in
+`cpu_fallback_nodes`. Otherwise it moves to the next provider, ending with `Cpu`. The worker emits
+one `selftest` event per model with `gen`, `provider`, `max_abs`, `ok` and `cpu_fallback_nodes`.
+
+**Job line (aw/1 additions):** `providers: ["migraphx", "dml", "cpu"]` (what the agent allows, in
+order, from its verified provider list and the user's "Use the GPU" setting) and
+`gpu: {"luid": "<hex>", "vendor", "name"} | null`. A job line without `providers` means
+`["cpu"]`.
+
+**Agent profile:** `gpus[]` gains `luid` (hex), and entries are de-duplicated by LUID. `providers` lists
+only providers that passed a probe on this PC: `mtgz-worker probe-providers` runs a small built-in
+graph and self-test per candidate provider and adapter. Results are cached per (runtime build,
+driver version, adapter). `caps.gpu` is true only when a GPU provider passed the probe.
+
+**GPU busy signal:** vendor-neutral, from the Windows PDH "GPU Engine" counters (per-process
+utilization), excluding Zero Farm's own worker processes. It replaces NVML as the gate for GPU work.
+Temperature comes from a vendor-neutral source where available (see DESIGN 8.5).
+
+**Coordinator routing:** a run's or campaign's `gpu` setting (`any` | `preferred` | `required`) and
+an optional `providers` allowlist are matched against each machine's verified `providers` and
+`gpus`. Evaluation is routed first, then self-play.
+
 ## Changes
+- v1 rev 7 (2026-11-12, planned): GPU inference contract (section 8): `create_session` as the one session factory,
+  `providers`/`gpu` in the job line, probed providers and adapter LUIDs in the profile, the PDH busy signal,
+  provider routing.
 - v1 rev 6 (2026-11-12): signed definitions (section 7): data keys, `definition/1`, the agent builds the job line
   from the signed template, coordinator-settable fields limited, versions never roll back.
 - v1 rev 5 (2026-11-12): evaluation and head-to-heads (section 5.2): `checkpoints` on eval leases,

@@ -623,6 +623,41 @@ Expect many friends' PCs to contribute mainly through the **CPU EP**: these nets
 CPU inference is competitive at small batches (the M4 Max beat its own GPU via MPS for MTG Zero;
 the 5090 needed CUDA graphs plus sparse uploads to pull ahead). Phase 0 measures this.
 
+### 8.5 Phases 3 and 4 in parallel (2026-11-12)
+
+The user's go-ahead covers both phases at once: self-play (3) and GPU for all vendors (4 + 4b,
+with no NVIDIA-first step). They share one contract, PROTOCOL section 8 (`create_session`).
+
+**Who owns what.**
+
+| Area | GPU work | Self-play work |
+|---|---|---|
+| worker (`zero_worker`) | `session` (providers, self-test, device release), `probe-providers` | the self-play job, the record writer; calls `create_session` only |
+| agent | `signals`/`policy`/`profile` GPU code (PDH busy signal, temperature, LUIDs, probe cache, `providers`/`gpu` in the job line) | the `records` result event, if anything changes there |
+| runtime | the runtime packs (Windows ML catalog, DirectML pack for Windows 10) | none |
+| coordinator | capability routing (`gpu`, `providers`) | self-play leases, quota and staleness with records |
+| trainer (zero-core, mtg-zero) | none | `feat/multi-remote` merge, `replay_rows`, the `pool` remote, gate 3 |
+
+**GPU busy and temperature.** The busy gate is the Windows PDH "GPU Engine" counters (per process,
+what Task Manager shows), excluding Zero Farm's own worker processes, for every vendor. NVML is
+kept only for NVIDIA details. Options for temperature, in order:
+1. `D3DKMTQueryAdapterInfo(KMTQAITYPE_ADAPTERPERFDATA)`: vendor-neutral, the source of Task
+   Manager's "GPU temperature" on recent drivers. To be confirmed on the AMD card.
+2. AMD's ADLX library (installed with the AMD driver): AMD only, and needs C++ interface bindings.
+3. No temperature gate (the driver's own thermal limits only).
+Decision pending (the user asked to be shown the choice).
+
+**Providers.** On Windows 11 24H2+: the Windows ML provider catalog (TensorRT-RTX, MIGraphX,
+OpenVINO). Its availability in an unpackaged per-user app is to be confirmed first. On Windows 10
+(the canary PC): a DirectML runtime pack. Each provider is accepted only through the self-test,
+which also exposes nodes left to the CPU. The graph features flagged in 8.2 are the risks: int64
+identity decoding, GatherElements/ScatterElements, boolean-mask attention.
+
+**Self-play run.** Phase 3 needs a run to feed. Options: (a) a short throwaway run forked from an
+EoE checkpoint, with a desktop-only twin as an A/B; (b) joining EoE run 2 (`eoe2e`, live,
+managed by another session) at an iteration boundary; (c) resuming the paused Delver line with the
+pool added. The user decides.
+
 ## 9. Phases
 
 Each phase ends with a stop for the user's go-ahead.
