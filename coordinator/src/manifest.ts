@@ -132,7 +132,7 @@ export async function verifyBuild(bucket: R2Bucket, buildId: string, pubkeys: st
       .filter(Boolean);
     if (keys.length) {
       const sig = await sigObj.text();
-      const why = await verifyMinisign(bytes, sig, keys);
+      const why = await verifyMinisign(bytes, sig, keys, "RELEASE_PUBKEYS");
       if (why) problems.push(`signature: ${why}`);
       else {
         const trusted = trustedComment(sig) ?? "";
@@ -169,9 +169,22 @@ async function ed25519Verify(pub: Uint8Array, sig: Uint8Array, msg: Uint8Array):
   return crypto.subtle.verify({ name: "Ed25519" }, key, sig, msg);
 }
 
+// The key id (16 hex chars, as minisign prints it: big-endian) of a .minisig file, or null.
+export function minisignKeyId(sig: string): string | null {
+  try {
+    const s = b64(sig.split(/\r?\n/)[1] ?? "");
+    if (s.length !== 74) return null;
+    return [...s.slice(2, 10)].reverse().map((b) => b.toString(16).padStart(2, "0")).join("").toUpperCase();
+  } catch {
+    return null;
+  }
+}
+
 // null if `sig` (a .minisig file) is a valid signature of `msg` by one of `pubkeys` (the base64
 // line of minisign.pub), else why not. Supports legacy ("Ed") and prehashed ("ED") signatures.
-export async function verifyMinisign(msg: Uint8Array, sig: string, pubkeys: string[]): Promise<string | null> {
+// `listName` names the key list in the answer: release keys sign builds (RELEASE_PUBKEYS), data
+// keys sign definitions (DATA_PUBKEYS), and each check is given only its own list.
+export async function verifyMinisign(msg: Uint8Array, sig: string, pubkeys: string[], listName = "RELEASE_PUBKEYS"): Promise<string | null> {
   const lines = sig.split(/\r?\n/);
   if (lines.length < 4 || !lines[0].startsWith("untrusted comment:") || !lines[2].startsWith("trusted comment: ")) {
     return "not a minisign signature file";
@@ -208,7 +221,7 @@ export async function verifyMinisign(msg: Uint8Array, sig: string, pubkeys: stri
     if (!(await ed25519Verify(pub, global, both))) return "trusted comment signature does not verify";
     return null;
   }
-  return "signed by a key not in RELEASE_PUBKEYS";
+  return `signed by a key not in ${listName}`;
 }
 
 // ---------- BLAKE2b-512 (RFC 7693), for minisign's prehashed signatures ----------

@@ -2,7 +2,7 @@
 
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { admin, advance, enroll, err, expectTiled, finish, idsOf, lease, makeBuild, makeCampaign, ok, upload } from "./helpers";
+import { admin, advance, ask, define, enroll, err, expectTiled, finish, idsOf, lease, makeBuild, makeCampaign, ok, upload } from "./helpers";
 
 const fuzzResult = (first: number, count: number, done: number, failures: object[] = []) =>
   JSON.stringify({ campaign: "fz", mode: "delver", first, count, done, failures, build_id: "b", engine_commit: "e" });
@@ -13,7 +13,9 @@ describe("fuzz campaigns", () => {
     const m = await enroll("a");
     const l1 = await lease(m);
     const l2 = await lease(m);
-    expect(l1.job).toEqual({ kind: "fuzz", mode: "delver", env: { FUZZ_POOL: "delver" }, first: 10_000_000, count: 20000 });
+    // Rev 6: mode and env come from the signed definition; the job says which seeds.
+    expect(l1.job).toEqual({ kind: "fuzz", first: 10_000_000, count: 20000 });
+    expect(l1.definition.key).toBe("defs/campaign/fz/1/definition.json");
     expect(l2.job.first).toBe(10_020_000);
     expect(l1).toMatchObject({ kind: "fuzz", run: null, campaign: "fz", checkpoint: null, runtime: null });
   });
@@ -23,6 +25,7 @@ describe("fuzz campaigns", () => {
     const put = (seed_base: number) =>
       admin("PUT", "/v1/admin/campaign/fz", { build_id: build, mode: "delver", env: {}, seed_base, chunk: 100 });
     expect(ok(await put(1000)).cursor).toBe(1000);
+    await define("campaign", "fz");
     const m = await enroll("a");
     await lease(m);
     await lease(m); // cursor 1200
@@ -34,6 +37,9 @@ describe("fuzz campaigns", () => {
     // A new build for the same campaign keeps the cursor.
     const build2 = await makeBuild({ tag: "v2" });
     expect(ok(await admin("PUT", "/v1/admin/campaign/fz", { build_id: build2, mode: "delver", env: {}, seed_base: 1000, chunk: 100 })).cursor).toBe(5100);
+    // Rev 6: the new build runs only once a definition signs it.
+    expect(ok(await ask(m)).reason).toBe("no_work");
+    await define("campaign", "fz");
     expect((await lease(m)).build.build_id).toBe(build2);
   });
 

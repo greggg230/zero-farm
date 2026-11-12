@@ -8,7 +8,7 @@
 // changes nothing. Answer: 429 `rate_limited` with `retry-after` (seconds) and `retry_after`.
 
 import type { Ctx } from "./ctx";
-import { HttpError } from "./util";
+import { HttpError, base64url } from "./util";
 
 export interface Limit {
   interval: number; // seconds per request, on average
@@ -48,8 +48,53 @@ export async function take(c: Ctx, key: string, bucket: Bucket, what: string): P
   throw new HttpError(429, "rate_limited", `too many ${what} requests; retry in ${retry} s`, { retry_after: retry });
 }
 
-// Rows of keys that have been quiet for a day carry no state (tat long past).
+// ---------- client IPs (enroll) ----------
+//
+// An IP is never stored. Its key is "ip:" + HMAC-SHA256(IP_SALT, address) (IPv6: the /64, which one
+// household or server usually gets whole), first 18 bytes, base64url. IP_SALT is a Worker secret;
+// without it each Worker instance draws a random one when it starts (so a new one with every
+// deploy), and instances then don't share enroll limits. Rows are deleted by the cron as soon as
+// they carry no state (within minutes), and never later than a day after the last request.
+
+let fallbackSalt: Uint8Array | null = null;
+const keyCache = new Map<string, CryptoKey>();
+
+async function hmacKey(salt: string | undefined): Promise<CryptoKey> {
+  const id = salt ?? "";
+  let k = keyCache.get(id);
+  if (!k) {
+    const raw = salt ? new TextEncoder().encode(salt) : (fallbackSalt ??= crypto.getRandomValues(new Uint8Array(32)));
+    k = await crypto.subtle.importKey("raw", raw, { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    keyCache.set(id, k);
+  }
+  return k;
+}
+
+// The part of an address that identifies a client: IPv4 as is, IPv6 its /64 (lowercase hex groups).
+export function ipPrefix(ip: string): string {
+  const a = ip.trim().toLowerCase();
+  if (!a.includes(":")) return a;
+  const [head, tail] = a.split("::");
+  const hs = head ? head.split(":") : [];
+  const ts = tail !== undefined && tail ? tail.split(":") : [];
+  // An embedded IPv4 tail (::ffff:192.0.2.1) counts as two groups; it is past the /64 anyway.
+  const n = (xs: string[]) => xs.reduce((s, x) => s + (x.includes(".") ? 2 : 1), 0);
+  const groups = tail === undefined ? hs : [...hs, ...Array(Math.max(0, 8 - n(hs) - n(ts))).fill("0"), ...ts];
+  return groups
+    .slice(0, 4)
+    .map((g) => (/^[0-9a-f]{1,4}$/.test(g) ? g.replace(/^0+(?=.)/, "") : g))
+    .join(":") + "::/64";
+}
+
+export async function ipKey(ip: string, salt: string | undefined): Promise<string> {
+  const mac = new Uint8Array(await crypto.subtle.sign("HMAC", await hmacKey(salt?.trim() || undefined), new TextEncoder().encode(ipPrefix(ip))));
+  return "ip:" + base64url(mac.subarray(0, 18));
+}
+
+// Deletes rows that carry no state any more: a row whose `tat` has passed is equivalent to no row
+// (the next request starts a fresh burst either way). Client-IP rows go as soon as that happens;
+// machine rows after a day (cheap to keep, and fewer writes for a machine that keeps asking).
 export async function prune(db: D1Database, now: number): Promise<number> {
-  const r = await db.prepare(`DELETE FROM rate_limits WHERE tat < ?`).bind(now - 86400).run();
+  const r = await db.prepare(`DELETE FROM rate_limits WHERE tat < ? OR (key LIKE 'ip:%' AND tat < ?)`).bind(now - 86400, now).run();
   return r.meta.changes ?? 0;
 }

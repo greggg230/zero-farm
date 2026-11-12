@@ -1,12 +1,31 @@
 // Desktop API (PROTOCOL 4): bearer = the admin token. Used by the trainer's pool remote, the
 // release tool, scripts/admin.ts and the /admin dashboard.
 
+import { accessEnabled } from "./access";
 import * as book from "./book";
 import { blockLifted } from "./blocks";
+import { config } from "./config";
 import { authAdmin, type Ctx } from "./ctx";
+import {
+  DEF_KEY_RE,
+  DEF_KINDS,
+  type Def,
+  type DefinitionRow,
+  MAX_DEFINITION,
+  MAX_SIGNATURE,
+  checkpointProblem,
+  currentDef,
+  currentDefs,
+  defKey,
+  evalProblem,
+  leaseProblem,
+  parseDefinition,
+  seatGens,
+} from "./definitions";
+import { MAX_EXTERNAL_BODY, type Contributor, type ExternalRow, ownContributor, parseReport, storeReport, totals } from "./external";
 import { CHANNELS, serveObject } from "./friend";
 import { bookFor } from "./leasebook";
-import { verifyBuild } from "./manifest";
+import { minisignKeyId, verifyBuild, verifyMinisign } from "./manifest";
 import {
   BUILD_RE,
   HEX64_RE,
@@ -16,6 +35,7 @@ import {
   bool,
   checkKey,
   cmpSemver,
+  conflict,
   hex,
   int,
   type Json,
@@ -30,8 +50,10 @@ import {
   parseJson,
   readBounded,
   readJson,
+  sha256Hex,
   str,
   unwrap,
+  uriDecode,
 } from "./util";
 
 const STATES = ["active", "paused"] as const;
@@ -47,7 +69,7 @@ function slug(v: string, what: string): string {
 // ---------- invites ----------
 
 export async function invites(c: Ctx): Promise<Response> {
-  authAdmin(c);
+  await authAdmin(c);
   const b = await readJson(c.req);
   const count = int(b.count, "count", { optional: true, min: 1, max: 100 }) ?? 1;
   const note = str(b.note, "note", { optional: true, max: 200 }) ?? null;
@@ -65,22 +87,44 @@ export async function invites(c: Ctx): Promise<Response> {
 
 // ---------- artifacts and builds ----------
 
-function uploadKey(raw: string): string {
-  const key = checkKey(decodeURIComponent(raw));
-  if (!["builds/", "ckpt/"].some((p) => key.startsWith(p))) throw bad("artifacts go under builds/ or ckpt/");
-  return key;
+// Upload keys: builds/, ckpt/, and (rev 6) a definition and its signature at
+// defs/<kind>/<id>/<version>/definition.json(.minisig). `registered`: that definition version is
+// registered, so its files can't change (agents check their sha256, and the version is spent).
+async function uploadKey(c: Ctx, raw: string): Promise<{ key: string; registered: boolean }> {
+  const key = checkKey(uriDecode(raw));
+  if (key.startsWith("defs/")) {
+    const m = DEF_KEY_RE.exec(key);
+    if (!m) throw bad("definitions go at defs/<run|campaign>/<id>/<version>/definition.json (and .minisig)");
+    const taken = await c.env.DB.prepare(`SELECT 1 FROM definitions WHERE kind = ? AND id = ? AND version = ?`).bind(m[1], m[2], Number(m[3])).first();
+    return { key, registered: !!taken };
+  }
+  if (!["builds/", "ckpt/"].some((p) => key.startsWith(p))) throw bad("artifacts go under builds/, ckpt/ or defs/");
+  return { key, registered: false };
 }
 
-// An agent release's installer on GitHub Releases (rev 4), where GET /download redirects:
-// https://github.com/<owner>/<repo>/releases/download/<tag>/<file>.exe
-const GITHUB_URL_RE = /^https:\/\/github\.com\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/releases\/download\/[A-Za-z0-9_.+-]+\/[A-Za-z0-9_.+-]+\.exe$/;
+const spent = (key: string) => conflict(`${key} belongs to a registered definition: its files can't change (sign a new version)`);
+
+// An agent release's installer on GitHub Releases (rev 4), where GET /download redirects. Exactly
+// https://github.com/<GITHUB_REPO>/releases/download/agent-v<version>/ZeroFarmSetup.exe, the
+// release's own version (security review H4/L4: no other repository, tag or file).
+export function githubUrlFor(repo: string, version: string): string {
+  return `https://github.com/${repo}/releases/download/agent-v${version}/ZeroFarmSetup.exe`;
+}
 
 // PUT /v1/admin/artifact/{key}: a whole object, or (with ?upload_id=&part=) one part of a
 // multipart upload for objects larger than a request may be.
 export async function putArtifact(c: Ctx, raw: string): Promise<Response> {
-  authAdmin(c);
-  const key = uploadKey(raw);
+  await authAdmin(c);
+  const { key, registered } = await uploadKey(c, raw);
   if (!c.req.body) throw bad("empty body");
+  if (registered) {
+    // Uploading the very same bytes again (a retried publish) is a no-op; anything else is refused.
+    if (c.url.searchParams.has("upload_id")) throw spent(key);
+    const body = await readBounded(c.req, MAX_DEFINITION);
+    const old = await c.env.BUCKET.get(key);
+    if (!old || (await sha256Hex(new Uint8Array(await old.arrayBuffer()))) !== (await sha256Hex(body))) throw spent(key);
+    return json({ ok: true, key, size: body.byteLength, unchanged: true });
+  }
   const uploadId = c.url.searchParams.get("upload_id");
   if (uploadId !== null) {
     const part = int(Number(c.url.searchParams.get("part")), "part", { min: 1, max: 10000 });
@@ -105,8 +149,9 @@ export async function putArtifact(c: Ctx, raw: string): Promise<Response> {
 // POST /v1/admin/artifact/{key}?uploads starts a multipart upload; ?upload_id= completes it
 // with {"parts": [{"part": 1, "etag": "..."}, ...]}.
 export async function postArtifact(c: Ctx, raw: string): Promise<Response> {
-  authAdmin(c);
-  const key = uploadKey(raw);
+  await authAdmin(c);
+  const { key, registered } = await uploadKey(c, raw);
+  if (registered) throw spent(key);
   if (c.url.searchParams.has("uploads")) {
     const mpu = await c.env.BUCKET.createMultipartUpload(key);
     return json({ key, upload_id: mpu.uploadId });
@@ -125,12 +170,12 @@ export async function postArtifact(c: Ctx, raw: string): Promise<Response> {
 
 // GET /v1/admin/artifact/{key}: any object (results, diag uploads, builds, checkpoints).
 export async function getArtifact(c: Ctx, raw: string): Promise<Response> {
-  authAdmin(c);
-  return serveObject(c, checkKey(decodeURIComponent(raw)));
+  await authAdmin(c);
+  return serveObject(c, checkKey(uriDecode(raw)));
 }
 
 export async function registerBuild(c: Ctx): Promise<Response> {
-  authAdmin(c);
+  await authAdmin(c);
   const b = await readJson(c.req);
   const id = str(b.build_id, "build_id", { re: BUILD_RE });
   const v = await verifyBuild(c.env.BUCKET, id, String(c.env.RELEASE_PUBKEYS ?? ""));
@@ -152,7 +197,7 @@ async function buildOfKind(db: D1Database, id: string, kind: string, what: strin
 }
 
 export async function agentRelease(c: Ctx): Promise<Response> {
-  authAdmin(c);
+  await authAdmin(c);
   const b = await readJson(c.req);
   const version = str(b.version, "version", { max: 64 });
   if (!isSemver(version)) throw bad("version must be semver");
@@ -166,7 +211,12 @@ export async function agentRelease(c: Ctx): Promise<Response> {
   // Rev 4: installers live on GitHub Releases, no longer in R2 (`setup`). Refused loudly rather
   // than ignored, so an old release tool can't think it attached one.
   if (b.setup !== undefined && b.setup !== null) throw bad("setup is no longer accepted: pass github_url (PROTOCOL rev 4)");
-  const githubUrl = b.github_url === undefined || b.github_url === null ? null : str(b.github_url, "github_url", { max: 512, re: GITHUB_URL_RE });
+  let githubUrl: string | null = null;
+  if (b.github_url !== undefined && b.github_url !== null) {
+    githubUrl = str(b.github_url, "github_url", { max: 512 });
+    const want = githubUrlFor(config(c.env).githubRepo, version);
+    if (githubUrl !== want) throw bad(`github_url must be ${want}`);
+  }
   await c.env.DB.prepare(`INSERT INTO agent_releases (channel, version, build_id, min_agent, t, github_url) VALUES (?, ?, ?, ?, ?, ?)`)
     .bind(channel, version, id, minAgent, c.now, githubUrl)
     .run();
@@ -207,7 +257,6 @@ function selfplayOf(v: unknown): book.SelfplayCfg | null {
 }
 
 export const MAX_EVAL_NETS = 16;
-const BOT_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/;
 
 // An eval batch (PROTOCOL 5.2, rev 5). Checks what needs no database here; LeaseBook checks that
 // the checkpoints are registered and that a batch never changes.
@@ -223,21 +272,9 @@ export function evalOf(v: unknown): book.EvalCfg | null {
   const job = jobOf(o.job, "eval.job");
   const paired = bool(job.paired, "eval.job.paired", { optional: true }) ?? false;
   if (paired && games % 2 !== 0) throw bad("eval.games must be even for a paired batch (whole pairs)");
-  if (!Array.isArray(job.seats) || job.seats.length < 2 || job.seats.length > MAX_EVAL_NETS) {
-    throw bad(`eval.job.seats must be a list of 2 to ${MAX_EVAL_NETS} seats ({"net": gen} or {"bot": name})`);
-  }
-  const nets = new Set<number>();
-  job.seats.forEach((x: Json, i: number) => {
-    const seat = obj(x, `eval.job.seats[${i}]`);
-    const hasNet = seat.net !== undefined && seat.net !== null;
-    const hasBot = seat.bot !== undefined && seat.bot !== null;
-    if (hasNet === hasBot) throw bad(`eval.job.seats[${i}] needs exactly one of net and bot`);
-    if (hasNet) nets.add(int(seat.net, `eval.job.seats[${i}].net`, { min: 0, max: 999_999_999 }));
-    else {
-      const bot = str(seat.bot, `eval.job.seats[${i}].bot`, { max: 64, re: BOT_RE });
-      if (bot.toLowerCase().startsWith("ext:")) throw bad(`eval.job.seats[${i}]: ext: bots can't run on the farm (${bot})`);
-    }
-  });
+  const seatProblems: string[] = [];
+  const nets = new Set<number>(seatGens(job.seats, "eval.job.seats", seatProblems));
+  if (seatProblems.length) throw bad(seatProblems[0], { problems: seatProblems });
   const named = [...nets].sort((a, b) => a - b).join(",");
   if (named !== [...checkpoints].sort((a, b) => a - b).join(",")) {
     throw bad(`eval.checkpoints [${checkpoints.join(", ")}] must be exactly the gens the seats name [${named}]`);
@@ -254,7 +291,7 @@ export function evalOf(v: unknown): book.EvalCfg | null {
 }
 
 export async function putRun(c: Ctx, run: string): Promise<Response> {
-  authAdmin(c);
+  await authAdmin(c);
   slug(run, "run");
   const b = await readJson(c.req);
   const cfg: book.RunCfg = {
@@ -273,7 +310,7 @@ export async function putRun(c: Ctx, run: string): Promise<Response> {
 }
 
 export async function getRunRoute(c: Ctx, run: string): Promise<Response> {
-  authAdmin(c);
+  await authAdmin(c);
   const r = await book.getRun(c.env.DB, slug(run, "run"));
   if (!r) throw notFound(`no run ${run}`);
   const scope = book.runScope(run);
@@ -299,6 +336,7 @@ export async function getRunRoute(c: Ctx, run: string): Promise<Response> {
     eval_state: batches.find((b) => b.batch === r.eval_batch && b.replaced_at === null) ?? null,
     eval_batches: batches,
     pool: await book.poolSize(c.env.DB, scope),
+    definition: await definitionStatus(c, "run", r.run, r, null),
   });
 }
 
@@ -314,7 +352,7 @@ async function evalBatches(db: D1Database, run: string, limit: number): Promise<
 }
 
 export async function putCheckpoint(c: Ctx, run: string, genStr: string): Promise<Response> {
-  authAdmin(c);
+  await authAdmin(c);
   slug(run, "run");
   if (!/^\d{1,9}$/.test(genStr)) throw bad("gen must be an integer");
   const b = await readJson(c.req);
@@ -328,11 +366,17 @@ export async function putCheckpoint(c: Ctx, run: string, genStr: string): Promis
   const head = await c.env.BUCKET.head(model);
   if (!head) throw bad(`${model} is not uploaded`);
   if (head.checksums.sha256 && hex(head.checksums.sha256) !== sha256) throw bad(`${model} does not match sha256`);
+  let referenceSize: number | null = null;
   if (reference) {
     const rh = await c.env.BUCKET.head(reference);
     if (!rh) throw bad(`${reference} is not uploaded`);
     if (rh.checksums.sha256 && hex(rh.checksums.sha256) !== referenceSha) throw bad(`${reference} does not match reference_sha256`);
+    referenceSize = rh.size;
   }
+  // Rev 6: a gen the current definition already signs must be exactly those files.
+  const def = await currentDef(c.env.DB, "run", run);
+  const facts = { gen: Number(genStr), sha256, size: head.size, reference_sha256: referenceSha, reference_size: referenceSize };
+  if (def && def.checkpoints[String(facts.gen)] && checkpointProblem(def, facts)) throw bad(checkpointProblem(def, facts)!);
   const ans = unwrap(
     await bookFor(c.env, book.runScope(run)).publishCheckpoint({
       run,
@@ -342,6 +386,7 @@ export async function putCheckpoint(c: Ctx, run: string, genStr: string): Promis
       reference,
       reference_sha256: referenceSha,
       size: head.size,
+      reference_size: referenceSize,
       now: c.now,
     }),
   );
@@ -387,19 +432,19 @@ async function requireCampaign(c: Ctx, id: string) {
 }
 
 export async function runResults(c: Ctx, run: string): Promise<Response> {
-  authAdmin(c);
+  await authAdmin(c);
   await requireRun(c, run);
   return listResults(c, book.runScope(run));
 }
 
 export async function campaignResults(c: Ctx, id: string): Promise<Response> {
-  authAdmin(c);
+  await authAdmin(c);
   await requireCampaign(c, id);
   return listResults(c, book.campaignScope(id));
 }
 
 export async function acceptRoute(c: Ctx, run: string): Promise<Response> {
-  authAdmin(c);
+  await authAdmin(c);
   await requireRun(c, run);
   const b = await readJson(c.req);
   const gen = int(b.gen, "gen", { min: 0 });
@@ -415,13 +460,13 @@ async function ackScope(c: Ctx, scope: string): Promise<Response> {
 }
 
 export async function runAck(c: Ctx, run: string): Promise<Response> {
-  authAdmin(c);
+  await authAdmin(c);
   await requireRun(c, run);
   return ackScope(c, book.runScope(run));
 }
 
 export async function campaignAck(c: Ctx, id: string): Promise<Response> {
-  authAdmin(c);
+  await authAdmin(c);
   await requireCampaign(c, id);
   return ackScope(c, book.campaignScope(id));
 }
@@ -429,7 +474,7 @@ export async function campaignAck(c: Ctx, id: string): Promise<Response> {
 // ---------- campaigns ----------
 
 export async function putCampaign(c: Ctx, id: string): Promise<Response> {
-  authAdmin(c);
+  await authAdmin(c);
   slug(id, "campaign");
   const b = await readJson(c.req);
   const envIn = obj(b.env, "env", { optional: true }) ?? {};
@@ -456,7 +501,7 @@ export async function putCampaign(c: Ctx, id: string): Promise<Response> {
 }
 
 export async function getCampaignRoute(c: Ctx, id: string): Promise<Response> {
-  authAdmin(c);
+  await authAdmin(c);
   const x = await book.getCampaign(c.env.DB, slug(id, "campaign"));
   if (!x) throw notFound(`no campaign ${id}`);
   const scope = book.campaignScope(id);
@@ -475,11 +520,12 @@ export async function getCampaignRoute(c: Ctx, id: string): Promise<Response> {
     pool: await book.poolSize(c.env.DB, scope),
     failures: fails.results[0].n,
     sites: fails.results[0].sites,
+    definition: await definitionStatus(c, "campaign", x.campaign, null, x),
   });
 }
 
 export async function failures(c: Ctx, id: string): Promise<Response> {
-  authAdmin(c);
+  await authAdmin(c);
   await requireCampaign(c, id);
   const after = int(Number(c.url.searchParams.get("after") ?? "0"), "after", { min: 0 });
   const limit = int(Number(c.url.searchParams.get("limit") ?? "500"), "limit", { min: 1, max: 1000 });
@@ -495,7 +541,7 @@ export async function failures(c: Ctx, id: string): Promise<Response> {
 // ---------- machines ----------
 
 export async function machines(c: Ctx): Promise<Response> {
-  authAdmin(c);
+  await authAdmin(c);
   const { results } = await c.env.DB.prepare(
     `SELECT m.*, i.note AS invite_note,
        (SELECT COUNT(*) FROM leases l WHERE l.machine_id = m.machine_id AND l.state = 'active') AS active_leases
@@ -512,7 +558,7 @@ export async function machines(c: Ctx): Promise<Response> {
 }
 
 export async function revoke(c: Ctx, id: string): Promise<Response> {
-  authAdmin(c);
+  await authAdmin(c);
   if (!MACHINE_RE.test(id)) throw notFound(`no machine ${id}`);
   const m = await c.env.DB.prepare(`SELECT machine_id FROM machines WHERE machine_id = ?`).bind(id).first();
   if (!m) throw notFound(`no machine ${id}`);
@@ -532,7 +578,7 @@ export async function revoke(c: Ctx, id: string): Promise<Response> {
 }
 
 export async function updateMachine(c: Ctx, id: string): Promise<Response> {
-  authAdmin(c);
+  await authAdmin(c);
   if (!MACHINE_RE.test(id)) throw notFound(`no machine ${id}`);
   const b = await readJson(c.req);
   const channel = oneOf(b.channel, "channel", CHANNELS, { optional: true });
@@ -551,7 +597,7 @@ export async function updateMachine(c: Ctx, id: string): Promise<Response> {
 }
 
 export async function pause(c: Ctx): Promise<Response> {
-  authAdmin(c);
+  await authAdmin(c);
   const b = await readJson(c.req);
   const paused = bool(b.paused, "paused");
   await c.env.DB.prepare(`INSERT OR REPLACE INTO settings (key, value) VALUES ('paused', ?)`).bind(paused ? "1" : "0").run();
@@ -561,7 +607,7 @@ export async function pause(c: Ctx): Promise<Response> {
 // ---------- diagnostics ----------
 
 export async function diag(c: Ctx): Promise<Response> {
-  authAdmin(c);
+  await authAdmin(c);
   const b = await readJson(c.req);
   const kind = oneOf(b.kind, "kind", ["sweep", "profile", "stability", "logs"] as const);
   const params = b.params === undefined || b.params === null ? null : JSON.stringify(opaque(obj(b.params, "params"), "params", 16384));
@@ -589,7 +635,7 @@ export async function diag(c: Ctx): Promise<Response> {
 }
 
 export async function diagList(c: Ctx): Promise<Response> {
-  authAdmin(c);
+  await authAdmin(c);
   const id = c.url.searchParams.get("machine_id");
   if (id !== null && !MACHINE_RE.test(id)) throw bad("bad machine_id");
   const where = id ? `WHERE machine_id = ?` : "";
@@ -614,11 +660,12 @@ export async function diagList(c: Ctx): Promise<Response> {
 // ---------- dashboard aggregates ----------
 
 export async function stats(c: Ctx): Promise<Response> {
-  authAdmin(c);
+  await authAdmin(c);
   const db = c.env.DB;
   const day = c.now - 86400;
   const hour = c.now - 3600;
-  const [machinesR, leasesR, crashesR, thrR, runsR, campsR, recentCrashR, fuzzR, classR, pausedR, failCountR, releasesR, diagR, blocksR, batchesR] = await db.batch<any>([
+  const cfg = config(c.env);
+  const [machinesR, leasesR, crashesR, thrR, runsR, campsR, recentCrashR, fuzzR, classR, pausedR, failCountR, releasesR, diagR, blocksR, batchesR, perMachineR, perScopeR, externalR] = await db.batch<any>([
     db.prepare(
       `SELECT machine_id, name, class, channel, agent_version, created_at, last_seen, revoked_at, paused, caps,
          json_extract(profile, '$.idle_h_day') AS idle_h_day, json_extract(profile, '$.on_h_day') AS on_h_day
@@ -636,6 +683,7 @@ export async function stats(c: Ctx): Promise<Response> {
            SUM(CASE WHEN state = 'expired' THEN 1 ELSE 0 END) AS expired,
            SUM(CASE WHEN state = 'given_back' THEN 1 ELSE 0 END) AS given_back,
            SUM(CASE WHEN state = 'cancelled' THEN 1 ELSE 0 END) AS cancelled,
+           SUM(CASE WHEN close_reason LIKE 'refused:%' THEN 1 ELSE 0 END) AS refused,
            SUM(COALESCE(json_extract(stats, '$.yields'), 0)) AS yields,
            SUM(COALESCE(json_extract(stats, '$.starved_ms'), 0)) AS starved_ms,
            MAX(COALESCE(json_extract(stats, '$.yield_ms_max'), 0)) AS yield_ms_max,
@@ -681,6 +729,20 @@ export async function stats(c: Ctx): Promise<Response> {
     ),
     db.prepare(`SELECT * FROM blocks WHERE until > ? ORDER BY t DESC`).bind(c.now),
     db.prepare(`SELECT * FROM eval_batches ORDER BY created_at DESC, run, lo DESC LIMIT 20`),
+    // Credited ids per machine and per run/campaign, by kind, over the last hour and day.
+    db
+      .prepare(
+        `SELECT machine_id, kind, SUM(CASE WHEN t >= ? THEN games ELSE 0 END) AS h1, SUM(games) AS h24
+         FROM results WHERE t >= ? AND kind IN ('selfplay', 'eval', 'fuzz') GROUP BY machine_id, kind`,
+      )
+      .bind(hour, day),
+    db
+      .prepare(
+        `SELECT scope, kind, SUM(CASE WHEN t >= ? THEN games ELSE 0 END) AS h1, SUM(games) AS h24
+         FROM results WHERE t >= ? AND kind IN ('selfplay', 'eval', 'fuzz') GROUP BY scope, kind`,
+      )
+      .bind(hour, day),
+    db.prepare(`SELECT * FROM external_sources ORDER BY reporter, id`),
   ]);
 
   const per = new Map<string, any>(leasesR.results.map((r: any) => [r.machine_id, r]));
@@ -717,10 +779,12 @@ export async function stats(c: Ctx): Promise<Response> {
       expired_24h: l.expired ?? 0,
       cancelled_24h: l.cancelled ?? 0,
       crashes_24h: crashes.get(m.machine_id) ?? 0,
+      refused_24h: l.refused ?? 0,
       blocked,
     };
   });
 
+  const defs = await currentDefs(db);
   const runs = [];
   for (const r of runsR.results as book.RunRow[]) {
     const scope = book.runScope(r.run);
@@ -747,6 +811,7 @@ export async function stats(c: Ctx): Promise<Response> {
       active_leases: extra.active,
       unacked_results: extra.unacked,
       pool: extra.pool,
+      definition: await definitionStatus(c, "run", r.run, r, null, defs.get(`run:${r.run}`) ?? null),
     });
   }
   const campaigns = [];
@@ -775,15 +840,82 @@ export async function stats(c: Ctx): Promise<Response> {
       active_leases: e.active,
       failures: e.failures,
       sites: e.sites,
+      definition: await definitionStatus(c, "campaign", x.campaign, null, x, defs.get(`campaign:${x.campaign}`) ?? null),
     });
   }
 
   const evalBatchesOut = [];
   for (const b of batchesR.results as book.EvalBatchRow[]) evalBatchesOut.push({ run: b.run, ...(await book.evalProgress(db, b)) });
 
+  // Contributors: the farm's PCs and the owner's own machines (POST /v1/admin/external) together.
+  const win = (rows: any[], key: string, field: string) => {
+    const out = new Map<string, Record<string, { h1: number; h24: number }>>();
+    for (const r of rows) {
+      const o = out.get(r[key]) ?? {};
+      o[r[field]] = { h1: r.h1 ?? 0, h24: r.h24 ?? 0 };
+      out.set(r[key], o);
+    }
+    return out;
+  };
+  const perMachine = win(perMachineR.results, "machine_id", "kind");
+  const none = { h1: 0, h24: 0 };
+  const contributors: Contributor[] = [
+    ...machinesOut.map((m: any): Contributor => {
+      const w = perMachine.get(m.machine_id) ?? {};
+      const status = m.revoked ? "revoked" : m.active_leases > 0 ? "working" : m.paused ? "paused" : m.last_seen && c.now - m.last_seen < 600 ? "online" : "offline";
+      return {
+        origin: "farm",
+        kind: "farm",
+        id: m.machine_id,
+        name: m.name,
+        hardware: m.class,
+        status,
+        last_seen: m.last_seen,
+        working_on: m.working_on ? String(m.working_on).split(",") : [],
+        selfplay: w.selfplay ?? none,
+        eval: w.eval ?? none,
+        fuzz: w.fuzz ?? none,
+        busy_h_24h: Math.round(((m.busy_s_24h ?? 0) / 3600) * 10) / 10,
+      };
+    }),
+    ...(externalR.results as ExternalRow[]).map((r) => ownContributor(r, c.now)),
+  ];
+  const perScope = win(perScopeR.results, "scope", "kind");
+  const scopes = new Set<string>([...perScope.keys()]);
+  for (const x of contributors) if (x.origin === "own" && x.status !== "offline") for (const s of x.working_on) scopes.add(s);
+  const byScope = [...scopes].sort().map((scope) => ({
+    scope,
+    farm: { selfplay: perScope.get(scope)?.selfplay ?? none, eval: perScope.get(scope)?.eval ?? none, fuzz: perScope.get(scope)?.fuzz ?? none },
+    own: contributors.filter((x) => x.origin === "own" && x.status !== "offline" && x.working_on.includes(scope)).map((x) => x.name),
+  }));
+  const blocks = blocksR.results
+    .map((x: any) => {
+      const m = machinesOut.find((y: any) => y.machine_id === x.machine_id);
+      return m && !blockLifted(x, m.agent_version) ? { ...x, name: m.name } : null;
+    })
+    .filter(Boolean);
+
   return json({
     t: c.now,
+    auth: c.admin ?? null,
     paused: pausedR.results[0]?.value === "1",
+    limits: {
+      definition_agent: cfg.definitionAgent,
+      data_keys: cfg.dataPubkeys.length,
+      max_active_leases: cfg.maxActiveLeases,
+      max_lease_chunks: cfg.maxLeaseChunks,
+      max_lease_bytes: cfg.maxLeaseBytes,
+      late_results_s: cfg.lateResultsS,
+      max_crashes_per_day: cfg.maxCrashesPerDay,
+      crash_retention_days: cfg.crashRetentionDays,
+      diag_retention_days: cfg.diagRetentionDays,
+      github_repo: cfg.githubRepo,
+      access: accessEnabled(c.env),
+    },
+    contributors,
+    totals: totals(contributors, c.now),
+    by_scope: byScope,
+    blocks,
     throughput: Object.fromEntries(thrR.results.map((r: any) => [r.kind, { last_hour: r.h1, last_day: r.h24, chunks_day: r.chunks }])),
     machines: machinesOut,
     runs,
@@ -798,4 +930,188 @@ export async function stats(c: Ctx): Promise<Response> {
       fuzz_sites: fuzzR.results,
     },
   });
+}
+
+// ---------- definitions (rev 6, PROTOCOL 7) ----------
+
+// PUT /v1/admin/definition {"kind", "id", "version", "key", "sha256"}: registers a definition whose
+// definition.json and .minisig were uploaded to `key` (defs/<kind>/<id>/<version>/...), after
+// checking its bytes, its signature (DATA_PUBKEYS only), its contents and its builds, and makes it
+// the current definition of that run or campaign.
+export async function putDefinition(c: Ctx): Promise<Response> {
+  await authAdmin(c);
+  const b = await readJson(c.req);
+  const kind = oneOf(b.kind, "kind", DEF_KINDS);
+  const id = slug(str(b.id, "id", { max: 63 }), "id");
+  const version = int(b.version, "version", { min: 1 });
+  const key = str(b.key, "key", { max: 200 });
+  if (key !== defKey(kind, id, version)) throw bad(`key must be ${defKey(kind, id, version)}`);
+  const sha = str(b.sha256, "sha256", { re: HEX64_RE });
+  const keys = config(c.env).dataPubkeys;
+  if (!keys.length) throw bad("DATA_PUBKEYS is not set on the coordinator: it can't verify definitions");
+
+  const obj = await c.env.BUCKET.get(key);
+  if (!obj) throw bad(`${key} is not uploaded`);
+  if (obj.size > MAX_DEFINITION) throw bad(`definition.json is larger than ${MAX_DEFINITION} bytes`);
+  const bytes = new Uint8Array(await obj.arrayBuffer());
+  const digest = await sha256Hex(bytes);
+  if (digest !== sha) throw bad(`${key} has sha256 ${digest}, not ${sha}`);
+  const sigObj = await c.env.BUCKET.get(`${key}.minisig`);
+  if (!sigObj) throw bad(`${key}.minisig is not uploaded`);
+  if (sigObj.size > MAX_SIGNATURE) throw bad(`${key}.minisig is larger than ${MAX_SIGNATURE} bytes`);
+  const sig = await sigObj.text();
+  const why = await verifyMinisign(bytes, sig, keys, "DATA_PUBKEYS");
+  if (why) throw bad(`signature: ${why}`);
+
+  const d = parseDefinition(new TextDecoder().decode(bytes));
+  const problems: string[] = [];
+  if (d.kind !== kind || d.id !== id || d.version !== version) {
+    problems.push(`the signed definition is ${d.kind} ${d.id} version ${d.version}, not ${kind} ${id} version ${version}`);
+  }
+  if (d.expires !== null && d.expires <= c.now) problems.push(`it expired at ${d.expires}`);
+  const ids = [...d.builds, ...(d.runtime ? [d.runtime] : [])];
+  const { results } = await c.env.DB.prepare(`SELECT build_id, kind, game FROM builds WHERE build_id IN (${ids.map(() => "?").join(",")})`)
+    .bind(...ids)
+    .all<{ build_id: string; kind: string; game: string | null }>();
+  const reg = new Map(results.map((r) => [r.build_id, r]));
+  for (const w of d.builds) {
+    const r = reg.get(w);
+    if (!r) problems.push(`build ${w} is not registered (POST /v1/admin/build first)`);
+    else if (r.kind !== "worker") problems.push(`build ${w} is a ${r.kind} build, not a worker`);
+    else if (r.game !== d.game) problems.push(`build ${w} is for game ${r.game}, not ${d.game}`);
+  }
+  if (d.runtime) {
+    const r = reg.get(d.runtime);
+    if (!r) problems.push(`runtime ${d.runtime} is not registered`);
+    else if (r.kind !== "runtime") problems.push(`runtime ${d.runtime} is a ${r.kind} build`);
+  }
+  // Gens already registered on the run must be exactly the signed files (they can't change).
+  const gens = Object.keys(d.checkpoints).map(Number);
+  if (kind === "run" && gens.length) {
+    const { results: ck } = await c.env.DB.prepare(`SELECT * FROM checkpoints WHERE run = ?`).bind(id).all<book.CheckpointRow>();
+    for (const row of ck) {
+      if (!d.checkpoints[String(row.gen)]) continue;
+      const p = checkpointProblem({ ...d, key, sha256: sha, size: bytes.length, key_id: "", registered_at: 0 }, book.ckptFacts(row));
+      if (p) problems.push(p);
+    }
+  }
+  if (problems.length) throw bad(`definition ${kind} ${id} version ${version} can't be registered`, { problems });
+
+  const row: DefinitionRow = {
+    kind,
+    id,
+    version,
+    key,
+    sha256: sha,
+    size: bytes.length,
+    created: d.created,
+    expires: d.expires,
+    game: d.game,
+    builds: JSON.stringify(d.builds),
+    runtime: d.runtime,
+    checkpoints: JSON.stringify(d.checkpoints),
+    jobs: JSON.stringify(d.jobs),
+    key_id: minisignKeyId(sig) ?? "",
+    registered_at: c.now,
+  };
+  const scope = kind === "run" ? book.runScope(id) : book.campaignScope(id);
+  return json(unwrap(await bookFor(c.env, scope).putDefinition(row)));
+}
+
+// What the current definition of a run or campaign allows now, for the admin page and GET run /
+// campaign: why some job can't be leased (problems), or that there is none (legacy only).
+export interface DefStatus {
+  version: number | null;
+  key: string | null;
+  sha256: string | null;
+  created: number | null;
+  expires: number | null;
+  registered_at: number | null;
+  key_id: string | null;
+  builds: string[];
+  runtime: string | null;
+  gens: number[];
+  jobs: string[];
+  problems: string[];
+}
+
+async function definitionStatus(
+  c: Ctx,
+  kind: "run" | "campaign",
+  id: string,
+  run: book.RunRow | null,
+  camp: book.CampaignRow | null,
+  known?: Def | null,
+): Promise<DefStatus> {
+  const d = known === undefined ? await currentDef(c.env.DB, kind, id) : known;
+  const agent = config(c.env).definitionAgent;
+  if (!d) {
+    return {
+      version: null,
+      key: null,
+      sha256: null,
+      created: null,
+      expires: null,
+      registered_at: null,
+      key_id: null,
+      builds: [],
+      runtime: null,
+      gens: [],
+      jobs: [],
+      problems: [`no definition: only agents older than ${agent} get its work (legacy leases)`],
+    };
+  }
+  const problems: string[] = [];
+  const say = (p: string | null) => {
+    if (p && !problems.includes(p)) problems.push(p);
+  };
+  if (run) {
+    if (parseJson<book.SelfplayCfg | null>(run.selfplay, null)) {
+      say(leaseProblem(d, "selfplay", run.build_id, run.runtime, c.now));
+      if (run.current_gen !== null) {
+        const ck = await c.env.DB.prepare(`SELECT * FROM checkpoints WHERE run = ? AND gen = ?`).bind(run.run, run.current_gen).first<book.CheckpointRow>();
+        if (ck) say(checkpointProblem(d, book.ckptFacts(ck)));
+      }
+    }
+    const ev = parseJson<book.EvalCfg | null>(run.eval, null);
+    if (ev && Array.isArray(ev.checkpoints)) {
+      say(leaseProblem(d, "eval", run.build_id, run.runtime, c.now));
+      if (d.jobs.eval) say(evalProblem(d, { checkpoints: ev.checkpoints, paired: book.isPaired(ev) }));
+      if (ev.checkpoints.length) {
+        const { results } = await c.env.DB.prepare(`SELECT * FROM checkpoints WHERE run = ? AND gen IN (${ev.checkpoints.map(() => "?").join(",")})`)
+          .bind(run.run, ...ev.checkpoints)
+          .all<book.CheckpointRow>();
+        for (const ck of results) say(checkpointProblem(d, book.ckptFacts(ck)));
+      }
+    }
+  }
+  if (camp) say(leaseProblem(d, "fuzz", camp.build_id, null, c.now));
+  if (d.expires !== null && d.expires <= c.now) say(`definition v${d.version} expired`);
+  return {
+    version: d.version,
+    key: d.key,
+    sha256: d.sha256,
+    created: d.created,
+    expires: d.expires,
+    registered_at: d.registered_at,
+    key_id: d.key_id,
+    builds: d.builds,
+    runtime: d.runtime,
+    gens: Object.keys(d.checkpoints)
+      .map(Number)
+      .sort((a, b) => a - b),
+    jobs: (["selfplay", "eval", "fuzz"] as const).filter((k) => d.jobs[k]),
+    problems,
+  };
+}
+
+// ---------- the owner's own machines (POST /v1/admin/external) ----------
+
+// A desktop reporter's numbers for machines that don't run the agent (external.ts). Each POST
+// replaces all sources of its reporter. Admin page only.
+export async function external(c: Ctx): Promise<Response> {
+  await authAdmin(c);
+  const report = parseReport(await readJson(c.req, MAX_EXTERNAL_BODY));
+  const n = await storeReport(c.env.DB, report, c.now);
+  return json({ ok: true, reporter: report.reporter, sources: n });
 }

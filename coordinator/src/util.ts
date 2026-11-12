@@ -121,6 +121,15 @@ export function safeEqual(a: string, b: string): boolean {
   return diff === 0;
 }
 
+// decodeURIComponent, but a malformed escape is a 400, not a 500 (review L8).
+export function uriDecode(s: string): string {
+  try {
+    return decodeURIComponent(s);
+  } catch {
+    throw bad("malformed percent-encoding in the path");
+  }
+}
+
 // R2 keys we accept from callers: relative, no "." or ".." segments, a plain character set.
 export function checkKey(key: string): string {
   if (

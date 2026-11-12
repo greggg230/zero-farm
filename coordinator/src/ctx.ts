@@ -1,13 +1,24 @@
 // Request context and authentication.
 
+import { accessEnabled, verifyAccess } from "./access";
+import type { AnyEnv } from "./config";
 import { HttpError, isSemver, safeEqual, sha256Hex } from "./util";
 
 export interface Ctx {
   req: Request;
-  env: Env & { TEST_CLOCK?: string };
+  env: AnyEnv;
   url: URL;
   now: number;
   exec: ExecutionContext;
+  admin?: AdminAuth; // set by authAdmin
+}
+
+// How the admin authenticated: the bearer token (CLI, trainer, release tool, dashboard fallback)
+// or a Cloudflare Access login / service token.
+export interface AdminAuth {
+  via: "token" | "access";
+  email?: string | null;
+  common_name?: string | null;
 }
 
 // Unix seconds. Tests move the clock with an `x-test-now` header, honoured only when the
@@ -63,9 +74,17 @@ export async function authMachine(c: Ctx): Promise<MachineRow> {
   return row;
 }
 
-// The admin token (Worker secret ADMIN_TOKEN). Unset -> nobody is admin.
-export function authAdmin(c: Ctx): void {
+// The admin: the bearer admin token (Worker secret ADMIN_TOKEN; unset -> no token is admin), or,
+// when Cloudflare Access is configured (access.ts), a valid Cf-Access-Jwt-Assertion.
+export async function authAdmin(c: Ctx): Promise<AdminAuth> {
   const token = bearer(c.req);
   const want = c.env.ADMIN_TOKEN;
-  if (!want || !token || !safeEqual(token, want)) throw new HttpError(401, "unauthorized", "admin token required");
+  if (want && token && safeEqual(token, want)) return (c.admin = { via: "token" });
+  const jwt = c.req.headers.get("cf-access-jwt-assertion");
+  if (jwt && accessEnabled(c.env)) {
+    const v = await verifyAccess(c.env, jwt, c.now);
+    if ("id" in v) return (c.admin = { via: "access", ...v.id });
+    console.warn("admin: Cloudflare Access JWT refused:", v.why);
+  }
+  throw new HttpError(401, "unauthorized", accessEnabled(c.env) ? "admin token or Cloudflare Access login required" : "admin token required");
 }

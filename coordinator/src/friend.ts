@@ -2,11 +2,13 @@
 
 import * as book from "./book";
 import { blockedBuilds, recordBlock } from "./blocks";
+import { config } from "./config";
 import { authMachine, type Ctx, type MachineRow } from "./ctx";
+import { currentDefs, DEF_KEY_RE, leaseProblem, type JobKind } from "./definitions";
 import { bookFor } from "./leasebook";
 import { minAgentOk } from "./manifest";
 import { parseRanges, total } from "./ranges";
-import { take } from "./ratelimit";
+import { ipKey, take } from "./ratelimit";
 import { cleanStats, telemetry } from "./telemetry";
 import {
   BUILD_RE,
@@ -38,6 +40,7 @@ import {
   str,
   strList,
   unwrap,
+  uriDecode,
 } from "./util";
 
 export const KINDS = ["fuzz", "eval", "selfplay", "diag"] as const;
@@ -45,6 +48,9 @@ export const CHANNELS = ["canary", "stable"] as const;
 // Rev 5: the first agent that downloads an eval lease's `checkpoints` (older agents know only
 // `checkpoint`, so they'd start the worker without its networks).
 export const EVAL_MIN_AGENT = "0.2.3";
+// Crash kinds (PROTOCOL 3). Rev 6: `definition`, a lease the agent refused because its definition
+// didn't verify or didn't match (PROTOCOL 7), reported once.
+export const CRASH_KINDS = ["panic", "crash", "agent", "blocked", "definition"] as const;
 const WAIT_S = 300;
 const LOGS_RESEND_S = 1800; // re-ask for an upload_diag that never arrived
 
@@ -105,9 +111,10 @@ async function latestRelease(db: D1Database, channel: string) {
 // ---------- POST /v1/enroll ----------
 
 export async function enroll(c: Ctx): Promise<Response> {
-  // Per client IP (Cloudflare always sets cf-connecting-ip; local tools may not).
+  // Per client IP (Cloudflare always sets cf-connecting-ip; local tools may not). Only an HMAC of
+  // the address (its /64 for IPv6) is stored, for minutes (ratelimit.ts).
   const ip = c.req.headers.get("cf-connecting-ip");
-  if (ip) await take(c, `ip:${ip.slice(0, 64)}`, "enroll", "enroll");
+  if (ip) await take(c, await ipKey(ip.slice(0, 64), c.env.IP_SALT), "enroll", "enroll");
   const b = await readJson(c.req);
   const invite = str(b.invite, "invite", { max: 32 }).trim().toUpperCase();
   const name = str(b.name, "name", { min: 1, max: 64 }).trim();
@@ -245,6 +252,9 @@ export async function lease(c: Ctx): Promise<Response> {
   const awHeader = c.req.headers.get("x-farm-aw") ?? "1";
   if (!/^\d{1,4}$/.test(awHeader)) throw bad("x-farm-aw must be an integer");
   const aw = Number(awHeader);
+  const cfg = config(c.env);
+  // Rev 6 (PROTOCOL 7): this agent verifies definitions, so it gets leases only with one.
+  const defAware = cmpSemver(agent, cfg.definitionAgent) >= 0;
 
   // Profile: the digest is the agent's; we only compare it with the last one.
   if (digest !== m.profile_digest) {
@@ -258,7 +268,7 @@ export async function lease(c: Ctx): Promise<Response> {
   const capsJson = JSON.stringify(caps);
   if (capsJson !== m.caps) await db.prepare(`UPDATE machines SET caps = ? WHERE machine_id = ?`).bind(capsJson, m.machine_id).run();
 
-  const [runsR, campsR, releaseR, pausedR, activeR, poolR, ratesR, classR, diagR] = await db.batch<any>([
+  const [runsR, campsR, releaseR, pausedR, activeR, poolR, ratesR, classR, diagR, mineR] = await db.batch<any>([
     db.prepare(`SELECT * FROM runs WHERE state = 'active'`),
     db.prepare(`SELECT * FROM campaigns WHERE state = 'active'`),
     db.prepare(`SELECT * FROM agent_releases WHERE channel = ? ORDER BY id DESC LIMIT 1`).bind(m.channel),
@@ -278,7 +288,10 @@ export async function lease(c: Ctx): Promise<Response> {
          AND NOT EXISTS (SELECT 1 FROM leases l WHERE l.lease_id = d.lease_id AND l.state = 'active') ORDER BY d.id`,
       )
       .bind(m.machine_id),
+    // This machine's live leases (an expired one not swept yet doesn't count).
+    db.prepare(`SELECT COUNT(*) AS n FROM leases WHERE machine_id = ? AND state = 'active' AND expires_at >= ?`).bind(m.machine_id, c.now),
   ]);
+  const defs = await currentDefs(db);
   const runs = runsR.results as book.RunRow[];
   const camps = campsR.results as book.CampaignRow[];
   const release = (releaseR.results[0] ?? null) as { version: string; min_agent: string } | null;
@@ -376,14 +389,20 @@ export async function lease(c: Ctx): Promise<Response> {
   const blocked = await blockedBuilds(db, m.machine_id, agent, c.now);
 
   // --- agent version: a job whose build needs a newer agent makes the agent update first ---
+  // Rev 6: a run or campaign with a definition needs a definition-aware agent, like a build's
+  // min_agent; one without a definition gets no definition-aware agent (PROTOCOL 7, rollout).
   let need: string | null = release && cmpSemver(agent, release.min_agent) < 0 ? release.min_agent : null;
   const usable = cands.filter((cd) => {
     const r = cd.run ? runs.find((x) => x.run === cd.run) : null;
-    const ids = r ? [r.build_id, r.runtime] : [camps.find((x) => x.campaign === cd.campaign)!.build_id];
+    const camp = r ? null : camps.find((x) => x.campaign === cd.campaign)!;
+    const ids = r ? [r.build_id, r.runtime] : [camp!.build_id];
     if (ids.some((id) => id && blocked.has(id))) return false;
     const infos = ids.filter(Boolean).map((id) => builds.get(id!));
     if (infos.some((i) => !i)) return false; // build not registered
-    const req = maxSemver([...infos.map((i) => i!.min_agent), cd.kind === "eval" ? EVAL_MIN_AGENT : null]);
+    const def = defs.get(r ? `run:${r.run}` : `campaign:${camp!.campaign}`);
+    if (!def && defAware) return false;
+    if (def && defAware && leaseProblem(def, cd.kind as JobKind, ids[0]!, r ? r.runtime : null, c.now)) return false;
+    const req = maxSemver([...infos.map((i) => i!.min_agent), cd.kind === "eval" ? EVAL_MIN_AGENT : null, def ? cfg.definitionAgent : null]);
     if (req && !minAgentOk(agent, req)) {
       // Only ask for an update the channel can deliver.
       if (release && cmpSemver(req, release.version) <= 0) need = maxSemver([need, req]);
@@ -398,11 +417,16 @@ export async function lease(c: Ctx): Promise<Response> {
   const withDiag = (o: Record<string, unknown>) => json(uploadDiag ? { ...o, upload_diag: uploadDiag } : o);
 
   if (pausedR.results[0]?.value === "1" || m.paused) return withDiag({ wait_s: WAIT_S, reason: "paused_by_admin" });
+  // Review M4: one machine can't hoard work (an agent runs one lease at a time; one more covers a
+  // lease it is still closing).
+  if ((mineR.results[0]?.n ?? 0) >= cfg.maxActiveLeases) return withDiag({ wait_s: WAIT_S, reason: "too_many_leases" });
 
-  // --- diagnostics asked for this machine come first ---
-  if (kinds.has("diag")) {
+  // --- diagnostics asked for this machine come first (legacy agents only: PROTOCOL 7) ---
+  if (kinds.has("diag") && !defAware) {
     for (const d of diagR.results as { id: number }[]) {
-      const l = unwrap(await bookFor(c.env, book.DIAG_SCOPE).grant({ now: c.now, machine_id: m.machine_id, kind: "diag", want: 0, diag_id: d.id }));
+      const l = unwrap(
+        await bookFor(c.env, book.DIAG_SCOPE).grant({ now: c.now, machine_id: m.machine_id, kind: "diag", want: 0, diag_id: d.id, def_aware: defAware }),
+      );
       if (l) return withDiag({ lease: l });
     }
   }
@@ -417,7 +441,7 @@ export async function lease(c: Ctx): Promise<Response> {
     const key = `${cd.scope}|${cd.kind}`;
     const want = leaseSize(cd.kind as Exclude<book.Kind, "diag">, cd.configured, rate.get(key) ?? classRate.get(key) ?? null);
     const l = unwrap(
-      await bookFor(c.env, cd.scope).grant({ now: c.now, machine_id: m.machine_id, kind: cd.kind, want, run: cd.run, campaign: cd.campaign }),
+      await bookFor(c.env, cd.scope).grant({ now: c.now, machine_id: m.machine_id, kind: cd.kind, want, run: cd.run, campaign: cd.campaign, def_aware: defAware }),
     );
     if (l) return withDiag({ lease: l });
   }
@@ -496,6 +520,12 @@ export async function result(c: Ctx, leaseId: string, seqStr: string): Promise<R
     if (l.pool === null) throw bad("x-ids: a diag lease has no ids");
     parseRanges(ids, "x-ids", [l.lo!, l.hi!]);
   }
+  // Review M3: chunks and bytes per lease, and no results long after it closed. Checked before
+  // the body is read (with its declared length) and again by LeaseBook with the real size.
+  const cfg = config(c.env);
+  const limits = { chunks: cfg.maxLeaseChunks, bytes: cfg.maxLeaseBytes, late_s: cfg.lateResultsS };
+  const declared = Number(c.req.headers.get("content-length") ?? "0");
+  await book.checkResultLimits(c.env.DB, l, Number.isSafeInteger(declared) && declared > 0 ? declared : 0, limits, c.now);
   const body = await readBounded(c.req, book.MAX_RESULT);
   if ((await sha256Hex(body)) !== sha) throw bad("body does not match x-sha256");
   const fuzz = l.kind === "fuzz" ? book.parseFuzz(body) : null;
@@ -516,6 +546,7 @@ export async function result(c: Ctx, leaseId: string, seqStr: string): Promise<R
       gen: genHeader === null ? null : Number(genHeader),
       key,
       fuzz,
+      limits,
     });
   } catch (e) {
     await c.env.BUCKET.delete(key);
@@ -535,6 +566,8 @@ export async function done(c: Ctx, leaseId: string): Promise<Response> {
   }
   const stats = cleanStats(b.stats);
   const givenBack = bool(b.given_back, "given_back", { optional: true }) ?? false;
+  // Rev 6: the agent refused the lease (its definition didn't verify or match): closed as given back.
+  const refused = str(b.refused, "refused", { optional: true, max: 32, re: /^[a-z][a-z0-9_]{0,31}$/ }) ?? null;
   const unfinished = b.unfinished === undefined || b.unfinished === null ? null : (obj(b.unfinished, "unfinished") as Record<string, Json>);
   const ans = unwrap(
     await bookFor(c.env, l.scope).done({
@@ -545,6 +578,7 @@ export async function done(c: Ctx, leaseId: string): Promise<Response> {
       results: b.results,
       stats,
       given_back: givenBack,
+      refused,
       unfinished,
     }),
   );
@@ -584,8 +618,9 @@ export async function serveObject(c: Ctx, key: string): Promise<Response> {
 
 export async function artifact(c: Ctx, rawKey: string): Promise<Response> {
   await authMachine(c);
-  const key = checkKey(decodeURIComponent(rawKey));
-  if (!key.startsWith("builds/") && !key.startsWith("ckpt/")) throw notFound(`no artifact ${key}`);
+  const key = checkKey(uriDecode(rawKey));
+  // Rev 6: definitions (defs/<kind>/<id>/<version>/definition.json and .minisig) too.
+  if (!key.startsWith("builds/") && !key.startsWith("ckpt/") && !DEF_KEY_RE.test(key)) throw notFound(`no artifact ${key}`);
   return serveObject(c, key);
 }
 
@@ -601,25 +636,35 @@ export async function crash(c: Ctx): Promise<Response> {
   const m = await authMachine(c);
   await take(c, m.machine_id, "crash", "crash report");
   const b = await readJson(c.req, 256 * 1024);
-  const kind = oneOf(b.kind, "kind", ["panic", "crash", "agent", "blocked"] as const);
+  const kind = oneOf(b.kind, "kind", CRASH_KINDS);
   const buildId = str(b.build_id, "build_id", { optional: true, re: BUILD_RE }) ?? null;
   const leaseId = str(b.lease_id, "lease_id", { optional: true, re: LEASE_RE }) ?? null;
   const osError = int(b.os_error, "os_error", { optional: true, min: -(2 ** 31), max: 2 ** 32 }) ?? null;
   const message = typeof b.message === "string" ? b.message.slice(0, 4096) : null;
   const backtrace = typeof b.backtrace === "string" ? b.backtrace.slice(0, 65536) : null;
   if (kind === "blocked" && !buildId) throw bad("a blocked report needs the build_id Windows refused to start");
-  const stmts = [
-    c.env.DB.prepare(
-      `INSERT INTO crashes (machine_id, build_id, kind, message, backtrace, lease_id, agent_version, os_error, t) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    ).bind(m.machine_id, buildId, kind, message, backtrace, leaseId, m.agent_version, osError, c.now),
-  ];
+  // Review M3: at most MAX_CRASHES_PER_DAY rows per machine per 24 h (rows are deleted after
+  // CRASH_RETENTION_DAYS by the cron). Past the cap a report is answered but not stored; a block
+  // is still recorded (it changes what the machine is offered).
+  const cfg = config(c.env);
+  const today = await c.env.DB.prepare(`SELECT COUNT(*) AS n FROM crashes WHERE machine_id = ? AND t > ?`)
+    .bind(m.machine_id, c.now - 86400)
+    .first<{ n: number }>();
+  const store = (today?.n ?? 0) < cfg.maxCrashesPerDay;
+  const stmts = store
+    ? [
+        c.env.DB.prepare(
+          `INSERT INTO crashes (machine_id, build_id, kind, message, backtrace, lease_id, agent_version, os_error, t) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        ).bind(m.machine_id, buildId, kind, message, backtrace, leaseId, m.agent_version, osError, c.now),
+      ]
+    : [];
   // Rev 5: Windows refused to start this worker build here. It isn't offered to this machine for
   // a day, or until a newer agent asks (blocks.ts).
   if (kind === "blocked") {
     stmts.push(recordBlock(c.env.DB, { machine_id: m.machine_id, build_id: buildId!, agent_version: m.agent_version, os_error: osError, message, now: c.now }));
   }
-  await c.env.DB.batch(stmts);
-  return json({ ok: true });
+  if (stmts.length) await c.env.DB.batch(stmts);
+  return json(store ? { ok: true } : { ok: true, stored: false });
 }
 
 // A friend's "Send diagnostics" (x-farm-diag: user): allowed without a request from the desktop,

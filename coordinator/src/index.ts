@@ -3,8 +3,12 @@
 //
 //   friends (machine token):  /v1/enroll /v1/lease /v1/lease/:id/{beat,result/:seq,done}
 //                             /v1/artifact/:key /v1/agent/latest /v1/crash /v1/diag/:name
-//   desktop (admin token):    /v1/admin/...
+//   desktop (admin token or a Cloudflare Access login):  /v1/admin/...
 //   dashboard:                /admin (static; reads /v1/admin/stats)
+//
+// Every /v1/* answer, errors included, carries `x-zerofarm-coordinator: 1`: agents (0.2.5+) treat
+// a 401/403 as "this PC was removed" only when the coordinator itself said so, never when a proxy,
+// a firewall rule or a misplaced Access policy answered.
 //   public:                   / (onboarding page), /download (302 to the newest installer on GitHub)
 
 import * as admin from "./admin";
@@ -40,6 +44,7 @@ const routes: [string, RegExp, Handler][] = [
   ["GET", /^\/v1\/admin\/artifact\/(.+)$/, admin.getArtifact],
   ["HEAD", /^\/v1\/admin\/artifact\/(.+)$/, admin.getArtifact],
   ["POST", /^\/v1\/admin\/build$/, admin.registerBuild],
+  ["PUT", /^\/v1\/admin\/definition$/, admin.putDefinition],
   ["POST", /^\/v1\/admin\/agent\/release$/, admin.agentRelease],
   ["PUT", new RegExp(`^/v1/admin/run/${SEG}$`), admin.putRun],
   ["GET", new RegExp(`^/v1/admin/run/${SEG}$`), admin.getRunRoute],
@@ -59,6 +64,7 @@ const routes: [string, RegExp, Handler][] = [
   ["POST", /^\/v1\/admin\/diag$/, admin.diag],
   ["GET", /^\/v1\/admin\/diag$/, admin.diagList],
   ["GET", /^\/v1\/admin\/stats$/, admin.stats],
+  ["POST", /^\/v1\/admin\/external$/, admin.external],
 
   ["GET", /^\/admin\/?$/, page],
   ["GET", /^\/$/, onboard.home],
@@ -66,8 +72,27 @@ const routes: [string, RegExp, Handler][] = [
   ["HEAD", /^\/download$/, onboard.download],
 ];
 
+export const COORDINATOR_HEADER = "x-zerofarm-coordinator";
+
+// Marks an answer as the coordinator's own (every /v1/* path, PROTOCOL 1).
+function mark(res: Response): Response {
+  try {
+    res.headers.set(COORDINATOR_HEADER, "1");
+    return res;
+  } catch {
+    const out = new Response(res.body, res);
+    out.headers.set(COORDINATOR_HEADER, "1");
+    return out;
+  }
+}
+
 async function handle(req: Request, env: Env, exec: ExecutionContext): Promise<Response> {
   const url = new URL(req.url);
+  const res = await route(req, env, exec, url);
+  return url.pathname.startsWith("/v1/") ? mark(res) : res;
+}
+
+async function route(req: Request, env: Env, exec: ExecutionContext, url: URL): Promise<Response> {
   const c: Ctx = { req, env, url, now: nowOf(req, env), exec };
   try {
     let pathMatched = false;

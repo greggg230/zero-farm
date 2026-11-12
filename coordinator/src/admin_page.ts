@@ -1,6 +1,7 @@
-// GET /admin: a static page that reads /v1/admin/stats with the admin token (kept in this
-// browser's localStorage). It shows nothing without that token; Cloudflare Access can also sit in
-// front of /admin (coordinator README, deploy checklist step 9).
+// GET /admin: a static page that reads /v1/admin/stats. Behind Cloudflare Access (coordinator
+// README, "Cloudflare Access") the browser's Access login is enough: the page asks once without a
+// token and, if the coordinator answers, hides the token box. Otherwise it falls back to the admin
+// token, kept for this browser tab only (sessionStorage). It shows nothing without one of the two.
 
 export const ADMIN_PAGE = `<!doctype html>
 <html lang="en">
@@ -24,6 +25,7 @@ export const ADMIN_PAGE = `<!doctype html>
   th, td { border-bottom: 1px solid var(--line); padding: 4px 8px; text-align: left; white-space: nowrap; }
   th { background: var(--head); font-weight: 600; }
   td.n { text-align: right; }
+  td.wrapok { white-space: normal; min-width: 220px; }
   .muted { color: var(--muted); }
   .bad { color: var(--bad); }
   .ok { color: var(--ok); }
@@ -32,14 +34,19 @@ export const ADMIN_PAGE = `<!doctype html>
   .tiles { display: flex; flex-wrap: wrap; gap: 16px; }
   .tile { border: 1px solid var(--line); padding: 8px 12px; min-width: 140px; }
   .tile b { display: block; font-size: 20px; }
+  .tile small { display: block; color: var(--muted); }
   code { font-size: 12px; }
+  [hidden] { display: none !important; }
 </style>
 </head>
 <body>
 <h1>zero-farm</h1>
 <div class="bar">
-  <input id="token" type="password" placeholder="admin token" autocomplete="off">
-  <button id="save">Load</button>
+  <span id="tokenbox" hidden>
+    <input id="token" type="password" placeholder="admin token" autocomplete="off">
+    <button id="save">Load</button>
+  </span>
+  <span id="who" class="muted"></span>
   <label><input id="auto" type="checkbox" checked style="min-width:0"> refresh every 30 s</label>
   <span id="when" class="muted"></span>
 </div>
@@ -58,6 +65,7 @@ function ago(t, now) {
   if (d < 172800) return Math.round(d / 3600) + " h ago";
   return Math.round(d / 86400) + " d ago";
 }
+function when(t) { return t ? new Date(t * 1000).toLocaleString() : ""; }
 function table(cols, rows) {
   if (!rows.length) return '<p class="muted">none</p>';
   const h = cols.map((c) => "<th>" + esc(c[0]) + "</th>").join("");
@@ -67,35 +75,86 @@ function table(cols, rows) {
   }).join("") + "</tr>").join("");
   return '<div class="wrap"><table><thead><tr>' + h + "</tr></thead><tbody>" + b + "</tbody></table></div>";
 }
-function getToken() { try { return localStorage.getItem("farm_admin_token") || ""; } catch { return ""; } }
-function setToken(t) { try { localStorage.setItem("farm_admin_token", t); } catch {} }
+
+// Auth: a Cloudflare Access login (no token needed) or the admin token, this tab only.
+let viaAccess = false;
+function getToken() { try { return sessionStorage.getItem("farm_admin_token") || ""; } catch { return ""; } }
+function setToken(t) { try { sessionStorage.setItem("farm_admin_token", t); } catch {} }
+try { localStorage.removeItem("farm_admin_token"); } catch {} // older pages kept it for good
+function authHeaders() {
+  const t = $("token").value.trim();
+  return t ? { authorization: "Bearer " + t } : {};
+}
+function showTokenBox(msg) {
+  viaAccess = false;
+  $("tokenbox").hidden = false;
+  $("who").textContent = "";
+  $("err").textContent = msg || "";
+}
 
 async function load() {
   const token = $("token").value.trim();
-  if (!token) { $("err").textContent = "Enter the admin token."; return; }
-  setToken(token);
+  if (token) setToken(token);
   let s;
   try {
-    const r = await fetch("/v1/admin/stats", { headers: { authorization: "Bearer " + token } });
+    // redirect "manual": an expired Access session answers with a redirect to the login page.
+    const r = await fetch("/v1/admin/stats", { headers: authHeaders(), redirect: "manual", credentials: "same-origin" });
+    if (r.type === "opaqueredirect" || r.status === 0) {
+      showTokenBox("Your Cloudflare Access login has expired: reload the page to sign in again (or use the admin token).");
+      return;
+    }
+    if (r.status === 401 || r.status === 403) {
+      showTokenBox(token ? "stats: HTTP " + r.status + " (wrong admin token?)" : "Sign in through Cloudflare Access, or enter the admin token.");
+      return;
+    }
     if (!r.ok) { $("err").textContent = "stats: HTTP " + r.status + " " + (await r.text()).slice(0, 200); return; }
     s = await r.json();
   } catch (e) { $("err").textContent = "stats: " + e; return; }
   $("err").textContent = "";
+  viaAccess = !!(s.auth && s.auth.via === "access");
+  $("tokenbox").hidden = viaAccess;
+  $("who").textContent = viaAccess ? "signed in through Cloudflare Access" + (s.auth.email || s.auth.common_name ? " as " + (s.auth.email || s.auth.common_name) : "") : "";
   $("when").textContent = "as of " + new Date(s.t * 1000).toLocaleTimeString();
+  render(s);
+}
+
+function render(s) {
   const now = s.t;
   const online = s.machines.filter((m) => !m.revoked && m.last_seen && now - m.last_seen < 600).length;
   const working = s.machines.filter((m) => m.active_leases > 0).length;
-  const thr = (k, f) => num((s.throughput[k] || {})[f] || 0);
+  const own = (s.contributors || []).filter((c) => c.origin === "own");
+  const ownOn = own.filter((c) => c.status !== "offline").length;
+  const T = s.totals || { farm: {}, own: {}, all: {} };
+  const tw = (o, k) => (o && o[k] ? num(o[k].h1) + " / " + num(o[k].h24) : "0 / 0");
+  const tri = (k) => '<b>' + tw(T.all, k) + "</b><small>farm " + tw(T.farm, k) + " &middot; own " + tw(T.own, k) + "</small>";
   let h = '<div class="tiles">';
   h += '<div class="tile">farm<b class="' + (s.paused ? "warn" : "ok") + '">' + (s.paused ? "paused" : "running") + "</b></div>";
-  h += '<div class="tile">machines online / working<b>' + online + " / " + working + "</b></div>";
-  h += '<div class="tile">self-play games 1 h / 24 h<b>' + thr("selfplay", "last_hour") + " / " + thr("selfplay", "last_day") + "</b></div>";
-  h += '<div class="tile">eval games 1 h / 24 h<b>' + thr("eval", "last_hour") + " / " + thr("eval", "last_day") + "</b></div>";
-  h += '<div class="tile">fuzz seeds 1 h / 24 h<b>' + thr("fuzz", "last_hour") + " / " + thr("fuzz", "last_day") + "</b></div>";
+  h += '<div class="tile">farm PCs online / working<b>' + online + " / " + working + "</b><small>own machines online: " + ownOn + " of " + own.length + "</small></div>";
+  h += '<div class="tile">self-play games 1 h / 24 h' + tri("selfplay") + "</div>";
+  h += '<div class="tile">eval games 1 h / 24 h' + tri("eval") + "</div>";
+  h += '<div class="tile">fuzz seeds 1 h / 24 h' + tri("fuzz") + "</div>";
   const f = s.failures.last_day;
   h += '<div class="tile">24 h: crashes / fuzz failures<b class="' + (f.crashes ? "bad" : "") + '">' + f.crashes + " / " + f.fuzz_failures + "</b></div>";
   h += '<div class="tile">24 h: leases expired / given back<b>' + f.expired + " / " + f.given_back + "</b></div>";
   h += "</div>";
+
+  // Contributors: the farm's PCs and the owner's own machines (pushed by a desktop reporter).
+  const origin = (c) => (c.origin === "farm" ? "farm" : "own: " + ({ local: "local", ssh: "SSH", vast: "Vast", other: "other" }[c.kind] || esc(c.kind)));
+  const stat = (c) => '<span class="' + ({ working: "ok", online: "ok", offline: "muted", paused: "warn", revoked: "bad" }[c.status] || "") + '">' + esc(c.status) + "</span>";
+  const w2 = (x) => num(x.h1) + " / " + num(x.h24);
+  h += "<h2>Contributors</h2>" + table([
+    ["name", (c) => esc(c.name) + (c.origin === "farm" ? '<br><code class="muted">' + esc(c.id) + "</code>" : "")],
+    ["origin", (c) => origin(c)], ["status", (c) => stat(c) + ' <span class="muted">' + ago(c.last_seen, now) + "</span>"],
+    ["hardware", (c) => esc(c.hardware || "")], ["working on", (c) => esc((c.working_on || []).join(", "))],
+    ["self-play 1 h / 24 h", (c) => w2(c.selfplay), "n"], ["eval 1 h / 24 h", (c) => w2(c.eval), "n"],
+    ["fuzz seeds 1 h / 24 h", (c) => w2(c.fuzz), "n"], ["busy h 24 h", (c) => (c.busy_h_24h === null ? "" : Number(c.busy_h_24h).toFixed(1)), "n"],
+  ], s.contributors || []);
+
+  h += "<h2>Per run and campaign</h2>" + table([
+    ["scope", (x) => esc(x.scope)], ["farm self-play 1 h / 24 h", (x) => w2(x.farm.selfplay), "n"],
+    ["farm eval 1 h / 24 h", (x) => w2(x.farm.eval), "n"], ["farm fuzz seeds 1 h / 24 h", (x) => w2(x.farm.fuzz), "n"],
+    ["own machines on it", (x) => esc((x.own || []).join(", "))],
+  ], s.by_scope || []);
 
   h += "<h2>Runs</h2>" + table([
     ["run", (r) => esc(r.run)], ["state", (r) => '<span class="' + (r.state === "active" ? "ok" : "warn") + '">' + r.state + "</span>"],
@@ -104,6 +163,7 @@ async function load() {
     ["accepted", (r) => (r.selfplay ? num(r.selfplay.accepted) : "-"), "n"],
     ["in flight", (r) => (r.selfplay ? num(r.selfplay.leased) + " leased + " + num(r.selfplay.pending) + " unacked" : "-")],
     ["eval", (r) => (r.eval ? esc(r.eval.batch) + ": " + num(r.eval.done) + " / " + num(r.eval.games) + " done" : "-")],
+    ["definition", (r) => defCell(r.definition)],
     ["active leases", (r) => r.active_leases, "n"], ["pool", (r) => num(r.pool), "n"], ["next gid", (r) => num(r.next_gid), "n"],
   ], s.runs);
 
@@ -124,12 +184,25 @@ async function load() {
     ["campaign", (x) => esc(x.campaign)], ["mode", (x) => esc(x.mode)], ["state", (x) => x.state], ["priority", (x) => x.priority, "n"],
     ["cursor", (x) => num(x.cursor), "n"], ["seeds done", (x) => num(x.seeds_done), "n"], ["pool", (x) => num(x.pool), "n"],
     ["active leases", (x) => x.active_leases, "n"], ["failures", (x) => '<span class="' + (x.failures ? "bad" : "") + '">' + x.failures + "</span>", "n"],
-    ["sites", (x) => x.sites, "n"],
+    ["sites", (x) => x.sites, "n"], ["definition", (x) => defCell(x.definition)],
   ], s.campaigns);
+
+  // Signed definitions (PROTOCOL 7): what each run's and campaign's current definition allows.
+  const defs = [...s.runs.map((r) => ({ kind: "run", id: r.run, d: r.definition })), ...s.campaigns.map((x) => ({ kind: "campaign", id: x.campaign, d: x.definition }))];
+  h += "<h2>Signed definitions</h2>" + table([
+    ["run / campaign", (x) => esc(x.kind) + " " + esc(x.id)], ["version", (x) => (x.d && x.d.version !== null ? "v" + x.d.version : '<span class="warn">none</span>'), "n"],
+    ["signed", (x) => (x.d && x.d.created ? when(x.d.created) : "")], ["key", (x) => "<code>" + esc((x.d && x.d.key_id) || "") + "</code>"],
+    ["expires", (x) => (x.d && x.d.expires ? '<span class="' + (x.d.expires <= now ? "bad" : "") + '">' + when(x.d.expires) + "</span>" : '<span class="muted">never</span>')],
+    ["jobs", (x) => esc(((x.d && x.d.jobs) || []).join(", "))], ["gens", (x) => esc(((x.d && x.d.gens) || []).join(", "))],
+    ["builds", (x) => ((x.d && x.d.builds) || []).map((b) => "<code>" + esc(String(b).slice(0, 8)) + "</code>").join(" ") +
+      (x.d && x.d.runtime ? ' <span class="muted">runtime</span> <code>' + esc(String(x.d.runtime).slice(0, 8)) + "</code>" : "")],
+    ["can't lease because", (x) => '<span class="' + (x.d && x.d.version === null ? "warn" : "bad") + '">' + esc(((x.d && x.d.problems) || []).join("; ")) + "</span>", "wrapok"],
+  ], defs);
 
   h += "<h2>Machines</h2>" + table([
     ["name", (m) => esc(m.name) + '<br><code class="muted">' + esc(m.machine_id) + "</code>"],
-    ["class", (m) => esc(m.class)], ["agent", (m) => esc(m.agent_version) + ' <span class="muted">' + esc(m.channel) + "</span>"],
+    ["class", (m) => esc(m.class)], ["agent", (m) => esc(m.agent_version) + ' <span class="muted">' + esc(m.channel) + "</span>" +
+      (s.limits && m.agent_version && cmpVer(m.agent_version, s.limits.definition_agent) < 0 ? ' <span class="warn" title="older than the first agent that verifies definitions">legacy</span>' : "")],
     ["last seen", (m) => (m.revoked ? '<span class="bad">revoked</span>' : ago(m.last_seen, now)) + (m.paused ? ' <span class="warn">paused</span>' : "")],
     ["working on", (m) => esc(m.working_on || "")],
     ["caps", (m) => (m.caps ? m.caps.threads + " thr, " + Math.round(m.caps.ram_mb / 1024) + " GB" + (m.caps.gpu ? ", gpu" : "") : "")],
@@ -140,12 +213,20 @@ async function load() {
     ["yields", (m) => num(m.yields_24h), "n"], ["max yield ms", (m) => num(m.yield_ms_max), "n"],
     ["starved h", (m) => '<span class="' + (m.starved_s_24h >= 600 ? "warn" : "") + '">' + hrs(m.starved_s_24h) + "</span>", "n"],
     ["given back", (m) => m.given_back_24h, "n"], ["expired", (m) => '<span class="' + (m.expired_24h ? "warn" : "") + '">' + m.expired_24h + "</span>", "n"],
+    ["refused", (m) => '<span class="' + (m.refused_24h ? "bad" : "") + '" title="leases the agent refused (definition checks)">' + (m.refused_24h || 0) + "</span>", "n"],
     ["crashes", (m) => '<span class="' + (m.crashes_24h ? "bad" : "") + '">' + m.crashes_24h + "</span>", "n"],
     // Builds Windows refused to start on this PC (Smart App Control etc.): not offered to it until then.
     ["blocked builds", (m) => (m.blocked || []).map((b) => '<span class="bad" title="' + esc(b.message || "") + '"><code>' +
       esc(String(b.build_id).slice(0, 8)) + "</code> os error " + esc(b.os_error ?? "?") + "</span> " +
-      '<span class="muted">until ' + new Date(b.until * 1000).toLocaleString() + "</span>").join("<br>")],
+      '<span class="muted">until ' + when(b.until) + "</span>").join("<br>")],
   ], s.machines);
+
+  // Every build Windows refused to start somewhere (crash kind "blocked"), until its block lifts.
+  h += "<h2>Blocked builds</h2>" + table([
+    ["machine", (b) => esc(b.name || b.machine_id)], ["build", (b) => "<code>" + esc(b.build_id) + "</code>"],
+    ["os error", (b) => esc(b.os_error ?? "?"), "n"], ["reported by agent", (b) => esc(b.agent_version || "")],
+    ["since", (b) => ago(b.t, now)], ["until", (b) => when(b.until)], ["message", (b) => esc((b.message || "").slice(0, 160))],
+  ], s.blocks || []);
 
   h += "<h2>Rates by hardware class</h2>" + table([
     ["class", (r) => esc(r.class)], ["kind", (r) => r.kind], ["scope", (r) => esc(r.scope)],
@@ -166,7 +247,7 @@ async function load() {
   ], s.diag_uploads || []);
 
   h += "<h2>Recent crashes</h2>" + table([
-    ["when", (x) => ago(x.t, now)], ["machine", (x) => esc(x.name || x.machine_id)], ["kind", (x) => x.kind],
+    ["when", (x) => ago(x.t, now)], ["machine", (x) => esc(x.name || x.machine_id)], ["kind", (x) => esc(x.kind)],
     ["build", (x) => '<code>' + esc(x.build_id || "") + "</code>"], ["message", (x) => esc((x.message || "").slice(0, 160))],
   ], s.failures.crashes);
 
@@ -174,14 +255,41 @@ async function load() {
     ["when", (x) => ago(x.t, now)], ["campaign", (x) => esc(x.campaign)], ["seed", (x) => x.seed, "n"],
     ["site", (x) => "<code>" + esc(x.site) + "</code>"], ["panic", (x) => esc((x.panic || "").slice(0, 160))],
   ], s.failures.fuzz_sites);
+
+  // The coordinator's limits (wrangler.jsonc vars; README "Limits").
+  const L = s.limits || {};
+  h += "<h2>Limits</h2>" + table([["limit", (x) => esc(x[0])], ["value", (x) => esc(x[1])]], [
+    ["active leases per machine", num(L.max_active_leases)],
+    ["result chunks per lease", num(L.max_lease_chunks)],
+    ["result bytes per lease", L.max_lease_bytes ? (L.max_lease_bytes / 1048576).toLocaleString() + " MiB" : ""],
+    ["results taken after a lease closed", L.late_results_s ? (L.late_results_s / 3600) + " h" : ""],
+    ["crash reports kept per machine per day", num(L.max_crashes_per_day)],
+    ["crash reports kept for", L.crash_retention_days + " days"],
+    ["diagnostics kept for", L.diag_retention_days + " days"],
+    ["first agent that verifies definitions", L.definition_agent || ""],
+    ["data keys (DATA_PUBKEYS)", num(L.data_keys)],
+    ["installers only from", L.github_repo ? "github.com/" + L.github_repo : ""],
+    ["Cloudflare Access logins", L.access ? "accepted" : "not configured"],
+  ]);
   $("out").innerHTML = h;
 }
-// Diagnostics uploads are behind the admin token too: fetch, then save as a file.
+function defCell(d) {
+  if (!d) return "";
+  if (d.version === null) return '<span class="warn">none (legacy)</span>';
+  return "v" + d.version + (d.problems && d.problems.length ? ' <span class="bad" title="' + esc(d.problems.join("; ")) + '">blocked</span>' : ' <span class="ok">ok</span>');
+}
+function cmpVer(a, b) {
+  const p = (v) => String(v).split("-")[0].split(".").map(Number);
+  const x = p(a), y = p(b);
+  for (let i = 0; i < 3; i++) if ((x[i] || 0) !== (y[i] || 0)) return (x[i] || 0) < (y[i] || 0) ? -1 : 1;
+  return 0;
+}
+// Diagnostics uploads are behind admin auth too: fetch, then save as a file.
 $("out").addEventListener("click", async (e) => {
   const key = e.target && e.target.getAttribute && e.target.getAttribute("data-key");
   if (!key) return;
   try {
-    const r = await fetch("/v1/admin/artifact/" + key, { headers: { authorization: "Bearer " + $("token").value.trim() } });
+    const r = await fetch("/v1/admin/artifact/" + key, { headers: authHeaders(), credentials: "same-origin" });
     if (!r.ok) { $("err").textContent = "download: HTTP " + r.status; return; }
     const a = document.createElement("a");
     a.href = URL.createObjectURL(await r.blob());
@@ -194,8 +302,8 @@ $("out").addEventListener("click", async (e) => {
 $("token").value = getToken();
 $("save").addEventListener("click", load);
 $("token").addEventListener("keydown", (e) => { if (e.key === "Enter") load(); });
-setInterval(() => { if ($("auto").checked && $("token").value) load(); }, 30000);
-if ($("token").value) load();
+setInterval(() => { if ($("auto").checked && (viaAccess || $("token").value)) load(); }, 30000);
+load(); // with Cloudflare Access in front, this works without a token
 </script>
 </body>
 </html>

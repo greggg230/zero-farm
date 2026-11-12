@@ -14,8 +14,21 @@
 // ranges and leases always start and end on even ids. A game whose pair-mate its lease hasn't
 // reported yet is "held" (not claimed) until a later chunk of the same lease brings the mate.
 
+import {
+  type Def,
+  type DefinitionRow,
+  type JobKind,
+  baseSeed,
+  checkpointProblem,
+  currentDef,
+  defAt,
+  defRef,
+  evalProblem,
+  leaseProblem,
+} from "./definitions";
 import { intersect, normalize, parseRanges, subtract, total, type Range } from "./ranges";
 import {
+  HttpError,
   type Json,
   bad,
   canonical,
@@ -25,6 +38,8 @@ import {
   notFound,
   parseJson,
 } from "./util";
+
+export { baseSeed } from "./definitions";
 
 export type Kind = "fuzz" | "eval" | "selfplay" | "diag";
 
@@ -139,6 +154,7 @@ export interface LeaseRow {
   stats: string | null;
   closed_at: number | null;
   close_reason: string | null;
+  def_version: number | null; // the definition it was issued with (null: legacy)
 }
 
 export interface CheckpointRow {
@@ -148,7 +164,17 @@ export interface CheckpointRow {
   sha256: string;
   reference: string | null;
   reference_sha256: string | null;
+  size: number | null;
+  reference_size: number | null;
 }
+
+export const ckptFacts = (c: CheckpointRow) => ({
+  gen: c.gen,
+  sha256: c.sha256,
+  size: c.size,
+  reference_sha256: c.reference_sha256,
+  reference_size: c.reference_size ?? null,
+});
 
 export const checkpointOf = (c: CheckpointRow) => ({
   gen: c.gen,
@@ -441,6 +467,9 @@ export interface GrantReq {
   run?: string;
   campaign?: string;
   diag_id?: number;
+  // The agent verifies definitions (it is DEFINITION_AGENT or newer): it gets leases only with a
+  // definition; an older agent only legacy leases, for a scope without one (PROTOCOL 7).
+  def_aware: boolean;
 }
 
 export interface Lease {
@@ -456,22 +485,14 @@ export interface Lease {
   runtime: { build_id: string; manifest: string } | null;
   checkpoint: ReturnType<typeof checkpointOf> | null;
   checkpoints: ReturnType<typeof checkpointOf>[] | null; // eval only (rev 5)
+  // Rev 6: the signed definition this lease is issued under (PROTOCOL 7); absent on legacy leases.
+  // Then `job` holds only the per-lease fields (and `kind`): the agent builds the job line from
+  // the definition's template.
+  definition?: { key: string; sha256: string };
   job: Record<string, Json>;
 }
 
 const buildRef = (id: string) => ({ build_id: id, manifest: `builds/${id}/manifest.json` });
-
-// The run's base seed: the job's "seed" if it sets one, else derived from the run name. It is the
-// same for every lease of the run; workers derive each game's seed from (seed, gid).
-export function baseSeed(name: string, job: Record<string, Json>): number {
-  if (typeof job.seed === "number" && Number.isSafeInteger(job.seed)) return job.seed;
-  let h = 0x811c9dc5;
-  for (let i = 0; i < name.length; i++) {
-    h ^= name.charCodeAt(i);
-    h = Math.imul(h, 0x01000193) >>> 0;
-  }
-  return h;
-}
 
 export async function grant(env: Env, req: GrantReq): Promise<Lease | null> {
   if (req.kind === "diag") return grantDiag(env, req);
@@ -483,8 +504,8 @@ function insertLease(db: D1Database, l: Lease, row: Partial<LeaseRow> & { scope:
   return db
     .prepare(
       `INSERT INTO leases (lease_id, machine_id, scope, run, campaign, kind, pool, lo, hi, gen, build_id, diag_id,
-         lease, state, beat_s, slack_s, issued_at, expires_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?)`,
+         lease, state, beat_s, slack_s, issued_at, expires_at, def_version)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)`,
     )
     .bind(
       l.lease_id,
@@ -504,6 +525,7 @@ function insertLease(db: D1Database, l: Lease, row: Partial<LeaseRow> & { scope:
       l.slack_s,
       l.issued_at,
       l.expires_at,
+      row.def_version ?? null,
     );
 }
 
@@ -518,12 +540,32 @@ function baseLease(now: number, kind: Kind): Pick<Lease, "lease_id" | "kind" | "
   };
 }
 
+// Rev 6 (PROTOCOL 7): the definition a lease of this scope is issued under, `undefined` for a
+// legacy lease, or null when this agent gets no lease here: a definition-aware agent needs one, an
+// older agent can't have one.
+async function grantDef(
+  db: D1Database,
+  req: GrantReq,
+  kind: "run" | "campaign",
+  id: string,
+  jobKind: JobKind,
+  build: string,
+  runtime: string | null,
+): Promise<Def | undefined | null> {
+  const d = await currentDef(db, kind, id);
+  if (!d) return req.def_aware ? null : undefined;
+  if (!req.def_aware) return null;
+  return leaseProblem(d, jobKind, build, runtime, req.now) === null ? d : null;
+}
+
 async function grantRunGames(env: Env, req: GrantReq): Promise<Lease | null> {
   const db = env.DB;
   const scope = runScope(req.run!);
   await sweep(env, scope, req.now);
   const run = await getRun(db, req.run!);
   if (!run || run.state !== "active") return null;
+  const def = await grantDef(db, req, "run", run.run, req.kind as JobKind, run.build_id, run.runtime);
+  if (def === null) return null;
   const stmts: Stmt[] = [];
   let range: Range;
   let pool: string;
@@ -547,7 +589,9 @@ async function grantRunGames(env: Env, req: GrantReq): Promise<Lease | null> {
       stmts.push(db.prepare(`UPDATE runs SET next_gid = ? WHERE run = ? AND next_gid = ?`).bind(range[1], run.run, run.next_gid));
     }
     gen = run.current_gen;
-    job = { ...sp.job, kind: "selfplay", games: range[1] - range[0], gid_base: range[0], seed: baseSeed(run.run, sp.job) };
+    // The seed is the run's (its job's `seed`, else from its name) with or without a definition.
+    const per = { kind: "selfplay", games: range[1] - range[0], gid_base: range[0], seed: baseSeed(run.run, sp.job) };
+    job = def ? per : { ...sp.job, ...per };
   } else {
     // Rev 5: an eval lease carries every network its seats name (`checkpoints`), never one
     // `checkpoint`; a paired batch is leased in whole pairs.
@@ -556,6 +600,10 @@ async function grantRunGames(env: Env, req: GrantReq): Promise<Lease | null> {
     if (!(await getBatch(db, run.run, ev.batch))) return null; // put before rev 5: never offered
     evalCkpts = await checkpointsOf(db, run.run, ev.checkpoints);
     if (!evalCkpts) return null;
+    // Rev 6: the batch's networks are the ones the definition seats, each signed as registered.
+    if (def && (evalProblem(def, { checkpoints: ev.checkpoints, paired: isPaired(ev) }) || evalCkpts.some((c) => checkpointProblem(def, ckptFacts(c))))) {
+      return null;
+    }
     pool = `eval:${ev.batch}`;
     let n = req.want;
     if (isPaired(ev)) n = Math.max(2, n - (n % 2));
@@ -566,11 +614,14 @@ async function grantRunGames(env: Env, req: GrantReq): Promise<Lease | null> {
       throw new Error(`eval pool ${scope}/${pool} holds a broken pair: ${JSON.stringify(range)}`);
     }
     stmts.push(...took.stmts);
-    job = { ...ev.job, kind: "eval", games: range[1] - range[0], gid_base: range[0], seed: baseSeed(run.run, ev.job) };
+    const per = { kind: "eval", games: range[1] - range[0], gid_base: range[0], seed: baseSeed(run.run, ev.job) };
+    job = def ? per : { ...ev.job, ...per };
   }
 
   const ckpt = await getCheckpoint(db, run.run, gen);
   if (req.kind === "selfplay" && !ckpt) return null;
+  // Rev 6: self-play plays the current checkpoint only once the definition signs it.
+  if (def && ckpt && checkpointProblem(def, ckptFacts(ckpt))) return null;
   const lease: Lease = {
     ...baseLease(req.now, req.kind),
     run: run.run,
@@ -579,9 +630,10 @@ async function grantRunGames(env: Env, req: GrantReq): Promise<Lease | null> {
     runtime: run.runtime ? buildRef(run.runtime) : null,
     checkpoint: ckpt ? checkpointOf(ckpt) : null,
     checkpoints: evalCkpts ? evalCkpts.map(checkpointOf) : null,
+    ...(def ? { definition: defRef(def) } : {}),
     job,
   };
-  stmts.push(insertLease(db, lease, { scope, machine_id: req.machine_id, pool, lo: range[0], hi: range[1] }));
+  stmts.push(insertLease(db, lease, { scope, machine_id: req.machine_id, pool, lo: range[0], hi: range[1], def_version: def?.version ?? null }));
   await db.batch(stmts);
   return lease;
 }
@@ -592,6 +644,8 @@ async function grantFuzz(env: Env, req: GrantReq): Promise<Lease | null> {
   await sweep(env, scope, req.now);
   const c = await getCampaign(db, req.campaign!);
   if (!c || c.state !== "active") return null;
+  const def = await grantDef(db, req, "campaign", c.campaign, "fuzz", c.build_id, null);
+  if (def === null) return null;
   const n = Math.max(1, Math.min(req.want, MAX_LEASE_IDS));
   const stmts: Stmt[] = [];
   let range: Range;
@@ -612,14 +666,21 @@ async function grantFuzz(env: Env, req: GrantReq): Promise<Lease | null> {
     runtime: null,
     checkpoint: null,
     checkpoints: null,
-    job: { kind: "fuzz", mode: c.mode, env: parseJson<Json>(c.env, {}), first: range[0], count: range[1] - range[0] },
+    ...(def ? { definition: defRef(def) } : {}),
+    job: def
+      ? { kind: "fuzz", first: range[0], count: range[1] - range[0] }
+      : { kind: "fuzz", mode: c.mode, env: parseJson<Json>(c.env, {}), first: range[0], count: range[1] - range[0] },
   };
-  stmts.push(insertLease(db, lease, { scope, machine_id: req.machine_id, pool: "fuzz", lo: range[0], hi: range[1] }));
+  stmts.push(insertLease(db, lease, { scope, machine_id: req.machine_id, pool: "fuzz", lo: range[0], hi: range[1], def_version: def?.version ?? null }));
   await db.batch(stmts);
   return lease;
 }
 
+// Diag leases (sweep / profile / stability) carry admin-chosen params and no definition (PROTOCOL
+// 7 covers runs and campaigns), so a definition-aware agent, which refuses any lease without one,
+// never gets them. Logs requests (upload_diag) are not leases and go to every agent.
 async function grantDiag(env: Env, req: GrantReq): Promise<Lease | null> {
+  if (req.def_aware) return null;
   const db = env.DB;
   await sweep(env, DIAG_SCOPE, req.now);
   const d = await db
@@ -734,12 +795,16 @@ export async function beat(env: Env, r: BeatReq): Promise<BeatAnswer> {
 
   // A newer checkpoint reaches self-play leases here, on every beat until the lease ends (the
   // agent switches at the next game boundary and ignores repeats).
+  // Rev 6: a definition lease switches only to a gen its own definition signs (the agent checks
+  // every checkpoint against the lease's definition). A new gen normally comes with a new
+  // definition version, so it reaches new leases instead.
   let checkpoint: BeatAnswer["checkpoint"] = null;
   if (l.kind === "selfplay" && l.run) {
     const run = await getRun(db, l.run);
     if (run && run.current_gen !== null && (l.gen === null || run.current_gen > l.gen)) {
       const c = await getCheckpoint(db, l.run, run.current_gen);
-      if (c) checkpoint = checkpointOf(c);
+      const def = c && l.def_version !== null ? await defAt(db, "run", l.run, l.def_version) : null;
+      if (c && (l.def_version === null || (def && !checkpointProblem(def, ckptFacts(c))))) checkpoint = checkpointOf(c);
     }
   }
   return { action, expires_at: r.now + EXPIRE_BEATS * l.beat_s, checkpoint };
@@ -758,6 +823,32 @@ export interface ResultReq {
   gen: number | null; // x-gen
   key: string; // where the Worker already stored the bytes (resultKey)
   fuzz: FuzzResult | null; // a fuzz result's parsed failures
+  limits: ResultLimits;
+}
+
+// Per lease (security review M3): at most `chunks` result chunks and `bytes` bytes, and none more
+// than `late_s` after the lease closed.
+export interface ResultLimits {
+  chunks: number;
+  bytes: number;
+  late_s: number;
+}
+
+// Throws when one more chunk of `size` bytes would break the lease's limits.
+export async function checkResultLimits(db: D1Database, l: LeaseRow, size: number, lim: ResultLimits, now: number): Promise<void> {
+  if (l.state !== "active" && l.closed_at !== null && now - l.closed_at > lim.late_s) {
+    throw gone(`lease closed ${now - l.closed_at} s ago: results are taken until ${lim.late_s} s after a lease ends`);
+  }
+  const r = await db
+    .prepare(`SELECT COUNT(*) AS n, COALESCE(SUM(size), 0) AS bytes FROM results WHERE lease_id = ?`)
+    .bind(l.lease_id)
+    .first<{ n: number; bytes: number }>();
+  if ((r?.n ?? 0) >= lim.chunks) {
+    throw new HttpError(413, "too_large", `this lease already has ${lim.chunks} result chunks, the most a lease may have`, { limit: "chunks" });
+  }
+  if ((r?.bytes ?? 0) + size > lim.bytes) {
+    throw new HttpError(413, "too_large", `this lease's results would exceed ${lim.bytes} bytes`, { limit: "bytes" });
+  }
 }
 
 export interface ResultAnswer {
@@ -924,6 +1015,7 @@ export async function putResult(env: Env, r: ResultReq): Promise<ResultCommit> {
   // results by cursor, so it sees it whatever it acked before. Only a cancelled lease's chunks
   // and self-play chunks older than max_stale generations are refused.
   if (l.state === "cancelled") throw gone("lease was cancelled");
+  await checkResultLimits(db, l, r.size, r.limits, r.now);
 
   // Which ids this chunk completes.
   let ids: Range[] = [];
@@ -950,6 +1042,9 @@ export async function putResult(env: Env, r: ResultReq): Promise<ResultCommit> {
 
   const fuzz = r.fuzz;
   if (l.kind === "fuzz" && !fuzz) throw bad("a fuzz result must be JSON (PROTOCOL 5.1)");
+  // A failure names a seed of this lease (review M3: no rows for seeds it never ran).
+  const outside = fuzz?.failures.find((f) => l.lo === null || l.hi === null || f.seed < l.lo || f.seed >= l.hi);
+  if (outside) throw bad(`failure seed ${outside.seed} is outside this lease's seeds [${l.lo}, ${l.hi})`);
 
   // Eval chunks belong to a batch; a paired batch credits whole pairs only (x-gen is ignored:
   // eval networks never go stale, and l.gen is null for eval leases).
@@ -994,7 +1089,9 @@ export async function putResult(env: Env, r: ResultReq): Promise<ResultCommit> {
         .prepare(`INSERT INTO claims (scope, lo, hi, lease_id, result_id) VALUES (?, ?, ?, ?, ${rid})`)
         .bind(l.scope, a, b, l.lease_id, l.lease_id, r.seq),
     ),
-    db.prepare(`UPDATE leases SET units_done = units_done + ? WHERE lease_id = ?`).bind(total(ids), l.lease_id),
+    // Only ids credited here count toward the machine's rate (review M4: re-reporting ids can't
+    // inflate it and win bigger leases).
+    db.prepare(`UPDATE leases SET units_done = units_done + ? WHERE lease_id = ?`).bind(total(credited), l.lease_id),
   ];
 
   if (credited.length) {
@@ -1074,6 +1171,7 @@ export interface DoneReq {
   results: number[];
   stats: Json | undefined;
   given_back: boolean;
+  refused: string | null; // rev 6: the agent refused the lease ("definition"); closed as given back
   unfinished: Record<string, Json> | null; // {"gids": [...]} or {"seeds": [...]}; checked, but the coordinator
   // works out what is unfinished itself (the lease's ids minus everything claimed)
 }
@@ -1110,7 +1208,8 @@ export async function done(env: Env, r: DoneReq): Promise<DoneAnswer> {
   const extra = stats ? [db.prepare(`UPDATE leases SET stats = ? WHERE lease_id = ?`).bind(stats, l.lease_id)] : [];
   // The final Stats (e.g. starved_ms) feed the rate.
   const final = stats ? { ...l, stats } : l;
-  const back = await closeLease(env, final, r.given_back ? "given_back" : "done", r.given_back ? "given_back" : "done", r.now, extra);
+  const state = r.given_back || r.refused ? "given_back" : "done";
+  const back = await closeLease(env, final, state, r.refused ? `refused:${r.refused}` : state, r.now, extra);
   return { ok: true, returned: total(back) };
 }
 
@@ -1272,6 +1371,7 @@ export interface CheckpointReq {
   reference: string | null;
   reference_sha256: string | null;
   size: number | null;
+  reference_size: number | null;
   now: number;
 }
 
@@ -1290,8 +1390,10 @@ export async function publishCheckpoint(env: Env, c: CheckpointReq): Promise<{ o
     throw conflict(`checkpoint ${c.gen} of ${c.run} was already published with different files`);
   }
   const insert = db
-    .prepare(`INSERT INTO checkpoints (run, gen, model, sha256, reference, reference_sha256, size, t) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-    .bind(c.run, c.gen, c.model, c.sha256, c.reference, c.reference_sha256, c.size, c.now);
+    .prepare(
+      `INSERT INTO checkpoints (run, gen, model, sha256, reference, reference_sha256, size, reference_size, t) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(c.run, c.gen, c.model, c.sha256, c.reference, c.reference_sha256, c.size, c.reference_size, c.now);
   if (run.current_gen !== null && c.gen < run.current_gen) {
     await db.batch([insert]);
     return { ok: true, unchanged: false, current: false };
@@ -1325,4 +1427,57 @@ export async function ack(env: Env, scope: string, cursor: number, now: number):
     .bind(now, scope, cursor)
     .run();
   return { ok: true, acked: res.meta.changes ?? 0 };
+}
+
+// ---------- definitions (rev 6) ----------
+
+export interface DefinitionAnswer {
+  ok: true;
+  kind: string;
+  id: string;
+  version: number;
+  key: string;
+  sha256: string;
+  unchanged: boolean;
+  current: true;
+}
+
+// Registers a verified definition (the Worker checked its signature and contents) and makes it the
+// current one of its run or campaign. Versions only go up: the same version again is fine only
+// with the same bytes.
+export async function putDefinition(env: Env, row: DefinitionRow): Promise<DefinitionAnswer> {
+  const db = env.DB;
+  const cur = await currentDef(db, row.kind, row.id);
+  const ans = { ok: true as const, kind: row.kind, id: row.id, version: row.version, key: row.key, sha256: row.sha256, current: true as const };
+  if (cur && row.version === cur.version) {
+    if (cur.sha256 === row.sha256) return { ...ans, unchanged: true };
+    throw conflict(`${row.kind} ${row.id} version ${row.version} was registered with other bytes: sign a new version`);
+  }
+  if (cur && row.version < cur.version) {
+    throw conflict(`${row.kind} ${row.id} is at version ${cur.version}: versions only go up (got ${row.version})`, { current: cur.version });
+  }
+  await db
+    .prepare(
+      `INSERT INTO definitions (kind, id, version, key, sha256, size, created, expires, game, builds, runtime, checkpoints, jobs, key_id, registered_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .bind(
+      row.kind,
+      row.id,
+      row.version,
+      row.key,
+      row.sha256,
+      row.size,
+      row.created,
+      row.expires,
+      row.game,
+      row.builds,
+      row.runtime,
+      row.checkpoints,
+      row.jobs,
+      row.key_id,
+      row.registered_at,
+    )
+    .run();
+  return { ...ans, unchanged: false };
 }
