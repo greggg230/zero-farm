@@ -321,7 +321,7 @@ describe("runs, checkpoints, campaigns", () => {
     expect(got).toMatchObject({ run: "r", runtime: rt, current_gen: null, next_gid: 0, selfplay: { quota: 100, slack: 0.1, max_stale: 1 } });
   });
 
-  it("publishes checkpoints: files must exist and match, generations never go back", async () => {
+  it("publishes checkpoints: files must exist and match; an older generation is registered, never made current", async () => {
     await makeRun("r", { gen: null });
     await putArtifact("ckpt/r/1/model.onnx", "m1");
     const sha = await sha256("m1");
@@ -335,8 +335,20 @@ describe("runs, checkpoints, campaigns", () => {
     await putArtifact("ckpt/r/1/model2.onnx", "m2");
     err(await admin("PUT", "/v1/admin/run/r/checkpoint/1", { model: "ckpt/r/1/model2.onnx", sha256: await sha256("m2") }), 409, "conflict");
     await publishCkpt("r", 3);
-    err(await admin("PUT", "/v1/admin/run/r/checkpoint/2", { model: "ckpt/r/1/model2.onnx", sha256: await sha256("m2") }), 409, "conflict");
-    expect(ok(await admin("GET", "/v1/admin/run/r")).current_gen).toBe(3);
+    // Rev 5: an older gen (an eval opponent, a head-to-head label) is registered but not current.
+    expect(ok(await admin("PUT", "/v1/admin/run/r/checkpoint/2", { model: "ckpt/r/1/model2.onnx", sha256: await sha256("m2") }))).toEqual({
+      ok: true,
+      unchanged: false,
+      current: false,
+    });
+    expect(ok(await admin("PUT", "/v1/admin/run/r/checkpoint/2", { model: "ckpt/r/1/model2.onnx", sha256: await sha256("m2") })).unchanged).toBe(true);
+    err(await admin("PUT", "/v1/admin/run/r/checkpoint/2", { model: "ckpt/r/1/model.onnx", sha256: sha }), 409, "conflict");
+    const r = ok(await admin("GET", "/v1/admin/run/r"));
+    expect(r.current_gen).toBe(3);
+    expect(r.checkpoints).toEqual([1, 2, 3]);
+    // The older gen started no quota count of its own; gen 3's is still the current one.
+    const q = (await env.DB.prepare(`SELECT gen FROM quotas WHERE run = 'r' ORDER BY gen`).all<any>()).results.map((x: any) => x.gen);
+    expect(q).toEqual([1, 3]);
   });
 
   it("results, accept and ack need a known run; inputs are checked", async () => {
