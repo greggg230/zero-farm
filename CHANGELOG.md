@@ -17,7 +17,8 @@ version is a GitHub Release tagged `agent-v<version>`.
   1 h, 4 h, 16 h, then once a day). Before, it asked for new work again at once, hundreds of times
   an hour.
 - Any other job program that fails to start is reported and retried later (1 minute, doubling up
-  to an hour), never in a tight loop.
+  to an hour), never in a tight loop; so is a job whose files can't be downloaded or don't match
+  their checksums.
 - Fix: clicking the tray icon could close Zero Farm ("RefCell already borrowed", seen three times
   in 10 s on one PC). The tray no longer re-enters itself while a menu or message box is open, and
   a problem in the tray is now reported to the farm instead of closing the app.

@@ -137,6 +137,16 @@ impl Engine {
         LeaseEnd::GivenBack(why.to_string())
     }
 
+    /// A lease whose files couldn't be fetched, verified or set up: give it back and wait before
+    /// asking again (the start-failure backoff, 1 min doubling to 1 h), never a lease storm. A
+    /// checkpoint or build that keeps failing verification would otherwise be leased again at
+    /// once, every time, at the coordinator's rate limit.
+    fn setup_failed(&mut self, lease: &Lease, why: &str) -> LeaseEnd {
+        let end = self.give_back_unstarted(lease, why);
+        self.start_failed(false);
+        end
+    }
+
     fn prepare(&mut self, lease: &Lease) -> Result<Prepared, CacheError> {
         let s = self.settings();
         let cap = s.disk_cap_mb << 20;
@@ -209,7 +219,7 @@ impl Engine {
             }
             Err(e) => {
                 log::error!("lease {id}: setup failed: {e}");
-                return self.give_back_unstarted(lease, &format!("setup failed: {e}"));
+                return self.setup_failed(lease, &format!("setup failed: {e}"));
             }
         };
         // Compatibility (DESIGN 2.2): a build that needs a newer agent makes us update first.
@@ -226,22 +236,22 @@ impl Engine {
             Ok(b) => b,
             Err(e) => {
                 log::error!("lease {id}: build failed re-verification: {e}");
-                return self.give_back_unstarted(lease, &format!("build verification failed: {e}"));
+                return self.setup_failed(lease, &format!("build verification failed: {e}"));
             }
         };
         if let Some((c, f)) = &prep.ckpt {
             if !Cache::reverify_file(&f.model, &c.sha256) {
-                return self.give_back_unstarted(lease, "checkpoint verification failed");
+                return self.setup_failed(lease, "checkpoint verification failed");
             }
         }
         if let Some((c, _)) = prep.models.iter().find(|(c, f)| !ckpt_intact(c, f)) {
             log::error!("lease {id}: checkpoint {} failed re-verification", c.gen);
-            return self.give_back_unstarted(lease, &format!("checkpoint {} verification failed", c.gen));
+            return self.setup_failed(lease, &format!("checkpoint {} verification failed", c.gen));
         }
         let work = self.cfg.layout.work().join(&id);
         let _ = zerofarm_common::fsutil::remove_dir_all_retry(&work, Duration::from_secs(5));
         if let Err(e) = std::fs::create_dir_all(work.join("out")) {
-            return self.give_back_unstarted(lease, &format!("work dir: {e}"));
+            return self.setup_failed(lease, &format!("work dir: {e}"));
         }
         let d = self.decide(None);
         let caps = self.caps(&d);

@@ -5,9 +5,11 @@
 
 mod harness;
 
+use farm_agent::status::Phase;
 use harness::{wait, H};
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 const RUN: &str = "h2h-test";
 
@@ -125,7 +127,9 @@ fn a_tampered_checkpoint_is_refused_before_any_worker_runs() {
     let bad = ckpt(&h, 70);
     // The lease's hash is right; the bytes served are not.
     h.mock.with(|s| s.artifacts.insert(format!("ckpt/{RUN}/70/model.onnx"), b"not the network the lease names".to_vec()));
-    h.push(eval_lease(&h, "l_ET", 4, 0, vec![good, bad], json!({})));
+    h.push(eval_lease(&h, "l_ET", 4, 0, vec![good.clone(), bad.clone()], json!({})));
+    // The same bad network again: it must not be fetched and refused in a loop.
+    h.push(eval_lease(&h, "l_ET2", 4, 4, vec![good, bad], json!({})));
     h.start();
     let done = h.wait_done("l_ET");
     assert_eq!(done["given_back"], true);
@@ -134,6 +138,10 @@ fn a_tampered_checkpoint_is_refused_before_any_worker_runs() {
     assert!(!h.layout.cache_ckpt().join(RUN).join("70").join("model.onnx").exists(), "nothing unverified in the cache");
     assert!(h.mock.results_for("l_ET").is_empty());
     assert!(!h.agent_log().contains("fakeworker: job"), "no worker got the job");
+    // No lease storm after a verification failure: the agent waits (1 min) before asking again.
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(h.mock.with(|s| s.lease_requests.len()), 1, "one lease request, then waiting");
+    assert_eq!(h.phase(), Phase::Waiting);
     h.stop();
 }
 
