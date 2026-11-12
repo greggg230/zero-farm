@@ -85,7 +85,7 @@ fn agent_against_the_real_coordinator() {
         json!({"game": "fake", "build_id": build_id, "runtime": null, "priority": 1.0, "state": "active",
                "selfplay": {"quota": 12, "slack": 0.0, "max_stale": 1, "games_per_lease": 6, "gpu": "any",
                             "needs": {"threads": 1, "ram_mb": 100},
-                            "job": {"settings": {}, "fake": {"game_ms": 50, "shard_every": 2}}},
+                            "job": {"settings": {"fake": {"game_ms": 50, "shard_every": 2}}}},
                "eval": null}),
     );
     put_json(
@@ -117,6 +117,8 @@ fn agent_against_the_real_coordinator() {
         version: "0.1.0".into(),
         build_id: None,
         keys: TrustedKeys::parse(&[key.pubkey.clone()]).unwrap(),
+        // Legacy leases (a coordinator before rev 6 sends no definition): no data key needed.
+        data_keys: TrustedKeys::default(),
         timings: harness::fast_timings(),
         kinds: vec!["fuzz".into(), "eval".into(), "selfplay".into(), "diag".into()],
         channel: "stable".into(),

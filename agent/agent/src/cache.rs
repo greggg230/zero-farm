@@ -1,6 +1,8 @@
 //! Worker builds, runtime packs and checkpoints on disk (DESIGN 3.5): downloaded by hash,
-//! verified (signature + every file for builds, sha256 for checkpoints) before first use and
-//! again before every worker start, least-recently-used evicted under the user's disk cap.
+//! verified (signature + every file for builds, sha256 and, from a signed definition, size for
+//! checkpoints) before first use and again before every worker start, least-recently-used evicted
+//! under the user's disk cap. Room for a checkpoint file is made for its declared size before it
+//! is downloaded (a legacy lease declares none: then for the most a legacy file may be).
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -12,12 +14,15 @@ use zerofarm_common::manifest::{
     check_rel_path, verify_dir, verify_manifest_bytes, Expect, Kind, ManifestError, VerifiedBuild, MANIFEST_FILE,
     MAX_MANIFEST_BYTES, MAX_SIG_BYTES, SIG_FILE,
 };
+use zerofarm_common::definition::CheckpointDef;
 use zerofarm_common::protocol::{ArtifactRef, CheckpointRef};
 
 /// Keep at least this much free on the volume regardless of the cap.
 pub const VOLUME_RESERVE: u64 = 1 << 30;
-/// Largest checkpoint/reference file accepted.
-pub const MAX_CKPT_BYTES: u64 = 2 << 30;
+/// Largest checkpoint/reference file accepted from a legacy lease (no definition, so no declared
+/// size): room for this much is made before it downloads, so the disk cap holds (security review
+/// L1). Networks are about 13 MB.
+pub const MAX_LEGACY_CKPT_BYTES: u64 = 256 << 20;
 
 #[derive(Debug)]
 pub enum CacheError {
@@ -144,11 +149,13 @@ fn prune_unlisted(base: &Path, dir: &Path, listed: &std::collections::BTreeSet<S
     }
 }
 
-/// Paths of a verified checkpoint.
+/// Paths of a verified checkpoint, and the sizes its definition declares (None: legacy).
 #[derive(Debug, Clone)]
 pub struct CkptFiles {
     pub model: PathBuf,
     pub reference: Option<PathBuf>,
+    pub model_size: Option<u64>,
+    pub reference_size: Option<u64>,
 }
 
 pub struct Cache {
@@ -284,12 +291,16 @@ impl Cache {
         format!("ckpt/{run}/{gen}")
     }
 
-    /// Verified checkpoint files (downloading if needed). The sha256 comes from the lease.
+    /// Verified checkpoint files (downloading if needed). The sha256 comes from the lease, which
+    /// the caller checked against the definition; `declared` (the definition's entry) adds the
+    /// sizes.
+    #[allow(clippy::too_many_arguments)]
     pub fn ensure_checkpoint(
         &self,
         client: &Client,
         run: &str,
         ck: &CheckpointRef,
+        declared: Option<&CheckpointDef>,
         cap: u64,
         keep: &[String],
         stop: &dyn Fn() -> bool,
@@ -303,18 +314,20 @@ impl Cache {
         let key = Self::ckpt_key(run, ck.gen);
         let dir = self.entry_dir(&key);
         let model = dir.join("model.onnx");
-        self.ensure_file(client, &ck.model, &model, &ck.sha256, cap, keep, stop)?;
+        let model_size = declared.map(|d| d.model_size);
+        let reference_size = declared.and_then(|d| d.reference_size);
+        self.ensure_file(client, &ck.model, &model, &ck.sha256, model_size, cap, keep, stop)?;
         let reference = match (&ck.reference, &ck.reference_sha256) {
             (Some(rkey), Some(rsha)) if zerofarm_common::is_sha256_hex(rsha) => {
                 let p = dir.join("reference.npz");
-                self.ensure_file(client, rkey, &p, rsha, cap, keep, stop)?;
+                self.ensure_file(client, rkey, &p, rsha, reference_size, cap, keep, stop)?;
                 Some(p)
             }
             (Some(_), _) => return Err(CacheError::Bad("reference without a valid sha256".into())),
             _ => None,
         };
         self.touch(&key);
-        Ok(CkptFiles { model, reference })
+        Ok(CkptFiles { model, reference, model_size, reference_size })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -324,24 +337,33 @@ impl Cache {
         key: &str,
         dest: &Path,
         sha: &str,
+        size: Option<u64>,
         cap: u64,
         keep: &[String],
         stop: &dyn Fn() -> bool,
     ) -> Result<(), CacheError> {
         if dest.exists() {
-            if zerofarm_common::hash::sha256_file(dest).map(|(h, _)| h == sha).unwrap_or(false) {
+            if Self::reverify_file(dest, sha, size) {
                 return Ok(());
             }
             let _ = std::fs::remove_file(dest);
         }
-        self.ensure_space(64 << 20, cap, keep)?;
-        client.download(key, dest, &Want { size: None, sha256: Some(sha.to_string()), max: MAX_CKPT_BYTES }, stop)?;
+        // Room for the whole file under the cap before a byte is fetched (L1): its declared size,
+        // else the most a legacy checkpoint file may be. A partial download already counts.
+        let max = size.unwrap_or(MAX_LEGACY_CKPT_BYTES);
+        let have = std::fs::metadata(zerofarm_common::http::part_path(dest)).map(|m| m.len()).unwrap_or(0);
+        self.ensure_space(max.saturating_sub(have), cap, keep)?;
+        client.download(key, dest, &Want { size, sha256: Some(sha.to_string()), max }, stop)?;
         Ok(())
     }
 
-    /// Re-checks a checkpoint file's sha256 right before handing it to a worker.
-    pub fn reverify_file(path: &Path, sha: &str) -> bool {
-        zerofarm_common::hash::sha256_file(path).map(|(h, _)| h == sha).unwrap_or(false)
+    /// Re-checks a checkpoint file's size (when declared) and sha256 right before handing it to a
+    /// worker.
+    pub fn reverify_file(path: &Path, sha: &str, size: Option<u64>) -> bool {
+        if size.is_some_and(|n| std::fs::metadata(path).map(|m| m.len() != n).unwrap_or(true)) {
+            return false;
+        }
+        zerofarm_common::hash::sha256_file(path).map(|(h, n)| h == sha && size.is_none_or(|s| s == n)).unwrap_or(false)
     }
 }
 

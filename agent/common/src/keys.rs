@@ -1,9 +1,14 @@
-//! The release public keys an agent or launcher trusts, and minisign signature checks.
+//! The public keys an agent or launcher trusts, and minisign signature checks.
+//!
+//! Two separate lists (PROTOCOL 2 and 7): **release keys** sign manifests (agents, workers,
+//! runtime packs) and **data keys** sign definitions (what a run or campaign may make a PC
+//! download and run). Each check accepts only its own list ([`TrustedKeys::compiled`] and
+//! [`TrustedKeys::compiled_data`]), and `build.rs` refuses a key on both.
 //!
 //! Production binaries trust exactly the keys compiled in by `build.rs`. Debug builds (never
 //! shipped: `farm-release release-agent` builds with `--release` and refuses a binary that contains
-//! the override's name) also accept extra keys from the environment variable
-//! [`TEST_KEYS_ENV`], so tests can sign throwaway builds with temporary keys.
+//! the overrides' names) also accept extra keys from the environment variables
+//! [`TEST_KEYS_ENV`] and [`TEST_DATA_KEYS_ENV`], so tests can sign with temporary keys.
 
 use base64::Engine as _;
 use std::fmt;
@@ -13,6 +18,10 @@ include!(concat!(env!("OUT_DIR"), "/trusted_keys.rs"));
 /// Debug-build-only env var adding trusted keys (comma separated). Compiled out of release builds.
 #[cfg(debug_assertions)]
 pub const TEST_KEYS_ENV: &str = "ZEROFARM_TEST_TRUSTED_KEYS";
+/// Debug-build-only env var adding trusted data keys (comma separated). Compiled out of release
+/// builds.
+#[cfg(debug_assertions)]
+pub const TEST_DATA_KEYS_ENV: &str = "ZEROFARM_TEST_TRUSTED_DATA_KEYS";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SigError {
@@ -90,13 +99,29 @@ impl TrustedKeys {
         Ok(TrustedKeys(out))
     }
 
-    /// The keys this binary trusts: the compiled-in list, plus (debug builds only) the test
-    /// override from the environment.
+    /// The release keys this binary trusts (manifests): the compiled-in list, plus (debug builds
+    /// only) the test override from the environment.
     pub fn compiled() -> Self {
-        #[allow(unused_mut)]
-        let mut list: Vec<String> = COMPILED_KEYS.iter().map(|s| s.to_string()).collect();
         #[cfg(debug_assertions)]
-        if let Ok(v) = std::env::var(TEST_KEYS_ENV) {
+        let test = Some(TEST_KEYS_ENV);
+        #[cfg(not(debug_assertions))]
+        let test = None;
+        Self::from_compiled(COMPILED_KEYS, test)
+    }
+
+    /// The data keys this binary trusts (definitions, PROTOCOL 7): the compiled-in list, plus
+    /// (debug builds only) the test override from the environment.
+    pub fn compiled_data() -> Self {
+        #[cfg(debug_assertions)]
+        let test = Some(TEST_DATA_KEYS_ENV);
+        #[cfg(not(debug_assertions))]
+        let test = None;
+        Self::from_compiled(COMPILED_DATA_KEYS, test)
+    }
+
+    fn from_compiled(compiled: &[&str], test_env: Option<&str>) -> Self {
+        let mut list: Vec<String> = compiled.iter().map(|s| s.to_string()).collect();
+        if let Some(v) = test_env.and_then(|name| std::env::var(name).ok()) {
             list.extend(v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()));
         }
         // A malformed compiled key fails the build (build.rs); a malformed test key is a test bug.

@@ -9,6 +9,10 @@
 //! farm-agent profile | keys | version
 //! ```
 //!
+//! `keys` prints every trusted key, one per line: `release <key id> <public key>` (manifests) and
+//! `data <key id> <public key>` (definitions); `farm-release release-agent` compares them with
+//! `common/trusted_keys.txt` and `common/trusted_data_keys.txt` before it signs this binary.
+//!
 //! Exit codes: 0 quit, 75 switch to `state\pending` (launcher), 76 hand over to the new
 //! `ZeroFarm.exe` (launcher), 2 usage, 3 not enrolled (headless), 4 revoked, 70 internal error.
 
@@ -123,6 +127,7 @@ fn config(args: &Args, layout: &Layout, machine: &Machine) -> AgentConfig {
         version,
         build_id,
         keys: TrustedKeys::compiled(),
+        data_keys: TrustedKeys::compiled_data(),
         timings: Timings::default(),
         kinds: vec!["fuzz".into(), "eval".into(), "selfplay".into(), "diag".into()],
         channel: machine.channel.clone(),
@@ -146,6 +151,9 @@ fn cmd_run(args: &Args) -> i32 {
     log::info!("farm-agent {} (build {:?}) starting, root {}, headless {headless}", cfg.version, cfg.build_id, layout.root.display());
     if cfg.keys.is_empty() {
         log::error!("this build trusts no release key: no work or update can be verified");
+    }
+    if cfg.data_keys.is_empty() {
+        log::error!("this build trusts no data key: no definition can be verified, so only legacy leases can run");
     }
     let profile_root = layout.root.clone();
     let profile = farm_agent::profile::detect(&profile_root);
@@ -371,7 +379,10 @@ fn main() {
         }
         "keys" => {
             for k in TrustedKeys::compiled().keys() {
-                println!("{} {}", k.key_id_hex(), k.b64);
+                println!("release {} {}", k.key_id_hex(), k.b64);
+            }
+            for k in TrustedKeys::compiled_data().keys() {
+                println!("data {} {}", k.key_id_hex(), k.b64);
             }
             0
         }

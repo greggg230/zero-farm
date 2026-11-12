@@ -1,7 +1,7 @@
 //! farm-release.exe (desktop only)
 //!
 //! ```text
-//! farm-release keygen --out FILE
+//! farm-release keygen --out FILE [--data]
 //! farm-release export-key --out FILE [--key FILE]        passphrase asked twice on the console
 //! farm-release import-key --from FILE --out FILE         passphrase asked on the console
 //! farm-release sign DIR --kind worker|agent|runtime [--key FILE] [--version V] [--game G]
@@ -15,7 +15,17 @@
 //! farm-release github-release DIR --github OWNER/REPO [--channel canary|stable] [--key FILE]
 //!              [--setup-exe FILE] [--notes-file F] [--gh PATH]
 //!              [--url URL [--token T] [--min-agent V]]
+//! farm-release define DEFINITION.json --key DATA_KEY_FILE [--publish --url URL [--token T]]
 //! ```
+//!
+//! `define` (PROTOCOL 7) validates a `definition/1` file, signs its bytes as they are with a data
+//! key (never the release key; the key must be in `common/trusted_data_keys.txt`), writes
+//! `DEFINITION.json.minisig` next to it, and with `--publish` uploads both to
+//! `defs/<kind>/<id>/<version>/` and registers the definition (`PUT /v1/admin/definition`). It
+//! prints one JSON line: `{"kind", "id", "version", "key", "sha256", "signature", "published"}`.
+//! Exit code 0 on success, 1 with `error: ...` on stderr otherwise. Other repositories' tools
+//! call it; keep this interface stable. The data key comes from `--key` or `ZEROFARM_DATA_KEY`
+//! (never the release key's default path). `keygen --data` makes one (same file format).
 //!
 //! The admin token comes from `--token` or `ZEROFARM_ADMIN_TOKEN`; the key file from `--key`,
 //! `ZEROFARM_RELEASE_KEY`, or `%USERPROFILE%\.zero-farm\release.key`.
@@ -116,7 +126,15 @@ fn run(a: &Args) -> Result<(), String> {
             let k = keygen(&out)?;
             println!("wrote {} (DPAPI-encrypted for this Windows user) and {}", out.display(), pub_path(&out).display());
             println!("key id {}", k.key_id_hex());
-            println!("public key (add to agent/common/trusted_keys.txt):\n{}", k.public_b64());
+            if a.has("data") {
+                println!(
+                    "a DATA key: it signs definitions only (farm-release define). Add the public key to \
+                     agent/common/trusted_data_keys.txt, NOT trusted_keys.txt (a key on both lists fails the build):\n{}",
+                    k.public_b64()
+                );
+            } else {
+                println!("a RELEASE key: it signs builds and agent releases. Add the public key to agent/common/trusted_keys.txt:\n{}", k.public_b64());
+            }
             Ok(())
         }
         Some("export-key") => {
@@ -255,7 +273,27 @@ fn run(a: &Args) -> Result<(), String> {
             }
             Ok(())
         }
-        _ => Err("usage: farm-release keygen|export-key|import-key|sign|verify|publish|release-agent|github-release (see the source header)".into()),
+        Some("define") => {
+            let file = a.pos.get(1).map(PathBuf::from).ok_or("usage: farm-release define DEFINITION.json --key DATA_KEY_FILE [--publish --url URL --token T]")?;
+            let key_path = a
+                .get("key")
+                .or_else(|| std::env::var("ZEROFARM_DATA_KEY").ok())
+                .map(PathBuf::from)
+                .ok_or("--key DATA_KEY_FILE (or ZEROFARM_DATA_KEY) is required: definitions are signed with a data key")?;
+            let client = if a.has("publish") {
+                let url = a.get("url").ok_or("--publish needs --url")?;
+                Some(admin_client(&url, &a.token()?)?)
+            } else if a.has("url") {
+                return Err("--url without --publish: add --publish to upload and register the definition".into());
+            } else {
+                None
+            };
+            let key = load_key(&key_path)?;
+            let d = define(&file, &key, client.as_ref())?;
+            println!("{}", serde_json::to_string(&d).map_err(|e| e.to_string())?);
+            Ok(())
+        }
+        _ => Err("usage: farm-release keygen|export-key|import-key|sign|verify|publish|release-agent|github-release|define (see the source header)".into()),
     }
 }
 

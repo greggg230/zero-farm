@@ -25,7 +25,7 @@ fn ckpt(h: &H, gen: u64) -> Value {
 fn eval_lease(h: &H, id: &str, games: u64, base: u64, ckpts: Vec<Value>, fake: Value) -> Value {
     let seats: Vec<Value> = ckpts.iter().map(|c| json!({"net": c["gen"]})).collect();
     let job = json!({"kind": "eval", "games": games, "gid_base": base, "seed": 31, "paired": true,
-                     "settings": {"sims": 32}, "seats": seats, "fake": fake});
+                     "settings": {"sims": 32, "fake": fake}, "seats": seats});
     let mut l = h.lease(id, job);
     l["run"] = json!(RUN);
     l["checkpoint"] = Value::Null;
@@ -36,13 +36,6 @@ fn eval_lease(h: &H, id: &str, games: u64, base: u64, ckpts: Vec<Value>, fake: V
 fn ranges_of(v: &str) -> Vec<(u64, u64)> {
     let a: Value = serde_json::from_str(v).unwrap();
     a.as_array().unwrap().iter().map(|r| (r[0].as_u64().unwrap(), r[1].as_u64().unwrap())).collect()
-}
-
-/// The job line the fakeworker logged (`fakeworker: job {...}` in worker.log).
-fn job_line(h: &H) -> Value {
-    let log = h.agent_log();
-    let line = log.lines().find(|l| l.contains("fakeworker: job ")).expect("job line in worker.log");
-    serde_json::from_str(&line[line.find("fakeworker: job ").unwrap() + 16..]).unwrap()
 }
 
 #[test]
@@ -64,7 +57,7 @@ fn eval_lease_with_two_networks_runs_and_uploads_every_game() {
     }
 
     // The job line: `models` by gen with absolute paths and hashes; no single model.
-    let job = job_line(&h);
+    let job = h.job_line();
     assert!(job["model"].is_null() && job["reference"].is_null(), "{job}");
     let models = job["models"].as_object().expect("models");
     assert_eq!(models.keys().cloned().collect::<BTreeSet<_>>(), BTreeSet::from(["70".to_string(), "80".to_string()]));

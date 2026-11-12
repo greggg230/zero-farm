@@ -1,5 +1,9 @@
 //! Shared harness: a temp install root, the mock coordinator with a signed fake worker build, and
 //! the real engine on a thread with scripted idle signals and short timings.
+//!
+//! The fake worker runs at normal priority here (`ZEROFARM_TEST_WORKER_PRIORITY=normal`, honoured
+//! by debug builds only), so a PC saturated by other builds can't starve it into timeouts; waits
+//! on the mock's state wake on each request it answers instead of polling.
 #![allow(dead_code)]
 
 use farm_agent::engine::{Control, Engine, EngineExit};
@@ -8,7 +12,7 @@ use farm_agent::settings::{Machine, SharedMachine};
 use farm_agent::signals::SharedSignals;
 use farm_agent::status::{Phase, SharedStatus, Status};
 use farm_agent::{AgentConfig, Timings};
-use mockcoord::testkit::{bin, make_worker_build, test_key, wait_until, TestKey};
+use mockcoord::testkit::{bin, make_worker_build, sign_definition, test_key, wait_until, TestKey};
 use mockcoord::MockCoord;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
@@ -25,6 +29,8 @@ pub struct H {
     pub layout: Layout,
     pub mock: MockCoord,
     pub key: TestKey,
+    /// The data key definitions are signed with (the engine trusts it, never `key`).
+    pub data_key: TestKey,
     pub build_id: String,
     pub token: String,
     pub signals: SharedSignals,
@@ -89,6 +95,8 @@ impl H {
 
     /// `extra` files go into the signed worker build (e.g. `startup.json`).
     pub fn with_build(extra: &[(&str, &[u8])]) -> H {
+        static PRIORITY: std::sync::Once = std::sync::Once::new();
+        PRIORITY.call_once(|| std::env::set_var("ZEROFARM_TEST_WORKER_PRIORITY", "normal"));
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("ZeroFarm");
         std::fs::create_dir_all(&root).unwrap();
@@ -96,6 +104,8 @@ impl H {
         let mock = MockCoord::start();
         let key = test_key();
         mock.trust(&key.pubkey);
+        let data_key = test_key();
+        mock.trust_data(&data_key.pubkey);
         let bdir = dir.path().join("build");
         let build_id = make_worker_build(&bdir, &key.key, &bin("fakeworker"), extra);
         mock.add_build_dir(&bdir);
@@ -106,6 +116,7 @@ impl H {
             layout,
             mock,
             key,
+            data_key,
             build_id,
             token,
             signals: SharedSignals::new(Signals::all_clear(0)),
@@ -127,6 +138,7 @@ impl H {
             version: self.version.clone(),
             build_id: None,
             keys: TrustedKeys::parse(&[self.key.pubkey.clone()]).unwrap(),
+            data_keys: TrustedKeys::parse(&[self.data_key.pubkey.clone()]).unwrap(),
             timings: self.timings.clone(),
             kinds: vec!["fuzz".into(), "eval".into(), "selfplay".into(), "diag".into()],
             channel: "stable".into(),
@@ -188,8 +200,28 @@ impl H {
     }
 
     pub fn wait_done(&self, id: &str) -> Value {
-        assert!(wait_until(T, || self.mock.done_for(id).is_some()), "no done for {id}; log: {}", self.agent_log());
+        assert!(self.mock.wait(T, |s| s.dones.iter().any(|(l, _)| l == id)), "no done for {id}; log: {}", self.agent_log());
         self.mock.done_for(id).unwrap()
+    }
+
+    /// Signs `def` (a `definition/1` value) with the data key, serves it, and returns the lease's
+    /// `definition` reference.
+    pub fn define(&self, def: &Value) -> Value {
+        let (bytes, sig) = sign_definition(def, &self.data_key.key);
+        self.mock.add_definition(bytes, &sig)
+    }
+
+    /// The job line the fakeworker logged (`fakeworker: job {...}` in worker.log), the `n`th one.
+    /// Log lines are redacted (M5): `%USERPROFILE%` is put back so paths can be checked.
+    pub fn job_line_n(&self, n: usize) -> Option<Value> {
+        let log = self.agent_log();
+        let line = log.lines().filter(|l| l.contains("fakeworker: job ")).nth(n)?;
+        let text = &line[line.find("fakeworker: job ").unwrap() + 16..];
+        Some(serde_json::from_str(&unredact(text)).expect("job line is JSON"))
+    }
+
+    pub fn job_line(&self) -> Value {
+        self.job_line_n(0).expect("job line in worker.log")
     }
 
     pub fn agent_log(&self) -> String {
@@ -213,4 +245,12 @@ impl Drop for H {
 
 pub fn wait(f: impl FnMut() -> bool) -> bool {
     wait_until(T, f)
+}
+
+/// Undoes the logs' `%USERPROFILE%` redaction in a JSON text (paths are JSON-escaped there).
+pub fn unredact(text: &str) -> String {
+    match std::env::var("USERPROFILE") {
+        Ok(p) => text.replace(zerofarm_common::redact::PROFILE, &p.replace('\\', "\\\\")),
+        Err(_) => text.to_string(),
+    }
 }

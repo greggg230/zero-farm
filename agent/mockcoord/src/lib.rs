@@ -6,6 +6,11 @@
 //! wins, fuzz results validated, 410 for cancelled leases and stale chunks, `done` answering 409
 //! `{"missing"}`) and scriptable everywhere else: queued leases, scripted beat answers, injected
 //! HTTP failures, an agent "latest" answer, `upload_diag` requests, a minimum enroll version.
+//!
+//! Every answer it makes carries `x-zerofarm-coordinator: 1`, as the real coordinator's do (rev 6);
+//! [`MockCoord::fail_next_raw`] answers without it, like a WAF or proxy in front of the
+//! coordinator. Signed definitions (PROTOCOL 7) are served under `defs/` and registered with
+//! `PUT /v1/admin/definition` (checked against the trusted data keys).
 
 pub mod testkit;
 
@@ -13,7 +18,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use tiny_http::{Header, Request, Response, Server};
 use zerofarm_common::keys::TrustedKeys;
@@ -47,6 +52,9 @@ pub struct FailRule {
     pub prefix: String,
     pub remaining: u32,
     pub status: u16,
+    /// None: the coordinator's own JSON error (marked). Some(body): something in front of the
+    /// coordinator answered (no `x-zerofarm-coordinator`), with this body.
+    pub raw_body: Option<String>,
 }
 
 #[derive(Default)]
@@ -55,6 +63,8 @@ pub struct State {
     pub url: String,
     pub admin_token: String,
     pub trusted: TrustedKeys,
+    /// Data keys (`PUT /v1/admin/definition` checks definition signatures with these).
+    pub trusted_data: TrustedKeys,
     pub invites: HashSet<String>,
     /// token -> machine id
     pub machines: HashMap<String, String>,
@@ -97,11 +107,15 @@ pub struct State {
     pub log: Vec<Logged>,
     pub builds_registered: Vec<String>,
     pub agent_releases: Vec<Value>,
+    /// `PUT /v1/admin/definition` bodies that were accepted.
+    pub definitions_registered: Vec<Value>,
 }
 
 pub struct MockCoord {
     pub url: String,
     pub state: Arc<Mutex<State>>,
+    /// Notified after every request (with `state`'s mutex): [`MockCoord::wait`] sleeps on it.
+    changed: Arc<Condvar>,
     server: Arc<Server>,
     thread: Option<JoinHandle<()>>,
 }
@@ -119,11 +133,16 @@ fn sha(b: &[u8]) -> String {
     zerofarm_common::hash::hex(&Sha256::digest(b))
 }
 
+fn coord_header() -> Header {
+    Header::from_bytes(&b"x-zerofarm-coordinator"[..], &b"1"[..]).unwrap()
+}
+
 fn reply(req: Request, status: u16, body: Value) -> u16 {
     let bytes = serde_json::to_vec(&body).unwrap();
     let resp = Response::from_data(bytes)
         .with_status_code(status)
-        .with_header(Header::from_bytes(&b"content-type"[..], &b"application/json"[..]).unwrap());
+        .with_header(Header::from_bytes(&b"content-type"[..], &b"application/json"[..]).unwrap())
+        .with_header(coord_header());
     let _ = req.respond(resp);
     status
 }
@@ -138,18 +157,41 @@ impl MockCoord {
         let port = server.server_addr().to_ip().unwrap().port();
         let url = format!("http://127.0.0.1:{port}");
         let state = Arc::new(Mutex::new(State { url: url.clone(), wait_s: 1, admin_token: "admin-secret".into(), ..Default::default() }));
-        let (s2, st2) = (server.clone(), state.clone());
+        let changed = Arc::new(Condvar::new());
+        let (s2, st2, cv2) = (server.clone(), state.clone(), changed.clone());
         let thread = std::thread::spawn(move || {
             for req in s2.incoming_requests() {
-                let st = st2.clone();
-                std::thread::spawn(move || handle(req, &st));
+                let (st, cv) = (st2.clone(), cv2.clone());
+                std::thread::spawn(move || {
+                    handle(req, &st);
+                    // Taken and released so a waiter between its check and its wait can't miss it.
+                    drop(st.lock().unwrap_or_else(|e| e.into_inner()));
+                    cv.notify_all();
+                });
             }
         });
-        MockCoord { url, state, server, thread: Some(thread) }
+        MockCoord { url, state, changed, server, thread: Some(thread) }
     }
 
     pub fn with<R>(&self, f: impl FnOnce(&mut State) -> R) -> R {
         f(&mut self.state.lock().unwrap())
+    }
+
+    /// Waits until `f(state)` holds, re-checking after every request the mock answers (no
+    /// polling), for at most `timeout`. False on timeout.
+    pub fn wait(&self, timeout: std::time::Duration, mut f: impl FnMut(&State) -> bool) -> bool {
+        let end = std::time::Instant::now() + timeout;
+        let mut g = self.state.lock().unwrap();
+        loop {
+            if f(&g) {
+                return true;
+            }
+            let now = std::time::Instant::now();
+            if now >= end {
+                return false;
+            }
+            g = self.changed.wait_timeout(g, end - now).unwrap().0;
+        }
     }
 
     pub fn add_invite(&self, code: &str) {
@@ -165,6 +207,11 @@ impl MockCoord {
 
     pub fn trust(&self, pubkey_b64: &str) {
         self.with(|s| s.trusted = TrustedKeys::parse(&[pubkey_b64]).unwrap());
+    }
+
+    /// The data key `PUT /v1/admin/definition` checks signatures with.
+    pub fn trust_data(&self, pubkey_b64: &str) {
+        self.with(|s| s.trusted_data = TrustedKeys::parse(&[pubkey_b64]).unwrap());
     }
 
     /// Serves every file of a build directory under `builds/<build_id>/`.
@@ -186,6 +233,16 @@ impl MockCoord {
         id
     }
 
+    /// Serves a signed definition (bytes + `.minisig`) at its PROTOCOL 7 key and returns the
+    /// lease's `definition` reference `{"key", "sha256"}`.
+    pub fn add_definition(&self, bytes: Vec<u8>, minisig: &str) -> Value {
+        let d: Value = serde_json::from_slice(&bytes).unwrap();
+        let key = format!("defs/{}/{}/{}/definition.json", d["kind"].as_str().unwrap(), d["id"].as_str().unwrap(), d["version"]);
+        self.add_artifact(&format!("{key}.minisig"), minisig.as_bytes().to_vec());
+        let sha = self.add_artifact(&key, bytes);
+        json!({"key": key, "sha256": sha})
+    }
+
     pub fn add_artifact(&self, key: &str, bytes: Vec<u8>) -> String {
         let h = sha(&bytes);
         self.with(|s| s.artifacts.insert(key.to_string(), bytes));
@@ -200,9 +257,18 @@ impl MockCoord {
         self.with(|s| s.beat_script.entry(lease_id.to_string()).or_default().push_back(answer));
     }
 
-    /// The next `count` requests matching `method` and path prefix get `status`.
+    /// The next `count` requests matching `method` and path prefix get `status` (a coordinator
+    /// error, marked as the coordinator's).
     pub fn fail_next(&self, method: &str, prefix: &str, count: u32, status: u16) {
-        self.with(|s| s.fail_rules.push(FailRule { method: method.into(), prefix: prefix.into(), remaining: count, status }));
+        self.with(|s| s.fail_rules.push(FailRule { method: method.into(), prefix: prefix.into(), remaining: count, status, raw_body: None }));
+    }
+
+    /// Like [`MockCoord::fail_next`], but answered by "something in front of the coordinator"
+    /// (a WAF, a proxy): `body` as text/html, no `x-zerofarm-coordinator` header.
+    pub fn fail_next_raw(&self, method: &str, prefix: &str, count: u32, status: u16, body: &str) {
+        self.with(|s| {
+            s.fail_rules.push(FailRule { method: method.into(), prefix: prefix.into(), remaining: count, status, raw_body: Some(body.into()) })
+        });
     }
 
     pub fn clear_failures(&self) {
@@ -274,9 +340,20 @@ fn handle(mut req: Request, st: &Arc<Mutex<State>>) {
     if let Some(rule) = s.fail_rules.iter_mut().find(|r| r.remaining > 0 && r.method == method && path.starts_with(&r.prefix)) {
         rule.remaining -= 1;
         let status = rule.status;
+        let raw = rule.raw_body.clone();
         s.log.push(Logged { method, path, agent, status });
         drop(s);
-        err(req, status, "internal", "injected failure");
+        match raw {
+            None => {
+                err(req, status, "internal", "injected failure");
+            }
+            Some(body) => {
+                let resp = Response::from_data(body.into_bytes())
+                    .with_status_code(status)
+                    .with_header(Header::from_bytes(&b"content-type"[..], &b"text/html"[..]).unwrap());
+                let _ = req.respond(resp);
+            }
+        }
         return;
     }
     let segs: Vec<&str> = path.trim_start_matches('/').split('/').collect();
@@ -339,6 +416,28 @@ fn handle(mut req: Request, st: &Arc<Mutex<State>>) {
                     "manifest": format!("builds/{id}/manifest.json"), "min_agent": json_body["min_agent"]}));
                 done!(reply(req, 200, json!({"ok": true})))
             }
+            ("PUT", ["definition"]) => {
+                let key = json_body["key"].as_str().unwrap_or("").to_string();
+                let check = (|| -> Result<(), String> {
+                    let bytes = s.artifacts.get(&key).ok_or("definition not uploaded")?;
+                    let sig = s.artifacts.get(&format!("{key}.minisig")).ok_or("signature not uploaded")?;
+                    if json_body["sha256"].as_str() != Some(sha(bytes).as_str()) {
+                        return Err("sha256 does not match the uploaded definition".into());
+                    }
+                    let d = zerofarm_common::definition::verify(&s.trusted_data, bytes, &String::from_utf8_lossy(sig))?;
+                    if d.key() != key || json_body["kind"] != d.kind.as_str() || json_body["id"] != d.id.as_str() || json_body["version"] != d.version {
+                        return Err("kind/id/version/key do not match the definition".into());
+                    }
+                    Ok(())
+                })();
+                match check {
+                    Ok(()) => {
+                        s.definitions_registered.push(json_body.clone());
+                        done!(reply(req, 200, json!({"ok": true, "current": true})))
+                    }
+                    Err(e) => done!(err(req, 400, "bad_request", &e)),
+                }
+            }
             ("POST", ["invites"]) => {
                 let n = json_body["count"].as_u64().unwrap_or(1);
                 let codes: Vec<String> = (0..n).map(|i| format!("TEST-CODE-{i:04}")).collect();
@@ -382,7 +481,7 @@ fn handle(mut req: Request, st: &Arc<Mutex<State>>) {
         }
         ("GET", ["artifact", rest @ ..]) => {
             let key = rest.join("/");
-            let allowed = key.starts_with("builds/") || key.starts_with("ckpt/");
+            let allowed = key.starts_with("builds/") || key.starts_with("ckpt/") || key.starts_with("defs/");
             match s.artifacts.get(&key).cloned().filter(|_| allowed) {
                 None => done!(err(req, 404, "not_found", &key)),
                 Some(bytes) => {
@@ -394,7 +493,7 @@ fn handle(mut req: Request, st: &Arc<Mutex<State>>) {
                     drop(s);
                     let code = match start {
                         Some(n) if n >= bytes.len() => {
-                            let _ = req.respond(Response::from_data(Vec::new()).with_status_code(416));
+                            let _ = req.respond(Response::from_data(Vec::new()).with_status_code(416).with_header(coord_header()));
                             416
                         }
                         Some(n) => {
@@ -402,12 +501,13 @@ fn handle(mut req: Request, st: &Arc<Mutex<State>>) {
                             let _ = req.respond(
                                 Response::from_data(bytes[n..].to_vec())
                                     .with_status_code(206)
-                                    .with_header(Header::from_bytes(&b"content-range"[..], cr.as_bytes()).unwrap()),
+                                    .with_header(Header::from_bytes(&b"content-range"[..], cr.as_bytes()).unwrap())
+                                    .with_header(coord_header()),
                             );
                             206
                         }
                         None => {
-                            let _ = req.respond(Response::from_data(bytes));
+                            let _ = req.respond(Response::from_data(bytes).with_header(coord_header()));
                             200
                         }
                     };
@@ -602,7 +702,8 @@ fn handle(mut req: Request, st: &Arc<Mutex<State>>) {
                 let resp = Response::from_data(body)
                     .with_status_code(429)
                     .with_header(Header::from_bytes(&b"retry-after"[..], &b"1800"[..]).unwrap())
-                    .with_header(Header::from_bytes(&b"content-type"[..], &b"application/json"[..]).unwrap());
+                    .with_header(Header::from_bytes(&b"content-type"[..], &b"application/json"[..]).unwrap())
+                    .with_header(coord_header());
                 let _ = req.respond(resp);
                 done!(429)
             } else {

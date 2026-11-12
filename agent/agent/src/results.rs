@@ -175,15 +175,16 @@ impl ResultStore {
     }
 }
 
-/// Which games (or fuzz seeds) of a lease were not delivered.
+/// Which games (or fuzz seeds) of a lease were not delivered (the lease's kind decides; the
+/// coordinator's job never does).
 pub fn compute_unfinished(lease: &Lease, metas: &[ResultMeta]) -> Option<Value> {
     let job = &lease.job;
-    match job.get("kind").and_then(Value::as_str).unwrap_or(&lease.kind) {
+    match lease.kind.as_str() {
         "selfplay" | "eval" => {
             let base = job.get("gid_base").and_then(Value::as_u64)?;
             let games = job.get("games").and_then(Value::as_u64)?;
             let delivered: Ranges = normalize(metas.iter().flat_map(|m| m.ids.as_ref().map(parse_ranges).unwrap_or_default()).collect());
-            let rest = subtract((base, base + games), &delivered);
+            let rest = subtract((base, base.checked_add(games)?), &delivered);
             (!rest.is_empty()).then(|| json!({"gids": ranges_json(&rest)}))
         }
         "fuzz" => {
@@ -192,7 +193,7 @@ pub fn compute_unfinished(lease: &Lease, metas: &[ResultMeta]) -> Option<Value> 
             }
             let first = job.get("first").and_then(Value::as_u64)?;
             let count = job.get("count").and_then(Value::as_u64)?;
-            Some(json!({"seeds": [[first, first + count]]}))
+            Some(json!({"seeds": [[first, first.checked_add(count)?]]}))
         }
         _ => None,
     }
@@ -360,7 +361,9 @@ fn process(store: &ResultStore, client: &Client, sh: &Shared, id: &str) -> Step 
                 let _ = std::fs::remove_file(&fpath);
                 let _ = std::fs::remove_file(&mpath);
             }
-            Err(e) if e.is_auth() => return Step::Revoked,
+            Err(e) if e.is_revoked() => return Step::Revoked,
+            // The coordinator refuses the token: keep everything and try again later.
+            Err(e) if e.is_unauthorized() => return Step::Retry(e),
             Err(e) if e.status() == Some(404) => {
                 log::info!("lease {id} is unknown at the coordinator ({e}); dropping its results");
                 store.discard(id);
@@ -389,10 +392,12 @@ fn process(store: &ResultStore, client: &Client, sh: &Shared, id: &str) -> Step 
             let lease: Option<Lease> = std::fs::read(dir.join("lease.json")).ok().and_then(|b| serde_json::from_slice(&b).ok());
             let unfinished = lease.as_ref().and_then(|l| compute_unfinished(l, &metas));
             log::info!("closing lease {id} left over from an earlier run ({} results)", metas.len());
-            DoneReq { results: store.delivered_seqs(id), stats: Stats::new(), given_back: true, unfinished }
+            DoneReq { results: store.delivered_seqs(id), stats: Stats::new(), given_back: true, unfinished, refused: None }
         }
     };
     let mut done = done;
+    // Stats leave the PC redacted (M5), whichever agent version wrote this done.json.
+    done.stats = crate::lease::redacted(done.stats);
     for attempt in 0..3 {
         let dropped = store.dropped(id);
         done.results.retain(|s| !dropped.contains(s));
@@ -423,7 +428,8 @@ fn finish_done(store: &ResultStore, id: &str, r: Result<Value, CallError>) -> St
             store.discard(id);
             Step::Done
         }
-        Err(e) if e.is_auth() => Step::Revoked,
+        Err(e) if e.is_revoked() => Step::Revoked,
+        Err(e) if e.is_unauthorized() => Step::Retry(e),
         Err(e) if matches!(e.status(), Some(404 | 410)) => {
             store.discard(id);
             Step::Done

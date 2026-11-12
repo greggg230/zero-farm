@@ -2,6 +2,7 @@
 //!
 //! The wire contract lives in `PROTOCOL.md` at the repository root; the types here follow it.
 
+pub mod definition;
 pub mod fsutil;
 pub mod hash;
 pub mod icon;
@@ -11,6 +12,7 @@ pub mod manifest;
 pub mod names;
 pub mod payload;
 pub mod protocol;
+pub mod redact;
 pub mod rotlog;
 pub mod winres;
 

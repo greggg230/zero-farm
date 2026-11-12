@@ -24,11 +24,11 @@ pub struct Win32Signals {
 }
 
 impl Win32Signals {
-    /// NVML is loaded only if the NVIDIA driver provides it (`nvml.dll`); otherwise GPU signals
-    /// are simply absent.
+    /// NVML is loaded only if the NVIDIA driver provides it (`nvml.dll` in System32); otherwise
+    /// GPU signals are simply absent.
     pub fn new(use_nvml: bool) -> Self {
         let nvml = if use_nvml {
-            match nvml_wrapper::Nvml::init() {
+            match load_nvml() {
                 Ok(n) => Some(n),
                 Err(e) => {
                     log::info!("NVML not available ({e}); no NVIDIA GPU signals");
@@ -103,6 +103,29 @@ impl SignalSource for Win32Signals {
             gpu: self.gpu(worker_pid),
         }
     }
+}
+
+/// NVML from `%SystemRoot%\System32\nvml.dll` only, where the NVIDIA driver installs it
+/// (security review L7): a bare `nvml.dll` would be searched for in the current directory and
+/// every `PATH` directory, where another program could plant one. The DLL is loaded with
+/// `LOAD_LIBRARY_SEARCH_SYSTEM32` and then handed to NVML by the full path it was loaded from.
+pub fn load_nvml() -> Result<nvml_wrapper::Nvml, String> {
+    let path = system32_module("nvml.dll").ok_or("no nvml.dll in System32")?;
+    nvml_wrapper::Nvml::builder().lib_path(path.as_os_str()).init().map_err(|e| e.to_string())
+}
+
+/// Loads `name` from System32 only and returns the full path it was loaded from. The module stays
+/// loaded (NVML loads it again by that path, which finds the same module).
+fn system32_module(name: &str) -> Option<std::path::PathBuf> {
+    use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32};
+    let w = crate::util::wide(name);
+    let h = unsafe { LoadLibraryExW(w.as_ptr(), std::ptr::null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
+    if h.is_null() {
+        return None;
+    }
+    let mut buf = vec![0u16; 1024];
+    let n = unsafe { GetModuleFileNameW(h, buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    (n > 0 && n < buf.len()).then(|| std::path::PathBuf::from(crate::util::from_wide(&buf[..n])))
 }
 
 pub fn idle_seconds() -> u64 {

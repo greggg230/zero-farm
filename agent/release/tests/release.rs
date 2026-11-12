@@ -1,7 +1,8 @@
 //! farm-release: keygen (DPAPI), sign (minisign-compatible), verify, publish to the mock
-//! coordinator, release-agent with prebuilt binaries. Temporary keys only.
+//! coordinator, release-agent with prebuilt binaries (exact trusted-key sets), define (signed
+//! definitions, PROTOCOL 7). Temporary keys only.
 
-use mockcoord::testkit::{bin, TEST_KEYS_ENV};
+use mockcoord::testkit::{bin, TEST_DATA_KEYS_ENV, TEST_KEYS_ENV};
 use mockcoord::MockCoord;
 use std::path::Path;
 use std::process::{Command, Output};
@@ -564,4 +565,165 @@ fn release_agent_refuses_debug_binaries() {
     let o = cli(&release_args(k.to_str().unwrap(), out.to_str().unwrap(), &mock.url, bins.to_str().unwrap()), &[(TEST_KEYS_ENV, &key.public_b64())]);
     assert!(!o.status.success());
     assert!(text(&o).contains("debug build"), "{}", text(&o));
+}
+
+// ---------- keys and definitions (PROTOCOL 7) ----------
+
+#[test]
+fn keygen_data_says_where_the_key_belongs() {
+    let t = tempfile::tempdir().unwrap();
+    let k = t.path().join("data.key");
+    let o = cli(&["keygen", "--data", "--out", k.to_str().unwrap()], &[]);
+    assert!(o.status.success(), "{}", text(&o));
+    let out = text(&o);
+    assert!(out.contains("trusted_data_keys.txt, NOT trusted_keys.txt"), "{out}");
+    assert!(!out.contains("Add the public key to agent/common/trusted_keys.txt"), "{out}");
+    // Same key file format as a release key: `define` loads it.
+    farm_release::load_key(&k).unwrap();
+    let r = cli(&["keygen", "--out", t.path().join("release.key").to_str().unwrap()], &[]);
+    assert!(text(&r).contains("RELEASE key") && text(&r).contains("trusted_keys.txt"), "{}", text(&r));
+}
+
+#[test]
+fn the_exact_key_set_is_checked() {
+    use farm_release::{check_key_set, parse_keys_output, KeySet};
+    let (a, b, c) = ("RWQAZVT770KTG1hmXk6yJ5i9pF1v5Q4lNLQ9C3fOUo8ynWWfamzJ2LpS", "RWTImfGffZDbH0xWVxO/H563BYqds0G+D+hJLn79XEo9xU3sbl6lLp9D", "RWQxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx");
+    let got = parse_keys_output(&format!("release 1B9342EFFB546500 {a}\ndata 1FDB907D9FF199C8 {b}\n")).unwrap();
+    let want = KeySet { release: [a.to_string()].into(), data: [b.to_string()].into() };
+    check_key_set("farm-agent.exe", &got, &want).unwrap();
+    // A stray build-time key on either list is refused, and so is a missing one.
+    let extra = parse_keys_output(&format!("release X {a}\nrelease Y {c}\ndata Z {b}\n")).unwrap();
+    let e = check_key_set("farm-agent.exe", &extra, &want).unwrap_err();
+    assert!(e.contains("release keys: extra") && e.contains(c), "{e}");
+    let no_data = parse_keys_output(&format!("release X {a}\n")).unwrap();
+    assert!(check_key_set("farm-agent.exe", &no_data, &want).unwrap_err().contains("data keys"));
+    let swapped = parse_keys_output(&format!("release X {b}\ndata Z {a}\n")).unwrap();
+    assert!(check_key_set("farm-agent.exe", &swapped, &want).is_err(), "a release key is not a data key");
+    // Agents before 0.2.5 print `<id> <key>`: release keys.
+    assert_eq!(parse_keys_output(&format!("1B9342EFFB546500 {a}\n")).unwrap().release, [a.to_string()].into());
+    assert!(parse_keys_output("what is this line").is_err());
+    // This tree's files are what the shipped binaries must trust.
+    let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let files = farm_release::expected_keys(&ws, false).unwrap();
+    assert!(files.release.contains(a) && files.data.contains(b), "{files:?}");
+    assert!(files.release.is_disjoint(&files.data));
+}
+
+#[test]
+fn the_launcher_and_agent_print_their_trusted_keys() {
+    let ws = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+    let want = farm_release::expected_keys(&ws, false).unwrap();
+    let run = |exe: &str| {
+        let o = Command::new(bin(exe)).arg("keys").env_remove(TEST_KEYS_ENV).env_remove(TEST_DATA_KEYS_ENV).output().unwrap();
+        farm_release::parse_keys_output(&String::from_utf8_lossy(&o.stdout)).unwrap()
+    };
+    let agent = run("farm-agent");
+    farm_release::check_key_set("farm-agent.exe", &agent, &want).unwrap();
+    let launcher = run("ZeroFarm");
+    assert_eq!(launcher.release, want.release);
+    assert!(launcher.data.is_empty());
+}
+
+fn definition_json(id: &str, version: u64) -> serde_json::Value {
+    serde_json::json!({
+        "definition": 1, "kind": "run", "id": id, "version": version, "created": 1794500000, "expires": null,
+        "game": "mtg", "builds": ["0123456789abcdef01234567"], "runtime": null,
+        "checkpoints": {"81": {"model_sha256": "a".repeat(64), "model_size": 13421772, "reference_sha256": "b".repeat(64), "reference_size": 412000}},
+        "jobs": {"selfplay": {"settings": {"sims": 64}}, "eval": null, "fuzz": null}
+    })
+}
+
+#[test]
+fn define_signs_publishes_and_registers_a_definition() {
+    let t = tempfile::tempdir().unwrap();
+    let dk = t.path().join("data.key");
+    let data = farm_release::keygen(&dk).unwrap();
+    let file = t.path().join("eoe2-v7.json");
+    // Signed as the bytes are, never re-serialised (compact here, with a trailing newline).
+    let mut bytes = serde_json::to_vec(&definition_json("eoe2", 7)).unwrap();
+    bytes.push(b'\n');
+    std::fs::write(&file, &bytes).unwrap();
+    let mock = MockCoord::start();
+    mock.trust_data(&data.public_b64());
+    let env = [(TEST_DATA_KEYS_ENV, data.public_b64()), ("ZEROFARM_ADMIN_TOKEN", "admin-secret".to_string())];
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+
+    let o = cli(&["define", file.to_str().unwrap(), "--key", dk.to_str().unwrap(), "--publish", "--url", &mock.url], &env);
+    assert!(o.status.success(), "{}", text(&o));
+    let out: serde_json::Value = serde_json::from_slice(&o.stdout).expect("one JSON line");
+    let key = "defs/run/eoe2/7/definition.json";
+    let sha = zerofarm_common::hash::sha256_hex(&bytes);
+    assert_eq!(out["key"], key);
+    assert_eq!(out["sha256"], sha.as_str());
+    assert_eq!((out["kind"].as_str(), out["id"].as_str(), out["version"].as_u64()), (Some("run"), Some("eoe2"), Some(7)));
+    assert_eq!(out["published"], true);
+    // What the agent checks: the stored bytes, a minisign signature by the data key (prehashed),
+    // verifiable with the minisign tooling.
+    assert_eq!(mock.with(|s| s.artifacts.get(key).cloned()).unwrap(), bytes);
+    let sig = String::from_utf8(mock.with(|s| s.artifacts.get(&format!("{key}.minisig")).cloned()).unwrap()).unwrap();
+    assert_eq!(std::fs::read_to_string(t.path().join("eoe2-v7.json.minisig")).unwrap(), sig);
+    let pk = minisign_verify::PublicKey::from_base64(&data.public_b64()).unwrap();
+    let s = minisign_verify::Signature::decode(&sig).unwrap();
+    pk.verify(&bytes, &s, false).unwrap();
+    assert_eq!(s.trusted_comment(), "definition=1 kind=run id=eoe2 version=7");
+    let d = zerofarm_common::definition::verify(&TrustedKeys::parse(&[data.public_b64()]).unwrap(), &bytes, &sig).unwrap();
+    assert_eq!(d.version, 7);
+    let reg = mock.with(|s| s.definitions_registered.clone());
+    assert_eq!(reg, vec![serde_json::json!({"kind": "run", "id": "eoe2", "version": 7, "key": key, "sha256": sha})]);
+    // Uploads first, registration last.
+    let order: Vec<String> = mock.with(|s| s.log.iter().filter(|l| l.method == "PUT").map(|l| l.path.clone()).collect());
+    assert_eq!(order, [format!("/v1/admin/artifact/{key}"), format!("/v1/admin/artifact/{key}.minisig"), "/v1/admin/definition".to_string()]);
+
+    // Without --publish: signed locally only.
+    let file2 = t.path().join("v8.json");
+    std::fs::write(&file2, serde_json::to_vec_pretty(&definition_json("eoe2", 8)).unwrap()).unwrap();
+    let o = cli(&["define", file2.to_str().unwrap(), "--key", dk.to_str().unwrap()], &env);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(t.path().join("v8.json.minisig").exists());
+    assert_eq!(mock.with(|s| s.definitions_registered.len()), 1);
+    let o = cli(&["define", file2.to_str().unwrap(), "--key", dk.to_str().unwrap(), "--url", &mock.url], &env);
+    assert!(!o.status.success() && text(&o).contains("--publish"), "{}", text(&o));
+}
+
+#[test]
+fn define_refuses_bad_definitions_and_the_wrong_keys() {
+    let t = tempfile::tempdir().unwrap();
+    let dk = t.path().join("data.key");
+    let data = farm_release::keygen(&dk).unwrap();
+    let rk = t.path().join("release.key");
+    let release = farm_release::keygen(&rk).unwrap();
+    let env_both = [(TEST_DATA_KEYS_ENV, data.public_b64()), (TEST_KEYS_ENV, release.public_b64())];
+    let env_both: Vec<(&str, &str)> = env_both.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let file = t.path().join("d.json");
+    let write = |v: &serde_json::Value| std::fs::write(&file, serde_json::to_vec_pretty(v).unwrap()).unwrap();
+    let define = |key: &Path, env: &[(&str, &str)]| cli(&["define", file.to_str().unwrap(), "--key", key.to_str().unwrap()], env);
+
+    write(&definition_json("eoe2", 1));
+    // The release key never signs a definition.
+    let o = define(&rk, &env_both);
+    assert!(!o.status.success() && text(&o).contains("is the release key"), "{}", text(&o));
+    // A key the agents don't trust as a data key: they would refuse it.
+    let o = define(&dk, &[]);
+    assert!(!o.status.success() && text(&o).contains("not a trusted data key"), "{}", text(&o));
+    // Invalid definitions.
+    for (change, why) in [
+        (serde_json::json!({"jobs": {"selfplay": {"settings": {}, "prefix": "x"}}}), "not allowed"),
+        (serde_json::json!({"jobs": {"selfplay": {"settings": {"book": "\\\\host\\share\\b"}}}}), "file path"),
+        (serde_json::json!({"builds": ["nope"]}), "not a build id"),
+        (serde_json::json!({"surprise": true}), "unknown field"),
+        (serde_json::json!({"kind": "campaign"}), "campaign defines fuzz jobs only"),
+    ] {
+        let mut v = definition_json("eoe2", 1);
+        for (k, x) in change.as_object().unwrap() {
+            v[k] = x.clone();
+        }
+        write(&v);
+        let o = define(&dk, &env_both);
+        assert!(!o.status.success() && text(&o).contains(why), "{why}: {}", text(&o));
+    }
+    assert!(!t.path().join("d.json.minisig").exists(), "nothing signed");
+    // And a data key never signs a build.
+    let d = worker_dir(t.path());
+    let o = cli(&["sign", d.to_str().unwrap(), "--kind", "worker", "--key", dk.to_str().unwrap(), "--game", "mtg", "--engine-commit", EC, "--core-commit", CC], &env_both);
+    assert!(!o.status.success() && text(&o).contains("is a data key"), "{}", text(&o));
 }

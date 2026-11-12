@@ -1,7 +1,7 @@
 //! fakeworker: a test worker that speaks aw/1 (PROTOCOL 5) with scripted behaviours.
 //!
 //! `fakeworker serve` sends `hello`, reads the `job` line and "plays" games by sleeping (no CPU
-//! load). Behaviour comes from the job's `fake` object (all fields optional):
+//! load). Behaviour comes from the job's `settings.fake` object (or `fake`; all fields optional):
 //!
 //! ```json
 //! {"game_ms": 100, "shard_every": 2, "status_ms": 500,
@@ -165,10 +165,13 @@ struct Cfg {
 
 impl Cfg {
     fn from(job: &Value) -> Cfg {
-        // The script comes from the job's `fake` object, or (fuzz campaigns, whose jobs the
-        // coordinator builds from `mode` and `env` only) from `env.FAKE` as a JSON string.
+        // The script comes from the job's `settings.fake` object (agents since 0.2.5 pass on only
+        // a job's template keys), its `fake` object, or (fuzz, whose jobs are `mode` and `env`
+        // only) from `env.FAKE` as a JSON string.
         let f = job
-            .get("fake")
+            .get("settings")
+            .and_then(|s| s.get("fake"))
+            .or_else(|| job.get("fake"))
             .cloned()
             .or_else(|| job.get("env").and_then(|e| e.get("FAKE")).and_then(Value::as_str).and_then(|s| serde_json::from_str(s).ok()))
             .unwrap_or(json!({}));

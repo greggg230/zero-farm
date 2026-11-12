@@ -16,8 +16,10 @@ fn progressed(h: &H, lease: &str, n: u64) -> bool {
     h.mock.with(|s| s.beats.iter().any(|(l, b)| l == lease && b["progress"]["games_done"].as_u64().unwrap_or(0) >= n))
 }
 
+/// A legacy self-play job; the fake worker's script travels in `settings.fake` (agents pass on
+/// only a job's template keys since 0.2.5).
 fn selfplay(games: u64, base: u64, fake: Value) -> Value {
-    json!({"kind": "selfplay", "games": games, "gid_base": base, "seed": 7, "settings": {}, "fake": fake})
+    json!({"kind": "selfplay", "games": games, "gid_base": base, "seed": 7, "settings": {"fake": fake}})
 }
 
 #[test]
@@ -250,8 +252,8 @@ fn fuzz_lease_uploads_each_failure_then_a_summary() {
     let mut h = H::new();
     let mut l = h.lease(
         "l_K",
-        json!({"kind": "fuzz", "mode": "delver", "env": {"FUZZ_POOL": "delver"}, "first": 10_000, "count": 4000,
-               "fake": {"game_ms": 50, "chunk": 1000, "fail_seeds": [10_500, 13_999]}}),
+        json!({"kind": "fuzz", "mode": "delver", "first": 10_000, "count": 4000,
+               "env": {"FUZZ_POOL": "delver", "FAKE": json!({"game_ms": 50, "chunk": 1000, "fail_seeds": [10_500, 13_999]}).to_string()}}),
     );
     l["campaign"] = json!("fuzz-delver");
     h.push(l);
@@ -464,10 +466,48 @@ fn no_lease_is_requested_while_the_user_is_active() {
 
 #[test]
 fn revoked_token_stops_the_engine() {
+    // Only the coordinator's own `revoked` (marked x-zerofarm-coordinator: 1) ends it.
+    let mut h = H::new();
+    let t = h.token.clone();
+    h.mock.with(|s| {
+        s.machines.remove(&t);
+        s.revoked.insert(t.clone());
+    });
+    h.start();
+    assert_eq!(h.join(), EngineExit::Revoked);
+}
+
+#[test]
+fn an_unknown_token_is_kept_and_retried_later() {
+    // The coordinator says `unauthorized`: keep the token, tell the friend, back off (M1).
     let mut h = H::new();
     h.token = "not-a-known-token".into();
     h.start();
-    assert_eq!(h.join(), EngineExit::Revoked);
+    assert!(wait(|| h.phase() == Phase::SignInFailed), "phase {:?}", h.phase());
+    assert_eq!(h.status.lock().unwrap().headline(), "This PC can't sign in to the farm; ask Gregg.");
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(h.mock.count("POST", "/v1/lease"), 1, "one try, then a 1 min wait");
+    assert!(!h.finished(), "the engine keeps running");
+    assert_eq!(h.stop(), EngineExit::Quit);
+}
+
+#[test]
+fn a_403_from_something_in_front_of_the_coordinator_is_a_network_error() {
+    // A WAF or proxy answers 403 with an HTML page, without the coordinator's header: the agent
+    // must not forget its enrollment (security review M1); it retries and works on.
+    let mut h = H::new();
+    let waf = "<html><body>Sorry, you have been blocked (Cloudflare error 1020)</body></html>";
+    h.mock.fail_next_raw("POST", "/v1/lease", 2, 403, waf);
+    h.mock.fail_next_raw("PUT", "/v1/lease/", 1, 401, waf);
+    h.mock.fail_next_raw("POST", "/v1/lease/l_W/beat", 1, 403, waf);
+    h.push(h.lease("l_W", selfplay(4, 0, json!({"game_ms": 100, "shard_every": 2}))));
+    h.start();
+    let done = h.wait_done("l_W");
+    assert_eq!(done["given_back"], false, "{done}");
+    assert_eq!(h.mock.results_for("l_W").len(), 2, "both chunks up after the refused upload was retried");
+    assert!(h.mock.count("POST", "/v1/lease") >= 3, "the two refused lease requests were retried");
+    assert!(!h.finished());
+    assert_eq!(h.stop(), EngineExit::Quit);
 }
 
 #[test]

@@ -136,9 +136,42 @@ pub fn take_blocked_report(layout: &Layout, build_id: &str, now: i64) -> bool {
     true
 }
 
+/// True (and the marker set) if a report about `what` is due: none in the last 24 h. For
+/// reports that would otherwise repeat after every wait (a refused definition, PROTOCOL 7); the
+/// marker is `state\reported-<first 16 hex of sha256(what)>`.
+pub fn take_report(layout: &Layout, what: &str, now: i64) -> bool {
+    // Markers older than a day mean nothing any more: drop them, so they never pile up.
+    if let Ok(rd) = std::fs::read_dir(layout.state()) {
+        for e in rd.flatten().filter(|e| e.file_name().to_string_lossy().starts_with("reported-")) {
+            let t = zerofarm_common::fsutil::read_trimmed(&e.path()).and_then(|s| s.parse::<i64>().ok());
+            if t.is_none_or(|t| now - t >= 86_400 || now < t) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+    let p = layout.state().join(format!("reported-{}", &zerofarm_common::hash::sha256_hex(what.as_bytes())[..16]));
+    let last = zerofarm_common::fsutil::read_trimmed(&p).and_then(|s| s.parse::<i64>().ok());
+    if last.is_some_and(|t| now - t < 86_400 && now >= t) {
+        return false;
+    }
+    let _ = std::fs::create_dir_all(layout.state());
+    let _ = zerofarm_common::fsutil::atomic_write(&p, now.to_string().as_bytes());
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn other_reports_once_a_day_each() {
+        let d = tempfile::tempdir().unwrap();
+        let layout = Layout::new(d.path());
+        assert!(take_report(&layout, "definition run/a: expired", 1000));
+        assert!(!take_report(&layout, "definition run/a: expired", 1000 + 3600));
+        assert!(take_report(&layout, "definition run/a: rollback", 1000 + 3600), "another reason");
+        assert!(take_report(&layout, "definition run/a: expired", 1000 + 86_400));
+    }
 
     #[test]
     fn classifies_policy_blocks() {
