@@ -10,8 +10,13 @@
 //!  "hang_after": null,         // games finished, then silence forever (ignores stdin)
 //!  "fatal_after": null,        // games finished, then {"ev":"error","fatal":true} + exit 2
 //!  "fail_seeds": [10450007],   // fuzz: seeds that "fail"
-//!  "chunk": 1000}              // fuzz: seeds per step
+//!  "chunk": 1000,              // fuzz: seeds per step
+//!  "selftest_fail_gen": null}  // eval: this network fails its self-test (then a fatal error)
 //! ```
+//!
+//! Eval jobs (PROTOCOL 5.2) self-test every network of `models` (the file must exist and match
+//! its sha256), then write one JSON row per game to `evals-<seq>.jsonl` files announced with
+//! `evals`; with `shard_every` odd, a file can end in the middle of a pair.
 //!
 //! Fuzz jobs can carry the same object as a JSON string in `env.FAKE`.
 //!
@@ -155,6 +160,7 @@ struct Cfg {
     fatal_after: Option<u64>,
     fail_seeds: Vec<u64>,
     chunk: u64,
+    selftest_fail_gen: Option<u64>,
 }
 
 impl Cfg {
@@ -182,6 +188,7 @@ impl Cfg {
                 .map(|a| a.iter().filter_map(Value::as_u64).collect())
                 .unwrap_or_default(),
             chunk: u("chunk", 1000).max(1),
+            selftest_fail_gen: o("selftest_fail_gen"),
         }
     }
 }
@@ -361,6 +368,91 @@ impl W {
         self.out.send(json!({"ev": "end", "reason": reason, "stats": self.stats(), "unfinished": unfinished}));
     }
 
+    /// Eval: one `selftest` per network in `models` (by gen); a network whose file is missing or
+    /// doesn't match its sha256 (or `selftest_fail_gen`) fails it, and the worker refuses to play.
+    fn selftest_models(&mut self, job: &Value) -> bool {
+        let Some(models) = job.get("models").and_then(Value::as_object) else { return true };
+        let mut gens: Vec<(u64, &Value)> = models.iter().filter_map(|(g, m)| g.parse().ok().map(|g| (g, m))).collect();
+        gens.sort_by_key(|(g, _)| *g);
+        for (gen, m) in gens {
+            let file_ok = |path: Option<&str>, sha: Option<&str>| match path {
+                Some(p) => std::fs::read(p).ok().is_some_and(|b| sha.is_none_or(|h| sha256_hex(&b) == h)),
+                None => true,
+            };
+            let ok = m.get("model").and_then(Value::as_str).is_some()
+                && file_ok(m.get("model").and_then(Value::as_str), m.get("sha256").and_then(Value::as_str))
+                && file_ok(m.get("reference").and_then(Value::as_str), None)
+                && self.cfg.selftest_fail_gen != Some(gen);
+            self.out.send(json!({"ev": "selftest", "gen": gen, "provider": "cpu", "max_abs": if ok { 2.5e-6 } else { 0.5 }, "ok": ok}));
+            if !ok {
+                self.out.send(json!({"ev": "error", "message": format!("network {gen} failed the self-test"), "fatal": true}));
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Eval rows (PROTOCOL 5.2), one JSON line per game.
+    fn flush_evals(&mut self, job: &Value, gids: &mut Vec<u64>) {
+        if gids.is_empty() {
+            return;
+        }
+        let paired = job.get("paired").and_then(Value::as_bool).unwrap_or(false);
+        let seats: Vec<Value> = job.get("seats").and_then(Value::as_array).cloned().unwrap_or_default();
+        let mut body = String::new();
+        for &g in gids.iter() {
+            let mut s = seats.clone();
+            if paired && g % 2 == 1 {
+                s.reverse();
+            }
+            let result = if g % 3 == 0 { json!([0.5, 0.5]) } else if g % 2 == 0 { json!([1, 0]) } else { json!([0, 1]) };
+            let row = json!({"gid": g, "pair": if paired { json!(g / 2) } else { Value::Null }, "seats": s, "result": result,
+                             "margin": (g % 7) as i64 - 3, "rounds": 5 + g % 4, "over": "life", "net_ms": 1.5});
+            body.push_str(&row.to_string());
+            body.push('\n');
+        }
+        let name = format!("evals-{}.jsonl", self.seq);
+        let _ = std::fs::create_dir_all(&self.out_dir);
+        std::fs::write(self.out_dir.join(&name), body.as_bytes()).expect("write evals");
+        self.out.send(json!({"ev": "evals", "seq": self.seq, "path": name, "games": gids.len(), "rows": gids.len(),
+                             "bytes": body.len(), "gids": ranges(gids)}));
+        self.seq += 1;
+        gids.clear();
+    }
+
+    fn run_eval(&mut self, job: &Value) {
+        if !self.selftest_models(job) {
+            std::process::exit(2);
+        }
+        let games = job.get("games").and_then(Value::as_u64).unwrap_or(4);
+        let base = job.get("gid_base").and_then(Value::as_u64).unwrap_or(0);
+        let mut unflushed = Vec::new();
+        let mut next = 0u64;
+        while next < games && matches!(self.stop, Stop::No) {
+            self.work(self.cfg.game_ms);
+            if matches!(self.stop, Stop::Quit) {
+                break;
+            }
+            unflushed.push(base + next);
+            next += 1;
+            self.done += 1;
+            self.out.send(json!({"ev": "fin", "n": 1}));
+            self.after_game_hooks();
+            if unflushed.len() >= self.cfg.shard_every {
+                self.flush_evals(job, &mut unflushed);
+            }
+        }
+        self.flush_evals(job, &mut unflushed);
+        let reason = match self.stop {
+            Stop::No => "done",
+            Stop::Finish => "finish",
+            Stop::Quit => "quit",
+        };
+        let rest: Vec<u64> = (base + next..base + games).collect();
+        let unfinished = if rest.is_empty() { Value::Null } else { json!({"gids": ranges(&rest)}) };
+        self.out.send(json!({"ev": "end", "reason": reason, "stats": self.stats(), "unfinished": unfinished}));
+    }
+
     fn run_fuzz(&mut self, job: &Value) {
         let first = job.get("first").and_then(Value::as_u64).unwrap_or(0);
         let count = job.get("count").and_then(Value::as_u64).unwrap_or(1000);
@@ -442,6 +534,7 @@ fn main() {
     w.status();
     match job.get("kind").and_then(Value::as_str) {
         Some("fuzz") => w.run_fuzz(&job),
+        Some("eval") => w.run_eval(&job),
         _ => w.run_games(&job),
     }
 }

@@ -2,7 +2,7 @@
 
 The Windows app invited friends install so their idle PCs do jobs for zero-core runs (MTG Zero
 first), plus its launcher, its installer and the desktop's release tool. The wire contract is
-[`../PROTOCOL.md`](../PROTOCOL.md) (v1 rev 4); the reasons are in
+[`../PROTOCOL.md`](../PROTOCOL.md) (v1 rev 5); the reasons are in
 [`../DESIGN.md`](../DESIGN.md) sections 2.2, 3, 4 and 5.
 
 | Crate | Output | What it is |
@@ -11,7 +11,7 @@ first), plus its launcher, its installer and the desktop's release tool. The wir
 | `launcher` | `ZeroFarm.exe`, `ZeroFarmSetup.exe` | PROTOCOL 6 launcher (no console, depends only on `common` without HTTP; hands over to a newer launcher); the single-file installer |
 | `agent` | `farm-agent.exe` (+ lib) | tray app: enrollment, idle policy, leases, verified downloads, worker control, uploads, self-update, install/uninstall |
 | `release` | `farm-release.exe` | desktop tool: keygen, key backup (export-key / import-key), sign, verify, publish, release-agent, installer build, GitHub releases (through `gh`) |
-| `fakeworker` | `fakeworker.exe`, `fakeagent.exe`, `fakelauncher.exe`, `fakegh.exe` | test binaries: an aw/1 worker with scripted behaviours; scripted stand-ins for the agent, for a new launcher and for the GitHub CLI |
+| `fakeworker` | `fakeworker.exe`, `fakeagent.exe`, `fakelauncher.exe`, `fakegh.exe` | test binaries: an aw/1 worker with scripted behaviours (self-play, fuzz and eval: per-network self-tests, eval rows), scripted stand-ins for the agent, for a new launcher and for the GitHub CLI |
 | `mockcoord` | lib | in-process mock coordinator (PROTOCOL rev 2) and a test kit (dev-dependency only) |
 
 ## Build
@@ -52,19 +52,23 @@ because each package has integration tests. Debug builds also honour these test-
 `ZEROFARM_TEST_TRUSTED_KEYS` (extra trusted keys, so tests sign with temporary keys),
 `ZEROFARM_TEST_HEADLESS` (no tray), `ZEROFARM_TEST_HEALTHY_TIMEOUT_S`,
 `ZEROFARM_TEST_TAKEOVER_CONFIRM_S`, `ZEROFARM_TEST_HANDOVER_S`, `ZEROFARM_TEST_COORDINATOR`.
+The in-process tests script a worker that Windows refuses to start through
+`AgentConfig::test_spawn_error` (honoured by debug builds only; `farm-agent.exe` sets None).
 
 No test installs the real agent, touches the real `ZeroFarm` registry entries, generates the real
 key, uses the CPU (the fake worker sleeps) or reaches the network beyond its own localhost mock.
 Install tests use a temp root, a temp shortcut folder and the registry name
 `ZeroFarmTest-<pid>-<n>`, removed by a guard even when an assertion fails.
 
-142 tests (+1 ignored), about 3 minutes on an otherwise idle PC:
+157 tests (+1 ignored), about 3 minutes on an otherwise idle PC:
 
 | Suite | Tests | Covers |
 |---|---|---|
 | `common` unit + `manifest_verify` | 23 + 9 | manifest rules and verification: tampered file, size change, missing/extra file, edited manifest, bad signature, unknown key, wrong trusted comment, legacy signatures, key rotation; minisign format; paths; DPAPI; backoff; canonical digest; rotating log; payload format; the round Z; VERSIONINFO write/read/patch and `.res` layout; launcher leftovers |
-| `agent` unit | 23 | idle policy (pure function over simulated signals), settings, cache LRU, results store, ranges, update cleanup, invite codes, panic sites, availability (dates, sample-and-hold with gaps, 7-day means) |
+| `agent` unit | 30 | idle policy (pure function over simulated signals), settings, cache LRU, results store, ranges, update cleanup, invite codes, panic sites, availability (dates, sample-and-hold with gaps, 7-day means); start failures (policy error codes, the 15 min → 24 h and 1 min → 1 h waits and their file, one `blocked` report per build per day); the tray window procedure re-entered while its state is busy (skipped, no panic) and a panic inside it (caught, reported as `agent`, the tray keeps working); the panic guard |
 | `agent/tests/lifecycle` | 35 | whole leases with the real fakeworker and the mock: download + verify, run, yield/suspend/resume, give-back after slack, upload retries after injected 503s, restart with pending results, orphaned leases, cancel, crash, hang, fatal error, slow yield, no hello, fuzz failures + summary, checkpoint switch, expiry, coordinator give-back, tampered / unknown-key / bad-signature builds, disk cap, profile resend, revoked token, quit event, launcher events, rev 2 (stale chunks, `done` missing, `upload_diag`, repeated checkpoints, duplicate ids, `x-farm-agent`); rev 3: starvation past slack gives back, brief starvation counted and kept, pause + starvation add up, availability recorded, the worker job's UI restrictions |
+| `agent/tests/eval` | 3 | eval leases (PROTOCOL 5.2) with the fakeworker's eval mode: two networks and their references downloaded, verified and cached; the job line's `models` (absolute paths, hashes, `model` null); every game uploaded with `x-ids` and no `x-gen`, files that split a pair, seat order per game; per-gen `selftest` in Stats; cached checkpoints in the next lease request; a tampered checkpoint refused before any worker starts, then a wait (no lease storm); a network failing its self-test reported once, with every gen's result |
+| `agent/tests/blocked` | 5 | a worker Windows refuses to start (scripted os error 4551): one `blocked` report with `os_error` and the build, the lease given back, no lease storm (one lease request while the 15 min wait runs), the tray status and balloon, the wait kept across a restart; shortened waits growing ×4 with the same build reported once; an older coordinator gets it as a `crash`; any other start failure: a `crash` report and a 1 min wait; a worker that starts ends the wait |
 | `agent/tests/update` | 6 | self-update in process: download + verify + `state\pending` + exit 75; `{"update"}` answer; tampered update refused; rolled-back version not retried; a required update that can't happen doesn't spin; older/equal ignored |
 | `agent/tests/selfupdate_e2e` | 2 | real launcher + real agent processes: update through the launcher; a version that never becomes healthy is rolled back, reported by the old agent, never re-downloaded, cleaned up |
 | `agent/tests/launcher_update` | 7 | the launcher updating itself. In process: swap + exit 76 + `launcher-swap`; with a pre-0.2 launcher, swap only (next logon); selftest failure never installs and isn't retried; `plan` (current + healthy only, verified package, never a downgrade or same version, no VERSIONINFO = 0.0.0, bad for 24 h). Real processes: the real launcher hands over to a newer real launcher (old exits 0, new runs the agent, `.old` deleted); fake new launchers that exit at once or never confirm are killed and rolled back, reported, not retried, `.bad` deleted |
@@ -237,10 +241,36 @@ Signatures are minisign-compatible: `minisign -Vm <dir>\manifest.json -p release
   Launchers older than 0.2.0 (they don't set `ZEROFARM_LAUNCHER=2` and don't know exit 76) get
   the files swapped after the selftest and the new launcher at the next logon, without the
   takeover probation (only the canary test PC ran such a launcher).
+- **Eval leases** (rev 5, PROTOCOL 5.2): every network in the lease's `checkpoints` (model and
+  reference) is downloaded, checked against its sha256 and kept in the cache, none evicted while
+  the lease runs, and re-checked before the worker starts; the job line gets `models` by gen
+  (`model`/`reference` null). `evals` files upload like shards (`x-ids` = gids, never `x-gen`).
+  Each `selftest` is kept per gen in Stats `selftest` (`selftest_max_abs` = the largest); a
+  network failing it ends the lease with one `crash` report that lists every gen's result.
+- **Start failures** (`startfail.rs`, rev 5): a worker Windows refuses to run (os error 4551
+  Smart App Control / WDAC, 1260 AppLocker / SRP, 225 Defender) is reported once per build per
+  day as `/v1/crash` kind `blocked` with `os_error` (a coordinator that refuses the kind gets a
+  plain `crash`), the lease goes back, and no lease is asked for during 15 min, 1 h, 4 h, 16 h,
+  then 24 h; the tray says "Windows is blocking Zero Farm's job program (Smart App Control)..."
+  with a balloon once. Any other start failure (or a worker that dies before `hello`) is a
+  `crash` report and a wait of 1 min doubling to 1 h. A lease whose files can't be downloaded,
+  verified or set up waits the same way (without a report), so a bad file is never fetched and
+  refused in a loop. The wait is kept in `state\start-backoff.json` across restarts and ends when
+  a worker says `hello`. (0.2.1 on a friend's PC with Smart App Control leased 521 times in 45
+  min.)
+- **Tray** (`tray.rs`): the tray state is never borrowed across a call that can pump or dispatch
+  messages (SetForegroundWindow, TrackPopupMenu, MessageBox, Shell_NotifyIcon, ShellExecute,
+  DestroyWindow, EnableWindow): the window procedure works out what to do under a short
+  `try_borrow_mut`, releases it, then makes those calls; a message that arrives while the state is
+  busy is skipped. Every window procedure runs in `logging::guard_ui` (`catch_unwind`): a panic
+  is logged and saved as a `/v1/crash` report of kind `agent`, which the engine sends within a
+  minute, and the app keeps running. (0.2.1 aborted with 0xC0000409 on tray clicks: "RefCell
+  already borrowed" inside the window procedure.)
 - **Reports**: `/v1/crash` for worker panics/crashes/hangs (stderr tail), agent panics (sent at the
-  next start), launcher rollbacks (agent and launcher) and failed launcher selftests; logs
-  uploaded on `upload_diag` or "Send diagnostics". Logs: `logs\agent.log`, `worker.log`,
-  `launcher.log`, rotating, under 20 MB together.
+  next start), caught tray panics, blocked workers, launcher rollbacks (agent and launcher) and
+  failed launcher selftests; reports that couldn't be sent wait in `state\crashes\` and go out
+  within a minute. Logs uploaded on `upload_diag` or "Send diagnostics". Logs:
+  `logs\agent.log`, `worker.log`, `launcher.log`, rotating, under 20 MB together.
 
 ## CLI
 

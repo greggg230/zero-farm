@@ -2,6 +2,8 @@
 //! its results, beat, yield/suspend/resume with the user's activity, give the lease back after
 //! `slack_s` paused, honour cancel/give_back/expiry and new checkpoints, and close it with
 //! `done`. Every network call runs off this loop's thread, so a yield is never delayed by I/O.
+//! Eval leases (rev 5, PROTOCOL 5.2) bring every network their seats name in `checkpoints`;
+//! all are downloaded and verified, then handed to the worker as `models`.
 
 use crate::cache::{Cache, CacheError, CkptFiles};
 use crate::engine::Engine;
@@ -31,6 +33,9 @@ pub enum LeaseEnd {
     Revoked,
     /// The agent is shutting down.
     Quit,
+    /// The worker could not be started (or died before `hello`): the lease went back and the
+    /// engine waits before asking again (startfail.rs). `blocked`: Windows refused to run it.
+    NotStarted { blocked: bool },
 }
 
 enum Ev {
@@ -80,6 +85,17 @@ struct Prepared {
     build: VerifiedBuild,
     runtime: Option<VerifiedBuild>,
     ckpt: Option<(CheckpointRef, CkptFiles)>,
+    /// Eval (rev 5): every network of the lease's `checkpoints`, in its order.
+    models: Vec<(CheckpointRef, CkptFiles)>,
+}
+
+/// A verified checkpoint still matches its hashes (model, and reference when it has one).
+fn ckpt_intact(c: &CheckpointRef, f: &CkptFiles) -> bool {
+    Cache::reverify_file(&f.model, &c.sha256)
+        && match (&f.reference, &c.reference_sha256) {
+            (Some(p), Some(h)) => Cache::reverify_file(p, h),
+            _ => true,
+        }
 }
 
 impl Engine {
@@ -121,6 +137,16 @@ impl Engine {
         LeaseEnd::GivenBack(why.to_string())
     }
 
+    /// A lease whose files couldn't be fetched, verified or set up: give it back and wait before
+    /// asking again (the start-failure backoff, 1 min doubling to 1 h), never a lease storm. A
+    /// checkpoint or build that keeps failing verification would otherwise be leased again at
+    /// once, every time, at the coordinator's rate limit.
+    fn setup_failed(&mut self, lease: &Lease, why: &str) -> LeaseEnd {
+        let end = self.give_back_unstarted(lease, why);
+        self.start_failed(false);
+        end
+    }
+
     fn prepare(&mut self, lease: &Lease) -> Result<Prepared, CacheError> {
         let s = self.settings();
         let cap = s.disk_cap_mb << 20;
@@ -130,6 +156,10 @@ impl Engine {
         }
         if let (Some(run), Some(c)) = (&lease.run, &lease.checkpoint) {
             keep.push(Cache::ckpt_key(run, c.gen));
+        }
+        // Eval: all of its networks stay in the cache while it runs (none evicts another).
+        if let (Some(run), Some(cks)) = (&lease.run, &lease.checkpoints) {
+            keep.extend(cks.iter().map(|c| Cache::ckpt_key(run, c.gen)));
         }
         // Beat while downloading so a big first download doesn't let the lease expire.
         let pump_stop = Arc::new(AtomicBool::new(false));
@@ -163,7 +193,15 @@ impl Engine {
                 }
                 None => None,
             };
-            Ok(Prepared { build, runtime, ckpt })
+            let mut models = Vec::new();
+            for c in lease.checkpoints.iter().flatten() {
+                let run = lease.run.as_deref().ok_or_else(|| CacheError::Bad("checkpoints without a run".into()))?;
+                if models.iter().any(|(m, _): &(CheckpointRef, CkptFiles)| m.gen == c.gen) {
+                    return Err(CacheError::Bad(format!("checkpoint {} is listed twice", c.gen)));
+                }
+                models.push((c.clone(), self.cache.ensure_checkpoint(&self.client, run, c, cap, &keep, &stop)?));
+            }
+            Ok(Prepared { build, runtime, ckpt, models })
         })();
         pump_stop.store(true, Ordering::SeqCst);
         let _ = pump.join();
@@ -181,7 +219,7 @@ impl Engine {
             }
             Err(e) => {
                 log::error!("lease {id}: setup failed: {e}");
-                return self.give_back_unstarted(lease, &format!("setup failed: {e}"));
+                return self.setup_failed(lease, &format!("setup failed: {e}"));
             }
         };
         // Compatibility (DESIGN 2.2): a build that needs a newer agent makes us update first.
@@ -198,44 +236,48 @@ impl Engine {
             Ok(b) => b,
             Err(e) => {
                 log::error!("lease {id}: build failed re-verification: {e}");
-                return self.give_back_unstarted(lease, &format!("build verification failed: {e}"));
+                return self.setup_failed(lease, &format!("build verification failed: {e}"));
             }
         };
         if let Some((c, f)) = &prep.ckpt {
             if !Cache::reverify_file(&f.model, &c.sha256) {
-                return self.give_back_unstarted(lease, "checkpoint verification failed");
+                return self.setup_failed(lease, "checkpoint verification failed");
             }
+        }
+        if let Some((c, _)) = prep.models.iter().find(|(c, f)| !ckpt_intact(c, f)) {
+            log::error!("lease {id}: checkpoint {} failed re-verification", c.gen);
+            return self.setup_failed(lease, &format!("checkpoint {} verification failed", c.gen));
         }
         let work = self.cfg.layout.work().join(&id);
         let _ = zerofarm_common::fsutil::remove_dir_all_retry(&work, Duration::from_secs(5));
         if let Err(e) = std::fs::create_dir_all(work.join("out")) {
-            return self.give_back_unstarted(lease, &format!("work dir: {e}"));
+            return self.setup_failed(lease, &format!("work dir: {e}"));
         }
         let d = self.decide(None);
         let caps = self.caps(&d);
         let (tx, rx) = mpsc::channel::<Ev>();
         let txw = tx.clone();
         let entry = build.entry_path().expect("worker manifests have an entry");
-        let spawn = WorkerProc::spawn(
-            SpawnOpts {
-                exe: &entry,
-                cwd: &work,
-                mem_limit_mb: caps.ram_mb.max(256),
-                cpu_job: !caps.gpu,
-                log: self.worker_log.clone(),
-                tag: id.clone(),
-                runtime_dir: prep.runtime.as_ref().map(|r| r.dir.as_path()),
-            },
-            move |m| {
-                let _ = txw.send(Ev::Worker(m));
-            },
-        );
+        let spawn = match self.cfg.test_spawn_error.filter(|_| cfg!(debug_assertions)) {
+            Some(code) => Err(std::io::Error::from_raw_os_error(code)),
+            None => WorkerProc::spawn(
+                SpawnOpts {
+                    exe: &entry,
+                    cwd: &work,
+                    mem_limit_mb: caps.ram_mb.max(256),
+                    cpu_job: !caps.gpu,
+                    log: self.worker_log.clone(),
+                    tag: id.clone(),
+                    runtime_dir: prep.runtime.as_ref().map(|r| r.dir.as_path()),
+                },
+                move |m| {
+                    let _ = txw.send(Ev::Worker(m));
+                },
+            ),
+        };
         let worker = match spawn {
             Ok(w) => w,
-            Err(e) => {
-                log::error!("lease {id}: could not start worker: {e}");
-                return self.give_back_unstarted(lease, &format!("could not start worker: {e}"));
-            }
+            Err(e) => return self.worker_not_started(lease, &e),
         };
         log::info!("lease {id}: worker pid {} started", worker.pid);
         let mark = CpuMark::take(&worker);
@@ -275,8 +317,52 @@ impl Engine {
             sample: (mark, Instant::now()),
             starved_ms: 0,
             stall_since: None,
+            selftests: Map::new(),
+            selftest_failed: false,
+            crash_reported: false,
+            hello_seen: false,
         };
         run.go(self)
+    }
+
+    /// The worker process could not be created. Windows refusing it by policy (Smart App
+    /// Control, AppLocker, Defender) is reported as `blocked` once a day per build; anything else
+    /// as a `crash`. Either way the lease goes back and the engine waits before asking again.
+    fn worker_not_started(&mut self, lease: &Lease, e: &std::io::Error) -> LeaseEnd {
+        let id = &lease.lease_id;
+        let build = lease.build.build_id.clone();
+        let blocked = crate::startfail::blocked_code(e);
+        match blocked {
+            Some(code) => {
+                let by = crate::startfail::blocked_by(code);
+                log::error!("lease {id}: Windows refused to start the worker ({by}, os error {code}): {e}");
+                if crate::startfail::take_blocked_report(&self.cfg.layout, &build, zerofarm_common::now_unix()) {
+                    self.report_crash(CrashReq {
+                        build_id: Some(build),
+                        kind: "blocked".into(),
+                        message: format!("Windows refused to start the worker: {by} ({e})"),
+                        lease_id: Some(id.clone()),
+                        os_error: Some(code as i64),
+                        ..Default::default()
+                    });
+                } else {
+                    log::info!("build {build} was already reported blocked today");
+                }
+            }
+            None => {
+                log::error!("lease {id}: could not start worker: {e}");
+                self.report_crash(CrashReq {
+                    build_id: Some(build),
+                    kind: "crash".into(),
+                    message: format!("could not start worker: {e}"),
+                    lease_id: Some(id.clone()),
+                    ..Default::default()
+                });
+            }
+        }
+        self.give_back_unstarted(lease, &format!("could not start worker: {e}"));
+        self.start_failed(blocked.is_some());
+        LeaseEnd::NotStarted { blocked: blocked.is_some() }
     }
 }
 
@@ -326,6 +412,14 @@ struct Run {
     /// Since when the worker has made no progress, paused or starved; past `slack_s` the lease
     /// is given back (PROTOCOL 3: starvation counts toward the slack like a pause).
     stall_since: Option<Instant>,
+    /// The worker's `selftest` results per network generation (Stats `selftest`, rev 5).
+    selftests: Map<String, Value>,
+    /// A network failed its self-test (the worker refuses to play with it).
+    selftest_failed: bool,
+    /// A crash report was sent for this lease.
+    crash_reported: bool,
+    /// The worker said `hello` (it started): start failures are over.
+    hello_seen: bool,
 }
 
 impl Run {
@@ -344,7 +438,25 @@ impl Run {
         s.insert("resume_ms_max".into(), json!(self.resume_ms_max));
         s.insert("paused_ms".into(), json!(paused));
         s.insert("starved_ms".into(), json!(self.starved_ms));
+        if !self.selftests.is_empty() {
+            let max = self.selftests.values().filter_map(|t| t.get("max_abs").and_then(Value::as_f64)).fold(None, |m: Option<f64>, x| {
+                Some(m.map_or(x, |m| m.max(x)))
+            });
+            if let Some(m) = max {
+                s.insert("selftest_max_abs".into(), json!(m));
+            }
+            s.insert("selftest".into(), Value::Object(self.selftests.clone()));
+        }
         s
+    }
+
+    /// The per-gen self-test results, for a crash report.
+    fn selftest_note(&self) -> String {
+        if self.selftests.is_empty() {
+            String::new()
+        } else {
+            format!("; selftest per gen: {}", Value::Object(self.selftests.clone()))
+        }
     }
 
     /// Every `starve_window` while the worker should be running: was it starved of CPU? Starved
@@ -445,6 +557,7 @@ impl Run {
 
     fn tick(&mut self, eng: &mut Engine) {
         let t = eng.cfg.timings.clone();
+        eng.maybe_send_saved_crashes();
         if eng.quitting() && !matches!(self.state, WState::Stopping(_)) {
             self.stop(After::Quit);
         }
@@ -554,15 +667,17 @@ impl Run {
         }
     }
 
-    fn report(&self, eng: &Engine, kind: &str, message: &str, exit_code: Option<i64>) {
+    fn report(&mut self, eng: &Engine, kind: &str, message: &str, exit_code: Option<i64>) {
+        self.crash_reported = true;
         eng.report_crash(CrashReq {
             build_id: Some(self.lease.build.build_id.clone()),
             kind: kind.into(),
-            message: message.into(),
+            message: format!("{message}{}", self.selftest_note()),
             backtrace: Some(self.worker.stderr_tail()).filter(|s| !s.is_empty()),
             lease_id: Some(self.lease.lease_id.clone()),
             exit_code,
             agent: None,
+            os_error: None,
         });
     }
 
@@ -603,6 +718,14 @@ impl Run {
         };
         j.insert("model".into(), model);
         j.insert("reference".into(), reference);
+        // Eval (rev 5, PROTOCOL 5.2): every network by gen; `model`/`reference` stay null.
+        if self.lease.checkpoints.is_some() {
+            let mut models = Map::new();
+            for (c, f) in &self.prep.models {
+                models.insert(c.gen.to_string(), json!({"model": f.model, "sha256": c.sha256, "reference": f.reference}));
+            }
+            j.insert("models".into(), Value::Object(models));
+        }
         j.insert("threads".into(), json!(self.threads));
         j.insert("out_dir".into(), json!("out"));
         j.insert("runtime_dir".into(), self.prep.runtime.as_ref().map(|r| json!(r.dir)).unwrap_or(Value::Null));
@@ -636,6 +759,8 @@ impl Run {
                 let line = self.job_line();
                 self.send(line);
                 self.job_sent = true;
+                self.hello_seen = true;
+                eng.start_ok();
                 self.state = WState::Running;
                 let started = eng.cfg.layout.cache().join("started");
                 let _ = std::fs::create_dir_all(&started);
@@ -643,8 +768,17 @@ impl Run {
             }
             "selftest" => {
                 log::info!("lease {}: selftest {v}", self.id());
-                if let Some(x) = v.get("max_abs") {
-                    self.stats.insert("selftest_max_abs".into(), x.clone());
+                // rev 5: one per network (`gen`); a single-model worker may leave `gen` out.
+                let gen = v.get("gen").and_then(Value::as_u64).or_else(|| self.prep.ckpt.as_ref().map(|(c, _)| c.gen));
+                let ok = v.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                let mut t = Map::new();
+                for k in ["provider", "max_abs", "ok"] {
+                    t.insert(k.into(), v.get(k).cloned().unwrap_or(Value::Null));
+                }
+                self.selftests.insert(gen.map(|g| g.to_string()).unwrap_or_else(|| "model".into()), Value::Object(t));
+                if !ok {
+                    log::error!("lease {}: network {gen:?} failed its self-test: {v}", self.id());
+                    self.selftest_failed = true;
                 }
                 if let Some(p) = v.get("provider").and_then(Value::as_str) {
                     self.provider = Some(p.to_string());
@@ -677,7 +811,7 @@ impl Run {
                     });
                 }
             }
-            "shard" | "records" => self.on_result_file(eng, &ev, &v),
+            "shard" | "records" | "evals" => self.on_result_file(eng, &ev, &v),
             "failure" => {
                 let mut f = Map::new();
                 for k in ["seed", "panic", "site", "repro", "output_tail"] {
@@ -868,6 +1002,10 @@ impl Run {
             self.report(eng, kind, &format!("worker exited with code {code} without `end`"), Some(code as i64));
             self.after.get_or_insert(After::Kill(format!("worker exited with code {code}")));
         }
+        // A network that failed its self-test is always reported, with every gen's result.
+        if self.selftest_failed && !self.crash_reported {
+            self.report(eng, "crash", "a network failed the worker's self-test", None);
+        }
         let fuzz = self.lease.kind == "fuzz" || self.lease.job.get("kind").and_then(Value::as_str) == Some("fuzz");
         let mut unfinished = end.as_ref().map(|e| e.get("unfinished").cloned().unwrap_or(Value::Null));
         if fuzz && end.is_some() && self.job_sent {
@@ -896,6 +1034,11 @@ impl Run {
             log::error!("lease {id}: could not write done: {e}");
         }
         eng.uploader.wake();
+        // Dead or killed before `hello`: a start failure, so no new lease at once.
+        if !self.hello_seen && matches!(self.after, Some(After::Kill(_))) {
+            eng.start_failed(false);
+            return LeaseEnd::NotStarted { blocked: false };
+        }
         match self.after.clone() {
             None => LeaseEnd::Done,
             Some(After::GiveBack(w)) => LeaseEnd::GivenBack(w),

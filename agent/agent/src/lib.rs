@@ -16,6 +16,7 @@ pub mod profile;
 pub mod results;
 pub mod settings;
 pub mod signals;
+pub mod startfail;
 pub mod status;
 pub mod tray;
 pub mod update;
@@ -65,6 +66,16 @@ pub struct Timings {
     pub max_wait: Duration,
     /// How long a new launcher's `selftest` may take (antivirus scans a new exe first).
     pub launcher_selftest: Duration,
+    /// Windows refused to start the worker (Smart App Control, AppLocker, Defender): wait this
+    /// long before asking for work again, ×4 after each further refusal, up to
+    /// `blocked_backoff_max` (PROTOCOL 3, rev 5: 15 min, 1 h, 4 h, 16 h, 24 h).
+    pub blocked_backoff: Duration,
+    pub blocked_backoff_max: Duration,
+    /// Any other failure to start a worker: wait this long, doubling up to `start_backoff_max`.
+    pub start_backoff: Duration,
+    pub start_backoff_max: Duration,
+    /// How often crash reports saved under `state\crashes\` (e.g. a caught tray panic) are sent.
+    pub crash_resend: Duration,
 }
 
 impl Default for Timings {
@@ -84,6 +95,11 @@ impl Default for Timings {
             upload_rescan: Duration::from_secs(30),
             max_wait: Duration::from_secs(300),
             launcher_selftest: Duration::from_secs(60),
+            blocked_backoff: Duration::from_secs(15 * 60),
+            blocked_backoff_max: Duration::from_secs(24 * 3600),
+            start_backoff: Duration::from_secs(60),
+            start_backoff_max: Duration::from_secs(3600),
+            crash_resend: Duration::from_secs(60),
         }
     }
 }
@@ -105,6 +121,10 @@ pub struct AgentConfig {
     /// `ZEROFARM_LAUNCHER` from the launcher that started us (0: none, or a launcher before
     /// 0.2.0 that can't hand over to a new launcher).
     pub launcher_level: u32,
+    /// Tests only (honoured by debug builds; `farm-agent.exe` always sets None): starting a
+    /// worker fails with this raw Windows error instead of creating the process, e.g. 4551 as
+    /// Smart App Control answers for an unsigned program.
+    pub test_spawn_error: Option<i32>,
 }
 
 /// The agent's identity: version and build id from `manifest.json` next to the executable

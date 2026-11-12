@@ -141,6 +141,9 @@ pub struct Lease {
     pub runtime: Option<ArtifactRef>,
     #[serde(default)]
     pub checkpoint: Option<CheckpointRef>,
+    /// rev 5 (eval, PROTOCOL 5.2): every network the job's seats name; `checkpoint` is null.
+    #[serde(default)]
+    pub checkpoints: Option<Vec<CheckpointRef>>,
     pub job: Value,
 }
 
@@ -217,6 +220,9 @@ pub struct CrashReq {
     pub exit_code: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent: Option<String>,
+    /// rev 5, kind `blocked`: the Windows error that refused to start the worker (4551, 1260, 225).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub os_error: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -236,6 +242,9 @@ pub struct ResultResp {
     pub credited: u64,
     #[serde(default)]
     pub already_credited: u64,
+    /// rev 5 (paired eval): games of this chunk waiting for their pair-mate (not credited yet).
+    #[serde(default)]
+    pub held: u64,
 }
 
 /// Header names (PROTOCOL 1 and 3).
@@ -291,5 +300,18 @@ mod tests {
         )
         .unwrap();
         assert_eq!(l.lease.unwrap().campaign.as_deref(), Some("fuzz-delver"));
+        // rev 5: an eval lease names its networks in `checkpoints`.
+        let e: Lease = serde_json::from_str(
+            r#"{"lease_id": "l_2", "kind": "eval", "issued_at": 1, "expires_at": 2, "beat_s": 60, "slack_s": 600,
+                "run": "h2h-a", "build": {"build_id": "0123456789abcdef01234567", "manifest": "m"}, "checkpoint": null,
+                "checkpoints": [{"gen": 80, "model": "ckpt/h2h-a/80/model.onnx", "sha256": "ab", "reference": null,
+                                 "reference_sha256": null}],
+                "job": {"kind": "eval", "games": 2, "gid_base": 0}}"#,
+        )
+        .unwrap();
+        assert_eq!(e.checkpoints.unwrap()[0].gen, 80);
+        let c = CrashReq { kind: "blocked".into(), os_error: Some(4551), ..Default::default() };
+        assert_eq!(serde_json::to_value(&c).unwrap()["os_error"], 4551);
+        assert!(serde_json::to_value(CrashReq::default()).unwrap().get("os_error").is_none());
     }
 }

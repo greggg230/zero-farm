@@ -5,12 +5,22 @@
 //! Menu: status, games today; pause 1 h / until tomorrow / indefinitely, resume; mode (idle
 //! only / always, low priority); GPU on/off; CPU threads; open logs folder; send diagnostics;
 //! about; quit.
+//!
+//! Re-entrancy (0.2.3): SetForegroundWindow, TrackPopupMenu, MessageBox, Shell_NotifyIcon and
+//! ShellExecute can pump or dispatch messages, which calls the window procedure again on this
+//! thread. 0.2.1 held a `RefCell` borrow across them; a nested message then panicked with
+//! "already borrowed" inside the `extern "system"` window procedure, which can't unwind, and the
+//! process aborted (0xC0000409) on tray clicks. Now the tray state is only borrowed for short
+//! stretches that make no such call: the window procedure collects what to do ([`Ui`]), drops
+//! the borrow, then does it; a message that arrives while the state is borrowed is skipped
+//! (`try_borrow_mut`); and every window procedure runs inside [`crate::logging::guard_ui`], so a
+//! panic is reported (`/v1/crash`, kind `agent`) instead of killing the app.
 
 use crate::engine::{Control, EngineExit};
 use crate::settings::{pause_for, pause_until_tomorrow, Mode, Pause, SharedMachine};
 use crate::status::{Phase, SharedStatus};
 use crate::util::wide;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::sync::Arc;
 use std::thread::JoinHandle;
 use windows_sys::Win32::Foundation::*;
@@ -21,6 +31,9 @@ use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const WM_TRAY: u32 = WM_APP + 1;
+/// Tests only: makes the tray window procedure panic (it must be caught).
+#[cfg(test)]
+const WM_TEST_PANIC: u32 = WM_APP + 99;
 const NIN_KEYSELECT: u32 = NIN_SELECT | 0x1;
 const TIMER_ID: usize = 1;
 const ID_PAUSE_1H: usize = 10;
@@ -66,6 +79,46 @@ struct Tray {
 thread_local! {
     static TRAY: RefCell<Option<Tray>> = const { RefCell::new(None) };
     static DLG: RefCell<Option<Dlg>> = const { RefCell::new(None) };
+    /// The tray menu is open (TrackPopupMenu runs its own loop): further clicks are ignored.
+    static MENU_OPEN: Cell<bool> = const { Cell::new(false) };
+    /// Explorer restarted while the tray state was busy: add the icon at the next tick.
+    static READD_ICON: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs `f` on the tray state, unless it is already borrowed further up this thread's stack (a
+/// message dispatched while a modal call pumps): then nothing happens and the answer is None.
+/// `f` must not call anything that can pump or dispatch messages: return [`Ui`] steps instead.
+fn with_tray<R>(f: impl FnOnce(&mut Tray) -> R) -> Option<R> {
+    TRAY.with(|t| match t.try_borrow_mut() {
+        Ok(mut g) => g.as_mut().map(f),
+        Err(_) => None,
+    })
+}
+
+/// A Win32 call that can re-enter the window procedure, made after the tray state is released.
+enum Ui {
+    Notify(u32, Box<NOTIFYICONDATAW>),
+    Message { text: String, title: &'static str, flags: u32 },
+    Open(Vec<u16>),
+    Quit,
+}
+
+fn run_ui(hwnd: HWND, steps: Vec<Ui>) {
+    for step in steps {
+        match step {
+            Ui::Notify(op, n) => unsafe {
+                Shell_NotifyIconW(op, &*n);
+            },
+            Ui::Message { text, title, flags } => {
+                message_box(hwnd, &text, title, flags);
+            }
+            Ui::Open(path) => unsafe {
+                let op = wide("open");
+                ShellExecuteW(std::ptr::null_mut(), op.as_ptr(), path.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL);
+            },
+            Ui::Quit => unsafe { PostQuitMessage(0) },
+        }
+    }
 }
 
 fn hinstance() -> HINSTANCE {
@@ -117,34 +170,32 @@ fn phase_color(p: Phase) -> u32 {
         Phase::Downloading | Phase::Updating => 0x1565C0,
         Phase::Waiting => 0x5C6BC0,
         Phase::Idle | Phase::Paused | Phase::Starting => 0x757575,
-        Phase::Offline | Phase::NotEnrolled => 0xEF6C00,
+        Phase::Offline | Phase::NotEnrolled | Phase::Blocked => 0xEF6C00,
         Phase::Revoked => 0xC62828,
     }
 }
 
 impl Tray {
-    fn nid(&self) -> NOTIFYICONDATAW {
-        let mut n: NOTIFYICONDATAW = unsafe { std::mem::zeroed() };
+    fn nid(&self) -> Box<NOTIFYICONDATAW> {
+        let mut n: Box<NOTIFYICONDATAW> = Box::new(unsafe { std::mem::zeroed() });
         n.cbSize = std::mem::size_of::<NOTIFYICONDATAW>() as u32;
         n.hWnd = self.hwnd;
         n.uID = 1;
         n
     }
 
-    fn add_icon(&mut self) {
+    fn add_icon(&self) -> Vec<Ui> {
         let mut n = self.nid();
         n.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
         n.uCallbackMessage = WM_TRAY;
         n.hIcon = self.icon;
         copy_wide(&mut n.szTip, "Zero Farm");
-        unsafe {
-            Shell_NotifyIconW(NIM_ADD, &n);
-            n.Anonymous.uVersion = NOTIFYICON_VERSION_4;
-            Shell_NotifyIconW(NIM_SETVERSION, &n);
-        }
+        let mut v = self.nid();
+        v.Anonymous.uVersion = NOTIFYICON_VERSION_4;
+        vec![Ui::Notify(NIM_ADD, n), Ui::Notify(NIM_SETVERSION, v)]
     }
 
-    fn refresh(&mut self) {
+    fn refresh(&mut self) -> Vec<Ui> {
         let st = self.status.lock().unwrap().clone();
         if self.icon_phase != Some(st.phase) {
             let old = self.icon;
@@ -165,12 +216,11 @@ impl Tray {
             n.dwInfoFlags = NIIF_INFO;
             crate::status::set(&self.status, |s| s.toast = None);
         }
-        unsafe { Shell_NotifyIconW(NIM_MODIFY, &n) };
+        vec![Ui::Notify(NIM_MODIFY, n)]
     }
 
-    fn remove_icon(&self) {
-        let n = self.nid();
-        unsafe { Shell_NotifyIconW(NIM_DELETE, &n) };
+    fn remove_icon(&self) -> Ui {
+        Ui::Notify(NIM_DELETE, self.nid())
     }
 
     fn save_settings(&self, f: impl FnOnce(&mut crate::settings::Settings)) {
@@ -183,7 +233,8 @@ impl Tray {
         self.control.wake();
     }
 
-    fn show_menu(&mut self) {
+    /// The tray menu (built only: showing it pumps messages, so that happens after the borrow).
+    fn build_menu(&self) -> HMENU {
         let st = self.status.lock().unwrap().clone();
         let s = self.machine.lock().unwrap().settings.clone();
         let now = zerofarm_common::now_unix();
@@ -195,6 +246,13 @@ impl Tray {
             };
             add(MF_STRING | MF_GRAYED, 1, &format!("Zero Farm {}", self.version));
             add(MF_STRING | MF_GRAYED, 2, &st.headline());
+            if st.phase == Phase::Blocked {
+                // The rest of the explanation (a menu item doesn't wrap).
+                for line in crate::status::BLOCKED_MESSAGE.split(". ").skip(1) {
+                    let line = if line.ends_with('.') { line.to_string() } else { format!("{line}.") };
+                    add(MF_STRING | MF_GRAYED, 6, &line);
+                }
+            }
             add(MF_STRING | MF_GRAYED, 3, &format!("Games today: {}", st.games_today));
             if let Some(g) = &st.gpu_note {
                 add(MF_STRING | MF_GRAYED, 4, g);
@@ -236,19 +294,11 @@ impl Tray {
             add(MF_STRING | if busy { MF_GRAYED } else { 0 }, ID_DIAG, if busy { "Sending diagnostics…" } else { "Send diagnostics" });
             add(MF_STRING, ID_ABOUT, "About Zero Farm");
             add(MF_STRING, ID_QUIT, "Quit");
-            let mut pt = POINT { x: 0, y: 0 };
-            GetCursorPos(&mut pt);
-            SetForegroundWindow(self.hwnd);
-            let cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, pt.x, pt.y, 0, self.hwnd, std::ptr::null());
-            PostMessageW(self.hwnd, WM_NULL, 0, 0);
-            DestroyMenu(m);
-            if cmd != 0 {
-                self.command(cmd as usize);
-            }
+            m
         }
     }
 
-    fn command(&mut self, id: usize) {
+    fn command(&mut self, id: usize) -> Vec<Ui> {
         let now = zerofarm_common::now_unix();
         match id {
             ID_PAUSE_1H => self.save_settings(|s| s.pause = pause_for(now, 3600)),
@@ -259,15 +309,11 @@ impl Tray {
             ID_MODE_ALWAYS => self.save_settings(|s| s.mode = Mode::Always),
             ID_GPU => self.save_settings(|s| s.gpu = !s.gpu),
             ID_THREADS_AUTO => self.save_settings(|s| s.cpu_threads = None),
-            ID_LOGS => unsafe {
-                let p = crate::util::wide_path(&self.layout.logs());
-                let op = wide("open");
-                ShellExecuteW(std::ptr::null_mut(), op.as_ptr(), p.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL);
-            },
+            ID_LOGS => return vec![Ui::Open(crate::util::wide_path(&self.layout.logs()))],
             ID_DIAG => {
                 use std::sync::atomic::Ordering;
                 if self.diag_running.swap(true, Ordering::SeqCst) {
-                    return;
+                    return vec![];
                 }
                 let (send, running, status) = (self.send_diag.clone(), self.diag_running.clone(), self.status.clone());
                 // The answer comes back as a balloon (refresh shows `toast`).
@@ -288,12 +334,12 @@ impl Tray {
                     m.machine_id.clone().unwrap_or_default(),
                     m.games_today()
                 );
-                message_box(self.hwnd, &text, "About Zero Farm", MB_OK | MB_ICONINFORMATION);
+                return vec![Ui::Message { text, title: "About Zero Farm", flags: MB_OK | MB_ICONINFORMATION }];
             }
             ID_QUIT => {
                 self.quitting = true;
-                self.remove_icon();
                 self.control.request_quit();
+                return vec![self.remove_icon()];
             }
             n if (ID_THREADS_BASE..ID_LOGS).contains(&n) => {
                 let t = (n - ID_THREADS_BASE) as u32;
@@ -301,12 +347,15 @@ impl Tray {
             }
             _ => {}
         }
+        vec![]
     }
 
     /// Called every second: refresh the icon and notice the engine ending.
-    fn tick(&mut self) {
+    fn tick(&mut self) -> Vec<Ui> {
         if self.engine.as_ref().is_some_and(|e| e.is_finished()) {
             let exit = self.engine.take().unwrap().join();
+            self.quitting = true;
+            let mut steps = Vec::new();
             self.exit_code = Some(match exit {
                 Ok(EngineExit::Quit) => 0,
                 Ok(EngineExit::Update(_)) => zerofarm_common::EXIT_UPDATE,
@@ -316,23 +365,25 @@ impl Tray {
                     m.forget_enrollment();
                     let _ = m.save(&self.layout);
                     drop(m);
-                    message_box(
-                        self.hwnd,
-                        "This PC was removed from the farm. Ask for a new invite code to join again.",
-                        "Zero Farm",
-                        MB_OK | MB_ICONWARNING,
-                    );
+                    steps.push(Ui::Message {
+                        text: "This PC was removed from the farm. Ask for a new invite code to join again.".into(),
+                        title: "Zero Farm",
+                        flags: MB_OK | MB_ICONWARNING,
+                    });
                     4
                 }
                 Err(_) => 70,
             });
-            self.remove_icon();
-            unsafe { PostQuitMessage(0) };
-            return;
+            steps.push(self.remove_icon());
+            steps.push(Ui::Quit);
+            return steps;
         }
-        if !self.quitting {
-            self.refresh();
+        if self.quitting {
+            return vec![];
         }
+        let mut steps = if READD_ICON.with(|r| r.replace(false)) { self.add_icon() } else { vec![] };
+        steps.extend(self.refresh());
+        steps
     }
 }
 
@@ -350,33 +401,67 @@ pub fn message_box(hwnd: HWND, text: &str, title: &str, flags: u32) -> i32 {
     unsafe { MessageBoxW(hwnd, t.as_ptr(), c.as_ptr(), flags) }
 }
 
+/// Shows the tray menu at the cursor and runs the chosen command. No borrow is held while the
+/// menu is up (TrackPopupMenu runs a message loop).
+fn tray_menu(hwnd: HWND) {
+    if MENU_OPEN.with(|m| m.get()) {
+        return;
+    }
+    let Some(menu) = with_tray(|t| t.build_menu()) else { return };
+    MENU_OPEN.with(|m| m.set(true));
+    let cmd = unsafe {
+        let mut pt = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut pt);
+        SetForegroundWindow(hwnd);
+        let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY | TPM_RIGHTBUTTON, pt.x, pt.y, 0, hwnd, std::ptr::null());
+        PostMessageW(hwnd, WM_NULL, 0, 0);
+        DestroyMenu(menu);
+        cmd
+    };
+    MENU_OPEN.with(|m| m.set(false));
+    if cmd != 0 {
+        if let Some(steps) = with_tray(|t| t.command(cmd as usize)) {
+            run_ui(hwnd, steps);
+        }
+    }
+}
+
+/// The tray window's procedure. Panics are caught (`guard_ui`): logged and reported, never an abort.
 unsafe extern "system" fn tray_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
-    let handled = TRAY.with(|t| {
-        let mut g = t.borrow_mut();
-        let Some(tray) = g.as_mut() else { return false };
-        if msg == tray.taskbar_created && msg != 0 {
-            tray.add_icon();
-            return true;
+    crate::logging::guard_ui("tray window", || tray_message(hwnd, msg, wp, lp)).unwrap_or(0)
+}
+
+fn tray_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    #[cfg(test)]
+    if msg == WM_TEST_PANIC {
+        panic!("test panic in the tray window procedure");
+    }
+    // TaskbarCreated (Explorer restarted): add the icon again.
+    let taskbar_created = TRAY.with(|t| t.try_borrow().ok().and_then(|g| g.as_ref().map(|t| t.taskbar_created)));
+    if msg != 0 && taskbar_created == Some(msg) {
+        match with_tray(|t| t.add_icon()) {
+            Some(steps) => run_ui(hwnd, steps),
+            None => READD_ICON.with(|r| r.set(true)),
         }
-        match msg {
-            WM_TIMER => {
-                tray.tick();
-                true
-            }
-            WM_TRAY => {
-                let ev = (lp as u32) & 0xffff;
-                if ev == WM_CONTEXTMENU || ev == WM_LBUTTONUP || ev == NIN_SELECT || ev == NIN_KEYSELECT {
-                    tray.show_menu();
-                }
-                true
-            }
-            _ => false,
-        }
-    });
-    if handled {
         return 0;
     }
-    DefWindowProcW(hwnd, msg, wp, lp)
+    match msg {
+        WM_TIMER => {
+            // Busy (a nested message): skip this tick; the next one comes in a second.
+            if let Some(steps) = with_tray(|t| t.tick()) {
+                run_ui(hwnd, steps);
+            }
+            0
+        }
+        WM_TRAY => {
+            let ev = (lp as u32) & 0xffff;
+            if ev == WM_CONTEXTMENU || ev == WM_LBUTTONUP || ev == NIN_SELECT || ev == NIN_KEYSELECT {
+                tray_menu(hwnd);
+            }
+            0
+        }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wp, lp) },
+    }
 }
 
 /// Runs the tray until the engine ends; returns the process exit code (0 quit, 75 update).
@@ -442,8 +527,9 @@ pub fn run(
             diag_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         tray.icon = make_icon(phase_color(Phase::Starting));
-        tray.add_icon();
+        let add = tray.add_icon();
         TRAY.with(|t| *t.borrow_mut() = Some(tray));
+        run_ui(hwnd, add);
         SetTimer(hwnd, TIMER_ID, 1000, None);
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
@@ -475,52 +561,58 @@ const IDC_NAME: usize = 102;
 const IDOK_: usize = 1;
 const IDCANCEL_: usize = 2;
 
+/// Like [`with_tray`], for the invite dialog's state.
+fn with_dlg<R>(f: impl FnOnce(&mut Dlg) -> R) -> Option<R> {
+    DLG.with(|d| match d.try_borrow_mut() {
+        Ok(mut g) => g.as_mut().map(f),
+        Err(_) => None,
+    })
+}
+
 unsafe extern "system" fn dlg_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    crate::logging::guard_ui("invite dialog", || unsafe { dlg_message(hwnd, msg, wp, lp) }).unwrap_or(0)
+}
+
+/// The dialog's state is borrowed only to copy handles out or set the result; the calls that
+/// send messages back to this window (EnableWindow, UpdateWindow, DestroyWindow, ...) and the
+/// blocking enrollment run without a borrow.
+unsafe fn dlg_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_COMMAND => {
             let id = wp & 0xffff;
             if id == IDOK_ {
-                DLG.with(|d| {
-                    let mut g = d.borrow_mut();
-                    let Some(dlg) = g.as_mut() else { return };
-                    let code = window_text(dlg.code);
-                    let name = window_text(dlg.name);
-                    if crate::enroll::normalize_invite(&code).is_none() {
-                        set_text(dlg.err, "That doesn't look like an invite code. It has 12 letters and digits: XXXX-XXXX-XXXX.");
-                        return;
+                let Some((code_h, name_h, err_h, join_h, enroll)) = with_dlg(|d| (d.code, d.name, d.err, d.join, d.try_enroll)) else {
+                    return 0;
+                };
+                let code = window_text(code_h);
+                let name = window_text(name_h);
+                if crate::enroll::normalize_invite(&code).is_none() {
+                    set_text(err_h, "That doesn't look like an invite code. It has 12 letters and digits: XXXX-XXXX-XXXX.");
+                    return 0;
+                }
+                set_text(err_h, "Connecting to the farm…");
+                EnableWindow(join_h, 0);
+                UpdateWindow(hwnd);
+                let f = &mut *enroll;
+                let r = f(&code, if name.trim().is_empty() { "My PC" } else { name.trim() });
+                EnableWindow(join_h, 1);
+                match r {
+                    Ok(()) => {
+                        with_dlg(|d| d.result = Some(true));
+                        DestroyWindow(hwnd);
                     }
-                    set_text(dlg.err, "Connecting to the farm…");
-                    EnableWindow(dlg.join, 0);
-                    UpdateWindow(hwnd);
-                    let f = &mut *dlg.try_enroll;
-                    let r = f(&code, if name.trim().is_empty() { "My PC" } else { name.trim() });
-                    EnableWindow(dlg.join, 1);
-                    match r {
-                        Ok(()) => {
-                            dlg.result = Some(true);
-                            DestroyWindow(hwnd);
-                        }
-                        Err(e) => set_text(dlg.err, &e),
-                    }
-                });
+                    Err(e) => set_text(err_h, &e),
+                }
                 return 0;
             }
             if id == IDCANCEL_ {
-                DLG.with(|d| {
-                    if let Some(dlg) = d.borrow_mut().as_mut() {
-                        dlg.result = Some(false);
-                    }
-                });
+                with_dlg(|d| d.result = Some(false));
                 DestroyWindow(hwnd);
                 return 0;
             }
         }
         WM_CLOSE => {
-            DLG.with(|d| {
-                if let Some(dlg) = d.borrow_mut().as_mut() {
-                    dlg.result = Some(false);
-                }
-            });
+            with_dlg(|d| d.result = Some(false));
             DestroyWindow(hwnd);
             return 0;
         }
@@ -613,7 +705,8 @@ pub fn invite_dialog(default_name: &str, try_enroll: &mut TryEnroll) -> bool {
         SetFocus(code);
         let mut msg: MSG = std::mem::zeroed();
         loop {
-            if DLG.with(|d| d.borrow().as_ref().map(|x| x.result.is_some()).unwrap_or(true)) {
+            // (Never busy here: this loop runs outside the window procedure.)
+            if DLG.with(|d| d.try_borrow().map(|g| g.as_ref().map(|x| x.result.is_some()).unwrap_or(true)).unwrap_or(false)) {
                 break;
             }
             if GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) <= 0 {
@@ -630,5 +723,123 @@ pub fn invite_dialog(default_name: &str, try_enroll: &mut TryEnroll) -> bool {
         }
         DeleteObject(font as _);
         r
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::settings::Machine;
+    use crate::status::Status;
+    use std::sync::Mutex;
+    use zerofarm_common::layout::Layout;
+
+    /// A message-only window with the real tray window procedure and a real tray state.
+    fn test_tray(layout: &Layout) -> HWND {
+        unsafe {
+            let class = wide("ZeroFarmTrayTest");
+            let wc = WNDCLASSEXW {
+                cbSize: std::mem::size_of::<WNDCLASSEXW>() as u32,
+                style: 0,
+                lpfnWndProc: Some(tray_proc),
+                cbClsExtra: 0,
+                cbWndExtra: 0,
+                hInstance: hinstance(),
+                hIcon: std::ptr::null_mut(),
+                hCursor: std::ptr::null_mut(),
+                hbrBackground: std::ptr::null_mut(),
+                lpszMenuName: std::ptr::null(),
+                lpszClassName: class.as_ptr(),
+                hIconSm: std::ptr::null_mut(),
+            };
+            RegisterClassExW(&wc);
+            let title = wide("Zero Farm test");
+            let hwnd = CreateWindowExW(0, class.as_ptr(), title.as_ptr(), 0, 0, 0, 0, 0, HWND_MESSAGE, std::ptr::null_mut(), hinstance(), std::ptr::null());
+            assert!(!hwnd.is_null(), "test window");
+            let tray = Tray {
+                hwnd,
+                machine: Arc::new(Mutex::new(Machine::default())),
+                status: Arc::new(Mutex::new(Status::default())),
+                control: Arc::new(Control::default()),
+                layout: layout.clone(),
+                version: "test".into(),
+                logical: 8,
+                physical: 4,
+                engine: None,
+                exit_code: None,
+                icon: std::ptr::null_mut(),
+                icon_phase: None,
+                taskbar_created: 0,
+                quitting: false,
+                send_diag: Arc::new(String::new),
+                diag_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            };
+            TRAY.with(|t| *t.borrow_mut() = Some(tray));
+            hwnd
+        }
+    }
+
+    fn drop_tray(hwnd: HWND) {
+        if let Some(t) = TRAY.with(|t| t.borrow_mut().take()) {
+            if !t.icon.is_null() {
+                unsafe { DestroyIcon(t.icon) };
+            }
+        }
+        unsafe { DestroyWindow(hwnd) };
+    }
+
+    #[test]
+    fn a_message_that_arrives_while_the_tray_is_busy_is_skipped_not_fatal() {
+        let d = tempfile::tempdir().unwrap();
+        let hwnd = test_tray(&Layout::new(d.path()));
+        let before = crate::logging::caught_panics();
+        // What aborted 0.2.1: SetForegroundWindow, TrackPopupMenu and MessageBox dispatch messages,
+        // so the window procedure runs again while the tray state is borrowed.
+        let inside = with_tray(|_| unsafe {
+            SendMessageW(hwnd, WM_TIMER, TIMER_ID, 0);
+            SendMessageW(hwnd, WM_TRAY, 0, WM_LBUTTONUP as LPARAM); // would open the menu
+            "inside"
+        });
+        assert_eq!(inside, Some("inside"));
+        assert_eq!(crate::logging::caught_panics(), before, "no panic, not even a caught one");
+        assert_eq!(with_tray(|t| t.icon_phase), Some(None), "the nested tick was skipped");
+        // Not busy: a tick runs (it refreshes the icon).
+        unsafe { SendMessageW(hwnd, WM_TIMER, TIMER_ID, 0) };
+        assert_eq!(with_tray(|t| t.icon_phase), Some(Some(Phase::Starting)));
+        drop_tray(hwnd);
+    }
+
+    #[test]
+    fn a_panic_in_the_window_procedure_is_reported_and_the_tray_keeps_working() {
+        let _lock = crate::logging::CRASH_CTX_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let d = tempfile::tempdir().unwrap();
+        let layout = Layout::new(d.path());
+        crate::logging::set_crash_context(layout.clone(), "0.0.0-test".into(), None);
+        let hwnd = test_tray(&layout);
+        let before = crate::logging::caught_panics();
+        let r = unsafe { SendMessageW(hwnd, WM_TEST_PANIC, 0, 0) };
+        assert_eq!(r, 0);
+        assert_eq!(crate::logging::caught_panics(), before + 1);
+        let reports: Vec<zerofarm_common::protocol::CrashReq> = std::fs::read_dir(layout.crashes())
+            .unwrap()
+            .flatten()
+            .filter_map(|f| serde_json::from_slice(&std::fs::read(f.path()).unwrap()).ok())
+            .collect();
+        let c = reports.iter().find(|c| c.message.contains("test panic in the tray")).expect("an agent crash report");
+        assert_eq!(c.kind, "agent");
+        assert!(c.message.contains("tray window"), "{}", c.message);
+        // The state was released by the unwinding: the next message works.
+        unsafe { SendMessageW(hwnd, WM_TIMER, TIMER_ID, 0) };
+        assert_eq!(with_tray(|t| t.icon_phase), Some(Some(Phase::Starting)));
+        drop_tray(hwnd);
+    }
+
+    #[test]
+    fn the_blocked_message_fits_the_tray() {
+        let st = Status { phase: Phase::Blocked, ..Status::default() };
+        // The tooltip holds 128 characters with "Zero Farm — " in front; the balloon 256.
+        assert!(st.headline().chars().count() + 12 < 128, "{}", st.headline());
+        assert!(crate::status::BLOCKED_MESSAGE.chars().count() < 256);
+        assert_eq!(crate::status::BLOCKED_MESSAGE.split(". ").count(), 3);
     }
 }
