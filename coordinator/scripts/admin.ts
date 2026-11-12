@@ -12,7 +12,8 @@ const USAGE = `zero-farm admin (FARM_URL, FARM_ADMIN_TOKEN)
 
   invites [--count N] [--note TEXT] [--channel stable|canary]
   machines
-  machine <machine_id> [--name N] [--channel stable|canary] [--paused true|false]
+  machine <machine_id> [--name N] [--channel stable|canary] [--paused true|false] [--unblock true]
+                                                   --unblock: lift the builds it reported blocked
   revoke <machine_id>
   pause | resume                                   farm-wide: no new leases while paused
 
@@ -27,6 +28,7 @@ const USAGE = `zero-farm admin (FARM_URL, FARM_ADMIN_TOKEN)
   run <run> <config.json|->                        create/update a run (PUT /v1/admin/run/<run>)
   run-get <run>
   checkpoint <run> <gen> <model.onnx> [reference.npz]   upload to ckpt/<run>/<gen>/ and publish
+                                                   (older than current: registered, not current)
   results <run> [--after N] [--limit N]
   accept <run> <gen> <games>                       the trainer's total of accepted games for gen
   ack <run> <cursor>
@@ -175,12 +177,13 @@ async function main(argv: string[]): Promise<void> {
     case "machines":
       return print(await api("GET", "/v1/admin/machines"));
     case "machine":
-      need(pos, 1, "machine <machine_id> [--name N] [--channel C] [--paused true|false]");
+      need(pos, 1, "machine <machine_id> [--name N] [--channel C] [--paused true|false] [--unblock true]");
       return print(
         await api("POST", `/v1/admin/machine/${pos[0]}`, {
           name: opt.name,
           channel: opt.channel,
           paused: opt.paused === undefined ? undefined : opt.paused === "true",
+          unblock: opt.unblock === undefined ? undefined : opt.unblock === "true",
         }),
       );
     case "revoke":

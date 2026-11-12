@@ -294,6 +294,19 @@ export const maxSemver = (vs: (string | null | undefined)[]): string | null =>
 
 export const clamp = (x: number, lo: number, hi: number) => Math.min(hi, Math.max(lo, x));
 
+// JSON with object keys sorted at every level: equal values give equal strings.
+export function canonical(v: unknown): string {
+  const sort = (x: unknown): unknown => {
+    if (Array.isArray(x)) return x.map(sort);
+    if (x && typeof x === "object") {
+      const o = x as Record<string, unknown>;
+      return Object.fromEntries(Object.keys(o).sort().map((k) => [k, sort(o[k])]));
+    }
+    return x;
+  };
+  return JSON.stringify(sort(v));
+}
+
 export function parseJson<T>(s: string | null | undefined, fallback: T): T {
   if (s === null || s === undefined) return fallback;
   try {

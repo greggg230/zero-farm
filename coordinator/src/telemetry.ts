@@ -87,5 +87,21 @@ export function cleanStats(v: unknown): Record<string, Json> | undefined {
   }
   if (typeof src.provider === "string") out.provider = src.provider.slice(0, 32);
   if (Array.isArray(src.throttle)) out.throttle = src.throttle.filter((t) => typeof t === "string").slice(0, 16).map((t) => (t as string).slice(0, 32));
+  // Rev 5: the worker's self-test per network generation (an eval lease runs one per checkpoint).
+  if (src.selftest && typeof src.selftest === "object" && !Array.isArray(src.selftest)) {
+    const st: Record<string, Json> = {};
+    for (const [gen, r] of Object.entries(src.selftest as Record<string, unknown>).slice(0, MAX_SELFTESTS)) {
+      if (!/^\d{1,9}$/.test(gen) || !r || typeof r !== "object" || Array.isArray(r)) continue;
+      const x = r as Record<string, unknown>;
+      const e: Record<string, Json> = {};
+      if (typeof x.provider === "string") e.provider = x.provider.slice(0, 32);
+      if (typeof x.max_abs === "number" && Number.isFinite(x.max_abs)) e.max_abs = x.max_abs;
+      if (typeof x.ok === "boolean") e.ok = x.ok;
+      st[gen] = e;
+    }
+    out.selftest = st;
+  }
   return out;
 }
+
+export const MAX_SELFTESTS = 16;

@@ -2,6 +2,7 @@
 // release tool, scripts/admin.ts and the /admin dashboard.
 
 import * as book from "./book";
+import { blockLifted } from "./blocks";
 import { authAdmin, type Ctx } from "./ctx";
 import { CHANNELS, serveObject } from "./friend";
 import { bookFor } from "./leasebook";
@@ -205,17 +206,50 @@ function selfplayOf(v: unknown): book.SelfplayCfg | null {
   };
 }
 
-function evalOf(v: unknown): book.EvalCfg | null {
+export const MAX_EVAL_NETS = 16;
+const BOT_RE = /^[A-Za-z0-9][A-Za-z0-9_.:-]{0,63}$/;
+
+// An eval batch (PROTOCOL 5.2, rev 5). Checks what needs no database here; LeaseBook checks that
+// the checkpoints are registered and that a batch never changes.
+export function evalOf(v: unknown): book.EvalCfg | null {
   if (v === undefined || v === null) return null;
   const o = obj(v, "eval");
+  if (o.gen !== undefined) throw bad("eval.gen was replaced by eval.checkpoints (PROTOCOL rev 5)");
+  const games = int(o.games, "eval.games", { min: 1, max: 1_000_000 });
+  if (!Array.isArray(o.checkpoints)) throw bad("eval.checkpoints must be a list of checkpoint gens (PROTOCOL 5.2)");
+  if (o.checkpoints.length > MAX_EVAL_NETS) throw bad(`eval.checkpoints has more than ${MAX_EVAL_NETS} gens`);
+  const checkpoints = o.checkpoints.map((g: unknown, i: number) => int(g, `eval.checkpoints[${i}]`, { min: 0, max: 999_999_999 }));
+  if (new Set(checkpoints).size !== checkpoints.length) throw bad("eval.checkpoints has a gen twice");
+  const job = jobOf(o.job, "eval.job");
+  const paired = bool(job.paired, "eval.job.paired", { optional: true }) ?? false;
+  if (paired && games % 2 !== 0) throw bad("eval.games must be even for a paired batch (whole pairs)");
+  if (!Array.isArray(job.seats) || job.seats.length < 2 || job.seats.length > MAX_EVAL_NETS) {
+    throw bad(`eval.job.seats must be a list of 2 to ${MAX_EVAL_NETS} seats ({"net": gen} or {"bot": name})`);
+  }
+  const nets = new Set<number>();
+  job.seats.forEach((x: Json, i: number) => {
+    const seat = obj(x, `eval.job.seats[${i}]`);
+    const hasNet = seat.net !== undefined && seat.net !== null;
+    const hasBot = seat.bot !== undefined && seat.bot !== null;
+    if (hasNet === hasBot) throw bad(`eval.job.seats[${i}] needs exactly one of net and bot`);
+    if (hasNet) nets.add(int(seat.net, `eval.job.seats[${i}].net`, { min: 0, max: 999_999_999 }));
+    else {
+      const bot = str(seat.bot, `eval.job.seats[${i}].bot`, { max: 64, re: BOT_RE });
+      if (bot.toLowerCase().startsWith("ext:")) throw bad(`eval.job.seats[${i}]: ext: bots can't run on the farm (${bot})`);
+    }
+  });
+  const named = [...nets].sort((a, b) => a - b).join(",");
+  if (named !== [...checkpoints].sort((a, b) => a - b).join(",")) {
+    throw bad(`eval.checkpoints [${checkpoints.join(", ")}] must be exactly the gens the seats name [${named}]`);
+  }
   return {
     batch: str(o.batch, "eval.batch", { re: SLUG_RE }),
-    games: int(o.games, "eval.games", { min: 1, max: 1_000_000 }),
+    games,
+    checkpoints,
     games_per_lease: perLease(o.games_per_lease, "eval.games_per_lease", 100000),
-    gen: int(o.gen, "eval.gen", { optional: true, min: 0 }) ?? null,
     gpu: oneOf(o.gpu, "eval.gpu", GPU, { optional: true }) ?? "any",
     needs: needsOf(o.needs, "eval.needs"),
-    job: jobOf(o.job, "eval.job"),
+    job,
   };
 }
 
@@ -245,6 +279,8 @@ export async function getRunRoute(c: Ctx, run: string): Promise<Response> {
   const scope = book.runScope(run);
   const sp = unwrap(await bookFor(c.env, scope).selfplayState(run));
   const ckpt = r.current_gen === null ? null : await c.env.DB.prepare(`SELECT * FROM checkpoints WHERE run = ? AND gen = ?`).bind(run, r.current_gen).first();
+  const gens = (await c.env.DB.prepare(`SELECT gen FROM checkpoints WHERE run = ? ORDER BY gen`).bind(run).all<{ gen: number }>()).results;
+  const batches = await evalBatches(c.env.DB, run, 50);
   return json({
     run: r.run,
     game: r.game,
@@ -258,9 +294,23 @@ export async function getRunRoute(c: Ctx, run: string): Promise<Response> {
     next_gid: r.next_gid,
     current_gen: r.current_gen,
     checkpoint: ckpt,
+    checkpoints: gens.map((g) => g.gen),
     selfplay_state: sp,
+    eval_state: batches.find((b) => b.batch === r.eval_batch && b.replaced_at === null) ?? null,
+    eval_batches: batches,
     pool: await book.poolSize(c.env.DB, scope),
   });
+}
+
+// A run's eval batches with their progress, newest first.
+async function evalBatches(db: D1Database, run: string, limit: number): Promise<book.EvalProgress[]> {
+  const { results } = await db
+    .prepare(`SELECT * FROM eval_batches WHERE run = ? ORDER BY created_at DESC, lo DESC LIMIT ?`)
+    .bind(run, limit)
+    .all<book.EvalBatchRow>();
+  const out: book.EvalProgress[] = [];
+  for (const b of results) out.push(await book.evalProgress(db, b));
+  return out;
 }
 
 export async function putCheckpoint(c: Ctx, run: string, genStr: string): Promise<Response> {
@@ -321,6 +371,9 @@ async function listResults(c: Ctx, scope: string): Promise<Response> {
       sha256: r.sha256,
       size: r.size,
       t: r.t,
+      // Eval chunks (PROTOCOL 5.2): `held` ids wait for their pair-mate; `also` = held ids of
+      // earlier chunks of this lease that this chunk completed (their rows are in those chunks).
+      ...(r.kind === "eval" ? { batch: r.batch, held: parseJson(r.held, []), also: parseJson(r.also, []) } : {}),
     })),
     cursor: results.length ? results[results.length - 1].id : after,
   });
@@ -485,13 +538,16 @@ export async function updateMachine(c: Ctx, id: string): Promise<Response> {
   const channel = oneOf(b.channel, "channel", CHANNELS, { optional: true });
   const paused = bool(b.paused, "paused", { optional: true });
   const name = str(b.name, "name", { optional: true, min: 1, max: 64 });
+  const unblock = bool(b.unblock, "unblock", { optional: true }) ?? false;
   const r = await c.env.DB.prepare(
     `UPDATE machines SET channel = COALESCE(?, channel), paused = COALESCE(?, paused), name = COALESCE(?, name) WHERE machine_id = ?`,
   )
     .bind(channel ?? null, paused === undefined ? null : paused ? 1 : 0, name ?? null, id)
     .run();
   if (!r.meta.changes) throw notFound(`no machine ${id}`);
-  return json({ ok: true });
+  // Rev 5: lifts the builds this machine reported as blocked by Windows (/v1/crash kind blocked).
+  const unblocked = unblock ? ((await c.env.DB.prepare(`DELETE FROM blocks WHERE machine_id = ?`).bind(id).run()).meta.changes ?? 0) : 0;
+  return json(unblock ? { ok: true, unblocked } : { ok: true });
 }
 
 export async function pause(c: Ctx): Promise<Response> {
@@ -562,7 +618,7 @@ export async function stats(c: Ctx): Promise<Response> {
   const db = c.env.DB;
   const day = c.now - 86400;
   const hour = c.now - 3600;
-  const [machinesR, leasesR, crashesR, thrR, runsR, campsR, recentCrashR, fuzzR, classR, pausedR, failCountR, releasesR, diagR] = await db.batch<any>([
+  const [machinesR, leasesR, crashesR, thrR, runsR, campsR, recentCrashR, fuzzR, classR, pausedR, failCountR, releasesR, diagR, blocksR, batchesR] = await db.batch<any>([
     db.prepare(
       `SELECT machine_id, name, class, channel, agent_version, created_at, last_seen, revoked_at, paused, caps,
          json_extract(profile, '$.idle_h_day') AS idle_h_day, json_extract(profile, '$.on_h_day') AS on_h_day
@@ -623,12 +679,18 @@ export async function stats(c: Ctx): Promise<Response> {
       `SELECT d.id, d.machine_id, m.name, d.name AS what, d.key, d.size, d.user, d.t FROM diag_uploads d
        LEFT JOIN machines m ON m.machine_id = d.machine_id ORDER BY d.id DESC LIMIT 20`,
     ),
+    db.prepare(`SELECT * FROM blocks WHERE until > ? ORDER BY t DESC`).bind(c.now),
+    db.prepare(`SELECT * FROM eval_batches ORDER BY created_at DESC, run, lo DESC LIMIT 20`),
   ]);
 
   const per = new Map<string, any>(leasesR.results.map((r: any) => [r.machine_id, r]));
   const crashes = new Map<string, number>(crashesR.results.map((r: any) => [r.machine_id, r.n]));
   const machinesOut = machinesR.results.map((m: any) => {
     const l = per.get(m.machine_id) ?? {};
+    // Builds Windows refused to start on this PC (rev 5), unless a newer agent has asked since.
+    const blocked = blocksR.results
+      .filter((x: any) => x.machine_id === m.machine_id && !blockLifted(x, m.agent_version))
+      .map((x: any) => ({ build_id: x.build_id, until: x.until, os_error: x.os_error, message: x.message, agent_version: x.agent_version, t: x.t }));
     return {
       machine_id: m.machine_id,
       name: m.name,
@@ -655,6 +717,7 @@ export async function stats(c: Ctx): Promise<Response> {
       expired_24h: l.expired ?? 0,
       cancelled_24h: l.cancelled ?? 0,
       crashes_24h: crashes.get(m.machine_id) ?? 0,
+      blocked,
     };
   });
 
@@ -670,8 +733,7 @@ export async function stats(c: Ctx): Promise<Response> {
       )
       .bind(scope, scope, scope)
       .first<any>();
-    const ev = parseJson<book.EvalCfg | null>(r.eval, null);
-    const evalLeft = ev ? await book.poolSize(db, scope, `eval:${ev.batch}`) : null;
+    const cur = r.eval_batch ? await book.getBatch(db, r.run, r.eval_batch) : null;
     runs.push({
       run: r.run,
       game: r.game,
@@ -681,7 +743,7 @@ export async function stats(c: Ctx): Promise<Response> {
       current_gen: r.current_gen,
       next_gid: r.next_gid,
       selfplay: sp,
-      eval: ev ? { batch: ev.batch, games: ev.games, unissued: evalLeft } : null,
+      eval: cur ? await book.evalProgress(db, cur) : null,
       active_leases: extra.active,
       unacked_results: extra.unacked,
       pool: extra.pool,
@@ -716,6 +778,9 @@ export async function stats(c: Ctx): Promise<Response> {
     });
   }
 
+  const evalBatchesOut = [];
+  for (const b of batchesR.results as book.EvalBatchRow[]) evalBatchesOut.push({ run: b.run, ...(await book.evalProgress(db, b)) });
+
   return json({
     t: c.now,
     paused: pausedR.results[0]?.value === "1",
@@ -723,6 +788,7 @@ export async function stats(c: Ctx): Promise<Response> {
     machines: machinesOut,
     runs,
     campaigns,
+    eval_batches: evalBatchesOut,
     classes: classR.results,
     releases: releasesR.results,
     diag_uploads: diagR.results.map((d: any) => ({ ...d, user: !!d.user })),

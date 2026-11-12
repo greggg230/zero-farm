@@ -9,11 +9,16 @@
 //   - in the pool (handed back by an expired / given-back / cancelled / finished lease).
 // A late result can claim ids that were already handed to another lease or back to the pool: the
 // first copy wins, the pool loses them, and the other lease's copy is counted as a duplicate.
+//
+// Paired eval batches (PROTOCOL 5.2) claim whole pairs (2k, 2k+1) only, so their claims, pool
+// ranges and leases always start and end on even ids. A game whose pair-mate its lease hasn't
+// reported yet is "held" (not claimed) until a later chunk of the same lease brings the mate.
 
 import { intersect, normalize, parseRanges, subtract, total, type Range } from "./ranges";
 import {
   type Json,
   bad,
+  canonical,
   conflict,
   gone,
   newLeaseId,
@@ -44,11 +49,29 @@ export interface SelfplayCfg {
 export interface EvalCfg {
   batch: string;
   games: number;
+  checkpoints: number[]; // rev 5: every network the seats name (rev 2's single `gen` is refused)
   games_per_lease: "auto" | number;
-  gen: number | null;
   gpu: "any" | "preferred" | "required";
   needs: Needs;
-  job: Record<string, Json>;
+  job: Record<string, Json>; // {settings, seats, paired}
+}
+
+export const isPaired = (ev: EvalCfg) => ev.job.paired === true;
+
+// An eval batch's identity: what can't change once the batch exists.
+export const evalSpec = (ev: EvalCfg) => canonical({ games: ev.games, checkpoints: ev.checkpoints, job: ev.job });
+
+export interface EvalBatchRow {
+  run: string;
+  batch: string;
+  lo: number;
+  hi: number;
+  games: number;
+  paired: number;
+  checkpoints: string;
+  spec: string;
+  created_at: number;
+  replaced_at: number | null;
 }
 export interface Needs {
   threads: number;
@@ -149,6 +172,20 @@ export async function getCampaign(db: D1Database, c: string): Promise<CampaignRo
 async function getCheckpoint(db: D1Database, run: string, gen: number | null): Promise<CheckpointRow | null> {
   if (gen === null) return null;
   return db.prepare(`SELECT * FROM checkpoints WHERE run = ? AND gen = ?`).bind(run, gen).first<CheckpointRow>();
+}
+export async function getBatch(db: D1Database, run: string, batch: string): Promise<EvalBatchRow | null> {
+  return db.prepare(`SELECT * FROM eval_batches WHERE run = ? AND batch = ?`).bind(run, batch).first<EvalBatchRow>();
+}
+// The checkpoints `gens` of a run, in that order; null if any is missing.
+async function checkpointsOf(db: D1Database, run: string, gens: number[]): Promise<CheckpointRow[] | null> {
+  if (!gens.length) return [];
+  const { results } = await db
+    .prepare(`SELECT * FROM checkpoints WHERE run = ? AND gen IN (${gens.map(() => "?").join(",")})`)
+    .bind(run, ...gens)
+    .all<CheckpointRow>();
+  const by = new Map(results.map((c) => [c.gen, c]));
+  const out = gens.map((g) => by.get(g));
+  return out.every((c) => c) ? (out as CheckpointRow[]) : null;
 }
 
 // ---------- pool and claims ----------
@@ -272,6 +309,45 @@ export async function selfplayState(db: D1Database, run: RunRow, sp: SelfplayCfg
   };
 }
 
+// ---------- eval progress ----------
+
+export interface EvalProgress {
+  batch: string;
+  games: number;
+  paired: boolean;
+  checkpoints: number[];
+  lo: number; // game ids [lo, hi)
+  hi: number;
+  done: number; // credited games (whole pairs for a paired batch)
+  leased: number; // ids in active leases not credited yet
+  unissued: number; // ids in the pool (0 once the batch was replaced: they were dropped)
+  created_at: number;
+  replaced_at: number | null;
+}
+
+export async function evalProgress(db: D1Database, b: EvalBatchRow): Promise<EvalProgress> {
+  const scope = runScope(b.run);
+  const pool = `eval:${b.batch}`;
+  const [done, leased, unissued] = await db.batch<{ n: number }>([
+    db.prepare(`SELECT COALESCE(SUM(hi - lo), 0) AS n FROM claims WHERE scope = ? AND lo >= ? AND hi <= ?`).bind(scope, b.lo, b.hi),
+    db.prepare(`SELECT COALESCE(SUM(hi - lo - claimed), 0) AS n FROM leases WHERE scope = ? AND pool = ? AND state = 'active'`).bind(scope, pool),
+    db.prepare(`SELECT COALESCE(SUM(hi - lo), 0) AS n FROM pool WHERE scope = ? AND pool = ?`).bind(scope, pool),
+  ]);
+  return {
+    batch: b.batch,
+    games: b.games,
+    paired: !!b.paired,
+    checkpoints: parseJson<number[]>(b.checkpoints, []),
+    lo: b.lo,
+    hi: b.hi,
+    done: done.results[0]?.n ?? 0,
+    leased: leased.results[0]?.n ?? 0,
+    unissued: unissued.results[0]?.n ?? 0,
+    created_at: b.created_at,
+    replaced_at: b.replaced_at,
+  };
+}
+
 // ---------- expiry and closing ----------
 
 export async function sweep(env: Env, scope: string, now: number): Promise<number> {
@@ -379,6 +455,7 @@ export interface Lease {
   build: { build_id: string; manifest: string };
   runtime: { build_id: string; manifest: string } | null;
   checkpoint: ReturnType<typeof checkpointOf> | null;
+  checkpoints: ReturnType<typeof checkpointOf>[] | null; // eval only (rev 5)
   job: Record<string, Json>;
 }
 
@@ -450,8 +527,9 @@ async function grantRunGames(env: Env, req: GrantReq): Promise<Lease | null> {
   const stmts: Stmt[] = [];
   let range: Range;
   let pool: string;
-  let gen: number | null;
+  let gen: number | null = null;
   let job: Record<string, Json>;
+  let evalCkpts: CheckpointRow[] | null = null;
 
   if (req.kind === "selfplay") {
     const sp = parseJson<SelfplayCfg | null>(run.selfplay, null);
@@ -471,16 +549,23 @@ async function grantRunGames(env: Env, req: GrantReq): Promise<Lease | null> {
     gen = run.current_gen;
     job = { ...sp.job, kind: "selfplay", games: range[1] - range[0], gid_base: range[0], seed: baseSeed(run.run, sp.job) };
   } else {
+    // Rev 5: an eval lease carries every network its seats name (`checkpoints`), never one
+    // `checkpoint`; a paired batch is leased in whole pairs.
     const ev = parseJson<EvalCfg | null>(run.eval, null);
-    if (!ev || run.eval_batch !== ev.batch) return null;
+    if (!ev || !Array.isArray(ev.checkpoints) || run.eval_batch !== ev.batch) return null;
+    if (!(await getBatch(db, run.run, ev.batch))) return null; // put before rev 5: never offered
+    evalCkpts = await checkpointsOf(db, run.run, ev.checkpoints);
+    if (!evalCkpts) return null;
     pool = `eval:${ev.batch}`;
     let n = req.want;
-    if (ev.job.paired === true) n = Math.max(2, n - (n % 2));
+    if (isPaired(ev)) n = Math.max(2, n - (n % 2));
     const took = await poolTake(db, scope, pool, n);
     if (!took) return null;
     range = took.range;
+    if (isPaired(ev) && (range[0] % 2 !== 0 || range[1] % 2 !== 0)) {
+      throw new Error(`eval pool ${scope}/${pool} holds a broken pair: ${JSON.stringify(range)}`);
+    }
     stmts.push(...took.stmts);
-    gen = ev.gen ?? run.current_gen;
     job = { ...ev.job, kind: "eval", games: range[1] - range[0], gid_base: range[0], seed: baseSeed(run.run, ev.job) };
   }
 
@@ -493,6 +578,7 @@ async function grantRunGames(env: Env, req: GrantReq): Promise<Lease | null> {
     build: buildRef(run.build_id),
     runtime: run.runtime ? buildRef(run.runtime) : null,
     checkpoint: ckpt ? checkpointOf(ckpt) : null,
+    checkpoints: evalCkpts ? evalCkpts.map(checkpointOf) : null,
     job,
   };
   stmts.push(insertLease(db, lease, { scope, machine_id: req.machine_id, pool, lo: range[0], hi: range[1] }));
@@ -525,6 +611,7 @@ async function grantFuzz(env: Env, req: GrantReq): Promise<Lease | null> {
     build: buildRef(c.build_id),
     runtime: null,
     checkpoint: null,
+    checkpoints: null,
     job: { kind: "fuzz", mode: c.mode, env: parseJson<Json>(c.env, {}), first: range[0], count: range[1] - range[0] },
   };
   stmts.push(insertLease(db, lease, { scope, machine_id: req.machine_id, pool: "fuzz", lo: range[0], hi: range[1] }));
@@ -567,6 +654,7 @@ async function grantDiag(env: Env, req: GrantReq): Promise<Lease | null> {
     build: buildRef(buildId),
     runtime: run?.runtime ? buildRef(run.runtime) : null,
     checkpoint: ckpt ? checkpointOf(ckpt) : null,
+    checkpoints: null,
     job: { kind: "diag", what: d.kind, params },
   };
   await db.batch([
@@ -675,8 +763,76 @@ export interface ResultReq {
 export interface ResultAnswer {
   ok: true;
   duplicate: boolean; // this exact upload was already stored
-  credited: number; // ids credited to this chunk
+  credited: number; // ids credited to this chunk (eval: with the `also` ids it completed)
   already_credited: number; // ids another chunk had credited first
+  held?: number; // eval: ids of this chunk waiting for their pair-mate
+}
+
+// Held games of earlier chunks of the same lease that a chunk completed (PROTOCOL 5.2): their
+// rows are in that earlier chunk (`key`).
+export interface AlsoEntry {
+  seq: number;
+  key: string;
+  ids: Range[];
+}
+
+// How a chunk's reported ids are counted: credited with rows here, credited before elsewhere,
+// held for a pair-mate, and earlier held games this chunk completed.
+interface Split {
+  here: Range[];
+  dup: Range[];
+  held: Range[];
+  also: AlsoEntry[];
+}
+
+const idList = (rs: Range[]) => rs.flatMap(([a, b]) => Array.from({ length: b - a }, (_, i) => a + i));
+// The whole pairs (2k, 2k+1) inside normalized ranges.
+const wholePairs = (rs: Range[]): Range[] => rs.map(([a, b]) => [a + (a % 2), b - (b % 2)] as Range).filter(([a, b]) => b > a);
+
+async function splitPlain(db: D1Database, scope: string, ids: Range[]): Promise<Split> {
+  const claimed = await claimedIn(db, scope, ids);
+  return { here: subtract(ids, claimed), dup: intersect(ids, claimed), held: [], also: [] };
+}
+
+// A paired eval chunk: a pair is credited only when both of its games are in, from this lease.
+// Pairs whole in this chunk are credited here; a lone game whose mate an earlier chunk of this
+// lease holds completes that pair (`also` names the earlier chunk); any other lone game is held.
+async function splitPaired(db: D1Database, l: LeaseRow, ids: Range[]): Promise<Split> {
+  const claimed = await claimedIn(db, l.scope, [[l.lo!, l.hi!]]);
+  const dup = intersect(ids, claimed);
+  const fresh = subtract(ids, claimed);
+  const whole = wholePairs(fresh);
+  const halves = idList(subtract(fresh, whole)); // at most two per range
+  const here: Range[] = [...whole];
+  const held: Range[] = [];
+  const alsoBy = new Map<number, AlsoEntry>();
+  if (halves.length) {
+    const { results } = await db
+      .prepare(`SELECT seq, key, held, also, deleted_at FROM results WHERE lease_id = ? ORDER BY seq`)
+      .bind(l.lease_id)
+      .all<{ seq: number; key: string; held: string | null; also: string | null; deleted_at: number | null }>();
+    const completed = normalize(results.flatMap((r) => parseJson<AlsoEntry[]>(r.also, []).flatMap((a) => a.ids)));
+    const heldBy = new Map<number, { seq: number; key: string }>();
+    for (const r of results) {
+      if (r.deleted_at !== null) continue; // its rows are gone
+      const still = subtract(subtract(normalize(parseJson<Range[]>(r.held, [])), completed), claimed);
+      for (const g of idList(still)) if (!heldBy.has(g)) heldBy.set(g, { seq: r.seq, key: r.key });
+    }
+    for (const g of halves) {
+      const mate = g % 2 === 0 ? g + 1 : g - 1;
+      const from = heldBy.get(mate);
+      if (!from) {
+        held.push([g, g + 1]);
+        continue;
+      }
+      here.push([g, g + 1]);
+      const e = alsoBy.get(from.seq) ?? { seq: from.seq, key: from.key, ids: [] };
+      e.ids.push([mate, mate + 1]);
+      alsoBy.set(from.seq, e);
+    }
+  }
+  const also = [...alsoBy.values()].sort((a, b) => a.seq - b.seq).map((e) => ({ ...e, ids: normalize(e.ids) }));
+  return { here: normalize(here), dup, held: normalize(held), also };
 }
 
 // The Worker writes a result's bytes to R2 *before* LeaseBook commits it (bodies up to 32 MB don't
@@ -748,9 +904,9 @@ export async function putResult(env: Env, r: ResultReq): Promise<ResultCommit> {
   await sweep(env, l.scope, r.now); // an expired lease must count as expired here
   l = (await getLease(db, r.lease_id))!;
   const existing = await db
-    .prepare(`SELECT sha256, games, dup_ids, key, deleted_at FROM results WHERE lease_id = ? AND seq = ?`)
+    .prepare(`SELECT sha256, games, dup_ids, held, kind, key, deleted_at FROM results WHERE lease_id = ? AND seq = ?`)
     .bind(l.lease_id, r.seq)
-    .first<{ sha256: string; games: number; dup_ids: string; key: string; deleted_at: number | null }>();
+    .first<{ sha256: string; games: number; dup_ids: string; held: string | null; kind: string; key: string; deleted_at: number | null }>();
   if (existing) {
     if (existing.sha256 === r.sha256) {
       return {
@@ -758,6 +914,7 @@ export async function putResult(env: Env, r: ResultReq): Promise<ResultCommit> {
         duplicate: true,
         credited: existing.games,
         already_credited: total(parseJson(existing.dup_ids, [])),
+        ...(existing.kind === "eval" ? { held: total(parseJson(existing.held, [])) } : {}),
         keep: existing.key === r.key && existing.deleted_at === null,
       };
     }
@@ -794,17 +951,25 @@ export async function putResult(env: Env, r: ResultReq): Promise<ResultCommit> {
   const fuzz = r.fuzz;
   if (l.kind === "fuzz" && !fuzz) throw bad("a fuzz result must be JSON (PROTOCOL 5.1)");
 
-  const claimed = await claimedIn(db, l.scope, ids);
-  const credited = subtract(ids, claimed);
-  const dup = intersect(ids, claimed);
+  // Eval chunks belong to a batch; a paired batch credits whole pairs only (x-gen is ignored:
+  // eval networks never go stale, and l.gen is null for eval leases).
+  let batch: string | null = null;
+  let paired = false;
+  if (l.kind === "eval" && l.run && l.pool?.startsWith("eval:")) {
+    batch = l.pool.slice(5);
+    paired = !!(await getBatch(db, l.run, batch))?.paired;
+  }
+  const { here, dup, held, also } = paired ? await splitPaired(db, l, ids) : await splitPlain(db, l.scope, ids);
+  const credited = normalize([...here, ...also.flatMap((a) => a.ids)]);
+  const isEval = l.kind === "eval";
 
   const key = r.key;
   const rid = `(SELECT id FROM results WHERE lease_id = ? AND seq = ?)`; // bound after the row's own values
   const stmts: Stmt[] = [
     db
       .prepare(
-        `INSERT INTO results (scope, lease_id, seq, machine_id, kind, gen, key, sha256, size, games, ids, dup_ids, t)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO results (scope, lease_id, seq, machine_id, kind, gen, key, sha256, size, games, ids, dup_ids, t, batch, held, also)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .bind(
         l.scope,
@@ -817,9 +982,12 @@ export async function putResult(env: Env, r: ResultReq): Promise<ResultCommit> {
         r.sha256,
         r.size,
         total(credited),
-        JSON.stringify(credited),
+        JSON.stringify(here),
         JSON.stringify(dup),
         r.now,
+        batch,
+        isEval ? JSON.stringify(held) : null,
+        isEval ? JSON.stringify(also) : null,
       ),
     ...credited.map(([a, b]) =>
       db
@@ -886,7 +1054,14 @@ export async function putResult(env: Env, r: ResultReq): Promise<ResultCommit> {
     }
   }
   await db.batch(stmts);
-  return { ok: true, duplicate: false, credited: total(credited), already_credited: total(dup), keep: true };
+  return {
+    ok: true,
+    duplicate: false,
+    credited: total(credited),
+    already_credited: total(dup),
+    ...(isEval ? { held: total(held) } : {}),
+    keep: true,
+  };
 }
 
 // ---------- done ----------
@@ -957,6 +1132,36 @@ export async function putRun(env: Env, cfg: RunCfg, now: number): Promise<{ ok: 
   const scope = runScope(cfg.run);
   const old = await getRun(db, cfg.run);
   const stmts: Stmt[] = [];
+
+  // Rev 5 eval batches (PROTOCOL 5.2): every network registered; a batch never changes and a batch
+  // name is never used twice in a run.
+  let existing: EvalBatchRow | null = null;
+  if (cfg.eval) {
+    const ev = cfg.eval;
+    if (ev.checkpoints.length) {
+      const have = old ? await checkpointsOf(db, cfg.run, ev.checkpoints) : null;
+      if (!have) {
+        const { results } = old
+          ? await db.prepare(`SELECT gen FROM checkpoints WHERE run = ?`).bind(cfg.run).all<{ gen: number }>()
+          : { results: [] as { gen: number }[] };
+        const known = new Set(results.map((x) => x.gen));
+        const missing = ev.checkpoints.filter((g) => !known.has(g));
+        throw bad(
+          `eval.checkpoints: ${missing.join(", ")} not registered on run ${cfg.run} (PUT /v1/admin/run/${cfg.run}/checkpoint/{gen} first;` +
+            ` a new run is put with "eval": null, then its checkpoints, then the batch)`,
+          { missing },
+        );
+      }
+    }
+    existing = await getBatch(db, cfg.run, ev.batch);
+    if (existing && old?.eval_batch !== ev.batch) {
+      throw conflict(`eval batch ${ev.batch} was used before in run ${cfg.run}: name a new batch`);
+    }
+    if (existing && existing.spec !== evalSpec(ev)) {
+      throw conflict(`eval batch ${ev.batch} exists with other games, checkpoints or job: name a new batch`);
+    }
+  }
+
   if (!old) {
     stmts.push(
       db
@@ -975,20 +1180,36 @@ export async function putRun(env: Env, cfg: RunCfg, now: number): Promise<{ ok: 
         .bind(cfg.game, cfg.build_id, cfg.runtime, cfg.priority, cfg.state, JSON.stringify(cfg.selfplay), JSON.stringify(cfg.eval), now, cfg.run),
     );
   }
-  // A new eval batch reserves its game ids now; the old batch's unplayed ids are dropped.
+  // A new eval batch reserves its game ids now; the old batch's unplayed ids are dropped. A paired
+  // batch starts on an even id: an odd id skipped to get there goes to the self-play pool.
   const oldBatch = old?.eval_batch ?? null;
-  const newBatch = cfg.eval?.batch ?? null;
-  if (newBatch !== oldBatch) {
-    stmts.push(db.prepare(`DELETE FROM pool WHERE scope = ? AND pool LIKE 'eval:%'`).bind(scope));
-    if (cfg.eval) {
-      const lo = old?.next_gid ?? 0;
-      stmts.push(
-        db.prepare(`INSERT INTO pool (scope, pool, lo, hi) VALUES (?, ?, ?, ?)`).bind(scope, `eval:${cfg.eval.batch}`, lo, lo + cfg.eval.games),
-        db.prepare(`UPDATE runs SET next_gid = ?, eval_batch = ? WHERE run = ?`).bind(lo + cfg.eval.games, cfg.eval.batch, cfg.run),
-      );
-    } else {
-      stmts.push(db.prepare(`UPDATE runs SET eval_batch = NULL WHERE run = ?`).bind(cfg.run));
+  const replaceOld = () =>
+    oldBatch === null
+      ? []
+      : [db.prepare(`UPDATE eval_batches SET replaced_at = ? WHERE run = ? AND batch = ? AND replaced_at IS NULL`).bind(now, cfg.run, oldBatch)];
+  if (cfg.eval && !existing) {
+    const ev = cfg.eval;
+    let lo = old?.next_gid ?? 0;
+    stmts.push(db.prepare(`DELETE FROM pool WHERE scope = ? AND pool LIKE 'eval:%'`).bind(scope), ...replaceOld());
+    if (isPaired(ev) && lo % 2 !== 0) {
+      stmts.push(...(await poolAdd(db, scope, "selfplay", [[lo, lo + 1]])));
+      lo += 1;
     }
+    stmts.push(
+      db.prepare(`INSERT INTO pool (scope, pool, lo, hi) VALUES (?, ?, ?, ?)`).bind(scope, `eval:${ev.batch}`, lo, lo + ev.games),
+      db.prepare(`UPDATE runs SET next_gid = ?, eval_batch = ? WHERE run = ?`).bind(lo + ev.games, ev.batch, cfg.run),
+      db
+        .prepare(
+          `INSERT INTO eval_batches (run, batch, lo, hi, games, paired, checkpoints, spec, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        )
+        .bind(cfg.run, ev.batch, lo, lo + ev.games, ev.games, isPaired(ev) ? 1 : 0, JSON.stringify(ev.checkpoints), evalSpec(ev), now),
+    );
+  } else if (!cfg.eval && oldBatch !== null) {
+    stmts.push(
+      db.prepare(`DELETE FROM pool WHERE scope = ? AND pool LIKE 'eval:%'`).bind(scope),
+      db.prepare(`UPDATE runs SET eval_batch = NULL WHERE run = ?`).bind(cfg.run),
+      ...replaceOld(),
+    );
   }
   await db.batch(stmts);
   if (cfg.state === "paused") await cancelScope(env, scope, null);
@@ -1054,29 +1275,34 @@ export interface CheckpointReq {
   now: number;
 }
 
-export async function publishCheckpoint(env: Env, c: CheckpointReq): Promise<{ ok: true; unchanged: boolean }> {
+// Registers a checkpoint. A gen newer than the current one becomes current for self-play (and
+// starts its quota count); rev 5: an older one is only registered, as an eval opponent or a
+// head-to-head's label (`current: false`).
+export async function publishCheckpoint(env: Env, c: CheckpointReq): Promise<{ ok: true; unchanged: boolean; current: boolean }> {
   const db = env.DB;
   const run = await getRun(db, c.run);
   if (!run) throw notFound(`no run ${c.run}`);
-  if (run.current_gen !== null && c.gen < run.current_gen) {
-    throw conflict(`gen ${c.gen} is older than the current checkpoint ${run.current_gen}`);
-  }
   const old = await getCheckpoint(db, c.run, c.gen);
   if (old) {
     if (old.sha256 === c.sha256 && old.reference_sha256 === c.reference_sha256 && old.model === c.model && old.reference === c.reference) {
-      return { ok: true, unchanged: true };
+      return { ok: true, unchanged: true, current: run.current_gen === c.gen };
     }
     throw conflict(`checkpoint ${c.gen} of ${c.run} was already published with different files`);
   }
+  const insert = db
+    .prepare(`INSERT INTO checkpoints (run, gen, model, sha256, reference, reference_sha256, size, t) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
+    .bind(c.run, c.gen, c.model, c.sha256, c.reference, c.reference_sha256, c.size, c.now);
+  if (run.current_gen !== null && c.gen < run.current_gen) {
+    await db.batch([insert]);
+    return { ok: true, unchanged: false, current: false };
+  }
   await db.batch([
-    db
-      .prepare(`INSERT INTO checkpoints (run, gen, model, sha256, reference, reference_sha256, size, t) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`)
-      .bind(c.run, c.gen, c.model, c.sha256, c.reference, c.reference_sha256, c.size, c.now),
+    insert,
     db.prepare(`UPDATE runs SET current_gen = ?, updated_at = ? WHERE run = ?`).bind(c.gen, c.now, c.run),
     // A new generation starts its quota count from zero.
     db.prepare(`INSERT OR REPLACE INTO quotas (run, gen, accepted, t) VALUES (?, ?, 0, ?)`).bind(c.run, c.gen, c.now),
   ]);
-  return { ok: true, unchanged: false };
+  return { ok: true, unchanged: false, current: true };
 }
 
 export async function accept(env: Env, run: string, gen: number, games: number, now: number): Promise<SelfplayState | null> {

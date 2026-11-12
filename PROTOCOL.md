@@ -156,7 +156,10 @@ Response, exactly one of:
   Sent when the agent is older than the `min_agent` of its channel's latest release, or older than
   the `min_agent` of a build it would otherwise be given and the channel's latest release is new
   enough for it. A job whose build needs an agent the channel doesn't offer yet is skipped. A worker
-  build whose `aw` differs from the request's `x-farm-aw` is skipped.
+  build whose `aw` differs from the request's `x-farm-aw` is skipped. Rev 5: an eval job needs
+  agent 0.2.3 or newer (the first that downloads `checkpoints`) on top of its builds' `min_agent`,
+  with the same rule (update if the channel offers it, else skipped). A build this machine
+  reported `blocked` (`/v1/crash` below) is skipped for that machine.
 
 Any of the three may also carry `"upload_diag": ["logs"]` (as a beat answer can): a machine with no
 lease hears about a diagnostics request on its next `/v1/lease`.
@@ -164,7 +167,8 @@ lease hears about a diagnostics request on its next `/v1/lease`.
 How the coordinator picks (DESIGN 5.1): diagnostics asked for this machine first; then runs'
 self-play (short of quota) and evaluation (unissued games), by run priority × fit ÷ (1 + that job's
 active leases); then fuzz, the backfill (also where a run with `"gpu": "preferred"` goes on a
-CPU-only PC). Caps must cover the job's `needs` and the disk its uncached builds take. A lease is
+CPU-only PC). Caps must cover the job's `needs` and the disk its uncached builds (and, rev 5, an
+eval job's uncached checkpoints) take. A lease is
 sized to about 450 s of this machine's measured rate for that job (ids per running second, from its
 past leases; its hardware class's average before it has one; 16 games / 10 eval games / 20000
 seeds before either), unless the run sets `games_per_lease` / the campaign sets `chunk`. Every
@@ -207,9 +211,10 @@ Body: result bytes (≤ 32 MB, else 413 `too_large`); headers:
   any lease, that reports it; later copies are duplicates. A chunk without `x-ids` completes
   nothing (fuzz per-failure results, diag results). Ids a lease never reports are reissued.
 - `x-gen` (self-play): the oldest checkpoint generation any game in the chunk was played with
-  (default: the lease's checkpoint).
+  (default: the lease's checkpoint). Ignored on eval chunks (rev 5).
 
-→ `{"ok": true, "duplicate": false, "credited": 4, "already_credited": 0}`. Idempotent: the same
+→ `{"ok": true, "duplicate": false, "credited": 4, "already_credited": 0}` (an eval chunk adds
+`"held": n`, section 5.2). Idempotent: the same
 `seq` with the same hash → 200 (`duplicate: true`); a different hash → 409. `seq` counts from 0 per
 lease. Late chunks (the lease expired, was given back or is done) are accepted: the trainer reads
 results by cursor, so it sees them whatever it acked before. 410 `gone`: the lease was cancelled,
@@ -232,12 +237,18 @@ lease (else 400). `returned` is how many ids went back. Repeating `done` → 200
 - `GET /v1/agent/latest?channel=stable` → `{"version": "0.3.1", "build_id": "...",
   "manifest": "builds/<id>/manifest.json", "min_agent": "0.3.0"}`. `channel` defaults to the
   machine's; nothing released on it → 404.
-- `POST /v1/crash` `{"build_id", "kind": "panic" | "crash" | "agent", "message", "backtrace",
-  "lease_id"}` → `{"ok": true}` (message kept to 4 KB, backtrace to 64 KB). `panic`: a Rust panic (a
-  worker's, seen on its stderr, with the worker `build_id`; or the agent's own, sent at its next
-  start, with the agent's `build_id`). `crash`: a worker that exited without `end`, hung, missed a
-  deadline or broke aw/1; `backtrace` = its stderr tail (agents may add `"exit_code"`). `agent`: a
-  launcher rollback or refused update, reported by the next agent that runs.
+- `POST /v1/crash` `{"build_id", "kind": "panic" | "crash" | "agent" | "blocked", "message",
+  "backtrace", "lease_id", "os_error"?}` → `{"ok": true}` (message kept to 4 KB, backtrace to 64
+  KB). `panic`: a Rust panic (a worker's, seen on its stderr, with the worker `build_id`; or the
+  agent's own, sent at its next start, with the agent's `build_id`). `crash`: a worker that exited
+  without `end`, hung, missed a deadline or broke aw/1; `backtrace` = its stderr tail (agents may
+  add `"exit_code"`). `agent`: a launcher rollback or refused update, reported by the next agent
+  that runs. `blocked` (rev 5): Windows refused to start the worker `build_id` (Smart App Control /
+  WDAC, AppLocker / SRP or Defender; `os_error` 4551, 1260 or 225). The coordinator then stops
+  offering that build to that machine for 24 h, or until the machine asks for work with a newer
+  agent than the one that reported it (a newer build is a different `build_id`, so it is offered at
+  once); the admin page lists it under the machine, and `POST /v1/admin/machine/{id}` `{"unblock":
+  true}` lifts it. A `blocked` report without `build_id` → 400.
 - `POST /v1/diag/{name}` body bytes (≤ 32 MB) → `{"ok": true, "key": "diag/..."}`, when the
   coordinator asked for it in a beat or lease answer (`"upload_diag": ["logs"]`); else, with header
   `x-farm-diag: user` (rev 3: the friend pressed "Send diagnostics"), ≤ 20 MB (else 413) and
@@ -264,6 +275,14 @@ cancelled, 409, 400) is dropped and left out of `done`'s `results`; `done` is se
 chunk is up. A lease left open by an agent that stopped is closed at that agent's next start with
 `given_back: true` once its saved results are uploaded. The agent beats (`running`, 0 games) while
 it downloads what a lease needs. 401/403 on any call: the agent stops and asks for a new invite.
+A worker that can't be started (rev 5) is never re-leased at once: the lease is given back and the
+agent waits before asking again. Blocked by policy (os error 4551
+ERROR_SYSTEM_INTEGRITY_POLICY_VIOLATION, 1260 ERROR_ACCESS_DISABLED_BY_POLICY, 225
+ERROR_VIRUS_INFECTED): a `blocked` crash report once per build per day, then 15 min, 1 h, 4 h,
+16 h and 24 h between lease requests (capped at 24 h), and the tray says Windows is blocking the
+job program; any other start failure (or a worker that dies before `hello`): a `crash` report and
+1 min doubling to 1 h. A lease whose files can't be downloaded, verified or set up waits the same
+way (no report). The backoff resets when a worker starts.
 
 `Stats` (per beat/done; all optional, counters since lease start):
 ```json
@@ -271,8 +290,12 @@ it downloads what a lease needs. 401/403 on any call: the agent stops and asks f
  "infer_ms_p50": 4.1, "infer_ms_p95": 9.8, "search_ms": 51000, "infer_ms": 40000, "wait_ms": 3000,
  "cpu_pct": 540, "gpu_pct": 0, "vram_mb": 0, "rss_mb": 900, "threads": 6, "concurrency": 32,
  "provider": "cpu", "gpu_temp_c": null, "throttle": [], "yields": 1, "yield_ms_max": 640,
- "selftest_max_abs": 3.1e-6, "paused_ms": 20000, "resume_ms_max": 80, "starved_ms": 0}
+ "selftest_max_abs": 3.1e-6, "paused_ms": 20000, "resume_ms_max": 80, "starved_ms": 0,
+ "selftest": {"81": {"provider": "cpu", "max_abs": 3.1e-6, "ok": true}}}
 ```
+`selftest` (rev 5): the worker's `selftest` result per network generation (an eval lease has one per
+checkpoint); `selftest_max_abs` is the largest `max_abs` among them. The coordinator keeps at most
+16 entries, keyed by gen (other keys are dropped).
 `starved_ms` (rev 3): time the worker should have been running but got no CPU because other
 programs saturated the PC (it runs at idle priority); the agent samples this every 5 s. It counts
 toward the lease's slack like a pause: a lease that has been paused and/or starved for longer than
@@ -290,21 +313,21 @@ and leaves paused and starved time out of a machine's rate.
 | `GET /v1/admin/artifact/{key}` | any object (results, diag uploads, builds, checkpoints); `range` as for machines |
 | `POST /v1/admin/build` | `{"build_id"}` after its manifest, signature and files are uploaded; the coordinator checks presence + sizes + hashes, and the signature and its trusted comment (`build_id=`, `kind=`) when the Worker var `RELEASE_PUBKEYS` is set → `{"ok": true, "build_id", "kind", "version", "size", "sig_verified"}`; failures → 400 with `"problems": [...]` |
 | `POST /v1/admin/agent/release` | `{"version", "build_id", "channel": "canary" \| "stable", "min_agent", "github_url": "<url>" \| null}`: `build_id` must be a registered agent build of that version, `min_agent` ≤ `version`. `github_url` (rev 4): the installer asset of the release's GitHub Release (`https://github.com/<owner>/<repo>/releases/download/<tag>/<file>.exe`, else 400), where `GET /download` redirects; create the GitHub Release first. `setup` (rev 3) → 400 → `{"ok": true, "channel", "version", "build_id", "min_agent", "github_url"}` |
-| `PUT /v1/admin/run/{run}` | `{"game", "build_id", "runtime", "priority": 1.0, "selfplay": {"quota": 600, "slack": 0.1, "max_stale": 1, "games_per_lease": "auto", "gpu": "any" \| "preferred" \| "required", "needs": {"threads", "ram_mb"}, "job": {...}} \| null, "eval": {"batch": "it81", "games": 110, "games_per_lease": "auto", "gen": null, "gpu", "needs", "job": {...}} \| null, "state": "active" \| "paused"}` → `{"ok": true, "created"}`. `build_id` must be a registered worker build, `runtime` a runtime build. A new eval `batch` reserves `games` fresh game ids (the old batch's unissued ones are dropped). Pausing a run, or dropping its `selfplay`/`eval`, cancels those leases at their next beat |
-| `GET /v1/admin/run/{run}` | config + state: `current_gen`, `next_gid`, `pool`, `selfplay_state` (`cap`, `accepted`, `leased`, `pending`, `in_flight`, `headroom`) |
-| `PUT /v1/admin/run/{run}/checkpoint/{gen}` | `{"model", "sha256", "reference", "reference_sha256"}` (files under `ckpt/<run>/`, uploaded first); makes `gen` current for self-play and resets that generation's quota counter → `{"ok": true, "unchanged"}`. A `gen` older than the current one, or the same `gen` with other files → 409 |
-| `GET /v1/admin/run/{run}/results?after={cursor}&limit=500` | → `{"results": [{"id", "key", "lease_id", "seq", "machine_id", "kind", "gen", "games", "ids", "dup_ids", "sha256", "size", "t"}], "cursor"}`. `ids`/`games`: the game ids credited to this chunk; `dup_ids`: ids in it that an earlier chunk was credited with (skip those games). `limit` ≤ 1000 |
+| `PUT /v1/admin/run/{run}` | `{"game", "build_id", "runtime", "priority": 1.0, "selfplay": {"quota": 600, "slack": 0.1, "max_stale": 1, "games_per_lease": "auto", "gpu": "any" \| "preferred" \| "required", "needs": {"threads", "ram_mb"}, "job": {...}} \| null, "eval": {"batch": "it81", "games": 110, "checkpoints": [81, 70], "games_per_lease": "auto", "gpu", "needs", "job": {"settings", "seats", "paired"}} \| null, "state": "active" \| "paused"}` → `{"ok": true, "created"}`. `build_id` must be a registered worker build, `runtime` a runtime build. A new eval `batch` reserves `games` fresh game ids (the old batch's unissued ones are dropped); its rules and checks are in section 5.2 (rev 5: `checkpoints` replaces `gen`, which is now refused). Pausing a run, or dropping its `selfplay`/`eval`, cancels those leases at their next beat |
+| `GET /v1/admin/run/{run}` | config + state: `current_gen`, `next_gid`, `pool`, `selfplay_state` (`cap`, `accepted`, `leased`, `pending`, `in_flight`, `headroom`), `checkpoints` (registered gens, rev 5), `eval_state` (the current batch's progress, section 5.2) and `eval_batches` (every batch of the run, newest first, same fields) |
+| `PUT /v1/admin/run/{run}/checkpoint/{gen}` | `{"model", "sha256", "reference", "reference_sha256"}` (files under `ckpt/<run>/`, uploaded first); makes `gen` current for self-play and resets that generation's quota counter → `{"ok": true, "unchanged", "current"}`. Rev 5: a `gen` older than the current one is registered without becoming current (`"current": false`: an eval opponent or a head-to-head label); the same `gen` with other files → 409 |
+| `GET /v1/admin/run/{run}/results?after={cursor}&limit=500` | → `{"results": [{"id", "key", "lease_id", "seq", "machine_id", "kind", "gen", "games", "ids", "dup_ids", "sha256", "size", "t"}], "cursor"}`. `ids`/`games`: the game ids credited to this chunk; `dup_ids`: ids in it that an earlier chunk was credited with (skip those games). Eval chunks (rev 5) also carry `batch`, `held` and `also`, and their `games` counts `also` too (section 5.2). `limit` ≤ 1000 |
 | `POST /v1/admin/run/{run}/accept` | `{"gen", "games": n}`: the trainer's total of games accepted for `gen` (a total, not an increment; include games held over for the next generation). Self-play stops when accepted + in flight (unclaimed ids in active self-play leases + credited self-play games not yet acked) reaches `quota × (1 + slack)`. Call it before `ack` |
 | `POST /v1/admin/run/{run}/ack` | `{"cursor"}`: results up to it are ingested (R2 objects deleted after 7 days) → `{"ok": true, "acked"}` |
 | `PUT /v1/admin/campaign/{id}` | `{"build_id", "mode", "env": {"FUZZ_POOL": "delver", ...}, "seed_base": 10000000, "chunk": "auto" \| n, "priority": 0.2, "state", "needs": {"threads", "ram_mb"} \| null}` → `{"ok": true, "created", "cursor"}`. The seed cursor never rewinds: a lower `seed_base` is ignored, a higher one moves it up |
 | `GET /v1/admin/campaign/{id}` · `GET …/results?after=` · `POST …/ack` | config + `cursor`, `seeds_done`, `pool`, `failures`, `sites`; results and ack as for runs (`ids` are seeds) |
 | `GET /v1/admin/campaign/{id}/failures?after=&limit=` | → `{"failures": [{"id", "seed", "mode", "site", "panic", "repro", "output_tail", "build_id", "engine_commit", "machine_id", "lease_id", "first_of_site", "t"}], "cursor"}` (section 5.1; one row per (seed, site)) |
 | `GET /v1/admin/machines` · `POST /v1/admin/machine/{id}/revoke` | revoking cancels the machine's active leases at once (their ids go back to the pool) → `{"ok": true, "cancelled"}` |
-| `POST /v1/admin/machine/{id}` | `{"name"?, "channel"?, "paused"?}`; a paused machine gets `wait_s` / `paused_by_admin` |
+| `POST /v1/admin/machine/{id}` | `{"name"?, "channel"?, "paused"?, "unblock"?}`; a paused machine gets `wait_s` / `paused_by_admin`; `"unblock": true` (rev 5) lifts the machine's build blocks (`/v1/crash` kind `blocked`) and answers `{"ok": true, "unblocked": n}` |
 | `POST /v1/admin/pause` | `{"paused": true \| false}`: farm-wide, no new leases while paused |
 | `POST /v1/admin/diag` | `{"machine_id" \| "class", "kind": "sweep" \| "profile" \| "stability" \| "logs", "params"}` → `{"requests": [{"id", "machine_id"}]}`. `class` = a hardware class as the stats show it (`"<cpu> / <gpu or 'no gpu'>"`). `logs` goes out as `upload_diag`; the others become `diag` leases (`params.build_id` or `params.run` picks the build) |
 | `GET /v1/admin/diag?machine_id=` | requests, uploads and diag-lease results with their R2 keys |
-| `GET /v1/admin/stats` | aggregates for the dashboard (`/admin`); per machine also `idle_h_day`, `on_h_day`, `starved_s_24h`; `releases` (latest per channel, `github_url`), `diag_uploads` (recent, `user`) |
+| `GET /v1/admin/stats` | aggregates for the dashboard (`/admin`); per machine also `idle_h_day`, `on_h_day`, `starved_s_24h`, `blocked` (rev 5: `[{"build_id", "until", "os_error", "message", "agent_version", "t"}]`); per run `eval` (the current batch's progress, rev 5); `eval_batches` (the 20 newest batches of all runs, with `run`); `releases` (latest per channel, `github_url`), `diag_uploads` (recent, `user`) |
 
 ## 5. Jobs (`lease.job`) and the agent↔worker protocol (`aw/1`)
 
@@ -316,7 +339,7 @@ Agent → worker:
 
 | Line | Meaning |
 |---|---|
-| `{"op": "job", "lease_id", "kind", ...Job, "model": "<local path>" \| null, "reference": "<local path>" \| null, "threads": 6, "out_dir": "out", "runtime_dir": "<local path>" \| null}` | start. Optional worker tuning (set by the agent's autotuning, never by the run): `conc`, `groups`, `infer_threads`, `spinning`; also `gen` and `sha256` of the model (else `gen` comes from the graph's metadata), `prefix` for shard names |
+| `{"op": "job", "lease_id", "kind", ...Job, "model": "<local path>" \| null, "reference": "<local path>" \| null, "threads": 6, "out_dir": "out", "runtime_dir": "<local path>" \| null}` | start. Optional worker tuning (set by the agent's autotuning, never by the run): `conc`, `groups`, `infer_threads`, `spinning`; also `gen` and `sha256` of the model (else `gen` comes from the graph's metadata), `prefix` for shard names. Eval (rev 5): `models` instead of `model`/`reference` (both null), section 5.2 |
 | `{"op": "checkpoint", "gen", "model", "reference", "sha256"?}` | self-play: a phase change, as a remote worker's today: games in flight continue, their searches restart on the new network, and each row records the network that searched it (`net`) |
 | `{"op": "yield"}` | stop starting batches, drop the ONNX session (free VRAM), answer `yielded` |
 | `{"op": "resume"}` | rebuild the session, carry on |
@@ -329,10 +352,11 @@ Worker → agent (`"ev"`):
 | Event | Fields |
 |---|---|
 | `hello` | `aw: 1`, `build_id`, `game`, `kinds`, `zero_onnx: [1]`, `pid` |
-| `selftest` | `provider`, `max_abs`, `ok` (before the first real batch with a model) |
+| `selftest` | `provider`, `max_abs`, `ok` (before the first real batch with a model); `gen` (rev 5): the network it tested, one event per gen of an eval job's `models` |
 | `status` | `stats`: Stats (section 3) |
 | `fin` | `n`: games finished since the last `fin` |
 | `shard` / `records` | `seq`, `path` (relative, under out_dir), `games`, `rows`, `bytes`, `gids`, `gen`? — a result file ready to upload (`shard` until phase 3, then `records`); the agent moves the file away and sends `gids` as `x-ids`, `gen` (the oldest checkpoint generation of its games) as `x-gen` |
+| `evals` | eval (rev 5): `seq`, `path`, `games`, `gids` (as `shard`, no `gen`): a file of eval rows (section 5.2); the agent uploads it with `gids` as `x-ids` |
 | `failure` | fuzz: `seed` (integer), `mode`, `panic`, `site` (string), `repro`, `output_tail` |
 | `yielded` · `resumed` | |
 | `end` | `reason`: `done` \| `finish` \| `quit`, `stats`: Stats, `unfinished`: `{"gids": ranges}` \| `{"seeds": ranges}` \| null |
@@ -369,36 +393,6 @@ game's seed from (`seed`, gid), so a game id replayed after a dropout is the sam
 are `[gid_base, gid_base + games)`; the agent passes the worker's `gids` for each result file on as
 that upload's `x-ids`.
 
-### 5.2 Evaluation and head-to-heads (rev 5)
-
-An eval batch plays fixed networks against each other (or against a built-in bot) and reports one
-row per game; the desktop computes the score, its error and an Elo difference. Checkpoints never go
-stale, so eval leases ignore `max_stale`.
-
-- **Batch** (desktop): `PUT /v1/admin/run/{run}` with `"eval": {"batch", "games", "checkpoints":
-  [gen, ...], "games_per_lease", "gpu", "needs", "job": {"settings": {...}, "seats": [Seat, Seat],
-  "paired": true}}`. Every gen in `checkpoints` must be registered on the run (`PUT .../checkpoint/
-  {gen}`). An ad hoc head-to-head is a run of its own (e.g. `h2h-eoe1-80v70`, `"selfplay": null`)
-  whose gens are just labels for the two networks.
-- **Seat**: `{"net": <gen>}` or `{"bot": "<name>"}` (a built-in bot of the game; `ext:` bots are
-  refused by `check-config`).
-- **Paired games**: with `"paired": true` game ids come in pairs `(2k, 2k+1)`: the same deal with
-  the seats swapped. Leases always carry whole pairs (`gid_base` and `games` even), and a pair is
-  credited only when both games are in. Seat order for game g: `seats` for even g, reversed for odd g.
-- **Lease**: `checkpoints` lists every network the seats name (`gen`, `model`, `sha256`,
-  `reference`, `reference_sha256`); `checkpoint` is null.
-- **Agent → worker** (`job` line): `models: {"<gen>": {"model": path, "sha256", "reference": path}}`
-  for every listed checkpoint. The worker runs the self-test (`selftest` event, one per gen) before
-  its first game and refuses to play with a network that fails it.
-- **Results**: the worker writes JSON lines, one per game: `{"gid", "pair", "seats": [Seat, ...],
-  "result": [r_seat0, ...], "margin", "rounds", "over", "net_ms"?}` (`result`: 1 win, 0.5 draw,
-  0 loss per seat, in seat order of that game). It announces each file with the event `evals`
-  (same fields as `shard`: `seq`, `path`, `games`, `gids`). The agent uploads it like any result;
-  `GET /v1/admin/run/{run}/results` lists it with `"kind": "eval"` and the batch.
-- **Semantics** must equal zero-core's `zero.h2h` / `Run.evaluate` at the same settings (eval sims,
-  seat order, the deal shared by a pair); the worker's gate checks native rows against the Python
-  path running the same ONNX graphs, byte for byte.
-
 ### 5.1 Fuzz results
 Modes are tools/fuzz_farm.py's names or `<name>-games|-matches|-events`; check a mode against a
 build with `mtgz-worker fuzz-check --mode M --env K=V` before creating a campaign. The **agent**
@@ -415,6 +409,72 @@ per-failure uploads carry none. Each failure needs an integer `seed` and a strin
 builds these from the worker's `failure` events and its `end`, adding `"final": false` (per failure,
 `done: null`, `failures: [that one]`) or `"final": true` (the end-of-lease summary); a worker failure
 without a `site` gets the `file:line:col` after "panicked at" in its panic text, else `"unknown"`.
+
+### 5.2 Evaluation and head-to-heads (rev 5)
+
+An eval batch plays fixed networks against each other (or against a built-in bot) and reports one
+row per game; the desktop computes the score, its error and an Elo difference. Checkpoints never go
+stale, so eval leases ignore `max_stale` (and `x-gen`).
+
+- **Batch** (desktop): `PUT /v1/admin/run/{run}` with `"eval": {"batch", "games", "checkpoints":
+  [gen, ...], "games_per_lease", "gpu", "needs", "job": {"settings": {...}, "seats": [Seat, Seat],
+  "paired": true}}`. Every gen in `checkpoints` must be registered on the run (`PUT .../checkpoint/
+  {gen}`, which needs the run to exist: a new run is put with `"eval": null` first, then its
+  checkpoints, then the batch). Gens may be registered in any order: one older than the run's
+  current gen is registered without becoming current. An ad hoc head-to-head is a run of its own
+  (e.g. `h2h-eoe1-80v70`, `"selfplay": null`) whose gens are just labels for the two networks.
+- **Checks** (400 unless noted): `checkpoints` is a list of at most 16 distinct registered gens;
+  `job.seats` is a list of 2 to 16 Seats; the set of gens the seats name equals `checkpoints`;
+  `ext:` bots are refused; `paired` is a boolean and `true` needs an even `games`; `gen` (rev 2's
+  single eval network) is refused. A batch can't change: putting the same `batch` again with other
+  `games`, `checkpoints` (order included) or `job` → 409 (re-putting it unchanged, or changing
+  `games_per_lease`, `gpu`, `needs`, the run's `priority` or `state`, is fine), and a batch name
+  the run used before → 409.
+- **Seat**: `{"net": <gen>}` or `{"bot": "<name>"}` (a built-in bot of the game; a name of up to 64
+  characters from `A-Za-z0-9_.:-`), exactly one of the two; other keys are passed to the worker as
+  they are.
+- **Paired games**: with `"paired": true` game ids come in pairs `(2k, 2k+1)`: the same deal with
+  the seats swapped. A paired batch starts on an even id (an odd id skipped to get there goes to the
+  run's self-play pool). Leases always carry whole pairs (`gid_base` and `games` even). Seat order
+  for game g: `seats` for even g, reversed for odd g.
+- **Lease**: `checkpoints` lists every network the seats name (`gen`, `model`, `sha256`,
+  `reference`, `reference_sha256`), in the batch's order; `checkpoint` is null. Only agents 0.2.3
+  or newer get eval leases (section 3). The agent downloads and verifies every checkpoint (and its
+  reference) into its cache before it starts the worker, and lists them in `cached.ckpts`.
+- **Agent → worker** (`job` line): `models: {"<gen>": {"model": path, "sha256", "reference": path |
+  null}}` for every listed checkpoint; `model` and `reference` are null. The worker runs the
+  self-test (`selftest` event with `gen`, one per gen) before its first game and refuses to play
+  with a network that fails it (a fatal `error`). The agent reports the per-gen results in Stats
+  (`selftest`, section 3) and, when one fails, in its `crash` report.
+- **Results**: the worker writes JSON lines, one per game: `{"gid", "pair", "seats": [Seat, ...],
+  "result": [r_seat0, ...], "margin", "rounds", "over", "net_ms"?}` (`result`: 1 win, 0.5 draw,
+  0 loss per seat, in seat order of that game). It announces each file with the event `evals`
+  (same fields as `shard`: `seq`, `path`, `games`, `gids`). The agent uploads it like any result,
+  `gids` as `x-ids`. A worker should keep both games of a pair in one file when it can (it saves
+  the desktop a lookup), but doesn't have to.
+- **Crediting** (paired batches): a pair is credited only when both of its games are in, from one
+  lease. Each eval chunk's reported ids split into `ids` (credited; their rows are in this chunk),
+  `dup_ids` (credited to another chunk before) and `held` (one game of a pair whose other game this
+  lease hasn't reported yet: not credited). When a later chunk of the same lease brings the other
+  game, that chunk credits the whole pair: its own game in `ids`, the held one in `also: [{"seq",
+  "key", "ids"}]`, naming the earlier chunk whose row it is. A lease that ends with held games
+  leaves those pairs unclaimed, so they go back to the pool and are played again in full (a late
+  chunk of that lease can still complete them, if no other lease has). The upload answer adds
+  `held` (games of this chunk now held). Unpaired batches credit game by game, as self-play does.
+- **Listing**: `GET /v1/admin/run/{run}/results` lists eval chunks with `"kind": "eval"`, `batch`,
+  `held` and `also`; `games` = credited ids in `ids` plus those in `also`. To read a batch: for
+  every listed chunk of it, take the rows of `key` whose `gid` is in `ids`, plus, for each `also`
+  entry, the rows of its `key` whose `gid` is in its `ids`. That is every credited game exactly
+  once, with both games of every credited pair.
+- **Progress**: `GET /v1/admin/run/{run}` → `eval_state` = `{"batch", "games", "paired",
+  "checkpoints", "lo", "hi", "done", "leased", "unissued", "created_at", "replaced_at"}` for the
+  current batch (`done`: credited games; `leased`: ids in active leases not credited yet;
+  `unissued`: in the pool; game ids `[lo, hi)`), and `eval_batches` (newest first, up to 50). The
+  batch is complete when `done` = `games`. The coordinator never reads rows, so it can't show a
+  score.
+- **Semantics** must equal zero-core's `zero.h2h` / `Run.evaluate` at the same settings (eval sims,
+  seat order, the deal shared by a pair); the worker's gate checks native rows against the Python
+  path running the same ONNX graphs, byte for byte.
 
 ## 6. Agent install layout, launcher and self-update
 
@@ -501,7 +561,21 @@ Agent exit codes: 0 the user quit, 75 switch to `state\pending`, 76 hand over to
 ## Changes
 - v1 rev 5 (2026-11-12): evaluation and head-to-heads (section 5.2): `checkpoints` on eval leases,
   eval batches name `checkpoints`, seats (`net`/`bot`), whole paired leases, `models` in the job
-  line, per-gen `selftest`, `evals` result files and their row format.
+  line, per-gen `selftest`, `evals` result files and their row format. From building it
+  (coordinator, agent 0.2.3): the batch checks (registered gens, seats = checkpoints, `ext:`
+  refused, even paired `games`, `gen` refused, batches immutable, names never reused);
+  checkpoints may be registered older than the current gen (not made current; answer `current`); a
+  paired batch starts on an even id; pair crediting within one lease, with `held` games and `also`
+  entries in the result listing and `held` in the upload answer; `x-gen` ignored on eval chunks;
+  `eval_state` / `eval_batches` / `checkpoints` in `GET /v1/admin/run`, run `eval` progress in
+  stats; eval leases need agent 0.2.3+, and their uncached checkpoints count against `caps.disk_mb`;
+  `selftest` events carry `gen`; Stats `selftest` per gen; aw/1 `evals` event in the table. Blocked
+  workers (a real PC with Smart App Control, 2026-11-12): `/v1/crash` kind `blocked` with `os_error`
+  (4551, 1260, 225); the coordinator skips that build for that machine for 24 h or until a newer
+  agent asks, lists the block on the admin page, and `POST /v1/admin/machine/{id}` `{"unblock":
+  true}` lifts it; agents back off after any worker start failure (blocked: 15 min, 1 h, 4 h, 16 h,
+  24 h; others 1 min doubling to 1 h) instead of leasing again at once (0.2.1 leased 521 times in 45
+  min). Section 5.1 now comes before 5.2.
 - v1 (2026-11-11): initial.
 - v1 rev 2 (2026-11-11, from building the coordinator): half-open id ranges spelled out; result
   uploads carry `x-ids` (and `x-gen`) and answer with credit counts, first copy wins; late uploads

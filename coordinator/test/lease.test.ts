@@ -229,11 +229,13 @@ describe("choosing work", () => {
 
   it("self-play first, then eval, then fuzz as the backfill", async () => {
     await makeCampaign("fz");
-    await makeRun("r", { quota: 10, slack: 0, games_per_lease: 10, eval: { batch: "it1", games: 4, games_per_lease: 2, job: { seats: ["a", "b"], paired: true } } });
+    const seats = [{ net: 1 }, { bot: "heuristic" }];
+    await makeRun("r", { quota: 10, slack: 0, games_per_lease: 10, eval: { batch: "it1", games: 4, checkpoints: [1], games_per_lease: 2, job: { seats, paired: true } } });
     const m = await enroll("a");
     expect((await lease(m)).kind).toBe("selfplay");
     const e1 = await lease(m);
-    expect(e1).toMatchObject({ kind: "eval", job: { kind: "eval", games: 2, gid_base: 0, seats: ["a", "b"], paired: true } });
+    expect(e1).toMatchObject({ kind: "eval", checkpoint: null, job: { kind: "eval", games: 2, gid_base: 0, seats, paired: true } });
+    expect(e1.checkpoints.map((c: any) => c.gen)).toEqual([1]);
     expect((await lease(m)).kind).toBe("eval");
     expect((await lease(m)).kind).toBe("fuzz"); // quota full, eval all issued
   });

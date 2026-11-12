@@ -103,9 +103,22 @@ async function load() {
     ["quota", (r) => (r.selfplay ? num(r.selfplay.quota) : "-"), "n"], ["cap", (r) => (r.selfplay ? num(r.selfplay.cap) : "-"), "n"],
     ["accepted", (r) => (r.selfplay ? num(r.selfplay.accepted) : "-"), "n"],
     ["in flight", (r) => (r.selfplay ? num(r.selfplay.leased) + " leased + " + num(r.selfplay.pending) + " unacked" : "-")],
-    ["eval", (r) => (r.eval ? esc(r.eval.batch) + ": " + num(r.eval.unissued) + " / " + num(r.eval.games) + " unissued" : "-")],
+    ["eval", (r) => (r.eval ? esc(r.eval.batch) + ": " + num(r.eval.done) + " / " + num(r.eval.games) + " done" : "-")],
     ["active leases", (r) => r.active_leases, "n"], ["pool", (r) => num(r.pool), "n"], ["next gid", (r) => num(r.next_gid), "n"],
   ], s.runs);
+
+  // Eval batches (PROTOCOL 5.2): progress only; the coordinator never reads game rows, so the
+  // score is the desktop's to compute.
+  const pct = (b) => (b.games ? Math.floor((100 * b.done) / b.games) : 0);
+  const bar = (b) => '<span style="display:inline-block;width:80px;height:8px;border:1px solid var(--line);vertical-align:middle">' +
+    '<span style="display:block;height:100%;width:' + pct(b) + '%;background:var(--ok)"></span></span> ' + pct(b) + "%";
+  const bstate = (b) => (b.done >= b.games ? '<span class="ok">complete</span>' : b.replaced_at ? '<span class="muted">replaced</span>' : "running");
+  h += "<h2>Eval batches</h2>" + table([
+    ["run", (b) => esc(b.run)], ["batch", (b) => esc(b.batch)], ["networks", (b) => esc((b.checkpoints || []).join(" v ") || "bots")],
+    ["paired", (b) => (b.paired ? "yes" : "no")], ["progress", (b) => bar(b)],
+    ["games done", (b) => num(b.done) + " / " + num(b.games), "n"], ["in leases", (b) => num(b.leased), "n"],
+    ["unissued", (b) => num(b.unissued), "n"], ["started", (b) => ago(b.created_at, now)], ["state", (b) => bstate(b)],
+  ], s.eval_batches || []);
 
   h += "<h2>Fuzz campaigns</h2>" + table([
     ["campaign", (x) => esc(x.campaign)], ["mode", (x) => esc(x.mode)], ["state", (x) => x.state], ["priority", (x) => x.priority, "n"],
@@ -128,6 +141,10 @@ async function load() {
     ["starved h", (m) => '<span class="' + (m.starved_s_24h >= 600 ? "warn" : "") + '">' + hrs(m.starved_s_24h) + "</span>", "n"],
     ["given back", (m) => m.given_back_24h, "n"], ["expired", (m) => '<span class="' + (m.expired_24h ? "warn" : "") + '">' + m.expired_24h + "</span>", "n"],
     ["crashes", (m) => '<span class="' + (m.crashes_24h ? "bad" : "") + '">' + m.crashes_24h + "</span>", "n"],
+    // Builds Windows refused to start on this PC (Smart App Control etc.): not offered to it until then.
+    ["blocked builds", (m) => (m.blocked || []).map((b) => '<span class="bad" title="' + esc(b.message || "") + '"><code>' +
+      esc(String(b.build_id).slice(0, 8)) + "</code> os error " + esc(b.os_error ?? "?") + "</span> " +
+      '<span class="muted">until ' + new Date(b.until * 1000).toLocaleString() + "</span>").join("<br>")],
   ], s.machines);
 
   h += "<h2>Rates by hardware class</h2>" + table([

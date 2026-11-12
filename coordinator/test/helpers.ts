@@ -170,10 +170,13 @@ export function runBody(build: string, o: RunOpts = {}) {
   };
 }
 
+// Creates a run, then publishes its checkpoint; an eval batch is put last, once its checkpoints
+// are registered (PROTOCOL 5.2: they must be, and the run must exist to register them).
 export async function makeRun(run: string, o: RunOpts = {}): Promise<string> {
   const build = o.build ?? (await makeBuild({ tag: run }));
-  ok(await admin("PUT", `/v1/admin/run/${run}`, runBody(build, o)));
+  ok(await admin("PUT", `/v1/admin/run/${run}`, runBody(build, { ...o, eval: null })));
   if (o.gen !== null) await publishCkpt(run, o.gen ?? 1);
+  if (o.eval) ok(await admin("PUT", `/v1/admin/run/${run}`, runBody(build, o)));
   return build;
 }
 

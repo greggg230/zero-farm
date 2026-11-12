@@ -1,6 +1,7 @@
 // Friend-facing API (PROTOCOL 3): bearer = machine token, except /v1/enroll.
 
 import * as book from "./book";
+import { blockedBuilds, recordBlock } from "./blocks";
 import { authMachine, type Ctx, type MachineRow } from "./ctx";
 import { bookFor } from "./leasebook";
 import { minAgentOk } from "./manifest";
@@ -41,6 +42,9 @@ import {
 
 export const KINDS = ["fuzz", "eval", "selfplay", "diag"] as const;
 export const CHANNELS = ["canary", "stable"] as const;
+// Rev 5: the first agent that downloads an eval lease's `checkpoints` (older agents know only
+// `checkpoint`, so they'd start the worker without its networks).
+export const EVAL_MIN_AGENT = "0.2.3";
 const WAIT_S = 300;
 const LOGS_RESEND_S = 1800; // re-ask for an upload_diag that never arrived
 
@@ -293,8 +297,8 @@ export async function lease(c: Ctx): Promise<Response> {
   const cands: Candidate[] = [];
   const poolN = new Map<string, number>((poolR.results as any[]).map((p) => [`${p.scope}|${p.pool}`, p.n]));
   const needsOk = (n: book.Needs | null | undefined) => !n || (caps.threads >= n.threads && caps.ram_mb >= n.ram_mb);
-  const diskOk = (ids: (string | null)[]) => {
-    const need = ids.reduce((s, id) => s + (id && !cachedBuilds.has(id) ? (builds.get(id)?.size ?? 0) : 0), 0);
+  const diskOk = (ids: (string | null)[], extra = 0) => {
+    const need = ids.reduce((s, id) => s + (id && !cachedBuilds.has(id) ? (builds.get(id)?.size ?? 0) : 0), extra);
     return need <= caps.disk_mb * 1024 * 1024;
   };
   for (const r of runs) {
@@ -317,24 +321,37 @@ export async function lease(c: Ctx): Promise<Response> {
       }
     }
     if (kinds.has("eval") && r.eval) {
-      const ev = JSON.parse(r.eval) as book.EvalCfg;
+      const ev = JSON.parse(r.eval) as book.EvalCfg | null;
       if (
         ev &&
+        Array.isArray(ev.checkpoints) &&
         (poolN.get(`${scope}|eval:${ev.batch}`) ?? 0) > 0 &&
         needsOk(ev.needs) &&
-        !(ev.gpu === "required" && !caps.gpu) &&
-        diskOk([r.build_id, r.runtime])
+        !(ev.gpu === "required" && !caps.gpu)
       ) {
-        const backfill = ev.gpu === "preferred" && !caps.gpu;
-        cands.push({
-          scope,
-          kind: "eval",
-          run: r.run,
-          priority: r.priority,
-          tier: backfill ? 2 : 1,
-          fit: (backfill ? 0.25 : 1) * cachedBonus,
-          configured: ev.games_per_lease,
-        });
+        // Rev 5: the lease brings every network the seats name; uncached ones count against the disk.
+        const keys = ev.checkpoints.map((g) => `${r.run}/${g}`);
+        let ckptBytes = 0;
+        if (keys.some((k) => !cachedCkpts.has(k))) {
+          const { results } = await db
+            .prepare(`SELECT gen, size FROM checkpoints WHERE run = ? AND gen IN (${ev.checkpoints.map(() => "?").join(",")})`)
+            .bind(r.run, ...ev.checkpoints)
+            .all<{ gen: number; size: number | null }>();
+          ckptBytes = results.reduce((s, x) => s + (cachedCkpts.has(`${r.run}/${x.gen}`) ? 0 : (x.size ?? 0)), 0);
+        }
+        if (diskOk([r.build_id, r.runtime], ckptBytes)) {
+          const backfill = ev.gpu === "preferred" && !caps.gpu;
+          const ckptBonus = keys.length && keys.every((k) => cachedCkpts.has(k)) ? 1.1 : 1;
+          cands.push({
+            scope,
+            kind: "eval",
+            run: r.run,
+            priority: r.priority,
+            tier: backfill ? 2 : 1,
+            fit: (backfill ? 0.25 : 1) * cachedBonus * ckptBonus,
+            configured: ev.games_per_lease,
+          });
+        }
       }
     }
   }
@@ -355,14 +372,18 @@ export async function lease(c: Ctx): Promise<Response> {
     }
   }
 
+  // --- builds Windows refused to start on this machine (rev 5): not offered to it for a while ---
+  const blocked = await blockedBuilds(db, m.machine_id, agent, c.now);
+
   // --- agent version: a job whose build needs a newer agent makes the agent update first ---
   let need: string | null = release && cmpSemver(agent, release.min_agent) < 0 ? release.min_agent : null;
   const usable = cands.filter((cd) => {
     const r = cd.run ? runs.find((x) => x.run === cd.run) : null;
     const ids = r ? [r.build_id, r.runtime] : [camps.find((x) => x.campaign === cd.campaign)!.build_id];
+    if (ids.some((id) => id && blocked.has(id))) return false;
     const infos = ids.filter(Boolean).map((id) => builds.get(id!));
     if (infos.some((i) => !i)) return false; // build not registered
-    const req = maxSemver(infos.map((i) => i!.min_agent));
+    const req = maxSemver([...infos.map((i) => i!.min_agent), cd.kind === "eval" ? EVAL_MIN_AGENT : null]);
     if (req && !minAgentOk(agent, req)) {
       // Only ask for an update the channel can deliver.
       if (release && cmpSemver(req, release.version) <= 0) need = maxSemver([need, req]);
@@ -461,13 +482,14 @@ export async function result(c: Ctx, leaseId: string, seqStr: string): Promise<R
   if (genHeader !== null && !/^\d{1,9}$/.test(genHeader)) throw bad("x-gen must be an integer");
   const l = await ownLeaseRow(c, m, leaseId);
   // A retry of a stored chunk is answered without touching R2 (LeaseBook re-checks under its lock).
-  const prior = await c.env.DB.prepare(`SELECT sha256, games, dup_ids FROM results WHERE lease_id = ? AND seq = ?`)
+  const prior = await c.env.DB.prepare(`SELECT sha256, games, dup_ids, kind, held FROM results WHERE lease_id = ? AND seq = ?`)
     .bind(leaseId, seq)
-    .first<{ sha256: string; games: number; dup_ids: string }>();
+    .first<{ sha256: string; games: number; dup_ids: string; kind: string; held: string | null }>();
   if (prior) {
     if (prior.sha256 !== sha) throw conflict(`result ${seq} of this lease was already uploaded with a different sha256`);
     await readBounded(c.req, book.MAX_RESULT);
-    return json({ ok: true, duplicate: true, credited: prior.games, already_credited: total(parseJson(prior.dup_ids, [])) });
+    const held = prior.kind === "eval" ? { held: total(parseJson(prior.held, [])) } : {};
+    return json({ ok: true, duplicate: true, credited: prior.games, already_credited: total(parseJson(prior.dup_ids, [])), ...held });
   }
   if (l.state === "cancelled") throw new HttpError(410, "gone", "lease was cancelled");
   if (ids !== null) {
@@ -579,16 +601,24 @@ export async function crash(c: Ctx): Promise<Response> {
   const m = await authMachine(c);
   await take(c, m.machine_id, "crash", "crash report");
   const b = await readJson(c.req, 256 * 1024);
-  const kind = oneOf(b.kind, "kind", ["panic", "crash", "agent"] as const);
+  const kind = oneOf(b.kind, "kind", ["panic", "crash", "agent", "blocked"] as const);
   const buildId = str(b.build_id, "build_id", { optional: true, re: BUILD_RE }) ?? null;
   const leaseId = str(b.lease_id, "lease_id", { optional: true, re: LEASE_RE }) ?? null;
+  const osError = int(b.os_error, "os_error", { optional: true, min: -(2 ** 31), max: 2 ** 32 }) ?? null;
   const message = typeof b.message === "string" ? b.message.slice(0, 4096) : null;
   const backtrace = typeof b.backtrace === "string" ? b.backtrace.slice(0, 65536) : null;
-  await c.env.DB.prepare(
-    `INSERT INTO crashes (machine_id, build_id, kind, message, backtrace, lease_id, agent_version, t) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  )
-    .bind(m.machine_id, buildId, kind, message, backtrace, leaseId, m.agent_version, c.now)
-    .run();
+  if (kind === "blocked" && !buildId) throw bad("a blocked report needs the build_id Windows refused to start");
+  const stmts = [
+    c.env.DB.prepare(
+      `INSERT INTO crashes (machine_id, build_id, kind, message, backtrace, lease_id, agent_version, os_error, t) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).bind(m.machine_id, buildId, kind, message, backtrace, leaseId, m.agent_version, osError, c.now),
+  ];
+  // Rev 5: Windows refused to start this worker build here. It isn't offered to this machine for
+  // a day, or until a newer agent asks (blocks.ts).
+  if (kind === "blocked") {
+    stmts.push(recordBlock(c.env.DB, { machine_id: m.machine_id, build_id: buildId!, agent_version: m.agent_version, os_error: osError, message, now: c.now }));
+  }
+  await c.env.DB.batch(stmts);
   return json({ ok: true });
 }
 

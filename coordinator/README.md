@@ -2,8 +2,10 @@
 
 The Cloudflare Worker that hands out work to invited friends' idle Windows PCs for zero-core
 training runs (MTG Zero first): enrollment, leases, the job mix per run, a signed-build index,
-result indexing for the trainer, fuzz campaigns, diagnostics, an admin dashboard, per-machine
-rate limits, and the public onboarding page (its download link redirects to GitHub Releases).
+result indexing for the trainer, eval batches and head-to-heads (several networks per lease,
+paired games), fuzz campaigns, diagnostics, builds a PC's Windows refuses to run, an admin
+dashboard, per-machine rate limits, and the public onboarding page (its download link redirects
+to GitHub Releases).
 
 - Wire contract: [`../PROTOCOL.md`](../PROTOCOL.md) sections 1-4 (and the coordinator side of 5-6).
 - Why it works this way: [`../DESIGN.md`](../DESIGN.md) sections 2, 3.4-3.5, 4, 5, 6, 7.
@@ -22,6 +24,7 @@ src/telemetry.ts   Analytics Engine writer (no-op without the binding) + Stats s
 src/admin_page.ts  the /admin dashboard (static HTML + JS)
 src/onboard.ts     the public pages: / (onboarding) and /download (302 to the installer on GitHub)
 src/ratelimit.ts   per-machine (and per-IP for enroll) rate limits: GCRA in D1, 429 + retry-after
+src/blocks.ts      worker builds Windows refused to start on a machine (crash kind "blocked")
 src/cron.ts        every minute: expire silent leases, delete acked results after 7 days, prune limits
 migrations/        D1 schema (numbered; `wrangler d1 migrations apply`)
 scripts/admin.ts   admin CLI
@@ -48,6 +51,7 @@ npm run admin -- invites --count 3 --note Sam
 npm run admin -- upload-build path/to/build-dir     # manifest.json + .minisig + files, then register
 npm run admin -- run eoe2 run.json
 npm run admin -- checkpoint eoe2 81 model.onnx reference.npz
+npm run admin -- machine m_... --unblock true      # lift the builds it reported blocked
 npm run admin -- campaign fuzz-delver campaign.json
 npm run admin -- agent-release 0.2.0 <build_id> canary 0.1.0 --github-url <installer asset URL>
 npm run admin -- stats
@@ -72,6 +76,19 @@ Example run config (`PUT /v1/admin/run/<run>`):
  "eval": null}
 ```
 
+A head-to-head (PROTOCOL 5.2) is a run of its own: put it with `"selfplay": null, "eval": null`,
+register its two networks (`checkpoint h2h-eoe1-80v70 80 ...`, then `... 70 ...`: the gens are
+labels, any order), then put it again with the batch:
+
+```json
+"eval": {"batch": "b1", "games": 200, "checkpoints": [80, 70], "games_per_lease": "auto",
+         "gpu": "any", "needs": {"threads": 2, "ram_mb": 2000},
+         "job": {"settings": {"sims": 32}, "seats": [{"net": 80}, {"net": 70}], "paired": true}}
+```
+
+`run-get` shows its progress (`eval_state`); `results` lists the rows to read (`ids` and
+`also`); a new batch needs a new name.
+
 ## Test
 
 ```
@@ -79,21 +96,23 @@ npm test          # vitest + @cloudflare/vitest-pool-workers: local workerd, no 
 npm run check     # wrangler types --check, tsc (src + test), tsc (scripts)
 ```
 
-95 tests in 11 files (about 2 minutes; the fleet simulation is most of it):
+109 tests in 13 files (about 2 minutes; the fleet simulation is most of it):
 
 | File | Covers |
 |---|---|
-| `api.test.ts` | every endpoint's happy path and validation; auth failures on every route (no token, unknown token, admin token on friend routes, machine token on admin routes, revoked → 403); tokens stored only as sha256; builds (missing/mismatched files, missing signature, wrong id); releases; checkpoints; diag (logs via beats and lease answers, diag leases); crashes; stats (incl. availability, starvation, releases, diagnostics uploads, the admin page's columns) |
+| `api.test.ts` | every endpoint's happy path and validation; auth failures on every route (no token, unknown token, admin token on friend routes, machine token on admin routes, revoked → 403); tokens stored only as sha256; builds (missing/mismatched files, missing signature, wrong id); releases; checkpoints (an older gen registered, not current); diag (logs via beats and lease answers, diag leases); crashes; stats (incl. availability, starvation, releases, diagnostics uploads, the admin page's columns) |
 | `ratelimit.test.ts` | 429 + `retry-after` after the burst; the 2026-11-11 hot loop (8 lease requests a second) gets exactly one answer per 5 s and is never locked out; a simulated day of a well-behaved agent (leases, beats, need_profile retries, wait_s, back-to-back leases at the limit's rate) is never limited; per machine; beats and crash reports; enroll per client IP (wrong codes count, the invite survives); the cron prunes |
 | `onboard.test.ts` | `/` without an installer (and its GitHub source link), with only canary (says "test build"), stable over canary, `?channel=`, an installer older than its channel's min_agent skipped; `/download` = 302 to the release's `github_url` (GET and HEAD, no bytes); `github_url` validation (GitHub release assets only), `setup` and `setup/` uploads refused; 426 `download` link per channel |
 | `diag.test.ts` | user-initiated uploads (`x-farm-diag: user`): no request needed, once an hour per machine, 20 MB (an oversize one doesn't use up the hour), requested uploads unchanged, a user upload answers open requests |
 | `lease.test.ts` | lifecycle: issue → beat → upload → done; expiry after 3 silent beats → reissue of exactly the unfinished ids; paused past slack → `give_back`; agent give-back; pause → `cancel`; new checkpoint through beats; `done` with missing results; job choice by priority, self-play → eval → fuzz backfill, GPU routing, needs/disk; lease sizing from measured and class rates; paused and starved (`starved_ms`) time not counted |
 | `quota.test.ts` | cap = quota × (1 + slack), trimmed last lease, in-flight = leased + unacked, rejected games freeing room, given-back ids reissued, checkpoint resets the count, expired leases stop counting |
 | `fuzz.test.ts` | cursor never rewinds (lower seed_base ignored, higher jumps), pool before cursor, failures parsed and deduped, campaign results/ack |
+| `eval.test.ts` | rev 5 eval batches: a head-to-head run without self-play (gens registered in any order), leases with every network (`checkpoints`, `checkpoint: null`) in whole pairs, odd `games_per_lease` rounded down; the batch checks (registered gens, seats = checkpoints, `ext:` bots, one of net/bot, seat count, even paired games, `gen` refused, a new run must register its gens first, bots-only batches); batches immutable and names never reused; pair crediting across chunks of a lease (`held`, `also`, retries) read back the documented way; a held game's pair given back whole and played again, a late chunk completing its own pair first, an expired lease's pair reissued; the even start and the skipped id in the self-play pool; `max_stale` and `x-gen` ignored; agent 0.2.3 gating; uncached checkpoints against the disk cap; progress in `GET run`, stats and the dashboard; per-gen `selftest` stats kept |
+| `blocked.test.ts` | rev 5 crash kind `blocked`: needs a `build_id`; that build no longer goes to that machine (others still get it); the crash row keeps `os_error`; stats and the dashboard list the block; lifted after 24 h, by a newer agent, by the admin (`unblock`), and a new build is offered at once; other crash kinds block nothing |
 | `results.test.ts` | idempotent uploads, conflicting hash → 409 (and the loser's bytes removed), hash/size/seq/ids checks, 32 MB limit, first copy wins across leases, late copies (pool and reissued ids), staleness, cursor paging, R2 deletion 7 days after ack |
 | `update.test.ts` | `{"update"}` for agents older than the channel's or a build's `min_agent`, no update loop for builds no release satisfies, `aw` mismatch, enroll → 426 |
 | `units.test.ts` | ranges, semver, sizing, BLAKE2b vectors, minisign (prehashed and legacy, tampering, wrong key, wrong trusted comment), telemetry adapter |
-| `fleet.test.ts` | 10 fake machines × 6 generations against the real Worker: random vanishing (some crash and lose games in progress, one dies for good holding a lease), pauses past the slack, late results, double and conflicting uploads, checkpoint switches, fuzz backfill; a fake trainer fills each generation by cursor. Asserts every game id and seed is claimed exactly once or back in the pool, every generation filled by exactly `quota` accepted games, accepted + in flight never over the cap, ≥ 3 machines per generation, the dead machine's games played by others |
+| `fleet.test.ts` | 10 fake machines × 6 generations against the real Worker: random vanishing (some crash and lose games in progress, one dies for good holding a lease), pauses past the slack, late results, double and conflicting uploads, checkpoint switches, fuzz backfill, and two paired eval batches (gen 2 v 1, then the current gen v 1) whose games finish in random order, so pairs are split across chunks and left half-played by dropouts; a fake trainer fills each generation by cursor and reads the eval batches by `ids` + `also`. Asserts every game id and seed is claimed exactly once or back in the pool, every generation filled by exactly `quota` accepted games, accepted + in flight never over the cap, ≥ 3 machines per generation, the dead machine's games played by others, every eval pair credited exactly once with both games from one lease, eval chunks never refused as stale |
 
 Test notes:
 - `TEST_CLOCK=1` (set only in `vitest.config.ts`) lets tests move time with an `x-test-now` header.
@@ -129,6 +148,10 @@ follow-ups add migration `0002_followups.sql` (rate limits, installers on releas
 diagnostics flag); `npm run deploy` applies it before the code that needs it. Rev 4 (installers
 on GitHub Releases) adds `0003_github_releases.sql` (`agent_releases.github_url`). After deploying
 rev 4, `/download` is 404 until a release names a `github_url` (`farm-release github-release`).
+Rev 5 (eval batches, blocked builds) adds `0004_eval_blocks.sql` (`eval_batches`, `blocks`,
+`results.batch/held/also`, `crashes.os_error`); deploy it before agents 0.2.3 go out, so their
+`blocked` reports are understood (an older coordinator answers 400 to that kind; the agent then
+sends it as `crash`).
 
 ## Deploy checklist (as originally written)
 
@@ -239,18 +262,47 @@ channel's latest release's `min_agent`, or older than the `min_agent` of a build
 get, provided the channel's latest release satisfies it. Builds no release satisfies yet are
 skipped, so an agent is never sent into an update loop.
 
+**Eval batches (rev 5).** A batch is a run's `eval` config plus a row in `eval_batches` (game ids
+`[lo, hi)`, paired or not, its checkpoints, and `spec`: the canonical JSON of `games`,
+`checkpoints` and `job`, so a re-put with another spec is refused and a name is never reused).
+Putting a batch checks every gen is registered; a run's gens may be registered in any order (an
+older one doesn't become current). A paired batch reserves from an even id (an odd `next_gid`
+gives its id to the self-play pool), and its pool, leases and claims stay pair-aligned: a lease
+takes an even count from the lowest pooled range, and only whole pairs are ever claimed. Crediting
+(`splitPaired` in `book.ts`): a chunk's ids minus those already claimed are split into whole pairs
+(credited here), lone games whose mate an earlier chunk of the same lease holds (credited here,
+the mate through an `also` entry naming that chunk), and lone games whose mate hasn't come (held:
+stored on the result row, not claimed). Claims for a completed pair point at the completing
+chunk. A held game is never claimed, so a lease that ends with one puts the whole pair back in the
+pool; a late chunk of that lease can still complete it if nobody else has. Eval leases list every
+network (`checkpoints`), go only to agents 0.2.3+, and their uncached checkpoints count against
+the disk cap; their chunks skip the staleness check. Progress (`evalProgress`): credited ids in
+the batch's range, unclaimed ids in active leases, pooled ids. The coordinator never reads rows,
+so the dashboard shows progress, not a score.
+
+**Blocked builds (rev 5).** `/v1/crash` kind `blocked` (Windows refused to start a worker: Smart
+App Control / WDAC 4551, AppLocker / SRP 1260, Defender 225) adds a `blocks` row (machine,
+build, the reporting agent version, `until` = now + 24 h). On `/v1/lease` the machine's blocks are
+read first; expired ones, and ones a newer agent has outgrown, are deleted; candidates whose build
+(or runtime) is blocked are skipped, so the machine gets other work or `no_work`. A new build has
+another id, so it isn't blocked. `POST /v1/admin/machine/{id}` `{"unblock": true}` deletes them;
+the dashboard lists them under the machine. Found on 2026-11-12: a friend's PC with Smart App
+Control got 521 leases in 45 minutes, each given back, held back only by the lease rate limit.
+
 **Telemetry and the dashboard.** Beats and `done` write a data point per Stats sample to Analytics
 Engine (index = machine; 20 doubles, the most AE takes, the last being `starved_ms`;
 `paused_ms` and `resume_ms_max` stay in D1). The dashboard reads D1 summaries via
 `/v1/admin/stats`: machines (last seen, work, busy/paused hours, availability as idle h/day of
 on h/day from the profile, yields, hours starved of CPU, give-backs, expiries, crashes),
-throughput, runs (quota, cap, accepted, in flight), campaigns, rates by hardware class, agent
-releases per channel (with the installer's GitHub link), recent diagnostics uploads, recent crashes and new
-fuzz failure sites. A Worker can write to AE but can only read it through the account's SQL API.
+throughput, runs (quota, cap, accepted, in flight, the current eval batch's games done), eval
+batches (networks, paired, a progress bar, games done, in leases, unissued, state), campaigns,
+rates by hardware class, agent releases per channel (with the installer's GitHub link), recent
+diagnostics uploads, recent crashes, new fuzz failure sites, and per machine the builds Windows
+blocked there. A Worker can write to AE but can only read it through the account's SQL API.
 
 **Not done / open:**
-- Eval jobs with several networks: a lease has one `checkpoint`, so eval opponents' models need a
-  protocol addition before phase 2.
+- The eval score (and its error, Elo) is the desktop's: the coordinator never reads rows, so the
+  dashboard shows a batch's progress only.
 - `outside_hours` is agent-side only. There is no contributors page yet (DESIGN 5).
 - Result uploads and `done` are not rate-limited (a reconnecting agent may upload many chunks at
   once); invite codes carry 60 bits and tokens 256.
