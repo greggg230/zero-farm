@@ -219,6 +219,7 @@ impl Engine {
                 lease_id: None,
                 exit_code: None,
                 agent: Some(self.cfg.version.clone()),
+                os_error: None,
             };
             self.report_crash(c);
         }

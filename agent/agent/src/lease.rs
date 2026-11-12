@@ -563,6 +563,7 @@ impl Run {
             lease_id: Some(self.lease.lease_id.clone()),
             exit_code,
             agent: None,
+            os_error: None,
         });
     }
 
