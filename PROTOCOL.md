@@ -180,6 +180,8 @@ Lease = {
   "runtime": {"build_id": "...", "manifest": "builds/<id>/manifest.json"} | null,
   "checkpoint": {"gen": 81, "model": "ckpt/eoe2/81/model.onnx", "sha256": "...",
                  "reference": "ckpt/eoe2/81/reference.npz", "reference_sha256": "..."} | null,
+  "checkpoints": [Checkpoint, ...] | null,              // eval only (rev 5, section 5.2): every
+                                                       // network the job's seats name, by gen
   "job": Job                                           // section 5, passed to the worker as is
 }
 ```
@@ -367,6 +369,36 @@ game's seed from (`seed`, gid), so a game id replayed after a dropout is the sam
 are `[gid_base, gid_base + games)`; the agent passes the worker's `gids` for each result file on as
 that upload's `x-ids`.
 
+### 5.2 Evaluation and head-to-heads (rev 5)
+
+An eval batch plays fixed networks against each other (or against a built-in bot) and reports one
+row per game; the desktop computes the score, its error and an Elo difference. Checkpoints never go
+stale, so eval leases ignore `max_stale`.
+
+- **Batch** (desktop): `PUT /v1/admin/run/{run}` with `"eval": {"batch", "games", "checkpoints":
+  [gen, ...], "games_per_lease", "gpu", "needs", "job": {"settings": {...}, "seats": [Seat, Seat],
+  "paired": true}}`. Every gen in `checkpoints` must be registered on the run (`PUT .../checkpoint/
+  {gen}`). An ad hoc head-to-head is a run of its own (e.g. `h2h-eoe1-80v70`, `"selfplay": null`)
+  whose gens are just labels for the two networks.
+- **Seat**: `{"net": <gen>}` or `{"bot": "<name>"}` (a built-in bot of the game; `ext:` bots are
+  refused by `check-config`).
+- **Paired games**: with `"paired": true` game ids come in pairs `(2k, 2k+1)`: the same deal with
+  the seats swapped. Leases always carry whole pairs (`gid_base` and `games` even), and a pair is
+  credited only when both games are in. Seat order for game g: `seats` for even g, reversed for odd g.
+- **Lease**: `checkpoints` lists every network the seats name (`gen`, `model`, `sha256`,
+  `reference`, `reference_sha256`); `checkpoint` is null.
+- **Agent → worker** (`job` line): `models: {"<gen>": {"model": path, "sha256", "reference": path}}`
+  for every listed checkpoint. The worker runs the self-test (`selftest` event, one per gen) before
+  its first game and refuses to play with a network that fails it.
+- **Results**: the worker writes JSON lines, one per game: `{"gid", "pair", "seats": [Seat, ...],
+  "result": [r_seat0, ...], "margin", "rounds", "over", "net_ms"?}` (`result`: 1 win, 0.5 draw,
+  0 loss per seat, in seat order of that game). It announces each file with the event `evals`
+  (same fields as `shard`: `seq`, `path`, `games`, `gids`). The agent uploads it like any result;
+  `GET /v1/admin/run/{run}/results` lists it with `"kind": "eval"` and the batch.
+- **Semantics** must equal zero-core's `zero.h2h` / `Run.evaluate` at the same settings (eval sims,
+  seat order, the deal shared by a pair); the worker's gate checks native rows against the Python
+  path running the same ONNX graphs, byte for byte.
+
 ### 5.1 Fuzz results
 Modes are tools/fuzz_farm.py's names or `<name>-games|-matches|-events`; check a mode against a
 build with `mtgz-worker fuzz-check --mode M --env K=V` before creating a campaign. The **agent**
@@ -467,6 +499,9 @@ Agent exit codes: 0 the user quit, 75 switch to `state\pending`, 76 hand over to
 `ZeroFarm.exe` (rev 3), anything else a crash (restart with backoff, 3 in 10 min → rollback).
 
 ## Changes
+- v1 rev 5 (2026-11-12): evaluation and head-to-heads (section 5.2): `checkpoints` on eval leases,
+  eval batches name `checkpoints`, seats (`net`/`bot`), whole paired leases, `models` in the job
+  line, per-gen `selftest`, `evals` result files and their row format.
 - v1 (2026-11-11): initial.
 - v1 rev 2 (2026-11-11, from building the coordinator): half-open id ranges spelled out; result
   uploads carry `x-ids` (and `x-gen`) and answer with credit counts, first copy wins; late uploads
