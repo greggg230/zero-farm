@@ -51,7 +51,8 @@ Uploads: results, a few KB per game or one small file per fuzz job. A busy PC up
 each other, for example this week's network against an older one, to measure which is stronger.
 Zero Farm downloads every network file the job names (about 13 MB each, plus a small reference
 file the job uses to check that the network computes correctly on your PC), checks each file's
-SHA-256 against the farm's, and keeps them in its cache under the 3 GB cap, so a later job with the
+size and SHA-256 against the job's signed definition (from 0.2.5; before, against the farm's), and
+keeps them in its cache under the 3 GB cap, so a later job with the
 same networks downloads nothing. The job program first self-tests every network, then plays the
 games on the CPU at the lowest priority, like any other job. What goes back is one small row per
 game: which network played which side, who won, by how much and in how many rounds, a few hundred
@@ -158,11 +159,23 @@ Privacy rules:
   file before anything runs (and again before every start), and refuses unknown keys, extra files
   and edited manifests.
 - **The secret key never leaves Gregg's PC** (stored DPAPI-encrypted); it is not on Cloudflare or
-  GitHub. The coordinator only hands out download locations and hashes, so a compromised server
-  can waste your idle time but can't run its own code on your PC. A passphrase-protected backup of
-  the key is kept in a password manager (`farm-release export-key`): with it, a lost desktop
-  doesn't strand anyone's install; without it, every friend would have to reinstall from the farm
-  page, because installed copies trust only this key.
+  GitHub. A passphrase-protected backup of the key is kept in a password manager
+  (`farm-release export-key`): with it, a lost desktop doesn't strand anyone's install; without
+  it, every friend would have to reinstall from the farm page, because installed copies trust only
+  this key.
+- **The job instructions come from signed definitions** (from 0.2.5). What a job may make your PC
+  download and run (which job programs, which network files with their exact sizes and SHA-256,
+  and the exact job settings) is fixed by a *definition* that Gregg signs on his PC with a second
+  key, the **data key**, which can sign nothing else. Zero Farm checks the signature, that the
+  definition hasn't expired and isn't older than one it has already seen, and builds the job
+  program's instructions only from it, plus a few numbers the farm fills in per job (which games or
+  seeds). The server (the coordinator) holds neither key, so a compromised server can withhold work
+  or waste your idle time, but can't choose what your PC runs or which files the job program reads
+  ([PROTOCOL.md](PROTOCOL.md) section 7). A job that fails any check is refused and reported, and
+  Zero Farm waits before asking for work again.
+- **A "removed from the farm" message** only follows the farm server's own answer. An error page
+  from something between your PC and the farm (a firewall, a proxy, Cloudflare's own protection) is
+  treated like a network problem: Zero Farm keeps its sign-in and tries again later.
 - **The installer isn't Authenticode-signed yet** (alpha), so Windows SmartScreen says "Windows
   protected your PC" (More info → Run anyway). Code signing is planned before more friends join.
 
@@ -171,6 +184,14 @@ key id `1B9342EFFB546500`:
 
 ```
 RWQAZVT770KTG1hmXk6yJ5i9pF1v5Q4lNLQ9C3fOUo8ynWWfamzJ2LpS
+```
+
+The data public key (definitions only; in
+[`agent/common/trusted_data_keys.txt`](agent/common/trusted_data_keys.txt)), key id
+`1FDB907D9FF199C8`:
+
+```
+RWTImfGffZDbH0xWVxO/H563BYqds0G+D+hJLn79XEo9xU3sbl6lLp9D
 ```
 
 ### Verify a download yourself
@@ -227,8 +248,8 @@ cargo build --release -p farm-agent -p zerofarm-launcher
 cargo test --workspace --all-features -- --test-threads=2
 ```
 
-A build from source trusts exactly the official release key, so it runs only workers and updates
-Gregg signed. Details, the test suites and the release flow: [`agent/README.md`](agent/README.md).
+A build from source trusts exactly the official release and data keys, so it runs only workers,
+jobs and updates Gregg signed. Details, the test suites and the release flow: [`agent/README.md`](agent/README.md).
 
 **Coordinator** (Node.js 22 and npm; tests run in a local Cloudflare runtime, no account needed):
 

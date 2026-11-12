@@ -147,7 +147,7 @@ pub fn providers() -> Vec<String> {
 pub fn detect(root: &std::path::Path) -> Profile {
     let (cores, threads, perf, eff) = cores();
     let (_, total) = crate::signals::memory_mb();
-    let nvml = nvml_wrapper::Nvml::init().ok();
+    let nvml = crate::signals::load_nvml().ok();
     // Rounded to 10 GB so the profile digest doesn't change with every download.
     let free_mb = crate::util::disk_free_bytes(root).map(|b| (b >> 20) / 10240 * 10240).unwrap_or(0);
     let avail = crate::availability::load(&zerofarm_common::layout::Layout::new(root)).means(&crate::util::local_now().0);

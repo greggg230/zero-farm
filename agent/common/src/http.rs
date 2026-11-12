@@ -2,6 +2,11 @@
 //! JSON bodies, bearer auth, `x-farm-agent` / `x-farm-aw` headers, error bodies
 //! `{"error", "message"}`, and retries of 5xx / network errors / 429 with exponential backoff
 //! (1 s → 5 min, jitter) while 4xx are never retried.
+//!
+//! A 401/403 counts as the coordinator's only when the answer carries
+//! `x-zerofarm-coordinator: 1`: anything else (a Cloudflare WAF rule, a proxy, a captive portal)
+//! is treated like a network error and retried with backoff, never as "this PC was removed"
+//! (security review M1).
 
 use crate::protocol::{headers, ApiError};
 use serde::de::DeserializeOwned;
@@ -21,8 +26,9 @@ const MAX_JSON_BYTES: u64 = 8 << 20;
 pub enum CallError {
     /// Could not talk to the server (DNS, connect, TLS, timeout, reset).
     Network(String),
-    /// The server answered with a 4xx/5xx.
-    Http { status: u16, code: String, message: String, retry_after: Option<u64>, body: Option<Value> },
+    /// The server answered with a 4xx/5xx. `coordinator`: the answer carried
+    /// `x-zerofarm-coordinator: 1` (the coordinator made it, not something in front of it).
+    Http { status: u16, code: String, message: String, retry_after: Option<u64>, body: Option<Value>, coordinator: bool },
     /// The answer could not be parsed.
     Decode(String),
     /// Downloaded bytes did not match the expected size or sha256.
@@ -44,17 +50,24 @@ impl CallError {
             _ => None,
         }
     }
-    /// PROTOCOL 1: retry 5xx and network errors; never retry 4xx except 429.
+    /// PROTOCOL 1: retry 5xx and network errors; never retry 4xx except 429. A 401/403 the
+    /// coordinator didn't mark as its own (a WAF or proxy answered) is a network error too.
     pub fn is_retryable(&self) -> bool {
         match self {
             CallError::Network(_) | CallError::Integrity(_) => true,
-            CallError::Http { status, .. } => *status >= 500 || *status == 429,
+            CallError::Http { status, coordinator, .. } => *status >= 500 || *status == 429 || (matches!(status, 401 | 403) && !coordinator),
             CallError::Decode(_) | CallError::Stopped => false,
         }
     }
-    /// The token is no longer accepted (revoked machine or unknown token).
-    pub fn is_auth(&self) -> bool {
-        matches!(self, CallError::Http { status: 401 | 403, .. })
+    /// The coordinator itself says this machine was revoked (`revoked`, marked with
+    /// `x-zerofarm-coordinator: 1`): the only answer that makes an agent forget its enrollment.
+    pub fn is_revoked(&self) -> bool {
+        matches!(self, CallError::Http { coordinator: true, code, .. } if code == "revoked")
+    }
+    /// The coordinator itself refuses the token (`unauthorized`, marked): the agent keeps the
+    /// token, backs off and tells the friend it can't sign in.
+    pub fn is_unauthorized(&self) -> bool {
+        matches!(self, CallError::Http { coordinator: true, code, .. } if code == "unauthorized")
     }
 }
 
@@ -186,6 +199,7 @@ impl Client {
     fn finish(&self, res: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<Vec<u8>, CallError> {
         let mut resp = res.map_err(net_err)?;
         let status = resp.status().as_u16();
+        let coordinator = coordinator_marked(&resp);
         let retry_after = resp
             .headers()
             .get("retry-after")
@@ -198,7 +212,7 @@ impl Client {
             }
             return Ok(body);
         }
-        Err(http_err(status, &body, retry_after))
+        Err(http_err(status, &body, retry_after, coordinator))
     }
 
     pub fn get_json<T: DeserializeOwned>(&self, path: &str) -> Result<T, CallError> {
@@ -222,6 +236,14 @@ impl Client {
             rb = rb.header(*k, *v);
         }
         let body = self.finish(rb.send(bytes))?;
+        serde_json::from_slice(&body).map_err(|e| CallError::Decode(e.to_string()))
+    }
+
+    /// PUT a JSON body; JSON answer (desktop API, e.g. `PUT /v1/admin/definition`).
+    pub fn put_json<B: Serialize, T: DeserializeOwned>(&self, path: &str, body: &B) -> Result<T, CallError> {
+        let bytes = serde_json::to_vec(body).map_err(|e| CallError::Decode(e.to_string()))?;
+        let rb = self.decorate(self.agent.put(&self.url(path))).header("content-type", "application/json");
+        let body = self.finish(rb.send(&bytes[..]))?;
         serde_json::from_slice(&body).map_err(|e| CallError::Decode(e.to_string()))
     }
 
@@ -296,8 +318,9 @@ impl Client {
                     return Err(CallError::Integrity("range not satisfiable; restarting".into()));
                 }
                 _ => {
+                    let coordinator = coordinator_marked(&resp);
                     let body = resp.body_mut().with_config().limit(64 * 1024).read_to_vec().unwrap_or_default();
-                    return Err(http_err(status, &body, None));
+                    return Err(http_err(status, &body, None, coordinator));
                 }
             };
             if let Some(h) = &self.on_success {
@@ -362,7 +385,12 @@ fn net_err(e: ureq::Error) -> CallError {
     CallError::Network(e.to_string())
 }
 
-fn http_err(status: u16, body: &[u8], retry_after: Option<u64>) -> CallError {
+/// The answer carries `x-zerofarm-coordinator: 1`: the coordinator made it.
+fn coordinator_marked(resp: &ureq::http::Response<ureq::Body>) -> bool {
+    resp.headers().get(headers::COORDINATOR).and_then(|v| v.to_str().ok()).is_some_and(|v| v.trim() == "1")
+}
+
+fn http_err(status: u16, body: &[u8], retry_after: Option<u64>, coordinator: bool) -> CallError {
     let parsed: Option<Value> = serde_json::from_slice(body).ok();
     let api: ApiError = parsed.clone().and_then(|v| serde_json::from_value(v).ok()).unwrap_or_default();
     CallError::Http {
@@ -371,6 +399,7 @@ fn http_err(status: u16, body: &[u8], retry_after: Option<u64>) -> CallError {
         message: if api.message.is_empty() { String::from_utf8_lossy(&body[..body.len().min(200)]).into_owned() } else { api.message },
         retry_after,
         body: parsed,
+        coordinator,
     }
 }
 
@@ -523,7 +552,15 @@ mod tests {
 
     #[test]
     fn retryability() {
-        let h = |s| CallError::Http { status: s, code: String::new(), message: String::new(), retry_after: None, body: None };
+        let e = |s, code: &str, coordinator| CallError::Http {
+            status: s,
+            code: code.into(),
+            message: String::new(),
+            retry_after: None,
+            body: None,
+            coordinator,
+        };
+        let h = |s| e(s, "", true);
         assert!(h(500).is_retryable());
         assert!(h(503).is_retryable());
         assert!(h(429).is_retryable());
@@ -531,6 +568,16 @@ mod tests {
         assert!(!h(409).is_retryable());
         assert!(!h(410).is_retryable());
         assert!(CallError::Network("x".into()).is_retryable());
-        assert!(h(401).is_auth());
+        // M1: only the coordinator's own `revoked` revokes; a WAF's 401/403 is a network error.
+        assert!(e(403, "revoked", true).is_revoked());
+        assert!(!e(403, "revoked", true).is_retryable());
+        assert!(!e(403, "revoked", false).is_revoked());
+        assert!(e(403, "revoked", false).is_retryable());
+        assert!(e(403, "http_403", false).is_retryable());
+        assert!(e(401, "http_401", false).is_retryable());
+        assert!(e(401, "unauthorized", true).is_unauthorized());
+        assert!(!e(401, "unauthorized", true).is_revoked());
+        assert!(!e(401, "unauthorized", true).is_retryable());
+        assert!(!e(401, "unauthorized", false).is_unauthorized());
     }
 }

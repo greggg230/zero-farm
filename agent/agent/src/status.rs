@@ -18,12 +18,17 @@ pub enum Phase {
     Updating,
     Offline,
     Revoked,
+    /// The coordinator refuses this PC's token (`unauthorized`); the token is kept and retried.
+    SignInFailed,
     /// Windows refuses to start the job program (Smart App Control and the like): waiting.
     Blocked,
 }
 
 /// What the friend reads when Windows blocks the job program (tray menu and balloon).
 pub const BLOCKED_MESSAGE: &str = "Windows is blocking Zero Farm's job program (Smart App Control). Zero Farm can't work on this PC until its programs are code-signed. Nothing is wrong with your PC.";
+
+/// What the friend reads when the farm refuses this PC's token (not a revocation).
+pub const SIGN_IN_MESSAGE: &str = "This PC can't sign in to the farm; ask Gregg.";
 
 #[derive(Clone, Debug, Default)]
 pub struct Status {
@@ -52,6 +57,7 @@ impl Status {
             Phase::Updating => "Updating…".to_string(),
             Phase::Offline => "Can't reach the farm right now; will retry".to_string(),
             Phase::Revoked => "This PC was removed from the farm".to_string(),
+            Phase::SignInFailed => SIGN_IN_MESSAGE.to_string(),
             Phase::Blocked => "Windows is blocking Zero Farm's job program (Smart App Control)".to_string(),
         };
         s.chars().take(120).collect()

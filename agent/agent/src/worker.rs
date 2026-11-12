@@ -150,7 +150,14 @@ impl WorkerProc {
             BELOW_NORMAL_PRIORITY_CLASS, CREATE_NO_WINDOW, CREATE_SUSPENDED, IDLE_PRIORITY_CLASS,
         };
         let job = make_job(opts.mem_limit_mb)?;
-        let prio = if opts.cpu_job { IDLE_PRIORITY_CLASS } else { BELOW_NORMAL_PRIORITY_CLASS };
+        let normal_for_tests = crate::test_worker_normal_priority();
+        let prio = if normal_for_tests {
+            windows_sys::Win32::System::Threading::NORMAL_PRIORITY_CLASS
+        } else if opts.cpu_job {
+            IDLE_PRIORITY_CLASS
+        } else {
+            BELOW_NORMAL_PRIORITY_CLASS
+        };
         let mut cmd = Command::new(opts.exe);
         if let Some(rt) = opts.runtime_dir {
             let path = std::env::var_os("PATH").unwrap_or_default();
@@ -174,7 +181,7 @@ impl WorkerProc {
             let _ = child.kill();
             return Err(e);
         }
-        if opts.cpu_job && !set_eco_qos(h) {
+        if opts.cpu_job && !normal_for_tests && !set_eco_qos(h) {
             log::debug!("EcoQoS not available on this Windows version");
         }
         let pid = child.id();

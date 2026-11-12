@@ -57,7 +57,8 @@ pub enum EngineExit {
     Quit,
     /// A verified new version is in `versions\<v>\` and `state\pending` names it: exit 75.
     Update(String),
-    /// The coordinator no longer accepts our token.
+    /// The coordinator itself said this machine was revoked (`revoked`, marked with
+    /// `x-zerofarm-coordinator: 1`): the enrollment is forgotten.
     Revoked,
     /// A newer `ZeroFarm.exe` is in place (`state\launcher-swap`): exit 76 so the launcher hands
     /// over to it.
@@ -93,6 +94,9 @@ pub struct Engine {
     pub avail: crate::availability::Tracker,
     quit_event: Option<zerofarm_common::names::QuitEvent>,
     backoff: Backoff,
+    /// The coordinator refuses the token (`unauthorized`): 1 min doubling to 1 h between tries,
+    /// the token kept (security review M1).
+    auth_backoff: Backoff,
     games_unsaved: u64,
     games_saved_at: Instant,
     /// The wait after a worker could not start (startfail.rs; persisted).
@@ -150,6 +154,7 @@ impl Engine {
             launcher_checked: false,
             avail,
             backoff: Backoff::default(),
+            auth_backoff: Backoff::new(Duration::from_secs(60), Duration::from_secs(3600)),
             games_unsaved: 0,
             games_saved_at: Instant::now(),
             start_backoff: StartBackoff::load(&cfg.layout),
@@ -415,7 +420,11 @@ impl Engine {
                 self.control.sleep(self.cfg.timings.idle_poll);
                 continue;
             }
-            match self.request_lease(&d) {
+            let answer = self.request_lease(&d);
+            if answer.is_ok() {
+                self.auth_backoff.reset();
+            }
+            match answer {
                 Ok(Answer::Lease(l)) => {
                     self.backoff.reset();
                     match self.run_lease(*l) {
@@ -449,9 +458,18 @@ impl Engine {
                         Ok(()) => {}
                     }
                 }
-                Err(e) if e.is_auth() => {
-                    log::error!("lease refused: {e}");
+                Err(e) if e.is_revoked() => {
+                    log::error!("the coordinator says this machine was revoked: {e}");
                     return EngineExit::Revoked;
+                }
+                // The coordinator itself refuses the token: keep it (a coordinator bug or a
+                // restore can fix that), say so in the tray and try again later.
+                Err(e) if e.is_unauthorized() => {
+                    let d = self.auth_backoff.next_delay();
+                    log::error!("the coordinator doesn't accept this PC's token ({e}); keeping it, trying again in {d:?}");
+                    self.set_status(Phase::SignInFailed, "", None);
+                    status::set(&self.status, |s| s.last_error = Some(e.to_string()));
+                    self.control.sleep(d);
                 }
                 Err(e) => {
                     let d = self.backoff.delay_for(&e);
@@ -465,16 +483,24 @@ impl Engine {
     }
 }
 
-/// `POST /v1/crash`. A coordinator before rev 5 refuses kind `blocked` (400): it then goes as a
-/// plain `crash`, the policy error in its message.
+/// `POST /v1/crash`, with the user name and profile path redacted from the message and the
+/// backtrace (worker stderr carries paths; security review M5). A coordinator that doesn't know a
+/// newer kind (`blocked` before rev 5, `definition` before rev 6) refuses it with 400: it then
+/// goes as a plain `crash`, the kind in its message.
 pub fn send_crash(client: &Client, c: &CrashReq) -> Result<(), CallError> {
-    match client.post_json::<_, Value>("/v1/crash", c) {
+    let mut c = c.clone();
+    c.message = zerofarm_common::redact::redact(&c.message).into_owned();
+    c.backtrace = c.backtrace.map(|b| zerofarm_common::redact::redact(&b).into_owned());
+    match client.post_json::<_, Value>("/v1/crash", &c) {
         Ok(_) => Ok(()),
-        Err(CallError::Http { status: 400, .. }) if c.kind == "blocked" => {
+        Err(CallError::Http { status: 400, .. }) if !matches!(c.kind.as_str(), "panic" | "crash" | "agent") => {
             let mut plain = c.clone();
             plain.kind = "crash".into();
             plain.os_error = None;
-            plain.message = format!("blocked by policy (os error {}): {}", c.os_error.unwrap_or(0), c.message);
+            plain.message = match c.kind.as_str() {
+                "blocked" => format!("blocked by policy (os error {}): {}", c.os_error.unwrap_or(0), c.message),
+                k => format!("{k}: {}", c.message),
+            };
             client.post_json::<_, Value>("/v1/crash", &plain).map(|_| ())
         }
         Err(e) => Err(e),
@@ -496,7 +522,7 @@ pub fn send_saved_crashes(client: &Client, layout: &zerofarm_common::layout::Lay
             Ok(()) => {
                 let _ = std::fs::remove_file(&p);
             }
-            Err(e) if e.is_retryable() || e.is_auth() => break,
+            Err(e) if e.is_retryable() || e.is_revoked() || e.is_unauthorized() => break,
             Err(e) => {
                 log::warn!("saved crash report refused ({e}); dropping it");
                 let _ = std::fs::remove_file(&p);

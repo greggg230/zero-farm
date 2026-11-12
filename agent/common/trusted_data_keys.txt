@@ -1,0 +1,10 @@
+# zero-farm data public keys, one per line (the base64 line of the minisign.pub that
+# `farm-release keygen --data` prints). Every agent build trusts exactly these keys plus any in the
+# build-time env var ZEROFARM_TRUSTED_DATA_KEYS (PROTOCOL 7).
+#
+# A data key signs definitions only (what a run or campaign may make a PC download and run); a
+# release key (trusted_keys.txt) signs manifests only. Each check accepts only its own list, and a
+# key may not be on both.
+#
+# The first zero-farm data key (key id 1FDB907D9FF199C8).
+RWTImfGffZDbH0xWVxO/H563BYqds0G+D+hJLn79XEo9xU3sbl6lLp9D

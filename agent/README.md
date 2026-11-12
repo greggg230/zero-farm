@@ -2,15 +2,15 @@
 
 The Windows app invited friends install so their idle PCs do jobs for zero-core runs (MTG Zero
 first), plus its launcher, its installer and the desktop's release tool. The wire contract is
-[`../PROTOCOL.md`](../PROTOCOL.md) (v1 rev 5); the reasons are in
+[`../PROTOCOL.md`](../PROTOCOL.md) (v1 rev 6); the reasons are in
 [`../DESIGN.md`](../DESIGN.md) sections 2.2, 3, 4 and 5.
 
 | Crate | Output | What it is |
 |---|---|---|
-| `common` | lib | protocol types, `manifest/1` + minisign verification, trusted keys, hashing, HTTP client (ureq + rustls/ring, no OpenSSL), DPAPI, install layout and state files, named mutex/quit event, rotating log, setup payload format, minisign signing (feature `sign`), the round "Z" icon and Windows resources (`icon.rs`, `winres.rs`, also used by the build scripts) |
+| `common` | lib | protocol types, `manifest/1` + `definition/1` + minisign verification, trusted release and data keys, log redaction, hashing, HTTP client (ureq + rustls/ring, no OpenSSL), DPAPI, install layout and state files, named mutex/quit event, rotating log, setup payload format, minisign signing (feature `sign`), the round "Z" icon and Windows resources (`icon.rs`, `winres.rs`, also used by the build scripts) |
 | `launcher` | `ZeroFarm.exe`, `ZeroFarmSetup.exe` | PROTOCOL 6 launcher (no console, depends only on `common` without HTTP; hands over to a newer launcher); the single-file installer |
 | `agent` | `farm-agent.exe` (+ lib) | tray app: enrollment, idle policy, leases, verified downloads, worker control, uploads, self-update, install/uninstall |
-| `release` | `farm-release.exe` | desktop tool: keygen, key backup (export-key / import-key), sign, verify, publish, release-agent, installer build, GitHub releases (through `gh`) |
+| `release` | `farm-release.exe` | desktop tool: keygen (release and data keys), key backup (export-key / import-key), sign, verify, publish, release-agent, installer build, GitHub releases (through `gh`), define (signed definitions) |
 | `fakeworker` | `fakeworker.exe`, `fakeagent.exe`, `fakelauncher.exe`, `fakegh.exe` | test binaries: an aw/1 worker with scripted behaviours (self-play, fuzz and eval: per-network self-tests, eval rows), scripted stand-ins for the agent, for a new launcher and for the GitHub CLI |
 | `mockcoord` | lib | in-process mock coordinator (PROTOCOL rev 2) and a test kit (dev-dependency only) |
 
@@ -32,12 +32,21 @@ compressed with `miniz_oxide`) and pass it to the MSVC linker, so no `rc.exe` is
 Agents compare launcher versions by this VERSIONINFO: **bump `launcher/Cargo.toml`'s version
 whenever the launcher changes** (an installed launcher is only ever replaced by a newer one).
 
-**Trusted release keys are compiled in**: `common/trusted_keys.txt` (one minisign public key per
-line) plus the build-time variable `ZEROFARM_TRUSTED_KEYS`. It holds the release key (key id
-1B9342EFFB546500). A build without a trusted key refuses to run any worker or update (the launcher
-exits, the agent logs it), and `farm-release release-agent` refuses to sign an agent that does not
-trust the signing key. A build from this source trusts exactly the official key, so it runs only
-workers and updates the owner signed.
+**Trusted keys are compiled in**, in two separate lists; each check accepts only its own list, and
+a key on both fails the build:
+
+- release keys (manifests: worker builds, runtime packs, agent updates): `common/trusted_keys.txt`
+  (one minisign public key per line) plus the build-time variable `ZEROFARM_TRUSTED_KEYS`. It holds
+  the release key (key id 1B9342EFFB546500);
+- data keys (definitions, PROTOCOL 7): `common/trusted_data_keys.txt` plus the build-time variable
+  `ZEROFARM_TRUSTED_DATA_KEYS`. It holds the data key (key id 1FDB907D9FF199C8).
+
+A build without a release key refuses to run any worker or update (the launcher exits, the agent
+logs it); without a data key it can verify no definition. `farm-release release-agent` refuses to
+sign an agent (or package a launcher) whose trusted keys are not exactly the two files' (a stray
+`ZEROFARM_TRUSTED_KEYS` at build time would otherwise ship an extra root of trust), or that does not
+trust the signing key. A build from this source trusts exactly the official keys, so it runs only
+workers, jobs and updates the owner signed.
 
 ## Test
 
@@ -49,9 +58,11 @@ Run it on the whole workspace in debug: the integration tests start the real `Ze
 `farm-agent.exe`, `fakeworker.exe` and `fakeagent.exe` from the target dir, and those are built
 because each package has integration tests. Debug builds also honour these test-only variables
 (compiled out of release builds; `release-agent` refuses a binary that contains their names):
-`ZEROFARM_TEST_TRUSTED_KEYS` (extra trusted keys, so tests sign with temporary keys),
-`ZEROFARM_TEST_HEADLESS` (no tray), `ZEROFARM_TEST_HEALTHY_TIMEOUT_S`,
-`ZEROFARM_TEST_TAKEOVER_CONFIRM_S`, `ZEROFARM_TEST_HANDOVER_S`, `ZEROFARM_TEST_COORDINATOR`.
+`ZEROFARM_TEST_TRUSTED_KEYS` and `ZEROFARM_TEST_TRUSTED_DATA_KEYS` (extra trusted release / data
+keys, so tests sign with temporary keys), `ZEROFARM_TEST_HEADLESS` (no tray),
+`ZEROFARM_TEST_HEALTHY_TIMEOUT_S`, `ZEROFARM_TEST_TAKEOVER_CONFIRM_S`, `ZEROFARM_TEST_HANDOVER_S`,
+`ZEROFARM_TEST_COORDINATOR`, `ZEROFARM_TEST_WORKER_PRIORITY=normal` (workers at normal priority
+instead of idle; the in-process test harness sets it).
 The in-process tests script a worker that Windows refuses to start through
 `AgentConfig::test_spawn_error` (honoured by debug builds only; `farm-agent.exe` sets None).
 
@@ -60,13 +71,14 @@ key, uses the CPU (the fake worker sleeps) or reaches the network beyond its own
 Install tests use a temp root, a temp shortcut folder and the registry name
 `ZeroFarmTest-<pid>-<n>`, removed by a guard even when an assertion fails.
 
-157 tests (+1 ignored), about 3 minutes on an otherwise idle PC:
+184 tests (+1 ignored), about 3 minutes on an otherwise idle PC:
 
 | Suite | Tests | Covers |
 |---|---|---|
-| `common` unit + `manifest_verify` | 23 + 9 | manifest rules and verification: tampered file, size change, missing/extra file, edited manifest, bad signature, unknown key, wrong trusted comment, legacy signatures, key rotation; minisign format; paths; DPAPI; backoff; canonical digest; rotating log; payload format; the round Z; VERSIONINFO write/read/patch and `.res` layout; launcher leftovers |
-| `agent` unit | 30 | idle policy (pure function over simulated signals), settings, cache LRU, results store, ranges, update cleanup, invite codes, panic sites, availability (dates, sample-and-hold with gaps, 7-day means); start failures (policy error codes, the 15 min → 24 h and 1 min → 1 h waits and their file, one `blocked` report per build per day); the tray window procedure re-entered while its state is busy (skipped, no panic) and a panic inside it (caught, reported as `agent`, the tray keeps working); the panic guard |
-| `agent/tests/lifecycle` | 35 | whole leases with the real fakeworker and the mock: download + verify, run, yield/suspend/resume, give-back after slack, upload retries after injected 503s, restart with pending results, orphaned leases, cancel, crash, hang, fatal error, slow yield, no hello, fuzz failures + summary, checkpoint switch, expiry, coordinator give-back, tampered / unknown-key / bad-signature builds, disk cap, profile resend, revoked token, quit event, launcher events, rev 2 (stale chunks, `done` missing, `upload_diag`, repeated checkpoints, duplicate ids, `x-farm-agent`); rev 3: starvation past slack gives back, brief starvation counted and kept, pause + starvation add up, availability recorded, the worker job's UI restrictions |
+| `common` unit + `manifest_verify` | 33 + 9 | manifest rules and verification: tampered file, size change, missing/extra file, edited manifest, bad signature, unknown key, wrong trusted comment, legacy signatures, key rotation; minisign format; paths; DPAPI; backoff; canonical digest; rotating log; payload format; the round Z; VERSIONINFO write/read/patch and `.res` layout; launcher leftovers; `definition/1` (a good one, every refusal: unknown fields, ids, builds, sizes, templates with foreign keys or paths, seats); path-like strings; per-lease fields (ranges, whole pairs, kind); redaction (profile paths in every spelling, short paths, names as words only, JSON); only a coordinator-marked `revoked` revokes, a WAF's 401/403 is retried |
+| `agent` unit | 34 | idle policy (pure function over simulated signals), settings, cache LRU, results store, ranges, update cleanup, invite codes, panic sites, availability (dates, sample-and-hold with gaps, 7-day means); start failures (policy error codes, the 15 min → 24 h and 1 min → 1 h waits and their file, one `blocked` report per build per day, other reports once a day per reason); the tray window procedure re-entered while its state is busy (skipped, no panic) and a panic inside it (caught, reported as `agent`, the tray keeps working); the panic guard; the legacy allowlist (only the kind's keys, paths and kind mismatches refused, eval checkpoints = the seats' networks); definition versions never go back |
+| `agent/tests/lifecycle` | 37 | whole leases with the real fakeworker and the mock: download + verify, run, yield/suspend/resume, give-back after slack, upload retries after injected 503s, restart with pending results, orphaned leases, cancel, crash, hang, fatal error, slow yield, no hello, fuzz failures + summary, checkpoint switch, expiry, coordinator give-back, tampered / unknown-key / bad-signature builds, disk cap, profile resend, revoked token (only the coordinator's own `revoked`), an unknown token kept (tray "can't sign in", one try then a wait), a WAF's 403/401 HTML on lease requests, uploads and beats retried as network errors, quit event, launcher events, rev 2 (stale chunks, `done` missing, `upload_diag`, repeated checkpoints, duplicate ids, `x-farm-agent`); rev 3: starvation past slack gives back, brief starvation counted and kept, pause + starvation add up, availability recorded, the worker job's UI restrictions |
+| `agent/tests/definitions` | 5 | signed definitions (PROTOCOL 7): the job line is the signed template + per-lease fields + the agent's own fields only (a coordinator's `prefix`, `models`, `out_dir`, `runtime_dir`, `threads`, settings dropped or overwritten), the definition remembered; an eval definition's seats and networks (the coordinator's seats ignored); a mid-lease network the definition doesn't name never fetched; refusals (`done` with `refused`, a `definition` report once per reason, a wait): signed with the release key, tampered bytes, an older version, another run's definition, expired, a build or runtime it doesn't name, a checkpoint hash, a job kind it has no template for, per-lease fields out of range; a legacy lease's allowlist (the review's UNC `models` and `prefix` never reach the worker; a path or a kind mismatch refuses it); a declared checkpoint size over the disk cap never downloaded |
 | `agent/tests/eval` | 3 | eval leases (PROTOCOL 5.2) with the fakeworker's eval mode: two networks and their references downloaded, verified and cached; the job line's `models` (absolute paths, hashes, `model` null); every game uploaded with `x-ids` and no `x-gen`, files that split a pair, seat order per game; per-gen `selftest` in Stats; cached checkpoints in the next lease request; a tampered checkpoint refused before any worker starts, then a wait (no lease storm); a network failing its self-test reported once, with every gen's result |
 | `agent/tests/blocked` | 5 | a worker Windows refuses to start (scripted os error 4551): one `blocked` report with `os_error` and the build, the lease given back, no lease storm (one lease request while the 15 min wait runs), the tray status and balloon, the wait kept across a restart; shortened waits growing ×4 with the same build reported once; an older coordinator gets it as a `crash`; any other start failure: a `crash` report and a 1 min wait; a worker that starts ends the wait |
 | `agent/tests/update` | 6 | self-update in process: download + verify + `state\pending` + exit 75; `{"update"}` answer; tampered update refused; rolled-back version not retried; a required update that can't happen doesn't spin; older/equal ignored |
@@ -74,16 +86,18 @@ Install tests use a temp root, a temp shortcut folder and the registry name
 | `agent/tests/launcher_update` | 7 | the launcher updating itself. In process: swap + exit 76 + `launcher-swap`; with a pre-0.2 launcher, swap only (next logon); selftest failure never installs and isn't retried; `plan` (current + healthy only, verified package, never a downgrade or same version, no VERSIONINFO = 0.0.0, bad for 24 h). Real processes: the real launcher hands over to a newer real launcher (old exits 0, new runs the agent, `.old` deleted); fake new launchers that exit at once or never confirm are killed and rolled back, reported, not retried, `.bad` deleted |
 | `agent/tests/install` | 5 | install/uninstall with a test registry name (Run value, Uninstall entry, shortcut, files, self-deleting stage 2), install starting the launcher and uninstall stopping it, tampered package refused, upgrade keeps previous / no downgrade, path normalisation |
 | `agent/tests/enroll` | 2 | invite → DPAPI token, single use, 426 keeps the invite and shows the download link |
-| `agent/tests/diag` | 1 | "Send diagnostics": logs body (header, tail caps), `x-farm-diag: user`, the once-an-hour 429 message, unrequested uploads without the header still refused |
+| `agent/tests/diag` | 2 | "Send diagnostics": logs body (header, tail caps), `x-farm-diag: user`, the once-an-hour 429 message, unrequested uploads without the header still refused; no user name or profile path in a log line as written, in an uploaded logs body (old logs too, JSON-escaped and `/` spellings), a crash report or Stats |
 | `agent/tests/real_coordinator` | 1 (ignored) | the agent against `wrangler dev` of `../coordinator`: run with checkpoint + fuzz campaign, every id credited once, the failure recorded (see the file header to run it) |
 | `launcher/tests/swap_rollback` | 10 | swap on exit 75, tampered pending refused, rollback when healthy never appears, rollback after 3 crashes, crash loop without a previous version, single instance, untrusted current refused, quit on exit 0, leftover launcher files deleted at start, `selftest` |
-| `release/tests/release` | 15 | keygen (DPAPI, never overwrites), sign + minisign-compatible verify + tamper detection, incomplete manifests refused, publish order and admin auth, foreign builds refused, release-agent publish + latest, refuses agents that don't trust the key, refuses debug binaries; GitHub releases through `fakegh`: release-agent `--github` (prerelease for canary, the seven assets, `SHA256SUMS` hashes and its minisign signature, then the coordinator release with `github_url`, nothing in R2 `setup/`), a failed `gh` leaves the channel alone, `github-release` of an existing package (stable, `--url`, re-run = view + upload `--clobber` + edit), an installer of another package refused; key backup: export then import gives the same key (the `minisign` crate decrypts the export; signatures after import verify with the original key), wrong / mismatched / empty passphrases refused, never overwrites, no passphrase on the command line |
+| `release/tests/release` | 20 | keygen (DPAPI, never overwrites; `--data` says where the key goes), exact trusted-key sets (`keys` of farm-agent and ZeroFarm; a stray, missing or swapped key refused), define (validates, signs the bytes as they are, minisign-verifiable, trusted comment, uploads then registers, `.minisig` next to the file, `--url` needs `--publish`; refuses the release key, an untrusted data key and bad definitions; a data key never signs a build), sign + minisign-compatible verify + tamper detection, incomplete manifests refused, publish order and admin auth, foreign builds refused, release-agent publish + latest, refuses agents that don't trust the key, refuses debug binaries; GitHub releases through `fakegh`: release-agent `--github` (prerelease for canary, the seven assets, `SHA256SUMS` hashes and its minisign signature, then the coordinator release with `github_url`, nothing in R2 `setup/`), a failed `gh` leaves the channel alone, `github-release` of an existing package (stable, `--url`, re-run = view + upload `--clobber` + edit), an installer of another package refused; key backup: export then import gives the same key (the `minisign` crate decrypts the export; signatures after import verify with the original key), wrong / mismatched / empty passphrases refused, never overwrites, no passphrase on the command line |
 | `fakeworker` | 1 + 3 | the fake worker speaks aw/1 |
 
-Timing-based tests tolerate a loaded machine: the worker runs at idle priority, so deadlines
-pause while it is starved of CPU (see "Worker control"). A saturated PC (other builds or
-training at normal priority) can still starve the idle-priority fake worker for tens of seconds,
-and then a few `lifecycle` tests time out waiting for results; run them again on a quieter PC.
+Timing-based tests tolerate a loaded machine. The in-process suites (`lifecycle`, `blocked`,
+`eval`, `definitions`) run the fake worker at normal priority (`ZEROFARM_TEST_WORKER_PRIORITY`,
+set once by the harness), so other builds or training at normal priority can't starve it into
+timeouts as they could the idle-priority worker; and their waits on the mock coordinator's state
+wake on each request it answers (`MockCoord::wait`) instead of polling. Starvation itself is still
+tested, with simulated signals.
 
 ## Install flow (`farm-agent install`, run by ZeroFarmSetup.exe)
 
@@ -166,6 +180,26 @@ package, makes or updates the GitHub Release, and with `--url` publishes the bui
 `--github`, `release-agent` publishes for self-updates only and `/download` keeps pointing at the
 previous GitHub installer.
 
+Definitions (PROTOCOL 7; what a run or campaign may make PCs download and run). One time,
+a data key, which signs definitions only (the release key never does, and a data key never signs a
+build):
+```
+farm-release keygen --data --out %USERPROFILE%\.zero-farm\data.key
+```
+then add its public key to `agent/common/trusted_data_keys.txt` (not `trusted_keys.txt`) and
+release an agent. Then, for every new version of a run's or campaign's definition:
+```
+farm-release define eoe2-v7.json --key %USERPROFILE%\.zero-farm\data.key --publish --url https://farm.greggg230.com --token %ZEROFARM_ADMIN_TOKEN%
+```
+validates the file against `definition/1` (the job templates take only their kind's keys and no
+path-like strings), signs its bytes as they are (minisign, prehashed; trusted comment
+`definition=1 kind=<kind> id=<id> version=<version>`), refuses a key that isn't a trusted data key
+of this build, writes `eoe2-v7.json.minisig`, uploads both to `defs/<kind>/<id>/<version>/`
+(`PUT /v1/admin/artifact/...`) and registers it (`PUT /v1/admin/definition`). It prints one JSON
+line (`kind`, `id`, `version`, `key`, `sha256`, `signature`, `published`) and exits 0, else prints
+`error: ...` and exits 1; the trainer's and campaign tools call it, so this interface stays as
+it is. Without `--publish` it only signs.
+
 Worker builds and runtime packs:
 ```
 farm-release sign <dir> --kind worker --game mtg --engine-commit <sha> --core-commit <sha> [--profile fuzz] [--min-agent 0.2.0]
@@ -241,6 +275,24 @@ Signatures are minisign-compatible: `minisign -Vm <dir>\manifest.json -p release
   Launchers older than 0.2.0 (they don't set `ZEROFARM_LAUNCHER=2` and don't know exit 76) get
   the files swapped after the selftest and the new launcher at the next logon, without the
   takeover probation (only the canary test PC ran such a launcher).
+- **Definitions** (`jobplan.rs`, rev 6, PROTOCOL 7): before anything is downloaded, a lease's
+  definition (`defs/<kind>/<id>/<version>/definition.json` + `.minisig`, through `/v1/artifact`) is
+  verified against the trusted **data** keys, then checked against the lease: its run or
+  campaign, `expires`, a version no older than the highest seen for it (`state\definitions.json`),
+  the worker build (in `builds`) and runtime (equal to `runtime`), every checkpoint's sha256 (and
+  then, when downloading and before every start, its size), the job kind. The job line is the
+  definition's template plus only `gid_base` / `games` / `seed` (or `first` / `count`), range-checked
+  (whole pairs for a paired eval), plus the agent's own fields, which always overwrite (`op`,
+  `lease_id`, `kind`, `model`, `reference`, eval `models`, `threads`, `out_dir`, `runtime_dir`). A
+  lease that fails is refused: `done` with `refused: "definition"`, a `/v1/crash` of kind
+  `definition` once a day per definition and reason (a coordinator before rev 6 gets a `crash`),
+  and the start-failure wait (1 min doubling to 1 h). A mid-lease self-play checkpoint is taken
+  only if the definition names it. **Legacy leases** (no `definition`, coordinators before rev 6)
+  get a strict allowlist instead: the job's kind must be the lease's, only the kind's template keys
+  (`settings`; `settings`/`seats`/`paired`; `mode`/`env`/`announce_result`; diag `what`/`params`)
+  and per-lease fields are kept, everything else (`prefix`, `models`, ...) is dropped, and a string
+  that looks like a path (separators, `..`, a drive) refuses the lease. Room for a checkpoint
+  file is made before it downloads: its declared size, or 256 MB for a legacy one.
 - **Eval leases** (rev 5, PROTOCOL 5.2): every network in the lease's `checkpoints` (model and
   reference) is downloaded, checked against its sha256 and kept in the cache, none evicted while
   the lease runs, and re-checked before the worker starts; the job line gets `models` by gen
@@ -267,10 +319,23 @@ Signatures are minisign-compatible: `minisign -Vm <dir>\manifest.json -p release
   minute, and the app keeps running. (0.2.1 aborted with 0xC0000409 on tray clicks: "RefCell
   already borrowed" inside the window procedure.)
 - **Reports**: `/v1/crash` for worker panics/crashes/hangs (stderr tail), agent panics (sent at the
-  next start), caught tray panics, blocked workers, launcher rollbacks (agent and launcher) and
-  failed launcher selftests; reports that couldn't be sent wait in `state\crashes\` and go out
-  within a minute. Logs uploaded on `upload_diag` or "Send diagnostics". Logs:
-  `logs\agent.log`, `worker.log`, `launcher.log`, rotating, under 20 MB together.
+  next start), caught tray panics, blocked workers, refused definitions, launcher rollbacks (agent
+  and launcher) and failed launcher selftests; reports that couldn't be sent wait in
+  `state\crashes\` and go out within a minute. Logs uploaded on `upload_diag` or "Send
+  diagnostics". Logs: `logs\agent.log`, `worker.log`, `launcher.log`, rotating, under 20 MB
+  together.
+- **Privacy** (`common/src/redact.rs`): every log line is redacted as it is written (the Windows
+  user name becomes `<user>`, the user-profile path `%USERPROFILE%`, in its `\`, `/`, JSON-escaped
+  and 8.3 short spellings), and so is every upload that can carry a path: the logs body (also logs
+  written before 0.2.5), crash reports (message and worker stderr tail) and Stats (beats and
+  `done`).
+- **Sign-in** (security review M1): only a coordinator answer marked `x-zerofarm-coordinator: 1`
+  with `revoked` makes the agent forget its enrollment ("This PC was removed from the farm"). A
+  marked `unauthorized` keeps the token, says "This PC can't sign in to the farm; ask Gregg." in the
+  tray and tries again after 1 min doubling to 1 h. Any other 401/403 (a WAF or proxy in front of
+  the coordinator) is a network error, retried with backoff.
+- **NVML** is loaded only from System32 (`LoadLibraryExW` with `LOAD_LIBRARY_SEARCH_SYSTEM32`, then
+  by that full path), never by a bare name searched through the current directory and `PATH`.
 
 ## CLI
 
@@ -279,8 +344,8 @@ farm-agent run [--root DIR] [--headless] [--coordinator URL]     what the launch
 farm-agent dry-run [--root DIR] [--seconds N]                    log policy decisions only
 farm-agent install | uninstall [...]                             see "Install flow"
 farm-agent enroll --invite CODE [--name NAME]                    headless enrollment
-farm-agent profile | keys | version
-ZeroFarm.exe [uninstall ... | selftest | --takeover PID]
+farm-agent profile | keys | version                                keys: "release|data <id> <key>" lines
+ZeroFarm.exe [uninstall ... | selftest | keys | --takeover PID]
 ZeroFarmSetup.exe [install options]
 ```
 

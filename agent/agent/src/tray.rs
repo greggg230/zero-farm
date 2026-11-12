@@ -170,7 +170,7 @@ fn phase_color(p: Phase) -> u32 {
         Phase::Downloading | Phase::Updating => 0x1565C0,
         Phase::Waiting => 0x5C6BC0,
         Phase::Idle | Phase::Paused | Phase::Starting => 0x757575,
-        Phase::Offline | Phase::NotEnrolled | Phase::Blocked => 0xEF6C00,
+        Phase::Offline | Phase::NotEnrolled | Phase::Blocked | Phase::SignInFailed => 0xEF6C00,
         Phase::Revoked => 0xC62828,
     }
 }

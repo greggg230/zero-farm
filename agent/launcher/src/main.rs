@@ -24,6 +24,8 @@
 //! Apps & Features uninstall entry points here because the agent's path changes on update).
 //! `ZeroFarm.exe selftest` checks that this binary runs, trusts a key and verifies the current
 //! version (an agent runs it on a new launcher before putting it in place); exit 0 = good.
+//! `ZeroFarm.exe keys` prints the release keys it trusts (`release <key id> <public key>`).
+//! Its log lines are redacted (no Windows user name or profile path; security review M5).
 
 #![windows_subsystem = "windows"]
 
@@ -600,6 +602,13 @@ fn main() {
     match args.first().map(String::as_str) {
         Some("uninstall") => std::process::exit(forward_uninstall(&layout, &args[1..])),
         Some("selftest") => std::process::exit(selftest(&layout)),
+        // The release keys this build trusts (`farm-release release-agent` checks them).
+        Some("keys") => {
+            for k in TrustedKeys::compiled().keys() {
+                println!("release {} {}", k.key_id_hex(), k.b64);
+            }
+            std::process::exit(0)
+        }
         _ => {}
     }
     let takeover = args.iter().position(|a| a == "--takeover").and_then(|i| args.get(i + 1)).and_then(|p| p.parse::<u32>().ok());

@@ -8,6 +8,7 @@ pub mod cache;
 pub mod engine;
 pub mod enroll;
 pub mod install;
+pub mod jobplan;
 pub mod launcher_update;
 pub mod lease;
 pub mod logging;
@@ -113,7 +114,10 @@ pub struct AgentConfig {
     pub version: String,
     /// This agent's build id, when it runs from a signed version directory.
     pub build_id: Option<String>,
+    /// Release keys: manifests (worker builds, runtime packs, agent updates) only.
     pub keys: TrustedKeys,
+    /// Data keys: definitions (PROTOCOL 7) only. Each check accepts only its own list.
+    pub data_keys: TrustedKeys,
     pub timings: Timings,
     /// Job kinds this agent asks for.
     pub kinds: Vec<String>,
@@ -139,6 +143,20 @@ pub fn agent_identity(exe_dir: &Path) -> (String, Option<String>) {
         }
     }
     (env!("CARGO_PKG_VERSION").to_string(), None)
+}
+
+/// Tests only (debug builds; compiled out of release builds): workers run at normal priority
+/// instead of IDLE_PRIORITY_CLASS, so a PC saturated by other builds doesn't starve the fake
+/// worker of the timing-sensitive suites (lifecycle, blocked, eval) into timeouts.
+pub fn test_worker_normal_priority() -> bool {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var("ZEROFARM_TEST_WORKER_PRIORITY").is_ok_and(|v| v == "normal")
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        false
+    }
 }
 
 /// Debug builds only: an environment override used by tests that run the real binaries.

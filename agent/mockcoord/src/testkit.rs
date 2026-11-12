@@ -12,6 +12,8 @@ use zerofarm_common::manifest::Kind;
 use zerofarm_common::sign::{sign_dir, template, SigningKey};
 
 pub const TEST_KEYS_ENV: &str = "ZEROFARM_TEST_TRUSTED_KEYS";
+/// The debug-only variable adding trusted **data** keys (definitions, PROTOCOL 7).
+pub const TEST_DATA_KEYS_ENV: &str = "ZEROFARM_TEST_TRUSTED_DATA_KEYS";
 
 /// `target/debug` (or whichever profile the test binary was built in).
 pub fn target_dir() -> PathBuf {
@@ -121,4 +123,14 @@ pub fn test_reg_name() -> String {
     use std::sync::atomic::{AtomicU32, Ordering};
     static N: AtomicU32 = AtomicU32::new(0);
     format!("ZeroFarmTest-{}-{}", std::process::id(), N.fetch_add(1, Ordering::SeqCst))
+}
+
+/// Signs a `definition/1` value with a (data) key as `farm-release define` does: the bytes are
+/// the JSON as given (pretty-printed here), the signature minisign prehashed. Returns both.
+pub fn sign_definition(def: &serde_json::Value, key: &SigningKey) -> (Vec<u8>, String) {
+    let mut bytes = serde_json::to_vec_pretty(def).unwrap();
+    bytes.push(b'\n');
+    let tc = format!("definition=1 kind={} id={} version={}", def["kind"].as_str().unwrap_or(""), def["id"].as_str().unwrap_or(""), def["version"]);
+    let sig = key.sign(&bytes, &tc).unwrap();
+    (bytes, sig)
 }

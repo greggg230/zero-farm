@@ -2,7 +2,9 @@
 //! launcher.log), the panic hook that turns an agent panic into a `/v1/crash` report on the next
 //! start, the guard that keeps a panic in a window procedure from aborting the process, and log
 //! uploads: on request (`upload_diag`) and when the friend presses "Send diagnostics" in the tray
-//! (`x-farm-diag: user`, once an hour).
+//! (`x-farm-diag: user`, once an hour). Log lines are redacted as they are written (the rotating
+//! log does it) and the uploaded body again (logs from before 0.2.5): no Windows user name or
+//! user-profile path leaves the PC (security review M5).
 
 use std::cell::{Cell, RefCell};
 use std::sync::{Arc, Mutex};
@@ -149,20 +151,20 @@ pub fn install_panic_hook(layout: Layout, version: String, build_id: Option<Stri
 }
 
 /// The `logs` diagnostics body (PROTOCOL 3, `text/plain`): `header` (if any), then the agent,
-/// worker and launcher logs, each tail-capped at 4 MB (under 13 MB in all).
+/// worker and launcher logs, each tail-capped at 4 MB (under 13 MB in all), redacted.
 pub fn logs_body(layout: &Layout, header: &str) -> Vec<u8> {
-    let mut body = Vec::new();
+    let mut body = String::new();
     if !header.is_empty() {
-        body.extend_from_slice(format!("===== about =====\n{header}\n").as_bytes());
+        body.push_str(&format!("===== about =====\n{header}\n"));
     }
     for name in ["agent.log", "worker.log", "launcher.log"] {
         if let Ok(b) = std::fs::read(layout.logs().join(name)) {
             let start = b.len().saturating_sub(4 << 20);
-            body.extend_from_slice(format!("===== {name} =====\n").as_bytes());
-            body.extend_from_slice(&b[start..]);
+            body.push_str(&format!("===== {name} =====\n"));
+            body.push_str(&String::from_utf8_lossy(&b[start..]));
         }
     }
-    body
+    zerofarm_common::redact::redact(&body).into_owned().into_bytes()
 }
 
 /// `upload_diag` from a beat (PROTOCOL 3): only `logs` is supported — the current agent and
@@ -203,7 +205,8 @@ pub fn user_diag_message(r: &Result<String, CallError>) -> String {
             format!("Diagnostics were already sent in the last hour. You can send them again in {min} min.")
         }
         Err(CallError::Http { status: 413, .. }) => "The logs are too big to send.".into(),
-        Err(e) if e.is_auth() => "This PC is no longer part of the farm, so diagnostics can't be sent.".into(),
+        Err(e) if e.is_revoked() => "This PC is no longer part of the farm, so diagnostics can't be sent.".into(),
+        Err(e) if e.is_unauthorized() => crate::status::SIGN_IN_MESSAGE.into(),
         Err(e) => format!("Couldn't send diagnostics: {e}"),
     }
 }

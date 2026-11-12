@@ -124,6 +124,14 @@ pub struct CheckpointRef {
     pub reference_sha256: Option<String>,
 }
 
+/// rev 6 (PROTOCOL 7): where a lease's signed definition is (`defs/<kind>/<id>/<version>/
+/// definition.json`, signature next to it as `.minisig`) and the sha256 of its bytes.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct DefinitionRef {
+    pub key: String,
+    pub sha256: String,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Lease {
     pub lease_id: String,
@@ -144,6 +152,12 @@ pub struct Lease {
     /// rev 5 (eval, PROTOCOL 5.2): every network the job's seats name; `checkpoint` is null.
     #[serde(default)]
     pub checkpoints: Option<Vec<CheckpointRef>>,
+    /// rev 6 (PROTOCOL 7): the signed definition the job line is built from. Absent on legacy
+    /// leases (coordinators before rev 6).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<DefinitionRef>,
+    /// The per-lease fields (`gid_base`, `games`, `seed` / `first`, `count`); before rev 6 the
+    /// whole job. The agent never forwards anything else from it (PROTOCOL 7).
     pub job: Value,
 }
 
@@ -198,6 +212,10 @@ pub struct DoneReq {
     pub stats: Stats,
     pub given_back: bool,
     pub unfinished: Option<Value>,
+    /// rev 6: the agent refused the lease (`"definition"`: its definition or its job failed the
+    /// checks of PROTOCOL 7); nothing was run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -259,6 +277,9 @@ pub mod headers {
     /// `user` on `POST /v1/diag/{name}`: the friend pressed "Send diagnostics" (no request
     /// needed; once an hour, 20 MB).
     pub const DIAG: &str = "x-farm-diag";
+    /// `1` on every answer the coordinator itself makes (not a WAF or proxy in front of it). The
+    /// agent forgets its enrollment only on a coordinator-marked `revoked` (security review M1).
+    pub const COORDINATOR: &str = "x-zerofarm-coordinator";
 }
 
 #[cfg(test)]

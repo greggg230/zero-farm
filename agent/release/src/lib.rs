@@ -9,9 +9,15 @@
 //!   package, `SHA256SUMS` and its signature; the coordinator's `GET /download` redirects to the
 //!   installer there (`github_url`);
 //! * the key can be exported as a passphrase-encrypted minisign secret key file (a backup that
-//!   outlives this PC's DPAPI) and imported again on another PC.
+//!   outlives this PC's DPAPI) and imported again on another PC;
+//! * definitions (PROTOCOL 7) are signed with a separate **data key** (`keygen --data`, the same
+//!   key file format), never with the release key: `define` validates a `definition/1`, signs it,
+//!   and with `--publish` uploads it and registers it with the coordinator;
+//! * an agent is signed only when its trusted keys are exactly `common/trusted_keys.txt` and
+//!   `common/trusted_data_keys.txt` (no stray build-time key ships to friends).
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use zerofarm_common::http::{with_retry, Backoff, Client};
@@ -29,6 +35,8 @@ pub const TEST_MARKERS: &[&str] = &[
     "ZEROFARM_TEST_HEALTHY_TIMEOUT_S",
     "ZEROFARM_TEST_TAKEOVER_CONFIRM_S",
     "ZEROFARM_TEST_HANDOVER_S",
+    "ZEROFARM_TEST_TRUSTED_DATA_KEYS",
+    "ZEROFARM_TEST_WORKER_PRIORITY",
 ];
 
 #[derive(Serialize, Deserialize)]
@@ -181,6 +189,9 @@ fn is_full_sha(s: &str) -> bool {
 /// Builds the manifest for `dir` from `opts` (with the defaults and checks per kind), signs it.
 pub fn sign(dir: &Path, opts: &SignOpts, key: &SigningKey) -> Result<(String, Manifest), String> {
     let kind = opts.kind.ok_or("--kind worker|agent|runtime is required")?;
+    if TrustedKeys::compiled_data().contains_b64(&key.public_b64()) {
+        return Err(format!("key {} is a data key: it signs definitions only; builds are signed with the release key", key.key_id_hex()));
+    }
     // Re-signing: the old manifest/signature are not part of the file list anyway.
     let mut t = template(kind, "");
     match kind {
@@ -399,14 +410,20 @@ pub fn release_agent(opts: &ReleaseAgentOpts, key: &SigningKey) -> Result<Releas
     if semver_ok(&version).is_none() {
         return Err(format!("farm-agent reports version {version:?}"));
     }
-    let trusted = run_capture(&agent, &["keys"])?;
-    if !trusted.lines().any(|l| l.split_whitespace().nth(1) == Some(key.public_b64().as_str())) {
+    let agent_keys = parse_keys_output(&run_capture(&agent, &["keys"])?)?;
+    if !agent_keys.release.contains(&key.public_b64()) {
         return Err(format!(
             "this farm-agent.exe does not trust the signing key {} — it could never verify its own updates. \
-             Add the public key to common/trusted_keys.txt (or ZEROFARM_TRUSTED_KEYS) and rebuild.",
+             Add the public key to common/trusted_keys.txt and rebuild.",
             key.key_id_hex()
         ));
     }
+    // Exactly the keys of the source tree (security review L3): a stray ZEROFARM_TRUSTED_KEYS or
+    // ZEROFARM_TRUSTED_DATA_KEYS at build time would otherwise ship an extra root of trust.
+    let want = expected_keys(&opts.workspace, opts.allow_test_binaries)?;
+    check_key_set("farm-agent.exe", &agent_keys, &want)?;
+    let launcher_keys = parse_keys_output(&run_capture(&launcher, &["keys"])?)?;
+    check_key_set("ZeroFarm.exe", &launcher_keys, &KeySet { release: want.release.clone(), data: BTreeSet::new() })?;
     let out = opts.out.clone().unwrap_or_else(|| opts.workspace.join("dist").join(format!("agent-{version}")));
     if out.exists() {
         std::fs::remove_dir_all(&out).map_err(|e| e.to_string())?;
@@ -451,6 +468,65 @@ pub fn release_agent(opts: &ReleaseAgentOpts, key: &SigningKey) -> Result<Releas
     Ok(Released { version, build_id, dir: out, setup, github })
 }
 
+/// The trusted keys a binary reports with its `keys` command.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KeySet {
+    pub release: BTreeSet<String>,
+    pub data: BTreeSet<String>,
+}
+
+/// Parses `farm-agent keys` / `ZeroFarm.exe keys`: `release <id> <key>` and `data <id> <key>`
+/// lines (agents before 0.2.5 print `<id> <key>`, release keys only).
+pub fn parse_keys_output(out: &str) -> Result<KeySet, String> {
+    let mut k = KeySet::default();
+    for line in out.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        let f: Vec<&str> = line.split_whitespace().collect();
+        match f.as_slice() {
+            ["release", _, b64] | [_, b64] => k.release.insert(b64.to_string()),
+            ["data", _, b64] => k.data.insert(b64.to_string()),
+            _ => return Err(format!("unexpected line in the keys output: {line:?}")),
+        };
+    }
+    Ok(k)
+}
+
+/// The keys in a trusted-keys file (`#` comments, one key per line), as `build.rs` reads it.
+pub fn key_file_keys(path: &Path) -> Result<BTreeSet<String>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    Ok(text.lines().map(|l| l.split('#').next().unwrap_or("").trim()).filter(|l| !l.is_empty()).map(String::from).collect())
+}
+
+/// What a released binary must trust: `common/trusted_keys.txt` and `common/trusted_data_keys.txt`
+/// of `workspace`; with test binaries, plus the test keys of this process's environment.
+pub fn expected_keys(workspace: &Path, test_binaries: bool) -> Result<KeySet, String> {
+    let common = workspace.join("common");
+    let mut k = KeySet { release: key_file_keys(&common.join("trusted_keys.txt"))?, data: key_file_keys(&common.join("trusted_data_keys.txt"))? };
+    if test_binaries {
+        let env = |name: &str| std::env::var(name).unwrap_or_default().split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>();
+        k.release.extend(env("ZEROFARM_TEST_TRUSTED_KEYS"));
+        k.data.extend(env("ZEROFARM_TEST_TRUSTED_DATA_KEYS"));
+    }
+    Ok(k)
+}
+
+/// A binary's trusted keys must be exactly `want`, both lists.
+pub fn check_key_set(what: &str, got: &KeySet, want: &KeySet) -> Result<(), String> {
+    let diff = |kind: &str, got: &BTreeSet<String>, want: &BTreeSet<String>| -> Option<String> {
+        let extra: Vec<&String> = got.difference(want).collect();
+        let missing: Vec<&String> = want.difference(got).collect();
+        (!extra.is_empty() || !missing.is_empty()).then(|| format!("{kind} keys: extra {extra:?}, missing {missing:?}"))
+    };
+    let problems: Vec<String> = [diff("release", &got.release, &want.release), diff("data", &got.data, &want.data)].into_iter().flatten().collect();
+    if problems.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "{what} does not trust exactly the keys in common/trusted_keys.txt and common/trusted_data_keys.txt ({}); \
+         rebuild it without ZEROFARM_TRUSTED_KEYS / ZEROFARM_TRUSTED_DATA_KEYS set",
+        problems.join("; ")
+    ))
+}
+
 fn check_channel(channel: &str) -> Result<(), String> {
     if !matches!(channel, "canary" | "stable") {
         return Err("--channel must be canary or stable".into());
@@ -473,6 +549,69 @@ pub fn post_agent_release(
     with_retry(&mut Backoff::default(), Some(6), &|| false, || client.post_json::<_, serde_json::Value>("/v1/admin/agent/release", &body))
         .map_err(|e| format!("POST /v1/admin/agent/release: {e}"))?;
     Ok(())
+}
+
+// ---------- Definitions (PROTOCOL 7) ----------
+
+/// What `define` did (printed as one JSON line).
+#[derive(Debug, Clone, Serialize)]
+pub struct Defined {
+    pub kind: String,
+    pub id: String,
+    pub version: u64,
+    /// `defs/<kind>/<id>/<version>/definition.json`
+    pub key: String,
+    pub sha256: String,
+    /// The `.minisig` written next to the definition file.
+    pub signature: PathBuf,
+    pub published: bool,
+}
+
+/// Validates `file` against `definition/1`, signs its bytes exactly as they are (minisign,
+/// prehashed) with a data key, writes `<file>.minisig`, and with `publish` uploads both to
+/// `defs/<kind>/<id>/<version>/` (`PUT /v1/admin/artifact/...`) and registers the definition
+/// (`PUT /v1/admin/definition`), which makes it current for that run or campaign.
+pub fn define(file: &Path, key: &SigningKey, publish: Option<&Client>) -> Result<Defined, String> {
+    use zerofarm_common::definition::{self as def, Definition};
+    let bytes = std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let d = Definition::parse(&bytes).map_err(|e| format!("{}: {e}", file.display()))?;
+    // A data key, never a release key: each check accepts only its own list.
+    if TrustedKeys::compiled().contains_b64(&key.public_b64()) {
+        return Err(format!("key {} is the release key; definitions are signed with a data key (farm-release keygen --data)", key.key_id_hex()));
+    }
+    let data_keys = TrustedKeys::compiled_data();
+    if !data_keys.contains_b64(&key.public_b64()) {
+        return Err(format!(
+            "key {} is not a trusted data key, so agents would refuse this definition: add its public key to \
+             agent/common/trusted_data_keys.txt and release an agent first",
+            key.key_id_hex()
+        ));
+    }
+    let sig = key.sign(&bytes, &d.trusted_comment())?;
+    // Self-check exactly as an agent will.
+    def::verify(&data_keys, &bytes, &sig).map_err(|e| format!("self-check failed: {e}"))?;
+    let mut sig_path = file.as_os_str().to_owned();
+    sig_path.push(def::SIG_SUFFIX);
+    let sig_path = PathBuf::from(sig_path);
+    std::fs::write(&sig_path, &sig).map_err(|e| format!("{}: {e}", sig_path.display()))?;
+    let sha = zerofarm_common::hash::sha256_hex(&bytes);
+    let k = d.key();
+    if let Some(client) = publish {
+        let mut backoff = Backoff::default();
+        let never = || false;
+        let up = |path: &str, body: &[u8], backoff: &mut Backoff| -> Result<(), String> {
+            let sha = zerofarm_common::hash::sha256_hex(body);
+            with_retry(backoff, Some(6), &never, || client.put_bytes(&format!("/v1/admin/artifact/{path}"), body, &[("x-sha256", sha.clone())]))
+                .map(|_| ())
+                .map_err(|e| format!("PUT {path}: {e}"))
+        };
+        up(&k, &bytes, &mut backoff)?;
+        up(&format!("{k}{}", def::SIG_SUFFIX), sig.as_bytes(), &mut backoff)?;
+        let body = serde_json::json!({"kind": d.kind, "id": d.id, "version": d.version, "key": k, "sha256": sha});
+        with_retry(&mut backoff, Some(6), &never, || client.put_json::<_, serde_json::Value>("/v1/admin/definition", &body))
+            .map_err(|e| format!("PUT /v1/admin/definition: {e}"))?;
+    }
+    Ok(Defined { kind: d.kind, id: d.id, version: d.version, key: k, sha256: sha, signature: sig_path, published: publish.is_some() })
 }
 
 // ---------- GitHub Releases ----------

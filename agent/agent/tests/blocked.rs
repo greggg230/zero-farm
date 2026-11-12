@@ -13,7 +13,7 @@ use serde_json::json;
 use std::time::{Duration, Instant};
 
 fn selfplay(games: u64, base: u64) -> serde_json::Value {
-    json!({"kind": "selfplay", "games": games, "gid_base": base, "seed": 7, "settings": {}, "fake": {"game_ms": 50}})
+    json!({"kind": "selfplay", "games": games, "gid_base": base, "seed": 7, "settings": {"fake": {"game_ms": 50}}})
 }
 
 fn lease_requests(h: &H) -> usize {

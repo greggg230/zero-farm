@@ -3,10 +3,13 @@
 //! `slack_s` paused, honour cancel/give_back/expiry and new checkpoints, and close it with
 //! `done`. Every network call runs off this loop's thread, so a yield is never delayed by I/O.
 //! Eval leases (rev 5, PROTOCOL 5.2) bring every network their seats name in `checkpoints`;
-//! all are downloaded and verified, then handed to the worker as `models`.
+//! all are downloaded and verified, then handed to the worker as `models`. Before anything is
+//! downloaded the lease's plan is worked out (jobplan.rs, PROTOCOL 7): its signed definition, or
+//! for a legacy lease the allowlist; the job line is built from that plan alone.
 
 use crate::cache::{Cache, CacheError, CkptFiles};
 use crate::engine::Engine;
+use crate::jobplan::{Plan, PlanError};
 use crate::results::{compute_unfinished, ResultMeta, Source};
 use crate::status::Phase;
 use crate::worker::{CpuMark, SpawnOpts, WorkerMsg, WorkerProc};
@@ -36,6 +39,9 @@ pub enum LeaseEnd {
     /// The worker could not be started (or died before `hello`): the lease went back and the
     /// engine waits before asking again (startfail.rs). `blocked`: Windows refused to run it.
     NotStarted { blocked: bool },
+    /// The lease failed its definition or job checks (PROTOCOL 7): nothing ran, `done` said
+    /// `refused`, and the engine waits before asking again.
+    Refused(String),
 }
 
 enum Ev {
@@ -89,13 +95,22 @@ struct Prepared {
     models: Vec<(CheckpointRef, CkptFiles)>,
 }
 
-/// A verified checkpoint still matches its hashes (model, and reference when it has one).
+/// A verified checkpoint still matches its hashes and declared sizes (model, and reference when
+/// it has one).
 fn ckpt_intact(c: &CheckpointRef, f: &CkptFiles) -> bool {
-    Cache::reverify_file(&f.model, &c.sha256)
+    Cache::reverify_file(&f.model, &c.sha256, f.model_size)
         && match (&f.reference, &c.reference_sha256) {
-            (Some(p), Some(h)) => Cache::reverify_file(p, h),
+            (Some(p), Some(h)) => Cache::reverify_file(p, h, f.reference_size),
             _ => true,
         }
+}
+
+/// Stats as they leave the PC: no user name or profile path in any string (security review M5).
+pub fn redacted(mut s: Stats) -> Stats {
+    for v in s.values_mut() {
+        zerofarm_common::redact::redact_json(v);
+    }
+    s
 }
 
 impl Engine {
@@ -129,12 +144,47 @@ impl Engine {
         stats.insert("error".into(), json!(why));
         let done = DoneReq {
             results: vec![],
-            stats,
+            stats: redacted(stats),
             given_back: true,
             unfinished: compute_unfinished(lease, &[]),
+            refused: None,
         };
         let _ = self.results.write_done(&lease.lease_id, &done);
         LeaseEnd::GivenBack(why.to_string())
+    }
+
+    /// A lease that failed its definition or job checks (PROTOCOL 7): nothing is downloaded or
+    /// run; `done` says `refused: "definition"` (the coordinator works out the unfinished ids);
+    /// a crash report of kind `definition` goes out once a day per definition and reason; the
+    /// engine waits before asking again (1 min doubling to 1 h), so a bad definition never makes
+    /// a lease storm.
+    fn refuse(&mut self, lease: &Lease, why: &str) -> LeaseEnd {
+        let id = &lease.lease_id;
+        log::error!("lease {id}: refused: {why}");
+        let mut stats = Stats::new();
+        stats.insert("error".into(), json!(format!("refused: {why}")));
+        let done = DoneReq { results: vec![], stats: redacted(stats), given_back: true, unfinished: None, refused: Some("definition".into()) };
+        if let Err(e) = self.results.write_done(id, &done) {
+            log::error!("lease {id}: could not write done: {e}");
+        }
+        self.uploader.wake();
+        let scope = match &lease.definition {
+            Some(d) => d.key.clone(),
+            None => format!("legacy {}", lease.run.as_deref().or(lease.campaign.as_deref()).unwrap_or(&lease.kind)),
+        };
+        if crate::startfail::take_report(&self.cfg.layout, &format!("definition {scope}: {why}"), zerofarm_common::now_unix()) {
+            self.report_crash(CrashReq {
+                build_id: Some(lease.build.build_id.clone()),
+                kind: "definition".into(),
+                message: format!("lease refused ({scope}): {why}"),
+                lease_id: Some(id.clone()),
+                ..Default::default()
+            });
+        } else {
+            log::info!("this refusal was already reported today");
+        }
+        self.start_failed(false);
+        LeaseEnd::Refused(why.to_string())
     }
 
     /// A lease whose files couldn't be fetched, verified or set up: give it back and wait before
@@ -147,9 +197,8 @@ impl Engine {
         end
     }
 
-    fn prepare(&mut self, lease: &Lease) -> Result<Prepared, CacheError> {
-        let s = self.settings();
-        let cap = s.disk_cap_mb << 20;
+    /// Cache entries a running lease must keep: its build, runtime and every network it uses.
+    fn keep_list(lease: &Lease) -> Vec<String> {
         let mut keep = vec![format!("builds/{}", lease.build.build_id)];
         if let Some(r) = &lease.runtime {
             keep.push(format!("builds/{}", r.build_id));
@@ -161,6 +210,13 @@ impl Engine {
         if let (Some(run), Some(cks)) = (&lease.run, &lease.checkpoints) {
             keep.extend(cks.iter().map(|c| Cache::ckpt_key(run, c.gen)));
         }
+        keep
+    }
+
+    fn prepare(&mut self, lease: &Lease, plan: &Plan) -> Result<Prepared, CacheError> {
+        let s = self.settings();
+        let cap = s.disk_cap_mb << 20;
+        let keep = Self::keep_list(lease);
         // Beat while downloading so a big first download doesn't let the lease expire.
         let pump_stop = Arc::new(AtomicBool::new(false));
         let pump = {
@@ -189,7 +245,7 @@ impl Engine {
             let ckpt = match &lease.checkpoint {
                 Some(c) => {
                     let run = lease.run.as_deref().ok_or_else(|| CacheError::Bad("checkpoint without a run".into()))?;
-                    Some((c.clone(), self.cache.ensure_checkpoint(&self.client, run, c, cap, &keep, &stop)?))
+                    Some((c.clone(), self.cache.ensure_checkpoint(&self.client, run, c, plan.declared(c.gen), cap, &keep, &stop)?))
                 }
                 None => None,
             };
@@ -199,7 +255,7 @@ impl Engine {
                 if models.iter().any(|(m, _): &(CheckpointRef, CkptFiles)| m.gen == c.gen) {
                     return Err(CacheError::Bad(format!("checkpoint {} is listed twice", c.gen)));
                 }
-                models.push((c.clone(), self.cache.ensure_checkpoint(&self.client, run, c, cap, &keep, &stop)?));
+                models.push((c.clone(), self.cache.ensure_checkpoint(&self.client, run, c, plan.declared(c.gen), cap, &keep, &stop)?));
             }
             Ok(Prepared { build, runtime, ckpt, models })
         })();
@@ -211,7 +267,20 @@ impl Engine {
     fn lease_inner(&mut self, lease: &Lease) -> LeaseEnd {
         let id = lease.lease_id.clone();
         self.set_status(Phase::Downloading, "work files", Some(describe_job(lease)));
-        let prep = match self.prepare(lease) {
+        // What the worker may be told, before anything is downloaded (PROTOCOL 7).
+        let plan = match self.plan(lease) {
+            Ok(p) => p,
+            Err(PlanError::Stopped) => {
+                self.give_back_unstarted(lease, "agent quitting");
+                return LeaseEnd::Quit;
+            }
+            Err(PlanError::Unavailable(why)) => {
+                log::warn!("lease {id}: its definition can't be fetched right now: {why}");
+                return self.setup_failed(lease, &format!("definition unavailable: {why}"));
+            }
+            Err(PlanError::Refused(why)) => return self.refuse(lease, &why),
+        };
+        let prep = match self.prepare(lease, &plan) {
             Ok(p) => p,
             Err(CacheError::Stopped) => {
                 self.give_back_unstarted(lease, "agent quitting");
@@ -240,7 +309,7 @@ impl Engine {
             }
         };
         if let Some((c, f)) = &prep.ckpt {
-            if !Cache::reverify_file(&f.model, &c.sha256) {
+            if !ckpt_intact(c, f) {
                 return self.setup_failed(lease, "checkpoint verification failed");
             }
         }
@@ -283,6 +352,7 @@ impl Engine {
         let mark = CpuMark::take(&worker);
         let mut run = Run {
             lease: lease.clone(),
+            plan,
             work,
             prep: Prepared { build, ..prep },
             worker,
@@ -368,6 +438,8 @@ impl Engine {
 
 struct Run {
     lease: Lease,
+    /// The job template and per-lease fields (jobplan.rs): the only source of the job line.
+    plan: Plan,
     work: PathBuf,
     prep: Prepared,
     worker: WorkerProc,
@@ -447,7 +519,7 @@ impl Run {
             }
             s.insert("selftest".into(), Value::Object(self.selftests.clone()));
         }
-        s
+        redacted(s)
     }
 
     /// The per-gen self-test results, for a crash report.
@@ -704,14 +776,15 @@ impl Run {
         }
     }
 
+    /// The job line (PROTOCOL 5 and 7): the plan (template + per-lease fields) and the agent's
+    /// own fields, which always overwrite: `op`, `lease_id`, `kind` (the lease's), the local
+    /// network paths (`model`, `reference`, eval `models`), `threads`, `out_dir`, `runtime_dir`.
+    /// No other coordinator-supplied key gets here.
     fn job_line(&self) -> Value {
-        let mut j = match &self.lease.job {
-            Value::Object(m) => m.clone(),
-            _ => Map::new(),
-        };
+        let mut j = self.plan.job.clone();
         j.insert("op".into(), json!("job"));
         j.insert("lease_id".into(), json!(self.lease.lease_id));
-        j.entry("kind").or_insert(json!(self.lease.kind));
+        j.insert("kind".into(), json!(self.lease.kind));
         let (model, reference) = match &self.prep.ckpt {
             Some((_, f)) => (json!(f.model), json!(f.reference)),
             None => (Value::Null, Value::Null),
@@ -719,12 +792,14 @@ impl Run {
         j.insert("model".into(), model);
         j.insert("reference".into(), reference);
         // Eval (rev 5, PROTOCOL 5.2): every network by gen; `model`/`reference` stay null.
-        if self.lease.checkpoints.is_some() {
+        if self.lease.kind == "eval" {
             let mut models = Map::new();
             for (c, f) in &self.prep.models {
                 models.insert(c.gen.to_string(), json!({"model": f.model, "sha256": c.sha256, "reference": f.reference}));
             }
             j.insert("models".into(), Value::Object(models));
+        } else {
+            j.remove("models");
         }
         j.insert("threads".into(), json!(self.threads));
         j.insert("out_dir".into(), json!("out"));
@@ -918,7 +993,7 @@ impl Run {
 
     /// PROTOCOL 5.1 fuzz result.
     fn fuzz_json(&self, failures: Vec<Value>, done: Option<u64>, is_final: bool) -> Value {
-        let j = &self.lease.job;
+        let j = &self.plan.job;
         json!({
             "campaign": self.lease.campaign, "mode": j.get("mode"), "first": j.get("first"), "count": j.get("count"),
             "done": done, "failures": failures, "build_id": self.prep.build.build_id,
@@ -931,8 +1006,9 @@ impl Run {
         match r {
             Ok(resp) => match resp.action.as_str() {
                 "continue" => {
-                    // rev 2: a newer checkpoint is repeated in every beat; act on it once.
-                    if let Some(c) = resp.checkpoint {
+                    // rev 2: a newer checkpoint is repeated in every beat; act on it once
+                    // (self-play only: eval networks never change during a lease).
+                    if let Some(c) = resp.checkpoint.filter(|_| self.lease.kind == "selfplay") {
                         let current = self.prep.ckpt.as_ref().map(|(c, _)| c.gen);
                         let failed = self.ckpt_failed.iter().any(|(g, h)| *g == c.gen && *h == c.sha256);
                         if current.is_none_or(|g| c.gen > g) && !self.ckpt_inflight && !failed {
@@ -958,9 +1034,9 @@ impl Run {
                 log::info!("lease {}: expired at the coordinator", self.id());
                 self.stop(After::Expire);
             }
-            Err(e) if e.is_auth() => {
+            Err(e) if e.is_revoked() => {
                 self.after = Some(After::Revoked);
-                self.kill("token refused");
+                self.kill("machine revoked");
             }
             Err(e) => log::warn!("lease {}: beat failed: {e}", self.id()),
         }
@@ -968,15 +1044,26 @@ impl Run {
 
     fn fetch_checkpoint(&mut self, eng: &Engine, c: CheckpointRef) {
         let Some(run) = self.lease.run.clone() else { return };
+        // With a definition, only a network it names, with its hashes and sizes (PROTOCOL 7).
+        let declared = match self.plan.check_new_checkpoint(&c) {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("lease {}: checkpoint {} not usable: {e}", self.id(), c.gen);
+                self.ckpt_failed.push((c.gen, c.sha256));
+                return;
+            }
+        };
         self.ckpt_inflight = true;
         let (client, tx) = (eng.client.clone(), self.tx.clone());
         let cache = Cache::new(eng.cfg.layout.clone(), eng.cfg.keys.clone());
         let cap = eng.settings().disk_cap_mb << 20;
-        let keep = vec![format!("builds/{}", self.lease.build.build_id), Cache::ckpt_key(&run, c.gen)];
+        // Everything the running worker uses stays (security review L2), plus the new network.
+        let mut keep = Engine::keep_list(&self.lease);
+        keep.push(Cache::ckpt_key(&run, c.gen));
         let control = eng.control.clone();
         std::thread::spawn(move || {
             let stop = move || control.quitting();
-            let r = match cache.ensure_checkpoint(&client, &run, &c, cap, &keep, &stop) {
+            let r = match cache.ensure_checkpoint(&client, &run, &c, declared.as_ref(), cap, &keep, &stop) {
                 Ok(f) => Ok((c, f)),
                 Err(e) => Err((c, e.to_string())),
             };
@@ -1006,11 +1093,11 @@ impl Run {
         if self.selftest_failed && !self.crash_reported {
             self.report(eng, "crash", "a network failed the worker's self-test", None);
         }
-        let fuzz = self.lease.kind == "fuzz" || self.lease.job.get("kind").and_then(Value::as_str) == Some("fuzz");
+        let fuzz = self.lease.kind == "fuzz";
         let mut unfinished = end.as_ref().map(|e| e.get("unfinished").cloned().unwrap_or(Value::Null));
         if fuzz && end.is_some() && self.job_sent {
-            let first = self.lease.job.get("first").and_then(Value::as_u64).unwrap_or(0);
-            let count = self.lease.job.get("count").and_then(Value::as_u64).unwrap_or(0);
+            let first = self.plan.job.get("first").and_then(Value::as_u64).unwrap_or(0);
+            let count = self.plan.job.get("count").and_then(Value::as_u64).unwrap_or(0);
             let left = unfinished.as_ref().and_then(|u| u.get("seeds")).map(crate::util::parse_ranges).unwrap_or_default();
             // x-ids: the seeds this lease covered = its range minus what the worker left.
             let covered = crate::util::subtract((first, first + count), &left);
@@ -1029,6 +1116,7 @@ impl Run {
             stats: self.merged_stats(),
             given_back,
             unfinished: unfinished.filter(|u| !u.is_null()),
+            refused: None,
         };
         if let Err(e) = eng.results.write_done(&id, &done) {
             log::error!("lease {id}: could not write done: {e}");

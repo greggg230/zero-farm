@@ -1,5 +1,6 @@
 //! A size-capped rotating log file: `<name>.log`, `<name>.log.1` … `<name>.log.<keep>`.
-//! Total size on disk stays under `max_bytes * (keep + 1)`.
+//! Total size on disk stays under `max_bytes * (keep + 1)`. Every line is redacted
+//! (`redact.rs`): no user name or user-profile path reaches a log file.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
@@ -42,9 +43,12 @@ impl RotatingFile {
         PathBuf::from(s)
     }
 
-    /// Appends one line (a trailing newline is added). Errors are swallowed: logging must never
-    /// take the program down.
+    /// Appends one line (a trailing newline is added), with the user name and profile path
+    /// redacted (security review M5: logs can be uploaded). Errors are swallowed: logging must
+    /// never take the program down.
     pub fn write_line(&self, line: &str) {
+        let line = crate::redact::redact(line);
+        let line: &str = &line;
         let mut g = match self.inner.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
