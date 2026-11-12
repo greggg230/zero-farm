@@ -207,7 +207,10 @@ function render(s) {
       (s.limits && m.agent_version && cmpVer(m.agent_version, s.limits.definition_agent) < 0 ? ' <span class="warn" title="older than the first agent that verifies definitions">legacy</span>' : "")],
     ["last seen", (m) => (m.revoked ? '<span class="bad">revoked</span>' : ago(m.last_seen, now)) + (m.paused ? ' <span class="warn">paused</span>' : "")],
     ["working on", (m) => esc(m.working_on || "")],
-    ["caps", (m) => (m.caps ? m.caps.threads + " thr, " + Math.round(m.caps.ram_mb / 1024) + " GB" + (m.caps.gpu ? ", gpu" : "") : "")],
+    ["caps", (m) => (m.caps ? m.caps.threads + " thr, " + Math.round(m.caps.ram_mb / 1024) + " GB" + (m.caps.gpu ? ", gpu" : "") : "") +
+      // Rev 7: the execution providers that passed this PC's probe (adapter LUIDs on hover).
+      (Array.isArray(m.providers) && m.providers.length ? '<br><span class="muted" title="providers' + ((m.luids || []).length ? "; LUIDs " + esc(m.luids.join(", ")) : "") +
+        '">' + esc(m.providers.join(", ")) + "</span>" : "")],
     ["games 24 h", (m) => num(m.games_24h), "n"], ["seeds 24 h", (m) => num(m.seeds_24h), "n"],
     ["busy h", (m) => hrs(m.busy_s_24h), "n"], ["paused h", (m) => hrs(m.paused_s_24h), "n"],
     ["idle h/day", (m) => (m.idle_h_day === null ? '<span class="muted">-</span>' : Number(m.idle_h_day).toFixed(1) +

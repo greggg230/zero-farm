@@ -26,6 +26,7 @@ import { MAX_EXTERNAL_BODY, type Contributor, type ExternalRow, ownContributor, 
 import { CHANNELS, serveObject } from "./friend";
 import { bookFor } from "./leasebook";
 import { minisignKeyId, verifyBuild, verifyMinisign } from "./manifest";
+import { GPU_MODES, type Routing, routingOf } from "./routing";
 import {
   BUILD_RE,
   HEX64_RE,
@@ -58,7 +59,6 @@ import {
 
 const STATES = ["active", "paused"] as const;
 const MAX_SIMPLE_PUT = 100 * 1024 * 1024;
-const GPU = ["any", "preferred", "required"] as const;
 const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,63}$/;
 
 function slug(v: string, what: string): string {
@@ -233,6 +233,11 @@ function needsOf(v: unknown, name: string): book.Needs {
   };
 }
 
+// Rev 7 capability routing (PROTOCOL 8): `gpu` (default any) and an optional `providers` allowlist.
+function routingIn(o: Record<string, any>, prefix: string): Routing {
+  return routingOf(oneOf(o.gpu, `${prefix}gpu`, GPU_MODES, { optional: true }) ?? "any", o.providers, prefix);
+}
+
 function perLease(v: unknown, name: string, max: number): "auto" | number {
   if (v === undefined || v === null || v === "auto") return "auto";
   return int(v, name, { min: 1, max });
@@ -250,7 +255,7 @@ function selfplayOf(v: unknown): book.SelfplayCfg | null {
     slack: num(o.slack, "selfplay.slack", { optional: true, min: 0, max: 10 }) ?? 0.1,
     max_stale: int(o.max_stale, "selfplay.max_stale", { optional: true, min: 0, max: 1000 }) ?? 1,
     games_per_lease: perLease(o.games_per_lease, "selfplay.games_per_lease", 100000),
-    gpu: oneOf(o.gpu, "selfplay.gpu", GPU, { optional: true }) ?? "any",
+    ...routingIn(o, "selfplay."),
     needs: needsOf(o.needs, "selfplay.needs"),
     job: jobOf(o.job, "selfplay.job"),
   };
@@ -284,7 +289,7 @@ export function evalOf(v: unknown): book.EvalCfg | null {
     games,
     checkpoints,
     games_per_lease: perLease(o.games_per_lease, "eval.games_per_lease", 100000),
-    gpu: oneOf(o.gpu, "eval.gpu", GPU, { optional: true }) ?? "any",
+    ...routingIn(o, "eval."),
     needs: needsOf(o.needs, "eval.needs"),
     job,
   };
@@ -495,6 +500,7 @@ export async function putCampaign(c: Ctx, id: string): Promise<Response> {
     priority: num(b.priority, "priority", { optional: true, min: 0, max: 1000 }) ?? 0.2,
     state: oneOf(b.state, "state", STATES, { optional: true }) ?? "active",
     needs: b.needs === undefined || b.needs === null ? null : needsOf(b.needs, "needs"),
+    ...routingIn(b, ""),
   };
   await buildOfKind(c.env.DB, cfg.build_id, "worker", "build_id");
   return json(unwrap(await bookFor(c.env, book.campaignScope(id)).putCampaign(cfg, c.now)));
@@ -514,6 +520,7 @@ export async function getCampaignRoute(c: Ctx, id: string): Promise<Response> {
     ...x,
     env: parseJson(x.env, {}),
     needs: parseJson(x.needs, null),
+    providers: parseJson(x.providers, null),
     seeds_done: claimed.results[0].n,
     seeds_leased: leased.results[0].ids,
     active_leases: leased.results[0].n,
@@ -668,7 +675,8 @@ export async function stats(c: Ctx): Promise<Response> {
   const [machinesR, leasesR, crashesR, thrR, runsR, campsR, recentCrashR, fuzzR, classR, pausedR, failCountR, releasesR, diagR, blocksR, batchesR, perMachineR, perScopeR, externalR] = await db.batch<any>([
     db.prepare(
       `SELECT machine_id, name, class, channel, agent_version, created_at, last_seen, revoked_at, paused, caps,
-         json_extract(profile, '$.idle_h_day') AS idle_h_day, json_extract(profile, '$.on_h_day') AS on_h_day
+         json_extract(profile, '$.idle_h_day') AS idle_h_day, json_extract(profile, '$.on_h_day') AS on_h_day,
+         json_extract(profile, '$.providers') AS providers, json_extract(profile, '$.gpus') AS gpus
        FROM machines ORDER BY created_at`,
     ),
     db
@@ -763,6 +771,11 @@ export async function stats(c: Ctx): Promise<Response> {
       revoked: m.revoked_at !== null,
       paused: !!m.paused,
       caps: parseJson(m.caps, null),
+      // Rev 7: the execution providers that passed this PC's probe, and its adapters' LUIDs.
+      providers: parseJson<unknown>(m.providers, null),
+      luids: parseJson<unknown[]>(m.gpus, [])
+        .map((g: any) => g?.luid)
+        .filter((x: unknown) => typeof x === "string"),
       working_on: l.working_on ?? null,
       active_leases: l.active ?? 0,
       leases_24h: l.leases ?? 0,
