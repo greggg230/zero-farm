@@ -4,6 +4,33 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>`.
 
+## 0.2.5 (2026-11-12, canary)
+
+A security update, from an independent review of the code.
+
+- **Job instructions come only from signed definitions.** What a job may make your PC download and
+  run (which job programs, which network files with their sizes and SHA-256, the exact job
+  settings) is now fixed by a definition Gregg signs with a separate *data key*. Zero Farm checks
+  its signature, that it hasn't expired and isn't older than one it has seen, that every network
+  file has the size and hash it names, and builds the job program's instructions only from it plus
+  the few numbers the farm fills in per job (which games or seeds) and its own file locations.
+  Before, the job program got most of a job's instructions as the farm server sent them, so the
+  server, not Gregg's signature, decided them. A job that fails a check is refused, reported once a
+  day, and Zero Farm waits before
+  asking again. Jobs from today's farm server (before it sends definitions) go through a strict
+  allowlist instead: only the fields a job needs, and nothing that looks like a file path.
+- **No more "This PC was removed from the farm" by mistake.** Only the farm server's own "revoked"
+  answer makes Zero Farm forget its sign-up. An error page from something in between (a firewall, a
+  proxy, Cloudflare's protection) is now treated like a network problem and retried. If the farm
+  refuses this PC's sign-in, the tray says "This PC can't sign in to the farm; ask Gregg." and Zero
+  Farm keeps trying, instead of throwing its sign-in away.
+- **Logs are redacted.** Your Windows user name and your user folder (`C:\Users\<you>`) no longer
+  appear in Zero Farm's logs, and are removed from everything it uploads: the logs (also older
+  ones), crash reports and performance numbers.
+- The NVIDIA GPU library (`nvml.dll`) is loaded only from `C:\Windows\System32`, never from another
+  folder where another program could have put a file of that name.
+- A network file is never downloaded unless the space it needs fits under the 3 GB cap first.
+
 ## 0.2.4 (2026-11-12, canary)
 
 - Release-path check: no user-visible changes. 0.2.3 must update itself to it before 0.2.3 goes
