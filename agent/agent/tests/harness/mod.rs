@@ -35,6 +35,8 @@ pub struct H {
     pub version: String,
     /// What the "launcher" told the engine (`ZEROFARM_LAUNCHER`).
     pub launcher_level: u32,
+    /// Starting a worker fails with this raw Windows error (`AgentConfig::test_spawn_error`).
+    pub spawn_error: Option<i32>,
     thread: Option<JoinHandle<EngineExit>>,
 }
 
@@ -71,6 +73,12 @@ pub fn fast_timings() -> Timings {
         upload_rescan: Duration::from_millis(300),
         max_wait: Duration::from_millis(500),
         launcher_selftest: Duration::from_secs(30),
+        // The real start-failure backoffs: tests that need several attempts shorten them.
+        blocked_backoff: Duration::from_secs(15 * 60),
+        blocked_backoff_max: Duration::from_secs(24 * 3600),
+        start_backoff: Duration::from_secs(60),
+        start_backoff_max: Duration::from_secs(3600),
+        crash_resend: Duration::from_millis(500),
     }
 }
 
@@ -107,6 +115,7 @@ impl H {
             timings: fast_timings(),
             version: "0.1.0".into(),
             launcher_level: 2,
+            spawn_error: None,
             thread: None,
         }
     }
@@ -122,6 +131,7 @@ impl H {
             kinds: vec!["fuzz".into(), "eval".into(), "selfplay".into(), "diag".into()],
             channel: "stable".into(),
             launcher_level: self.launcher_level,
+            test_spawn_error: self.spawn_error,
         }
     }
 

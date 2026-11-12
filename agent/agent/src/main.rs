@@ -127,6 +127,7 @@ fn config(args: &Args, layout: &Layout, machine: &Machine) -> AgentConfig {
         kinds: vec!["fuzz".into(), "eval".into(), "selfplay".into(), "diag".into()],
         channel: machine.channel.clone(),
         launcher_level: std::env::var(zerofarm_common::LAUNCHER_ENV).ok().and_then(|v| v.parse().ok()).unwrap_or(0),
+        test_spawn_error: None,
     }
 }
 

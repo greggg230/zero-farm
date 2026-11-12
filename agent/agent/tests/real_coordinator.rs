@@ -121,6 +121,7 @@ fn agent_against_the_real_coordinator() {
         kinds: vec!["fuzz".into(), "eval".into(), "selfplay".into(), "diag".into()],
         channel: "stable".into(),
         launcher_level: 0,
+        test_spawn_error: None,
     };
     let control = Arc::new(Control::default());
     let mut eng = Engine::new(

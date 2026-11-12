@@ -91,6 +91,8 @@ pub struct State {
     /// Answer user-initiated uploads with 429 (retry-after 1800), as after one in the last hour.
     pub user_diag_limited: bool,
     pub enrolls: Vec<Value>,
+    /// Answer `/v1/crash` kind `blocked` with 400, as a coordinator before rev 5 does.
+    pub refuse_blocked: bool,
     pub fail_rules: Vec<FailRule>,
     pub log: Vec<Logged>,
     pub builds_registered: Vec<String>,
@@ -586,6 +588,9 @@ fn handle(mut req: Request, st: &Arc<Mutex<State>>) {
                     }
                 }
             }
+        }
+        ("POST", ["crash"]) if s.refuse_blocked && json_body["kind"] == "blocked" => {
+            done!(err(req, 400, "bad_request", "kind must be panic, crash or agent"))
         }
         ("POST", ["crash"]) => {
             s.crashes.push(json_body.clone());

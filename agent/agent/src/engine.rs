@@ -6,6 +6,7 @@ use crate::policy::{decide, mem_floor_mb, Decision, PolicyState};
 use crate::results::{ResultStore, Uploader};
 use crate::settings::{Settings, SharedMachine};
 use crate::signals::SignalSource;
+use crate::startfail::StartBackoff;
 use crate::status::{self, Phase, SharedStatus};
 use crate::AgentConfig;
 use serde_json::Value;
@@ -94,6 +95,13 @@ pub struct Engine {
     backoff: Backoff,
     games_unsaved: u64,
     games_saved_at: Instant,
+    /// The wait after a worker could not start (startfail.rs; persisted).
+    pub(crate) start_backoff: StartBackoff,
+    /// The "Windows is blocking..." balloon was shown this run.
+    blocked_toast_shown: bool,
+    /// Saved crash reports (`state\crashes\`) are sent in the background every `crash_resend`.
+    crash_sent_at: Instant,
+    crash_sending: Arc<AtomicBool>,
 }
 
 impl Engine {
@@ -124,7 +132,6 @@ impl Engine {
         status::set(&status, |s| s.version = cfg.version.clone());
         Ok(Engine {
             quit_event: zerofarm_common::names::QuitEvent::open(&cfg.layout.root),
-            cfg,
             client,
             machine,
             status,
@@ -145,6 +152,11 @@ impl Engine {
             backoff: Backoff::default(),
             games_unsaved: 0,
             games_saved_at: Instant::now(),
+            start_backoff: StartBackoff::load(&cfg.layout),
+            blocked_toast_shown: false,
+            crash_sent_at: Instant::now(),
+            crash_sending: Arc::new(AtomicBool::new(false)),
+            cfg,
         })
     }
 
@@ -203,9 +215,55 @@ impl Engine {
     pub fn report_crash(&self, mut c: CrashReq) {
         c.agent = Some(self.cfg.version.clone());
         log::warn!("crash report: {} {}", c.kind, c.message);
-        if let Err(e) = self.client.post_json::<_, Value>("/v1/crash", &c) {
+        if let Err(e) = send_crash(&self.client, &c) {
             log::info!("crash report not sent ({e}); keeping it for later");
             save_crash_file(&self.cfg.layout, &c);
+        }
+    }
+
+    /// Sends the crash reports saved under `state\crashes\` (a caught tray panic, reports that
+    /// could not be sent) in the background, at most every `crash_resend`.
+    pub(crate) fn maybe_send_saved_crashes(&mut self) {
+        if self.crash_sent_at.elapsed() < self.cfg.timings.crash_resend {
+            return;
+        }
+        self.crash_sent_at = Instant::now();
+        let any = std::fs::read_dir(self.cfg.layout.crashes()).map(|mut rd| rd.next().is_some()).unwrap_or(false);
+        if !any || self.crash_sending.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let (client, layout, busy) = (self.client.clone(), self.cfg.layout.clone(), self.crash_sending.clone());
+        std::thread::spawn(move || {
+            send_saved_crashes(&client, &layout);
+            busy.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// A worker could not be started (startfail.rs): wait before asking for work again.
+    pub(crate) fn start_failed(&mut self, blocked: bool) {
+        let d = self.start_backoff.fail(&self.cfg.layout, blocked, &self.cfg.timings, zerofarm_common::now_unix());
+        log::warn!(
+            "{}; asking for work again in {} s",
+            if blocked { "Windows is blocking the job program" } else { "the job program could not start" },
+            d.as_secs()
+        );
+        self.show_start_wait();
+        if blocked && !self.blocked_toast_shown {
+            self.blocked_toast_shown = true;
+            status::set(&self.status, |s| s.toast = Some(status::BLOCKED_MESSAGE.into()));
+        }
+    }
+
+    /// A worker started (said hello): start failures are over.
+    pub(crate) fn start_ok(&mut self) {
+        self.start_backoff.reset(&self.cfg.layout);
+    }
+
+    fn show_start_wait(&self) {
+        if self.start_backoff.blocked {
+            self.set_status(Phase::Blocked, status::BLOCKED_MESSAGE, None);
+        } else {
+            self.set_status(Phase::Waiting, "a job program could not start; trying again later", None);
         }
     }
 
@@ -223,20 +281,7 @@ impl Engine {
             };
             self.report_crash(c);
         }
-        let dir = self.cfg.layout.crashes();
-        let Ok(rd) = std::fs::read_dir(&dir) else { return };
-        for e in rd.flatten() {
-            let p = e.path();
-            let Some(c) = std::fs::read(&p).ok().and_then(|b| serde_json::from_slice::<CrashReq>(&b).ok()) else {
-                let _ = std::fs::remove_file(&p);
-                continue;
-            };
-            if self.client.post_json::<_, Value>("/v1/crash", &c).is_ok() {
-                let _ = std::fs::remove_file(&p);
-            } else {
-                break;
-            }
-        }
+        send_saved_crashes(&self.client, &self.cfg.layout);
     }
 
     fn startup(&mut self) {
@@ -356,7 +401,14 @@ impl Engine {
                 self.set_status(Phase::Updating, "launcher", None);
                 return EngineExit::RestartLauncher;
             }
+            self.maybe_send_saved_crashes();
             let d = self.decide(None);
+            // A worker could not start: no lease until the wait is over (never a lease storm).
+            if let Some(left) = self.start_backoff.remaining(zerofarm_common::now_unix(), &self.cfg.timings) {
+                self.show_start_wait();
+                self.control.sleep(left.min(self.cfg.timings.max_wait));
+                continue;
+            }
             if !d.work {
                 let why = d.block.map(|b| b.describe()).unwrap_or("");
                 self.set_status(Phase::Idle, why, None);
@@ -408,6 +460,46 @@ impl Engine {
                     status::set(&self.status, |s| s.last_error = Some(e.to_string()));
                     self.control.sleep(d);
                 }
+            }
+        }
+    }
+}
+
+/// `POST /v1/crash`. A coordinator before rev 5 refuses kind `blocked` (400): it then goes as a
+/// plain `crash`, the policy error in its message.
+pub fn send_crash(client: &Client, c: &CrashReq) -> Result<(), CallError> {
+    match client.post_json::<_, Value>("/v1/crash", c) {
+        Ok(_) => Ok(()),
+        Err(CallError::Http { status: 400, .. }) if c.kind == "blocked" => {
+            let mut plain = c.clone();
+            plain.kind = "crash".into();
+            plain.os_error = None;
+            plain.message = format!("blocked by policy (os error {}): {}", c.os_error.unwrap_or(0), c.message);
+            client.post_json::<_, Value>("/v1/crash", &plain).map(|_| ())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// Sends every report in `state\crashes\`, oldest first; stops at the first that has to wait
+/// (network, 5xx, 429, or the token refused). One the coordinator refuses otherwise is dropped.
+pub fn send_saved_crashes(client: &Client, layout: &zerofarm_common::layout::Layout) {
+    let Ok(rd) = std::fs::read_dir(layout.crashes()) else { return };
+    let mut files: Vec<std::path::PathBuf> = rd.flatten().map(|e| e.path()).collect();
+    files.sort();
+    for p in files {
+        let Some(c) = std::fs::read(&p).ok().and_then(|b| serde_json::from_slice::<CrashReq>(&b).ok()) else {
+            let _ = std::fs::remove_file(&p);
+            continue;
+        };
+        match send_crash(client, &c) {
+            Ok(()) => {
+                let _ = std::fs::remove_file(&p);
+            }
+            Err(e) if e.is_retryable() || e.is_auth() => break,
+            Err(e) => {
+                log::warn!("saved crash report refused ({e}); dropping it");
+                let _ = std::fs::remove_file(&p);
             }
         }
     }
