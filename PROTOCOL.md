@@ -18,18 +18,25 @@ manifests `manifest/1`.
 - IDs: `machine_id` `m_<26 base32>`, `lease_id` `l_<26>`, `invite` codes `XXXX-XXXX-XXXX` (base32, no
   0/1/O/I), runs and campaigns are slugs `[a-z0-9][a-z0-9-]{0,62}`.
 - Auth: `authorization: Bearer <token>`. Machine tokens are 32 random bytes base64url, stored in D1
-  only as sha256. One admin token (Worker secret `ADMIN_TOKEN`), used only from the desktop.
+  only as sha256. One admin token (Worker secret `ADMIN_TOKEN`), used only from the desktop. Rev 6:
+  `/v1/admin/*` also accepts a Cloudflare Access login (section 4).
+- **Coordinator mark** (rev 6): every `/v1/*` answer, errors included, carries the header
+  `x-zerofarm-coordinator: 1`. A 401/403 without it came from something on the path (a proxy, a
+  firewall or WAF rule, a misplaced Access policy), not from the coordinator.
 - Errors: HTTP 4xx/5xx with `{"error": "<code>", "message": "<text>"}` (some add fields, named
   below). Codes and their statuses: `bad_request` 400 (405 for a method a path doesn't take),
   `unauthorized` 401 (403 for an unknown or used invite code), `revoked` 403, `not_found` 404,
-  `conflict` 409, `gone` 410 (lease expired/cancelled, stale result), `too_large` 413,
+  `conflict` 409, `gone` 410 (lease expired/cancelled, stale result), `too_large` 413 (a body, or rev
+  6 a lease's result limits),
   `update_required` 426, `rate_limited` 429, `internal` 500. Clients retry 5xx and network errors
   with exponential backoff (1 s → 5 min, jitter); never retry 4xx except `429` (honour
   `retry-after`).
 - Rate limits (rev 3): a token bucket per machine (GCRA: on average one request per interval, a
   burst at once). `POST /v1/lease` 1 per 5 s after a burst of 6; beats 1 per 10 s after 12 (all
   of a machine's leases together); `POST /v1/crash` 1 per 10 s after 30; a user-initiated
-  `POST /v1/diag/{name}` 1 per hour; `POST /v1/enroll` 1 per 60 s after 10 per client IP. Over
+  `POST /v1/diag/{name}` 1 per hour; `POST /v1/enroll` 1 per 60 s after 10 per client IP (rev 6:
+  the coordinator keys it by an HMAC of the address, IPv6 by its /64, and deletes the row once the
+  limit has reset; it never stores an address). Over
   the limit → 429 `rate_limited` with header `retry-after: <s>` and `"retry_after": <s>`; a
   refused request changes nothing (no lease work, nothing stored). A well-behaved agent (one
   lease request per `wait_s` or per finished lease, one beat per `beat_s`) never hits them.
@@ -150,8 +157,9 @@ know are ignored.
 
 Response, exactly one of:
 - `{"lease": Lease}`
-- `{"wait_s": 300, "reason": "no_work" | "paused_by_admin" | "outside_hours"}` (`outside_hours` is
-  the agent's own; the coordinator never sends it)
+- `{"wait_s": 300, "reason": "no_work" | "paused_by_admin" | "too_many_leases" | "outside_hours"}`
+  (`outside_hours` is the agent's own; the coordinator never sends it; `too_many_leases`, rev 6:
+  the machine already holds `MAX_ACTIVE_LEASES` live leases, default 2)
 - `{"update": {"min_agent": "0.4.0"}}` → the agent updates itself (section 6) before asking again.
   Sent when the agent is older than the `min_agent` of its channel's latest release, or older than
   the `min_agent` of a build it would otherwise be given and the channel's latest release is new
@@ -159,7 +167,10 @@ Response, exactly one of:
   build whose `aw` differs from the request's `x-farm-aw` is skipped. Rev 5: an eval job needs
   agent 0.2.3 or newer (the first that downloads `checkpoints`) on top of its builds' `min_agent`,
   with the same rule (update if the channel offers it, else skipped). A build this machine
-  reported `blocked` (`/v1/crash` below) is skipped for that machine.
+  reported `blocked` (`/v1/crash` below) is skipped for that machine. Rev 6 (section 7): a run or
+  campaign with a definition needs an agent of at least `DEFINITION_AGENT` (0.2.5), with the same
+  rule; an agent of at least `DEFINITION_AGENT` gets nothing from a run or campaign without one, and
+  no diag leases.
 
 Any of the three may also carry `"upload_diag": ["logs"]` (as a beat answer can): a machine with no
 lease hears about a diagnostics request on its next `/v1/lease`.
@@ -186,7 +197,11 @@ Lease = {
                  "reference": "ckpt/eoe2/81/reference.npz", "reference_sha256": "..."} | null,
   "checkpoints": [Checkpoint, ...] | null,              // eval only (rev 5, section 5.2): every
                                                        // network the job's seats name, by gen
-  "job": Job                                           // section 5, passed to the worker as is
+  "definition": {"key": "defs/<kind>/<id>/<version>/definition.json", "sha256": "..."},
+                                                       // rev 6, section 7; absent on legacy leases
+  "job": Job                                           // section 5; with a definition only
+                                                       // {"kind", "gid_base", "games", "seed"} or
+                                                       // {"kind", "first", "count"}
 }
 ```
 
@@ -195,7 +210,9 @@ Lease = {
   "stats": Stats}` → `{"action": "continue" | "cancel" | "give_back",
   "expires_at": 1794301500, "checkpoint": {...} | null}`. A newer `checkpoint` (self-play) means:
 switch at the next game boundary; it is repeated in every beat while it is newer than the lease's
-own checkpoint (ignore repeats). `cancel`: stop now, discard (sent when the run or campaign was
+own checkpoint (ignore repeats). Rev 6: only a gen the lease's own definition signs is offered, so
+a definition lease normally keeps its gen (a new gen comes with a new definition version and
+reaches new leases); eval leases never switch. `cancel`: stop now, discard (sent when the run or campaign was
 paused, or the run dropped that job kind; the lease is closed, so later calls get 410).
 `give_back`: finish uploading finished games, then `done` with `given_back: true` (also sent, as a
 backstop, once a lease has reported `paused` for longer than `slack_s`). A beat for an expired or
@@ -213,6 +230,13 @@ Body: result bytes (≤ 32 MB, else 413 `too_large`); headers:
 - `x-gen` (self-play): the oldest checkpoint generation any game in the chunk was played with
   (default: the lease's checkpoint). Ignored on eval chunks (rev 5).
 
+Rev 6 limits (security review M3; Worker vars): at most `MAX_LEASE_CHUNKS` chunks (default 2,000)
+and `MAX_LEASE_BYTES` bytes (default 1 GiB) per lease, else 413 `too_large` with `"limit": "chunks"`
+or `"bytes"` (checked against `content-length` before the body is read); no new chunk more than
+`LATE_RESULTS_S` (default 24 h) after the lease closed, else 410 `gone`. A retry of a stored chunk
+is still answered. A fuzz failure's `seed` must be one of the lease's seeds (else 400). A
+machine's measured rate counts only the ids credited to its chunks.
+
 → `{"ok": true, "duplicate": false, "credited": 4, "already_credited": 0}` (an eval chunk adds
 `"held": n`, section 5.2). Idempotent: the same
 `seq` with the same hash → 200 (`duplicate: true`); a different hash → 409. `seq` counts from 0 per
@@ -223,7 +247,9 @@ the agent drops that chunk. A fuzz chunk must be the JSON of section 5.1 (else 4
 
 ### POST /v1/lease/{lease_id}/done
 `{"results": [0, 1, 2], "stats": Stats, "given_back": false,
-  "unfinished": {"gids": [[1200, 1215]]} | null}` → `{"ok": true, "returned": 15}`. `results` lists
+  "unfinished": {"gids": [[1200, 1215]]} | null, "refused": "definition"?}` → `{"ok": true,
+  "returned": 15}`. `refused` (rev 6, section 7): the agent refused the lease; it is closed like a
+give-back (state `given_back`, reason `refused:<why>`) and counted on the admin page. `results` lists
 every seq the agent uploaded; any the coordinator doesn't have → 409 `conflict`
 `{"missing": [seq, ...]}` (upload them, then call `done` again). Unfinished ids go back to the
 pool; the coordinator works them out itself (the lease's ids minus every id credited to any chunk),
@@ -233,13 +259,16 @@ lease (else 400). `returned` is how many ids went back. Repeating `done` → 200
 
 ### Other
 - `GET` (or `HEAD`) `/v1/artifact/{key}` → bytes (R2 key from a lease/manifest; only keys under
-  `builds/`, `ckpt/`, anything else → 404; supports `range` → 206 and `if-none-match` → 304).
+  `builds/`, `ckpt/` and, rev 6, `defs/<kind>/<id>/<version>/definition.json` and its `.minisig`;
+  anything else → 404; supports `range` → 206 and `if-none-match` → 304).
 - `GET /v1/agent/latest?channel=stable` → `{"version": "0.3.1", "build_id": "...",
   "manifest": "builds/<id>/manifest.json", "min_agent": "0.3.0"}`. `channel` defaults to the
   machine's; nothing released on it → 404.
-- `POST /v1/crash` `{"build_id", "kind": "panic" | "crash" | "agent" | "blocked", "message",
-  "backtrace", "lease_id", "os_error"?}` → `{"ok": true}` (message kept to 4 KB, backtrace to 64
-  KB). `panic`: a Rust panic (a worker's, seen on its stderr, with the worker `build_id`; or the
+- `POST /v1/crash` `{"build_id", "kind": "panic" | "crash" | "agent" | "blocked" | "definition",
+  "message", "backtrace", "lease_id", "os_error"?}` → `{"ok": true}` (message kept to 4 KB,
+  backtrace to 64 KB). Rev 6: at most `MAX_CRASHES_PER_DAY` (100) rows per machine per 24 h are
+  kept, for `CRASH_RETENTION_DAYS` (30); past the cap the answer is `{"ok": true, "stored": false}`
+  (a `blocked` block is still recorded). `definition`: a lease the agent refused (section 7). `panic`: a Rust panic (a worker's, seen on its stderr, with the worker `build_id`; or the
   agent's own, sent at its next start, with the agent's `build_id`). `crash`: a worker that exited
   without `end`, hung, missed a deadline or broke aw/1; `backtrace` = its stderr tail (agents may
   add `"exit_code"`). `agent`: a launcher rollback or refused update, reported by the next agent
@@ -255,7 +284,8 @@ lease (else 400). `returned` is how many ids went back. Repeating `done` → 200
   once an hour per machine (else 429); else 409 `conflict`. Any upload answers the open requests
   of that name. An unanswered request is asked again after 30 min. `logs`: `text/plain`, an
   optional `===== about =====` header (agent version, status, settings), then the agent, worker
-  and launcher logs, each tail-capped at 4 MB.
+  and launcher logs, each tail-capped at 4 MB. Rev 6: diagnostics uploads and diag-lease results (R2
+  objects and rows) are deleted after `DIAG_RETENTION_DAYS` (14).
 
 ### Public pages (no auth, rev 3)
 - `GET /`: the onboarding page for invited friends (what Zero Farm is and does to a PC, the
@@ -274,7 +304,10 @@ including fuzz JSON; a worker's own `seq` is informational). A chunk refused wit
 cancelled, 409, 400) is dropped and left out of `done`'s `results`; `done` is sent once every other
 chunk is up. A lease left open by an agent that stopped is closed at that agent's next start with
 `given_back: true` once its saved results are uploaded. The agent beats (`running`, 0 games) while
-it downloads what a lease needs. 401/403 on any call: the agent stops and asks for a new invite.
+it downloads what a lease needs. A 401/403 (rev 6, agent 0.2.5): only `revoked` 403 with the
+coordinator mark (section 1) makes the agent forget its enrollment and ask for a new invite; a
+marked `unauthorized` keeps the token and backs off; an unmarked 401/403 is treated like a network
+error (retried with backoff). Older agents stop at any 401/403.
 A worker that can't be started (rev 5) is never re-leased at once: the lease is given back and the
 agent waits before asking again. Blocked by policy (os error 4551
 ERROR_SYSTEM_INTEGRITY_POLICY_VIOLATION, 1260 ERROR_ACCESS_DISABLED_BY_POLICY, 225
@@ -303,19 +336,26 @@ toward the lease's slack like a pause: a lease that has been paused and/or starv
 while starved. The coordinator keeps the fields above (`paused_ms`, `resume_ms_max` in D1 only)
 and leaves paused and starved time out of a machine's rate.
 
-## 4. Desktop API (bearer = admin token)
+## 4. Desktop API (bearer = admin token, or a Cloudflare Access login)
+
+Rev 6: when the Worker secrets `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` are set, a valid
+`Cf-Access-Jwt-Assertion` (RS256 from the team's JWKS, `aud` one of `ACCESS_AUD`, `iss` the team,
+not expired; with `ACCESS_EMAILS` set, its `email` or service token `common_name` listed) also
+counts as the admin. The bearer token keeps working. With Access in front of `/v1/admin`, desktop
+tools also send an Access service token (`CF-Access-Client-Id`, `CF-Access-Client-Secret`).
 
 | Call | Body → answer |
 |---|---|
 | `POST /v1/admin/invites` | `{"count": 3, "note": "Sam", "channel": "stable" (default) \| "canary"}` → `{"codes": [...]}` |
-| `PUT /v1/admin/artifact/{key}` | bytes (optional `x-sha256`, checked by R2) → `{"ok": true, "key", "size"}` (builds/, ckpt/; up to ~100 MB, a Worker request's limit) |
+| `PUT /v1/admin/artifact/{key}` | bytes (optional `x-sha256`, checked by R2) → `{"ok": true, "key", "size"}` (builds/, ckpt/, rev 6 `defs/<kind>/<id>/<version>/definition.json` and `.minisig`; up to ~100 MB, a Worker request's limit). A registered definition's files can't change: the same bytes again → `"unchanged": true`, other bytes → 409 |
 | `POST /v1/admin/artifact/{key}?uploads` · `PUT …?upload_id=&part=N` · `POST …?upload_id=` | multipart upload for bigger artifacts: → `{"upload_id"}`; part bytes (≥ 5 MiB except the last) → `{"part", "etag"}`; `{"parts": [{"part", "etag"}, ...]}` → `{"ok": true, "size"}` |
 | `GET /v1/admin/artifact/{key}` | any object (results, diag uploads, builds, checkpoints); `range` as for machines |
 | `POST /v1/admin/build` | `{"build_id"}` after its manifest, signature and files are uploaded; the coordinator checks presence + sizes + hashes, and the signature and its trusted comment (`build_id=`, `kind=`) when the Worker var `RELEASE_PUBKEYS` is set → `{"ok": true, "build_id", "kind", "version", "size", "sig_verified"}`; failures → 400 with `"problems": [...]` |
-| `POST /v1/admin/agent/release` | `{"version", "build_id", "channel": "canary" \| "stable", "min_agent", "github_url": "<url>" \| null}`: `build_id` must be a registered agent build of that version, `min_agent` ≤ `version`. `github_url` (rev 4): the installer asset of the release's GitHub Release (`https://github.com/<owner>/<repo>/releases/download/<tag>/<file>.exe`, else 400), where `GET /download` redirects; create the GitHub Release first. `setup` (rev 3) → 400 → `{"ok": true, "channel", "version", "build_id", "min_agent", "github_url"}` |
+| `POST /v1/admin/agent/release` | `{"version", "build_id", "channel": "canary" \| "stable", "min_agent", "github_url": "<url>" \| null}`: `build_id` must be a registered agent build of that version, `min_agent` ≤ `version`. `github_url` (rev 4): the installer asset of the release's GitHub Release, where `GET /download` redirects; create the GitHub Release first. Rev 6: exactly `https://github.com/<GITHUB_REPO>/releases/download/agent-v<version>/ZeroFarmSetup.exe` (the var defaults to `greggg230/zero-farm`), else 400. `setup` (rev 3) → 400 → `{"ok": true, "channel", "version", "build_id", "min_agent", "github_url"}` |
+| `PUT /v1/admin/definition` | rev 6, section 7: `{"kind": "run" \| "campaign", "id", "version", "key", "sha256"}` after `definition.json` and `.minisig` are uploaded to `key` = `defs/<kind>/<id>/<version>/definition.json` → `{"ok": true, "kind", "id", "version", "key", "sha256", "unchanged", "current": true}`; failures → 400 with `"problems"`, a version not above the current one (or the same with other bytes) → 409 |
 | `PUT /v1/admin/run/{run}` | `{"game", "build_id", "runtime", "priority": 1.0, "selfplay": {"quota": 600, "slack": 0.1, "max_stale": 1, "games_per_lease": "auto", "gpu": "any" \| "preferred" \| "required", "needs": {"threads", "ram_mb"}, "job": {...}} \| null, "eval": {"batch": "it81", "games": 110, "checkpoints": [81, 70], "games_per_lease": "auto", "gpu", "needs", "job": {"settings", "seats", "paired"}} \| null, "state": "active" \| "paused"}` → `{"ok": true, "created"}`. `build_id` must be a registered worker build, `runtime` a runtime build. A new eval `batch` reserves `games` fresh game ids (the old batch's unissued ones are dropped); its rules and checks are in section 5.2 (rev 5: `checkpoints` replaces `gen`, which is now refused). Pausing a run, or dropping its `selfplay`/`eval`, cancels those leases at their next beat |
-| `GET /v1/admin/run/{run}` | config + state: `current_gen`, `next_gid`, `pool`, `selfplay_state` (`cap`, `accepted`, `leased`, `pending`, `in_flight`, `headroom`), `checkpoints` (registered gens, rev 5), `eval_state` (the current batch's progress, section 5.2) and `eval_batches` (every batch of the run, newest first, same fields) |
-| `PUT /v1/admin/run/{run}/checkpoint/{gen}` | `{"model", "sha256", "reference", "reference_sha256"}` (files under `ckpt/<run>/`, uploaded first); makes `gen` current for self-play and resets that generation's quota counter → `{"ok": true, "unchanged", "current"}`. Rev 5: a `gen` older than the current one is registered without becoming current (`"current": false`: an eval opponent or a head-to-head label); the same `gen` with other files → 409 |
+| `GET /v1/admin/run/{run}` | config + state: `current_gen`, `next_gid`, `pool`, `selfplay_state` (`cap`, `accepted`, `leased`, `pending`, `in_flight`, `headroom`), `checkpoints` (registered gens, rev 5), `eval_state` (the current batch's progress, section 5.2) and `eval_batches` (every batch of the run, newest first, same fields); rev 6 `definition` (as in stats; `GET /v1/admin/campaign/{id}` too) |
+| `PUT /v1/admin/run/{run}/checkpoint/{gen}` | `{"model", "sha256", "reference", "reference_sha256"}` (files under `ckpt/<run>/`, uploaded first); makes `gen` current for self-play and resets that generation's quota counter → `{"ok": true, "unchanged", "current"}`. Rev 5: a `gen` older than the current one is registered without becoming current (`"current": false`: an eval opponent or a head-to-head label); the same `gen` with other files → 409. Rev 6: a gen the current definition already signs must be exactly those files (else 400); self-play with a definition plays the new current gen once a definition signs it |
 | `GET /v1/admin/run/{run}/results?after={cursor}&limit=500` | → `{"results": [{"id", "key", "lease_id", "seq", "machine_id", "kind", "gen", "games", "ids", "dup_ids", "sha256", "size", "t"}], "cursor"}`. `ids`/`games`: the game ids credited to this chunk; `dup_ids`: ids in it that an earlier chunk was credited with (skip those games). Eval chunks (rev 5) also carry `batch`, `held` and `also`, and their `games` counts `also` too (section 5.2). `limit` ≤ 1000 |
 | `POST /v1/admin/run/{run}/accept` | `{"gen", "games": n}`: the trainer's total of games accepted for `gen` (a total, not an increment; include games held over for the next generation). Self-play stops when accepted + in flight (unclaimed ids in active self-play leases + credited self-play games not yet acked) reaches `quota × (1 + slack)`. Call it before `ack` |
 | `POST /v1/admin/run/{run}/ack` | `{"cursor"}`: results up to it are ingested (R2 objects deleted after 7 days) → `{"ok": true, "acked"}` |
@@ -327,7 +367,8 @@ and leaves paused and starved time out of a machine's rate.
 | `POST /v1/admin/pause` | `{"paused": true \| false}`: farm-wide, no new leases while paused |
 | `POST /v1/admin/diag` | `{"machine_id" \| "class", "kind": "sweep" \| "profile" \| "stability" \| "logs", "params"}` → `{"requests": [{"id", "machine_id"}]}`. `class` = a hardware class as the stats show it (`"<cpu> / <gpu or 'no gpu'>"`). `logs` goes out as `upload_diag`; the others become `diag` leases (`params.build_id` or `params.run` picks the build) |
 | `GET /v1/admin/diag?machine_id=` | requests, uploads and diag-lease results with their R2 keys |
-| `GET /v1/admin/stats` | aggregates for the dashboard (`/admin`); per machine also `idle_h_day`, `on_h_day`, `starved_s_24h`, `blocked` (rev 5: `[{"build_id", "until", "os_error", "message", "agent_version", "t"}]`); per run `eval` (the current batch's progress, rev 5); `eval_batches` (the 20 newest batches of all runs, with `run`); `releases` (latest per channel, `github_url`), `diag_uploads` (recent, `user`) |
+| `GET /v1/admin/stats` | aggregates for the dashboard (`/admin`); per machine also `idle_h_day`, `on_h_day`, `starved_s_24h`, `blocked` (rev 5: `[{"build_id", "until", "os_error", "message", "agent_version", "t"}]`); per run `eval` (the current batch's progress, rev 5); `eval_batches` (the 20 newest batches of all runs, with `run`); `releases` (latest per channel, `github_url`), `diag_uploads` (recent, `user`). Rev 6: `auth` (`{"via": "token" \| "access", "email"?, "common_name"?}`), `limits`, per run and campaign `definition` (current version, gens, jobs, builds and `problems`: why a job can't be leased), per machine `refused_24h`, `blocks` (every active block), `contributors` (farm PCs and external sources, below), `totals` (`farm`, `own`, `all`: self-play/eval games and fuzz seeds over 1 h and 24 h), `by_scope` |
+| `POST /v1/admin/external` | rev 6: a reporter's numbers for the owner's machines that don't run the agent (the desktop playing locally, machines over SSH, rented boxes): `{"reporter": "<id>", "t": <unix>, "sources": [{"id", "name", "kind": "local" \| "ssh" \| "vast" \| "other", "hardware"?, "working_on": ["run:<run>", "campaign:<id>", ...], "selfplay_games": {"1h", "24h"}, "eval_games": {"1h", "24h"}, "fuzz_seeds": {"1h", "24h"}, "busy_h_24h": x \| null}]}` (at most 64 sources, 64 KB) → `{"ok": true, "reporter", "sources": n}`. Each POST replaces all sources of its reporter; a source whose last report is over 30 min old shows offline; rows are deleted 7 days after it. Admin page only (`contributors` in stats), never on a public page |
 
 ## 5. Jobs (`lease.job`) and the agent↔worker protocol (`aw/1`)
 
@@ -619,6 +660,39 @@ current for that run/campaign. Leases are issued only for a run or campaign with
 definition, and only with builds, runtimes, checkpoints and job kinds it names. The run/campaign
 `job` objects the coordinator keeps are no longer sent to agents.
 
+Coordinator details (from building it, rev 6):
+- **Registering.** `key` must be `defs/<kind>/<id>/<version>/definition.json` (the `.minisig` next to
+  it, at most 4 KB; the definition at most 1 MiB) and its bytes must hash to `sha256`. The signature
+  is checked against `DATA_PUBKEYS` only (a release key's signature is refused); no data key set →
+  400. The contents get the agent's checks (`definition/1`: no unknown fields; slugs; `created` > 0
+  and `expires` after it; 1 to 64 worker builds; at most 1024 checkpoints, files of 1 byte to
+  1 GiB, `reference_sha256` and `reference_size` together; templates with only their kind's keys:
+  self-play `settings`, eval `settings`, `seats`, `paired` (required), fuzz `mode`, `env`,
+  `announce_result`; no per-lease fields such as `seed`; no path-like strings or keys; eval seats
+  name only listed gens; a run defines self-play and eval, a campaign fuzz) plus the
+  coordinator's: the body names the requested kind, id and version, it hasn't expired, its builds
+  are registered worker builds of its `game`, its runtime a registered runtime, and gens already
+  registered on the run match it. The trusted comment (`definition=1 kind=… id=… version=…` from
+  `farm-release define`) is not checked: the signed bytes are what count. A version must be
+  higher than the current one; re-registering the current one with the same bytes answers
+  `"unchanged": true`. Once registered, its files can't be replaced.
+- **Leasing.** A lease uses the current (highest) version, and only if it hasn't expired, names the
+  run's (or campaign's) build and runtime (a campaign's runtime is null), has a template for the
+  job kind, signs the checkpoint files exactly as registered (self-play: the current gen; eval:
+  every network of the batch, which must be exactly the gens the signed seats name, and the
+  batch's pairing must equal the template's `paired`). Otherwise that job gets no lease (the admin
+  page says why). The lease's `job` is `{"kind", "gid_base", "games", "seed"}` (self-play, eval)
+  or `{"kind", "first", "count"}` (fuzz), `kind` = the lease's kind; `seed` is the run's base
+  seed (its job's `seed`, else from its name), the same as on legacy leases. Paired eval leases
+  keep whole pairs; games stay within 1 to 100,000, seeds per lease within 1 to 10^8, ids below
+  2^53.
+- **Rollout.** `DEFINITION_AGENT` (var, default `0.2.5`) is the first definition-aware agent. An
+  older agent gets legacy leases (no `definition`, the coordinator's job object) only from a run or
+  campaign that has no definition yet; once it has one, the older agent gets `{"update"}` if its
+  channel offers `DEFINITION_AGENT`, else nothing from there. A definition-aware agent gets nothing
+  from a run or campaign without a definition, and no diag leases (they carry admin-chosen
+  `params` and no definition); logs requests (`upload_diag`) are unaffected.
+
 **Desktop.** `farm-release define <definition.json> --key <data key> [--publish --url --token]`
 signs, uploads and registers a definition. `farm_h2h`, campaign creation and the trainer's pool
 remote produce a new version whenever builds, checkpoints or job settings change; self-play adds
@@ -631,6 +705,21 @@ that, a lease without a definition is never issued, and a definition-aware agent
 ## Changes
 - v1 rev 6 (2026-11-12): signed definitions (section 7): data keys, `definition/1`, the agent builds the job line
   from the signed template, coordinator-settable fields limited, versions never roll back.
+- v1 rev 6, coordinator side (2026-11-12, from building it; agent 0.2.5): section 7's coordinator
+  details (registration checks equal to the agent's, `defs/` keys in `/v1/artifact` and the admin
+  upload, leasing rules, `seed` per lease and not in templates, beats switch only to gens the lease's
+  definition signs, `DEFINITION_AGENT` rollout with `{"update"}`, no diag leases for
+  definition-aware agents); `done` takes `refused`; crash kind `definition`; the coordinator mark
+  `x-zerofarm-coordinator: 1` on every `/v1/*` answer and the agent's 401/403 rules; Cloudflare
+  Access logins on `/v1/admin/*` (section 4); `github_url` pinned to `GITHUB_REPO`'s
+  `agent-v<version>/ZeroFarmSetup.exe`; limits (security review M3/M4): result chunks and bytes
+  per lease (413 with `limit`), no results 24 h after a lease closed (410), fuzz failure seeds
+  inside the lease, rates from credited ids only, `MAX_ACTIVE_LEASES` per machine (`reason:
+  "too_many_leases"`), crash rows capped per machine per day (`stored: false`) and kept 30 days,
+  diagnostics kept 14 days; enroll rate limits keyed by an HMAC of the client IP; desktop API
+  `PUT /v1/admin/definition` and `POST /v1/admin/external` (the owner's own machines, admin page
+  only), stats fields (`auth`, `limits`, `definition`, `refused_24h`, `blocks`, `contributors`,
+  `totals`, `by_scope`), checkpoints keep their reference size.
 - v1 rev 5 (2026-11-12): evaluation and head-to-heads (section 5.2): `checkpoints` on eval leases,
   eval batches name `checkpoints`, seats (`net`/`bot`), whole paired leases, `models` in the job
   line, per-gen `selftest`, `evals` result files and their row format. From building it
