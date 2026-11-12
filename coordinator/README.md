@@ -51,9 +51,9 @@ npm run dev                      # wrangler dev on 0.0.0.0:5400
 line: `wrangler types --check` reads it). The dashboard is
 [http://localhost:5400/admin](http://localhost:5400/admin) while `npm run dev` runs.
 
-Admin CLI (any base URL; behind Cloudflare Access also `CF_ACCESS_CLIENT_ID` and
-`CF_ACCESS_CLIENT_SECRET`, an Access service token, sent as `CF-Access-Client-Id` /
-`CF-Access-Client-Secret` next to the bearer token):
+Admin CLI (any base URL; the bearer token is all it needs. Only if `/v1/admin` is ever put behind
+Cloudflare Access: also `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET`, an Access service
+token, sent as `CF-Access-Client-Id` / `CF-Access-Client-Secret` next to the bearer token):
 
 ```
 export FARM_URL=http://localhost:5400 FARM_ADMIN_TOKEN=dev-admin-token
@@ -115,7 +115,7 @@ npm test          # vitest + @cloudflare/vitest-pool-workers: local workerd, no 
 npm run check     # wrangler types --check, tsc (src + test), tsc (scripts)
 ```
 
-140 tests in 17 files (about 2 minutes; the fleet simulation is most of it):
+141 tests in 17 files (about 2 minutes; the fleet simulation is most of it):
 
 | File | Covers |
 |---|---|
@@ -130,7 +130,7 @@ npm run check     # wrangler types --check, tsc (src + test), tsc (scripts)
 | `blocked.test.ts` | rev 5 crash kind `blocked`: needs a `build_id`; that build no longer goes to that machine (others still get it); the crash row keeps `os_error`; stats and the dashboard list the block; lifted after 24 h, by a newer agent, by the admin (`unblock`), and a new build is offered at once; other crash kinds block nothing |
 | `results.test.ts` | idempotent uploads, conflicting hash → 409 (and the loser's bytes removed), hash/size/seq/ids checks, 32 MB limit, first copy wins across leases, late copies (pool and reissued ids), staleness, cursor paging, R2 deletion 7 days after ack |
 | `definitions.test.ts` | rev 6 signed definitions (really signed, with a throwaway test data key): registering (answer, `GET run`, stats; same version again, other bytes, lower versions; registered files can't change, the same bytes can be re-uploaded); signatures (none, another key, a release key, other bytes, no `DATA_PUBKEYS`, a key that isn't where kind/id/version say); contents (the agent's rules: unknown fields, templates per kind, per-lease fields, path-like strings, sizes, times; unregistered or wrong-kind builds, game, runtime, expired, gens that don't match registered checkpoints, a body naming another run); legacy leases only for older agents and only until a definition exists, then `{"update"}`; leases only with the definition's build, runtime, current gen and job kinds; eval batches only with the signed seats' networks and pairing; expiry; agents download `defs/`; `done` with `refused` and crash kind `definition`; one new version per gen |
-| `access.test.ts` | Cloudflare Access (a locally generated RSA key and JWKS behind a stubbed fetch): a valid JWT is the admin, JWKS cached; service tokens; the bearer token still works; refused: wrong `aud`/`iss`, expired, not yet valid, no identity, other `alg`, another signer, tampered payload, unknown kid (refetched at most once a minute); several AUDs; `ACCESS_EMAILS`; no Access configured → JWTs mean nothing; the page's Access detection and token fallback |
+| `access.test.ts` | Cloudflare Access (a locally generated RSA key and JWKS behind a stubbed fetch): a valid JWT is the admin, JWKS cached; service tokens; the bearer token still works; refused: wrong `aud`/`iss`, expired, not yet valid, no identity, other `alg`, another signer, tampered payload, unknown kid (refetched at most once a minute); several AUDs; `ACCESS_EMAILS`; no Access configured → JWTs mean nothing; the `CF_Authorization` cookie: reads same-origin / typed-in / non-browser accepted, cross-site and same-site refused; changes need `x-farm-admin: 1` and a same-origin `Origin` / `Sec-Fetch-Site` (a form post, another origin, same-site, or no origin information refused, nothing changed); the cookie gets the same JWT checks; bearer requests need none of it; the page's Access detection, token fallback and header |
 | `limits.test.ts` | security review hardening: chunks and bytes per lease (413, nothing left in R2), results until 24 h after a lease closed, rates from credited ids only, fuzz failures inside the lease, `MAX_ACTIVE_LEASES` (expired leases don't count), crash rows per machine per day (blocks still recorded), crash and diagnostics retention (R2 objects and rows), enroll limits keyed by an HMAC of the IP (IPv6 by /64) and deleted within minutes, the coordinator mark on every `/v1/*` answer (errors, 405, artifacts, 206) and not elsewhere, malformed percent-encoding → 400, installers pinned to `GITHUB_REPO`'s `agent-v<version>/ZeroFarmSetup.exe` |
 | `external.test.ts` | the owner's own machines: merged contributors (farm and own), totals by origin, per run; each POST replaces the reporter's sources; offline after 30 min (1-hour numbers drop out, 24-hour ones after a day), deleted after 7 days; validation and size limit; admin only; never on the public page |
 | `update.test.ts` | `{"update"}` for agents older than the channel's or a build's `min_agent`, no update loop for builds no release satisfies, `aw` mismatch, enroll → 426 |
@@ -206,7 +206,7 @@ reset them):
   instances then don't share enroll limits.
 - `ACCESS_TEAM_DOMAIN` (`<team>` or `<team>.cloudflareaccess.com`), `ACCESS_AUD` (the Access
   application's Application Audience (AUD) tag; comma separated for several) and optionally
-  `ACCESS_EMAILS` (comma separated emails and service-token client ids allowed as admin): only
+  `ACCESS_EMAILS` (comma separated emails allowed as admin, on top of the Access policy): only
   once the Access application below exists.
 
 Order:
@@ -216,31 +216,35 @@ Order:
    --publish`, or `npm run admin -- definition <file>`), check `stats` / the dashboard's "Signed
    definitions" (no problems listed), then release agent 0.2.5. From the first definition on, older
    agents get nothing from that run or campaign (and `{"update"}` once 0.2.5 is on their channel).
-3. Cloudflare Access (below), then its secrets.
+3. Cloudflare Access on `/admin` (below), then its secrets.
 
 ### Cloudflare Access (security review H1)
 
-With Access, the dashboard needs no token box (the page asks once without one and hides the box
-when the coordinator answers), and a leaked bearer token alone no longer opens `/v1/admin` from
-outside. Steps for the owner, in the Cloudflare dashboard (Zero Trust):
-1. **Access → Applications → Add an application → Self-hosted.** One application with two
-   destinations: `farm.greggg230.com` path `admin`, and `farm.greggg230.com` path `v1/admin`
-   (one application, so the browser's one login covers the page and the API calls it makes).
-   Never a path that covers `/v1/` as a whole: friends' agents must reach `/v1/lease` etc. without
-   Access.
-2. **Policies:** an Allow policy for the owner's email; a **Service Auth** policy with a new service
-   token (Access → Service credentials → Service Tokens) for the CLI, the trainer's pool remote and
-   `farm-release`. Note the token's client id and secret.
+Access protects only the dashboard page, `/admin`. `/v1/admin` stays outside Access, so the CLI,
+`farm-release`, `farm_h2h`, `farm_report` and the trainer keep using the bearer token, with no
+service token. The page's own API calls are signed in by the browser's Access session: the
+coordinator accepts the `CF_Authorization` cookie Access sets after the login (the same JWT and
+checks as `Cf-Access-Jwt-Assertion`), so the page needs no token box (it asks once without one and
+hides the box when the coordinator answers; the box stays as the fallback). Because a cookie rides
+along on any request to the host, a cookie-authenticated request must come from the page: changes
+need the page's `x-farm-admin: 1` header and a same-origin `Origin` / `Sec-Fetch-Site`, and reads
+are refused when `Sec-Fetch-Site` says cross-site. Bearer-token requests are unaffected.
+
+Steps for the owner, in the Cloudflare dashboard (Zero Trust):
+1. **Access → Applications → Add an application → Self-hosted**: one application with the
+   destination `farm.greggg230.com`, path `admin`. Never a path that covers `/v1/`: friends'
+   agents must reach `/v1/lease` etc. without Access.
+2. **Policy:** an Allow policy for the owner's email.
 3. Copy the application's **Application Audience (AUD) tag** (its overview page) and the team
-   domain (Settings → Custom pages / your `<team>.cloudflareaccess.com`), then
-   `npx wrangler secret put ACCESS_TEAM_DOMAIN`, `... ACCESS_AUD`, and optionally `...
-   ACCESS_EMAILS` (the owner's email and the service token's client id).
-4. The desktop tools keep their bearer token and add the service token: `CF_ACCESS_CLIENT_ID` and
-   `CF_ACCESS_CLIENT_SECRET` for `scripts/admin.ts`; the trainer's pool remote and `farm-release`
-   need the same two headers (`CF-Access-Client-Id`, `CF-Access-Client-Secret`) before step 1's
-   `v1/admin` destination goes live, or they get Access's login page instead of the API.
-5. Check: [https://farm.greggg230.com/admin](https://farm.greggg230.com/admin) shows "signed in
-   through Cloudflare Access", and `npm run admin -- stats` still works.
+   domain (`<team>.cloudflareaccess.com`, under Settings), then
+   `npx wrangler secret put ACCESS_TEAM_DOMAIN` and `npx wrangler secret put ACCESS_AUD`
+   (optionally `ACCESS_EMAILS`, the owner's email, as a second check).
+4. Check: [https://farm.greggg230.com/admin](https://farm.greggg230.com/admin) asks for the Access
+   login, then shows "signed in through Cloudflare Access" without a token; `npm run admin --
+   stats` still works with the bearer token.
+
+If `/v1/admin` is ever put behind Access too, the desktop tools need an Access service token
+(`scripts/admin.ts` already sends `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` when set).
 
 ## Deploy checklist (as originally written)
 
@@ -262,8 +266,8 @@ outside. Steps for the owner, in the Cloudflare dashboard (Zero Trust):
    be on the same Cloudflare account).
 8. `npm run deploy`: type-checks, applies D1 migrations remotely, deploys. Later schema changes are
    new files in `migrations/`; apply them before deploying code that needs them.
-9. Cloudflare Access: see "Cloudflare Access" above (rev 6: `/admin` and `/v1/admin`, a service
-   token for the desktop tools, the `ACCESS_*` secrets).
+9. Cloudflare Access: see "Cloudflare Access" above (rev 6: Access on `/admin` only, an Allow
+   policy for the owner, the `ACCESS_*` secrets; the page's API calls use the Access cookie).
 10. Smoke test: `FARM_URL=https://farm.greggg230.com FARM_ADMIN_TOKEN=... npm run admin -- stats`,
     then open [https://farm.greggg230.com/admin](https://farm.greggg230.com/admin).
 11. For local development, run `npm install` and `npm run db:local` once, then `npm run dev`.
@@ -409,11 +413,16 @@ uploads and diag-lease results (objects and rows) and old diagnostics requests a
 retention, 500 per kind per minute.
 
 **Cloudflare Access.** `authAdmin` accepts the bearer token first, then (with `ACCESS_TEAM_DOMAIN`
-and `ACCESS_AUD` set) a `Cf-Access-Jwt-Assertion`: RS256 only, key by `kid` from the team's JWKS
-(cached an hour; an unknown kid refetches at most once a minute), `iss`, `aud`, `exp`/`nbf`/`iat`
-with a minute's leeway, and the optional `ACCESS_EMAILS` allowlist (email, or a service token's
-`common_name`). Stats answer `auth`, which the page uses to hide the token box. The token, when
-used, lives in `sessionStorage` (this tab only).
+and `ACCESS_AUD` set) an Access JWT from `Cf-Access-Jwt-Assertion` or the `CF_Authorization`
+cookie: RS256 only, key by `kid` from the team's JWKS (cached an hour; an unknown kid refetches at
+most once a minute), `iss`, `aud`, `exp`/`nbf`/`iat` with a minute's leeway, and the optional
+`ACCESS_EMAILS` allowlist (email, or a service token's `common_name`). A cookie-authenticated
+request also passes `cookieRequestProblem` (CSRF): changes need `x-farm-admin: 1`, an `Origin`
+equal to this origin and/or `Sec-Fetch-Site: same-origin` (at least one sent, neither saying
+otherwise); reads need `Sec-Fetch-Site` absent, `same-origin` or `none`. The coordinator answers no
+CORS preflight, so no other site can send the header. Stats answer `auth` (`cookie: true` for the
+cookie), which the page uses to hide the token box. The token, when used, lives in
+`sessionStorage` (this tab only).
 
 **Contributors.** `POST /v1/admin/external` stores a reporter's sources in `external_sources` (one
 D1 batch: delete the reporter's rows, insert the new ones). Stats merge them with the farm's PCs

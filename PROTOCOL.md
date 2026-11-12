@@ -338,10 +338,16 @@ and leaves paused and starved time out of a machine's rate.
 
 ## 4. Desktop API (bearer = admin token, or a Cloudflare Access login)
 
-Rev 6: when the Worker secrets `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` are set, a valid
-`Cf-Access-Jwt-Assertion` (RS256 from the team's JWKS, `aud` one of `ACCESS_AUD`, `iss` the team,
-not expired; with `ACCESS_EMAILS` set, its `email` or service token `common_name` listed) also
-counts as the admin. The bearer token keeps working. With Access in front of `/v1/admin`, desktop
+Rev 6: when the Worker secrets `ACCESS_TEAM_DOMAIN` and `ACCESS_AUD` are set, a valid Access JWT
+(RS256 from the team's JWKS, `aud` one of `ACCESS_AUD`, `iss` the team, not expired; with
+`ACCESS_EMAILS` set, its `email` or service token `common_name` listed) also counts as the admin,
+from the `Cf-Access-Jwt-Assertion` header or the `CF_Authorization` cookie. Access protects only
+the `/admin` page; its API calls to `/v1/admin/*` carry the browser's Access cookie. A
+cookie-authenticated request must come from that page: a change (any method but GET/HEAD) needs
+the header `x-farm-admin: 1` and a same-origin `Origin` and/or `Sec-Fetch-Site: same-origin` (at
+least one present, neither saying otherwise); a read is refused when `Sec-Fetch-Site` is present
+and not `same-origin` or `none`; refusals are 403 `unauthorized`. The bearer token keeps working
+and needs none of this (desktop tools use it). If `/v1/admin` is ever put behind Access, desktop
 tools also send an Access service token (`CF-Access-Client-Id`, `CF-Access-Client-Secret`).
 
 | Call | Body → answer |
@@ -711,7 +717,8 @@ that, a lease without a definition is never issued, and a definition-aware agent
   definition signs, `DEFINITION_AGENT` rollout with `{"update"}`, no diag leases for
   definition-aware agents); `done` takes `refused`; crash kind `definition`; the coordinator mark
   `x-zerofarm-coordinator: 1` on every `/v1/*` answer and the agent's 401/403 rules; Cloudflare
-  Access logins on `/v1/admin/*` (section 4); `github_url` pinned to `GITHUB_REPO`'s
+  Access logins on `/v1/admin/*` (section 4: Access on `/admin` only; the `CF_Authorization`
+  cookie with CSRF checks, `x-farm-admin: 1`, or `Cf-Access-Jwt-Assertion`); `github_url` pinned to `GITHUB_REPO`'s
   `agent-v<version>/ZeroFarmSetup.exe`; limits (security review M3/M4): result chunks and bytes
   per lease (413 with `limit`), no results 24 h after a lease closed (410), fuzz failure seeds
   inside the lease, rates from credited ids only, `MAX_ACTIVE_LEASES` per machine (`reason:

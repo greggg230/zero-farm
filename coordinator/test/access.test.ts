@@ -5,6 +5,7 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearAccessCache, teamOrigin } from "../src/access";
+import { env } from "cloudflare:workers";
 import { ADMIN, advance, call, clock, enroll, err, ok } from "./helpers";
 
 const TEAM = "farmteam";
@@ -130,6 +131,45 @@ describe("Cloudflare Access", () => {
     err(await withJwt(await jwt(claims({ email: "friend@example.com" })), env), 401, "unauthorized");
   });
 
+  it("the CF_Authorization cookie (Access protects only /admin) signs the page's API calls in", async () => {
+    const j = await jwt(claims());
+    const ORIGIN = "https://farm.test"; // the test Worker's origin
+    const req = (method: string, path: string, headers: Record<string, string>, env: Record<string, string> = ENV, body?: unknown) =>
+      call(method, path, { headers: { cookie: `theme=dark; CF_Authorization=${j}; x=y`, ...headers }, env, body, agent: null });
+    const page = { "x-farm-admin": "1", origin: ORIGIN, "sec-fetch-site": "same-origin" };
+    // Reads: same-origin, typed in (none), or no fetch metadata at all (not a browser).
+    expect(ok(await req("GET", "/v1/admin/stats", page)).auth).toEqual({ via: "access", cookie: true, email: "owner@example.com", common_name: null });
+    ok(await req("GET", "/v1/admin/stats", { "sec-fetch-site": "none" }));
+    ok(await req("GET", "/v1/admin/stats", {}));
+    err(await req("GET", "/v1/admin/stats", { "sec-fetch-site": "cross-site" }), 403, "unauthorized");
+    err(await req("GET", "/v1/admin/stats", { "sec-fetch-site": "same-site" }), 403, "unauthorized");
+    // Changes: the page's header and same-origin, or refused (CSRF).
+    expect(ok(await req("POST", "/v1/admin/invites", page, ENV, { count: 1 })).codes).toHaveLength(1);
+    ok(await req("POST", "/v1/admin/invites", { "x-farm-admin": "1", origin: ORIGIN }, ENV, { count: 1 })); // an older browser: Origin only
+    const refused = async (headers: Record<string, string>) =>
+      expect(err(await req("POST", "/v1/admin/invites", headers, ENV, { count: 1 }), 403, "unauthorized").message).toMatch(/must come from the admin page/);
+    await refused({ origin: ORIGIN, "sec-fetch-site": "same-origin" }); // no x-farm-admin (a form post)
+    await refused({ "x-farm-admin": "0", origin: ORIGIN, "sec-fetch-site": "same-origin" });
+    await refused({ "x-farm-admin": "1", origin: "https://evil.example", "sec-fetch-site": "cross-site" });
+    await refused({ "x-farm-admin": "1", origin: "https://evil.example" });
+    await refused({ "x-farm-admin": "1", "sec-fetch-site": "same-site" });
+    await refused({ "x-farm-admin": "1" }); // neither Origin nor Sec-Fetch-Site
+    expect((await env.DB.prepare(`SELECT COUNT(*) AS n FROM invites`).first<any>()).n).toBe(2);
+    // The same JWT checks as the header: a cookie for another application, expired, not allowed.
+    const other = await jwt(claims({ aud: ["other-app"] }));
+    err(await call("GET", "/v1/admin/stats", { headers: { cookie: `CF_Authorization=${other}` }, env: ENV }), 401, "unauthorized");
+    const old = await jwt(claims({ exp: clock.now - 120 }));
+    err(await call("GET", "/v1/admin/stats", { headers: { cookie: `CF_Authorization=${old}` }, env: ENV }), 401, "unauthorized");
+    err(await req("GET", "/v1/admin/stats", page, { ...ENV, ACCESS_EMAILS: "someone@example.com" }), 401, "unauthorized");
+    // Without Access configured the cookie means nothing; a bearer token needs none of the checks.
+    err(await req("GET", "/v1/admin/stats", page, {}), 401, "unauthorized");
+    ok(await call("POST", "/v1/admin/invites", { token: ADMIN(), body: { count: 1 }, headers: { origin: "https://evil.example" }, env: ENV }));
+    // Never a machine's credential.
+    const m = await enroll("pc");
+    err(await call("GET", "/v1/agent/latest", { headers: { cookie: `CF_Authorization=${j}` }, env: ENV }), 401, "unauthorized");
+    expect(m.token).toBeTruthy();
+  });
+
   it("an Access JWT is no machine token, and the admin page works without a token box", async () => {
     const m = await enroll("pc");
     const j = await jwt(claims());
@@ -139,6 +179,7 @@ describe("Cloudflare Access", () => {
     expect(page).toContain("signed in through Cloudflare Access");
     expect(page).toContain('id="tokenbox" hidden');
     expect(page).toContain("sessionStorage");
+    expect(page).toContain(`"x-farm-admin": "1"`); // every API call: the cookie's CSRF check
     expect(page).not.toContain("localStorage.setItem");
   });
 });

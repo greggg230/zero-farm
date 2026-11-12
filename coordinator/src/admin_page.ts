@@ -1,7 +1,9 @@
 // GET /admin: a static page that reads /v1/admin/stats. Behind Cloudflare Access (coordinator
-// README, "Cloudflare Access") the browser's Access login is enough: the page asks once without a
-// token and, if the coordinator answers, hides the token box. Otherwise it falls back to the admin
-// token, kept for this browser tab only (sessionStorage). It shows nothing without one of the two.
+// README, "Cloudflare Access": Access protects this page only) the browser's Access session cookie
+// (CF_Authorization) is enough for its API calls too: the page asks once without a token and, if
+// the coordinator answers, hides the token box. Every call sends `x-farm-admin: 1` (the CSRF check
+// for cookie-authenticated requests). Otherwise it falls back to the admin token, kept for this
+// browser tab only (sessionStorage). It shows nothing without one of the two.
 
 export const ADMIN_PAGE = `<!doctype html>
 <html lang="en">
@@ -83,7 +85,7 @@ function setToken(t) { try { sessionStorage.setItem("farm_admin_token", t); } ca
 try { localStorage.removeItem("farm_admin_token"); } catch {} // older pages kept it for good
 function authHeaders() {
   const t = $("token").value.trim();
-  return t ? { authorization: "Bearer " + t } : {};
+  return t ? { "x-farm-admin": "1", authorization: "Bearer " + t } : { "x-farm-admin": "1" };
 }
 function showTokenBox(msg) {
   viaAccess = false;

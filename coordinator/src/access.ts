@@ -1,7 +1,9 @@
 // Cloudflare Access logins as admin (security review H1). When the secrets ACCESS_TEAM_DOMAIN and
-// ACCESS_AUD are set, a request to /v1/admin/* that carries a valid `Cf-Access-Jwt-Assertion`
-// (Access adds it after a login, or after a service token's headers) counts as the admin. The
-// bearer admin token keeps working (the CLI, the trainer, farm-release).
+// ACCESS_AUD are set, a request to /v1/admin/* that carries a valid Access JWT counts as the admin:
+// in `Cf-Access-Jwt-Assertion` (Access adds it on a path it protects), or in the `CF_Authorization`
+// cookie (the browser's session from logging in to /admin, which Access protects; /v1/admin stays
+// outside Access, and cookie requests pass CSRF checks, ctx.ts). The bearer admin token keeps
+// working (the CLI, the trainer, farm-release).
 //
 // Checks (Cloudflare's "validate JWTs" guidance): RS256 only, signed by a key from the team's
 // JWKS (https://<team>.cloudflareaccess.com/cdn-cgi/access/certs, cached), `iss` = the team URL,
