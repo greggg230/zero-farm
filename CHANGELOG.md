@@ -4,10 +4,15 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>`.
 
-## 0.2.1 (2026-11-12, canary)
+## 0.2.2 (2026-11-12, canary)
 
-- Release-path check: no user-visible changes. It proves that 0.2.0 updates itself, launcher
-  included, before 0.2.0 goes to the stable channel.
+- Release-path check: no user-visible changes. The first version built from this public
+  repository; 0.2.1 must update itself to it before 0.2.1 goes to the stable channel.
+
+## 0.2.1 (2026-11-12, stable)
+
+- The first stable release. No user-visible changes from 0.2.0; it proved on a canary PC that
+  0.2.0 updates itself, launcher included, and then updated itself to 0.2.2 the same way.
 
 ## 0.2.0 (2026-11-12, canary)
 
