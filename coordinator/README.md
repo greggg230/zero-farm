@@ -3,9 +3,11 @@
 The Cloudflare Worker that hands out work to invited friends' idle Windows PCs for zero-core
 training runs (MTG Zero first): enrollment, leases, the job mix per run, a signed-build index,
 result indexing for the trainer, eval batches and head-to-heads (several networks per lease,
-paired games), fuzz campaigns, diagnostics, builds a PC's Windows refuses to run, an admin
-dashboard, per-machine rate limits, and the public onboarding page (its download link redirects
-to GitHub Releases).
+paired games), fuzz campaigns, diagnostics, builds a PC's Windows refuses to run, signed
+definitions (what a lease may make a PC download and run, signed on the desktop with a data key),
+an admin dashboard (Cloudflare Access login or the admin token; the owner's own machines merged in
+as contributors), per-machine rate limits, upload and retention limits, and the public onboarding
+page (its download link redirects to GitHub Releases).
 
 - Wire contract: [`../PROTOCOL.md`](../PROTOCOL.md) sections 1-4 (and the coordinator side of 5-6).
 - Why it works this way: [`../DESIGN.md`](../DESIGN.md) sections 2, 3.4-3.5, 4, 5, 6, 7.
@@ -14,18 +16,24 @@ Stack: Worker + D1 `zero-farm` + R2 `zero-farm` + Durable Object `LeaseBook` + A
 dataset `zero_farm`. Production is `farm.greggg230.com` (see "Deployed").
 
 ```
-src/index.ts       router + cron entry
+src/index.ts       router + cron entry; marks every /v1/* answer (x-zerofarm-coordinator: 1)
+src/config.ts      vars and secrets, with their defaults
 src/friend.ts      friend API (enroll, lease + job choice and sizing, beat, result, done, artifact, ...)
-src/admin.ts       desktop API (invites, artifacts, builds, releases, runs, checkpoints, results, ...)
+src/admin.ts       desktop API (invites, artifacts, builds, releases, runs, checkpoints, results,
+                   definitions, external contributions, stats, ...)
+src/access.ts      Cloudflare Access JWTs as admin (RS256, the team's JWKS, cached)
+src/definitions.ts signed definitions (PROTOCOL 7): parsing, the agent's checks, what they allow
+src/external.ts    the owner's own machines' numbers (POST /v1/admin/external), contributors
 src/book.ts        a scope's leases, id pool, claims and quota: runs inside LeaseBook
 src/leasebook.ts   the Durable Object: serialises every change to one run / campaign
 src/manifest.ts    build checks: manifest, file sizes/hashes, minisign (Ed25519, BLAKE2b prehash)
 src/telemetry.ts   Analytics Engine writer (no-op without the binding) + Stats sanitising
 src/admin_page.ts  the /admin dashboard (static HTML + JS)
 src/onboard.ts     the public pages: / (onboarding) and /download (302 to the installer on GitHub)
-src/ratelimit.ts   per-machine (and per-IP for enroll) rate limits: GCRA in D1, 429 + retry-after
+src/ratelimit.ts   per-machine (and per-IP-HMAC for enroll) rate limits: GCRA in D1, 429 + retry-after
 src/blocks.ts      worker builds Windows refused to start on a machine (crash kind "blocked")
-src/cron.ts        every minute: expire silent leases, delete acked results after 7 days, prune limits
+src/cron.ts        every minute: expire silent leases, delete acked results after 7 days, crash
+                   rows after 30 days, diagnostics after 14, prune limits and external sources
 migrations/        D1 schema (numbered; `wrangler d1 migrations apply`)
 scripts/admin.ts   admin CLI
 test/              vitest in local workerd, including the simulated fleet
@@ -39,10 +47,13 @@ npm run db:local                 # apply migrations to the local D1 in .wrangler
 npm run dev                      # wrangler dev on 0.0.0.0:5400
 ```
 
-`.dev.vars` (gitignored) holds `ADMIN_TOKEN=dev-admin-token` for local runs. The dashboard is
+`.dev.vars` (gitignored) holds `ADMIN_TOKEN=dev-admin-token` for local runs (keep it to that one
+line: `wrangler types --check` reads it). The dashboard is
 [http://localhost:5400/admin](http://localhost:5400/admin) while `npm run dev` runs.
 
-Admin CLI (any base URL):
+Admin CLI (any base URL; the bearer token is all it needs. Only if `/v1/admin` is ever put behind
+Cloudflare Access: also `CF_ACCESS_CLIENT_ID` and `CF_ACCESS_CLIENT_SECRET`, an Access service
+token, sent as `CF-Access-Client-Id` / `CF-Access-Client-Secret` next to the bearer token):
 
 ```
 export FARM_URL=http://localhost:5400 FARM_ADMIN_TOKEN=dev-admin-token
@@ -53,9 +64,17 @@ npm run admin -- run eoe2 run.json
 npm run admin -- checkpoint eoe2 81 model.onnx reference.npz
 npm run admin -- machine m_... --unblock true      # lift the builds it reported blocked
 npm run admin -- campaign fuzz-delver campaign.json
+npm run admin -- definition definition.json         # + definition.json.minisig (a data key's), PROTOCOL 7
 npm run admin -- agent-release 0.2.0 <build_id> canary 0.1.0 --github-url <installer asset URL>
+npm run admin -- external report.json               # the owner's own machines (admin page only)
 npm run admin -- stats
 ```
+
+Since rev 6 a run or campaign gets work from definition-aware agents (0.2.5+) only once a signed
+definition names its build, runtime, checkpoints and job templates: sign one on the desktop with
+the data key (`farm-release define`, which also uploads and registers it), and a new version
+whenever builds, checkpoints or job settings change (the trainer adds each new gen). Until a run
+or campaign has one, only older agents work on it.
 
 (`farm-release release-agent --github greggg230/zero-farm` in `../agent` does the agent release in
 one go: build, sign, publish the build, make the GitHub Release, then this release call with its
@@ -63,9 +82,9 @@ one go: build, sign, publish the build, make the GitHub Release, then this relea
 and its GitHub installer, e.g. to promote a canary build to stable.)
 
 Commands: `invites`, `machines`, `machine`, `revoke`, `pause`/`resume`, `put`, `get`, `build`,
-`upload-build`, `agent-release`, `run`, `run-get`, `checkpoint`, `results`, `accept`, `ack`,
-`campaign`, `campaign-get`, `campaign-results`, `campaign-ack`, `failures`, `diag`, `diag-list`,
-`stats`. Files over 64 MB go up as R2 multipart uploads.
+`upload-build`, `definition`, `agent-release`, `run`, `run-get`, `checkpoint`, `results`, `accept`,
+`ack`, `campaign`, `campaign-get`, `campaign-results`, `campaign-ack`, `failures`, `diag`,
+`diag-list`, `external`, `stats`. Files over 64 MB go up as R2 multipart uploads.
 
 Example run config (`PUT /v1/admin/run/<run>`):
 
@@ -96,7 +115,7 @@ npm test          # vitest + @cloudflare/vitest-pool-workers: local workerd, no 
 npm run check     # wrangler types --check, tsc (src + test), tsc (scripts)
 ```
 
-109 tests in 13 files (about 2 minutes; the fleet simulation is most of it):
+141 tests in 17 files (about 2 minutes; the fleet simulation is most of it):
 
 | File | Covers |
 |---|---|
@@ -110,15 +129,24 @@ npm run check     # wrangler types --check, tsc (src + test), tsc (scripts)
 | `eval.test.ts` | rev 5 eval batches: a head-to-head run without self-play (gens registered in any order), leases with every network (`checkpoints`, `checkpoint: null`) in whole pairs, odd `games_per_lease` rounded down; the batch checks (registered gens, seats = checkpoints, `ext:` bots, one of net/bot, seat count, even paired games, `gen` refused, a new run must register its gens first, bots-only batches); batches immutable and names never reused; pair crediting across chunks of a lease (`held`, `also`, retries) read back the documented way; a held game's pair given back whole and played again, a late chunk completing its own pair first, an expired lease's pair reissued; the even start and the skipped id in the self-play pool; `max_stale` and `x-gen` ignored; agent 0.2.3 gating; uncached checkpoints against the disk cap; progress in `GET run`, stats and the dashboard; per-gen `selftest` stats kept |
 | `blocked.test.ts` | rev 5 crash kind `blocked`: needs a `build_id`; that build no longer goes to that machine (others still get it); the crash row keeps `os_error`; stats and the dashboard list the block; lifted after 24 h, by a newer agent, by the admin (`unblock`), and a new build is offered at once; other crash kinds block nothing |
 | `results.test.ts` | idempotent uploads, conflicting hash → 409 (and the loser's bytes removed), hash/size/seq/ids checks, 32 MB limit, first copy wins across leases, late copies (pool and reissued ids), staleness, cursor paging, R2 deletion 7 days after ack |
+| `definitions.test.ts` | rev 6 signed definitions (really signed, with a throwaway test data key): registering (answer, `GET run`, stats; same version again, other bytes, lower versions; registered files can't change, the same bytes can be re-uploaded); signatures (none, another key, a release key, other bytes, no `DATA_PUBKEYS`, a key that isn't where kind/id/version say); contents (the agent's rules: unknown fields, templates per kind, per-lease fields, path-like strings, sizes, times; unregistered or wrong-kind builds, game, runtime, expired, gens that don't match registered checkpoints, a body naming another run); legacy leases only for older agents and only until a definition exists, then `{"update"}`; leases only with the definition's build, runtime, current gen and job kinds; eval batches only with the signed seats' networks and pairing; expiry; agents download `defs/`; `done` with `refused` and crash kind `definition`; one new version per gen |
+| `access.test.ts` | Cloudflare Access (a locally generated RSA key and JWKS behind a stubbed fetch): a valid JWT is the admin, JWKS cached; service tokens; the bearer token still works; refused: wrong `aud`/`iss`, expired, not yet valid, no identity, other `alg`, another signer, tampered payload, unknown kid (refetched at most once a minute); several AUDs; `ACCESS_EMAILS`; no Access configured → JWTs mean nothing; the `CF_Authorization` cookie: reads same-origin / typed-in / non-browser accepted, cross-site and same-site refused; changes need `x-farm-admin: 1` and a same-origin `Origin` / `Sec-Fetch-Site` (a form post, another origin, same-site, or no origin information refused, nothing changed); the cookie gets the same JWT checks; bearer requests need none of it; the page's Access detection, token fallback and header |
+| `limits.test.ts` | security review hardening: chunks and bytes per lease (413, nothing left in R2), results until 24 h after a lease closed, rates from credited ids only, fuzz failures inside the lease, `MAX_ACTIVE_LEASES` (expired leases don't count), crash rows per machine per day (blocks still recorded), crash and diagnostics retention (R2 objects and rows), enroll limits keyed by an HMAC of the IP (IPv6 by /64) and deleted within minutes, the coordinator mark on every `/v1/*` answer (errors, 405, artifacts, 206) and not elsewhere, malformed percent-encoding → 400, installers pinned to `GITHUB_REPO`'s `agent-v<version>/ZeroFarmSetup.exe` |
+| `external.test.ts` | the owner's own machines: merged contributors (farm and own), totals by origin, per run; each POST replaces the reporter's sources; offline after 30 min (1-hour numbers drop out, 24-hour ones after a day), deleted after 7 days; validation and size limit; admin only; never on the public page |
 | `update.test.ts` | `{"update"}` for agents older than the channel's or a build's `min_agent`, no update loop for builds no release satisfies, `aw` mismatch, enroll → 426 |
 | `units.test.ts` | ranges, semver, sizing, BLAKE2b vectors, minisign (prehashed and legacy, tampering, wrong key, wrong trusted comment), telemetry adapter |
-| `fleet.test.ts` | 10 fake machines × 6 generations against the real Worker: random vanishing (some crash and lose games in progress, one dies for good holding a lease), pauses past the slack, late results, double and conflicting uploads, checkpoint switches, fuzz backfill, and two paired eval batches (gen 2 v 1, then the current gen v 1) whose games finish in random order, so pairs are split across chunks and left half-played by dropouts; a fake trainer fills each generation by cursor and reads the eval batches by `ids` + `also`. Asserts every game id and seed is claimed exactly once or back in the pool, every generation filled by exactly `quota` accepted games, accepted + in flight never over the cap, ≥ 3 machines per generation, the dead machine's games played by others, every eval pair credited exactly once with both games from one lease, eval chunks never refused as stale |
+| `fleet.test.ts` | 10 fake machines × 6 generations against the real Worker, with the real lease cap (2); rev 6: 4 run an agent older than `DEFINITION_AGENT`, the campaign is signed from the start and the run once gen 2 is out (then a new version per gen and batch), every definition lease is checked as an agent would (signature, run, build, runtime, checkpoints, per-lease fields only), legacy agents get legacy self-play leases before the cutover and nothing after; random vanishing (some crash and lose games in progress, one dies for good holding a lease), pauses past the slack, late results, double and conflicting uploads, checkpoint switches, fuzz backfill, and two paired eval batches (gen 2 v 1, then the current gen v 1) whose games finish in random order, so pairs are split across chunks and left half-played by dropouts; a fake trainer fills each generation by cursor and reads the eval batches by `ids` + `also`. Asserts every game id and seed is claimed exactly once or back in the pool, every generation filled by exactly `quota` accepted games, accepted + in flight never over the cap, ≥ 3 machines per generation, the dead machine's games played by others, every eval pair credited exactly once with both games from one lease, eval chunks never refused as stale |
 
 Test notes:
 - `TEST_CLOCK=1` (set only in `vitest.config.ts`) lets tests move time with an `x-test-now` header.
   It is not in `wrangler.jsonc`, so a deployed Worker ignores the header.
 - `vitest.config.ts` sets `RELEASE_PUBKEYS` to empty: `wrangler.jsonc` carries the real release
   key, and the test builds carry fake signatures (signature checks have their own unit tests).
+  It sets `DATA_PUBKEYS` to a throwaway test data key (its secret half is in `test/helpers.ts`;
+  nothing else trusts it), so test definitions are really signed and verified; `IP_SALT`; and
+  `MAX_ACTIVE_LEASES` to 100 (tests hold several leases per machine on purpose; the cap's own test
+  and the fleet use 2). `call(..., {env})` overrides vars for one request (the Worker's checks;
+  LeaseBook keeps the bindings).
 - Rate limits are on in every test. Tests that fire many requests at one frozen clock time space
   them out with `advance()`; enroll is limited per `cf-connecting-ip`, which only the rate-limit
   test sends.
@@ -142,7 +170,7 @@ Worker secret; the owner keeps the only other copy in a local file outside the r
 it; `FARM_ADMIN_TOKEN="$(cat <that file>)"` for the CLI). Smoke-tested: admin auth and stats, invite ->
 enroll -> invite reuse refused -> lease (`no_work`) -> revoke -> lease refused (test rows deleted).
 `RELEASE_PUBKEYS` holds release key 1B9342EFFB546500 (step 6 done). Not done: step 9 (Cloudflare
-Access on `/admin`; optional, since the page shows nothing without the admin token).
+Access; rev 6 adds the support, see "Cloudflare Access" below).
 Redeploy: `npm run deploy` from this directory (migrations first, then code). The 11-12
 follow-ups add migration `0002_followups.sql` (rate limits, installers on releases, user
 diagnostics flag); `npm run deploy` applies it before the code that needs it. Rev 4 (installers
@@ -152,6 +180,71 @@ Rev 5 (eval batches, blocked builds) adds `0004_eval_blocks.sql` (`eval_batches`
 `results.batch/held/also`, `crashes.os_error`); deploy it before agents 0.2.3 go out, so their
 `blocked` reports are understood (an older coordinator answers 400 to that kind; the agent then
 sends it as `crash`).
+
+### Deploy notes: rev 6 (signed definitions, Access, limits, contributors)
+
+Migration `0005_definitions_limits.sql` adds `definitions`, `external_sources`,
+`leases.def_version`, `checkpoints.reference_size` and indexes, and deletes the old
+plaintext-IP rate-limit rows. New vars (in `wrangler.jsonc`, so a deploy sets them):
+
+| Var | Default | What |
+|---|---|---|
+| `DATA_PUBKEYS` | the data key `RWTImfGf...` (id 1FDB907D9FF199C8) | the only keys that may sign definitions (comma separated) |
+| `DEFINITION_AGENT` | `0.2.5` | the first agent that verifies definitions |
+| `GITHUB_REPO` | `greggg230/zero-farm` | where installers (`github_url`) must come from |
+| `MAX_ACTIVE_LEASES` | `2` | live leases per machine |
+| `MAX_LEASE_CHUNKS` / `MAX_LEASE_BYTES` | `2000` / `1073741824` | result chunks / bytes per lease |
+| `LATE_RESULTS_S` | `86400` | results are taken until this long after a lease closed |
+| `MAX_CRASHES_PER_DAY` | `100` | crash rows kept per machine per 24 h |
+| `CRASH_RETENTION_DAYS` / `DIAG_RETENTION_DAYS` | `30` / `14` | the cron deletes older crash rows / diagnostics (objects and rows) |
+
+Secrets (`npx wrangler secret put NAME`; they stay out of this public repo, and a deploy doesn't
+reset them):
+- `IP_SALT`: the HMAC key for client IPs in enroll rate-limit rows, e.g.
+  `node -e "console.log(require('crypto').randomBytes(32).toString('base64url'))"`. Without it
+  each Worker instance draws a random key when it starts (so a new one with every deploy), and
+  instances then don't share enroll limits.
+- `ACCESS_TEAM_DOMAIN` (`<team>` or `<team>.cloudflareaccess.com`), `ACCESS_AUD` (the Access
+  application's Application Audience (AUD) tag; comma separated for several) and optionally
+  `ACCESS_EMAILS` (comma separated emails allowed as admin, on top of the Access policy): only
+  once the Access application below exists.
+
+Order:
+1. `npx wrangler secret put IP_SALT`, then `npm run deploy` (migration 0005, then the code).
+   Agents up to 0.2.4 keep working: nothing has a definition yet, so they get legacy leases.
+2. Sign and register a definition for every active run and campaign (`farm-release define ...
+   --publish`, or `npm run admin -- definition <file>`), check `stats` / the dashboard's "Signed
+   definitions" (no problems listed), then release agent 0.2.5. From the first definition on, older
+   agents get nothing from that run or campaign (and `{"update"}` once 0.2.5 is on their channel).
+3. Cloudflare Access on `/admin` (below), then its secrets.
+
+### Cloudflare Access (security review H1)
+
+Access protects only the dashboard page, `/admin`. `/v1/admin` stays outside Access, so the CLI,
+`farm-release`, `farm_h2h`, `farm_report` and the trainer keep using the bearer token, with no
+service token. The page's own API calls are signed in by the browser's Access session: the
+coordinator accepts the `CF_Authorization` cookie Access sets after the login (the same JWT and
+checks as `Cf-Access-Jwt-Assertion`), so the page needs no token box (it asks once without one and
+hides the box when the coordinator answers; the box stays as the fallback). Because a cookie rides
+along on any request to the host, a cookie-authenticated request must come from the page: changes
+need the page's `x-farm-admin: 1` header and a same-origin `Origin` / `Sec-Fetch-Site`, and reads
+are refused when `Sec-Fetch-Site` says cross-site. Bearer-token requests are unaffected.
+
+Steps for the owner, in the Cloudflare dashboard (Zero Trust):
+1. **Access → Applications → Add an application → Self-hosted**: one application with the
+   destination `farm.greggg230.com`, path `admin`. Never a path that covers `/v1/`: friends'
+   agents must reach `/v1/lease` etc. without Access.
+2. **Policy:** an Allow policy for the owner's email.
+3. Copy the application's **Application Audience (AUD) tag** (its overview page) and the team
+   domain (`<team>.cloudflareaccess.com`, under Settings), then
+   `npx wrangler secret put ACCESS_TEAM_DOMAIN` and `npx wrangler secret put ACCESS_AUD`
+   (optionally `ACCESS_EMAILS`, the owner's email, as a second check).
+4. Check: [https://farm.greggg230.com/admin](https://farm.greggg230.com/admin) asks for the Access
+   login, then shows "signed in through Cloudflare Access" without a token; `npm run admin --
+   stats` still works with the bearer token.
+
+If `/v1/admin` is ever put behind Access too, the desktop tools need an Access service token
+(`scripts/admin.ts` already sends `CF_ACCESS_CLIENT_ID` / `CF_ACCESS_CLIENT_SECRET` when set).
 
 ## Deploy checklist (as originally written)
 
@@ -173,12 +266,8 @@ sends it as `crash`).
    be on the same Cloudflare account).
 8. `npm run deploy`: type-checks, applies D1 migrations remotely, deploys. Later schema changes are
    new files in `migrations/`; apply them before deploying code that needs them.
-9. Cloudflare Access (Zero Trust → Access → Applications → Self-hosted): domain
-   `farm.greggg230.com`, path `admin`, policy = the user's email. Put Access only on `/admin`:
-   friends' agents (`/v1/*`) and the trainer/CLI (`/v1/admin/*`) authenticate with bearer tokens
-   and can't pass an Access login. To also put Access on `/v1/admin/*`, create a service token and
-   teach `scripts/admin.ts` / the pool remote to send `CF-Access-Client-Id` / `CF-Access-Client-Secret`
-   (not done).
+9. Cloudflare Access: see "Cloudflare Access" above (rev 6: Access on `/admin` only, an Allow
+   policy for the owner, the `ACCESS_*` secrets; the page's API calls use the Access cookie).
 10. Smoke test: `FARM_URL=https://farm.greggg230.com FARM_ADMIN_TOKEN=... npm run admin -- stats`,
     then open [https://farm.greggg230.com/admin](https://farm.greggg230.com/admin).
 11. For local development, run `npm install` and `npm run db:local` once, then `npm run dev`.
@@ -300,11 +389,53 @@ rates by hardware class, agent releases per channel (with the installer's GitHub
 diagnostics uploads, recent crashes, new fuzz failure sites, and per machine the builds Windows
 blocked there. A Worker can write to AE but can only read it through the account's SQL API.
 
+**Signed definitions (rev 6, PROTOCOL 7).** `definitions` holds every registered version per
+(kind, id); the current one is the highest. Registering (`PUT /v1/admin/definition`, in the Worker,
+then `putDefinition` in the scope's LeaseBook, so it is serialised with grants) checks the bytes'
+sha256, the signature against `DATA_PUBKEYS` only (the same minisign code as builds), the agent's
+own `definition/1` rules (`src/definitions.ts` mirrors `agent/common/src/definition.rs`, so a
+definition every agent would refuse is never registered) and the coordinator's (registered builds
+of the right kind and game, gens matching registered checkpoints, versions only going up). A grant
+reads the scope's current definition: an agent of at least `DEFINITION_AGENT` (the Worker passes
+`def_aware`) gets a lease only under one, an older agent only when there is none; the lease names
+it (`definition: {key, sha256}`, `leases.def_version`) and its `job` holds only the per-lease
+fields. A job the definition doesn't cover (build, runtime, unsigned current gen, eval networks or
+pairing, expiry, no template) gets no lease, and `definition.problems` in `GET run` / stats says
+why. Beats offer a newer gen only if the lease's own definition signs it. Diag leases never go to
+definition-aware agents. The run's base seed stays the coordinator's (templates can't carry one).
+
+**Limits and retention (rev 6, security review M3/M4).** Result chunks and bytes per lease are
+checked twice: in the Worker before the body is read (declared length) and in LeaseBook with the
+real size (concurrent uploads), so a refused chunk's R2 object is deleted. A machine's live leases
+(`state = 'active'` and not past `expires_at`) are counted before choosing; concurrent requests
+of one machine can overshoot by its burst, at most. The cron deletes crash rows, diagnostics
+uploads and diag-lease results (objects and rows) and old diagnostics requests after their
+retention, 500 per kind per minute.
+
+**Cloudflare Access.** `authAdmin` accepts the bearer token first, then (with `ACCESS_TEAM_DOMAIN`
+and `ACCESS_AUD` set) an Access JWT from `Cf-Access-Jwt-Assertion` or the `CF_Authorization`
+cookie: RS256 only, key by `kid` from the team's JWKS (cached an hour; an unknown kid refetches at
+most once a minute), `iss`, `aud`, `exp`/`nbf`/`iat` with a minute's leeway, and the optional
+`ACCESS_EMAILS` allowlist (email, or a service token's `common_name`). A cookie-authenticated
+request also passes `cookieRequestProblem` (CSRF): changes need `x-farm-admin: 1`, an `Origin`
+equal to this origin and/or `Sec-Fetch-Site: same-origin` (at least one sent, neither saying
+otherwise); reads need `Sec-Fetch-Site` absent, `same-origin` or `none`. The coordinator answers no
+CORS preflight, so no other site can send the header. Stats answer `auth` (`cookie: true` for the
+cookie), which the page uses to hide the token box. The token, when used, lives in
+`sessionStorage` (this tab only).
+
+**Contributors.** `POST /v1/admin/external` stores a reporter's sources in `external_sources` (one
+D1 batch: delete the reporter's rows, insert the new ones). Stats merge them with the farm's PCs
+(credited ids per machine and kind from `results` over 1 h / 24 h): `contributors`, `totals`
+(farm, own, all; an offline source's last hour doesn't count, its day only while its report is
+under a day old) and `by_scope` (farm numbers per run/campaign plus the own sources working on
+it; reporters give no per-run numbers).
+
 **Not done / open:**
 - The eval score (and its error, Elo) is the desktop's: the coordinator never reads rows, so the
   dashboard shows a batch's progress only.
 - `outside_hours` is agent-side only. There is no contributors page yet (DESIGN 5).
 - Result uploads and `done` are not rate-limited (a reconnecting agent may upload many chunks at
-  once); invite codes carry 60 bits and tokens 256.
+  once; rev 6 caps them per lease instead); invite codes carry 60 bits and tokens 256.
 - The first-lease 60 s benchmark from DESIGN 5.1 isn't a separate job: rates come from real leases
   (with hardware-class averages before that).

@@ -72,23 +72,61 @@ disk space, GPU).
 
 ## What it sends
 
-Machine and performance data only ([DESIGN.md](DESIGN.md) 5.4; exact fields in
-[PROTOCOL.md](PROTOCOL.md) section 3):
+The short version, as on the farm's front page:
+
+Sent to the farm (farm.greggg230.com, run by Gregg on Cloudflare; only Gregg can see it):
+
+- **About your PC:** Windows version, processor model and core count, memory, free disk space,
+  graphics card model, memory and driver version, the name you gave your PC when you joined, and a
+  random ID.
+- **How it's going:** how many games or tests it ran and how long they took, how busy the processor
+  and graphics card were, memory used, graphics card temperature, how often it paused because you
+  came back (and how fast), and how many hours a day your PC is idle or on.
+- **Crash reports:** if Zero Farm itself crashes, its error message and where in its own code it
+  happened.
+- **Results** of the games and tests it ran.
+- **Your IP address**, which the farm's host (Cloudflare) sees like any website. Zero Farm uses it
+  only to stop people guessing invite codes, and keeps it scrambled for at most a day.
+- **Only if you press "Send diagnostics" or Gregg asks for them:** Zero Farm's own log files (what
+  it did and when), with your Windows account name removed.
+
+**Never collected:** your files, documents, photos, browsing, passwords, keystrokes, screen,
+microphone or camera; or the names of programs, windows or games you use. Zero Farm only asks
+Windows yes/no questions such as "is something fullscreen?" and "is another program using the
+graphics card?". It reads and writes only its own folder.
+
+**You're in control:** pause or quit from the tray icon; uninstalling removes everything from your
+PC; ask Gregg to delete your PC's data from the farm. The source code is public:
+[https://github.com/greggg230/zero-farm](https://github.com/greggg230/zero-farm)
+
+In detail ([DESIGN.md](DESIGN.md) 5.4; exact fields in [PROTOCOL.md](PROTOCOL.md) section 3):
 
 | What | When |
 |---|---|
 | The name you give the PC and a random machine id | at sign-up |
 | Hardware profile: Windows version, CPU model and core counts, RAM, free disk, GPU models / VRAM / driver versions, the ONNX Runtime providers available, hours per day the PC was idle / Zero Farm was running | at sign-up and when it changes (at most daily) |
-| Per-job performance: games or seeds done, timings, CPU %, memory, threads, time paused or starved of CPU, how fast it yielded | with each heartbeat and at the end of a job |
-| Crash reports: the error message and stack trace of a crashed job or of Zero Farm itself, the job's last log lines; if Windows refuses to run the job program, which kind of policy refused it (a Windows error number) | when something crashes; a blocked job program once a day |
-| Logs: Zero Farm's own log files (`%LOCALAPPDATA%\ZeroFarm\logs`) | only when you press **Send diagnostics** in the tray, or when Gregg asks for that machine's logs from the farm |
+| Per-job performance: games or seeds done, timings, CPU %, GPU %, memory, threads, GPU temperature, time paused or starved of CPU, how fast it yielded | with each heartbeat and at the end of a job |
+| Crash reports: the error message and stack trace of a crashed job or of Zero Farm itself, the job's last log lines; if Windows refuses to run the job program, which kind of policy refused it (a Windows error number); a job Zero Farm refused because its signed definition didn't check out | when something crashes; a blocked job program once a day; a refused job once |
+| Logs: Zero Farm's own log files (`%LOCALAPPDATA%\ZeroFarm\logs`), with your Windows user name and user-folder path removed | only when you press **Send diagnostics** in the tray, or when Gregg asks for that machine's logs from the farm |
 | The job results | as jobs finish |
 
-Privacy rules: no file names, user names, window titles, process names or game names are read or
-sent. "A fullscreen app / another GPU program is active" is only ever a yes/no used to step aside.
-Your IP address is seen by Cloudflare like any web request and is kept only briefly to rate-limit
-sign-up attempts (pruned after a day). Per-heartbeat performance samples go to Cloudflare Workers
-Analytics Engine; summaries are kept in the farm's database for the admin dashboard.
+Privacy rules:
+
+- No file names, window titles, process names or game names are read or sent. "A fullscreen app /
+  another GPU program is active" is only ever a yes/no used to step aside.
+- **Logs are redacted.** From 0.2.5, everything Zero Farm writes to its logs, and everything it
+  uploads that could carry a file path (the logs, crash reports, performance numbers), has your
+  Windows user name replaced with `<user>` and your user folder (`C:\Users\<you>`) with
+  `%USERPROFILE%`. Before 0.2.5 the logs contained the install path, and so your Windows user name.
+  The logs still contain paths inside Zero Farm's own folder, and the PC name you gave at sign-up
+  (by default your PC's name) is sent once, at sign-up.
+- **Your IP address** is seen by Cloudflare, like with any website. The farm's server never stores
+  it: to rate-limit sign-up attempts it keeps only a keyed hash (HMAC) of it (of its /64 for IPv6),
+  deleted once the limit has reset, within minutes and never later than a day.
+- **How long things are kept on the farm:** crash reports 30 days (at most 100 per PC per day),
+  diagnostics uploads 14 days, job result files until 7 days after Gregg's trainer has read them.
+- Per-heartbeat performance samples go to Cloudflare Workers Analytics Engine; summaries are kept in
+  the farm's database for the admin dashboard.
 
 ## What code runs
 

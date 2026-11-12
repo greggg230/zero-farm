@@ -8,6 +8,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import * as book from "./book";
+import type { DefinitionRow } from "./definitions";
 import { HttpError, type Outcome } from "./util";
 
 // What callers see. Spelled out (rather than derived from the class through DurableObjectStub)
@@ -26,6 +27,7 @@ export interface LeaseBookApi {
   accept(run: string, gen: number, games: number, now: number): Promise<Outcome<book.SelfplayState | null>>;
   ack(scope: string, cursor: number, now: number): Promise<Outcome<{ ok: true; acked: number }>>;
   selfplayState(run: string): Promise<Outcome<book.SelfplayState | null>>;
+  putDefinition(row: DefinitionRow): Promise<Outcome<book.DefinitionAnswer>>;
 }
 
 export class LeaseBook extends DurableObject<Env> implements LeaseBookApi {
@@ -77,6 +79,10 @@ export class LeaseBook extends DurableObject<Env> implements LeaseBookApi {
   }
   ack(scope: string, cursor: number, now: number) {
     return this.serial(() => book.ack(this.env, scope, cursor, now));
+  }
+  // Rev 6: definitions change what a scope's grants may issue, so they go through its LeaseBook.
+  putDefinition(row: DefinitionRow) {
+    return this.serial(() => book.putDefinition(this.env, row));
   }
   // Read-only, but serialised so it never sees half of a change.
   selfplayState(run: string) {

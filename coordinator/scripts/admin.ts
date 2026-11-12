@@ -2,13 +2,19 @@
 //
 //   npm run admin -- <command> [args]        (FARM_URL and FARM_ADMIN_TOKEN must be set)
 //
+// With Cloudflare Access in front of /v1/admin (coordinator README, "Cloudflare Access"), also set
+// CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET (an Access service token): they go out as the
+// CF-Access-Client-Id / CF-Access-Client-Secret headers, and the bearer token still authenticates
+// to the coordinator itself.
+//
 // Runs on Node 22 with type stripping (no build step); erasable TypeScript only.
 
 import { createHash } from "node:crypto";
 import { closeSync, createReadStream, openSync, readFileSync, readSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
-const USAGE = `zero-farm admin (FARM_URL, FARM_ADMIN_TOKEN)
+const USAGE = `zero-farm admin (FARM_URL, FARM_ADMIN_TOKEN; behind Cloudflare Access also
+CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET, an Access service token)
 
   invites [--count N] [--note TEXT] [--channel stable|canary]
   machines
@@ -20,6 +26,8 @@ const USAGE = `zero-farm admin (FARM_URL, FARM_ADMIN_TOKEN)
   put <key> <file>                                 upload under builds/ or ckpt/ (multipart if big)
   get <key> [out_file]                             download any object (results, diag, builds, ckpt)
   build <build_id>                                 register an uploaded build (checks hashes + signature)
+  definition <definition.json>                     upload it and its .minisig (signed with a data key) to
+                                                   defs/<kind>/<id>/<version>/ and register it (PROTOCOL 7)
   upload-build <dir>                               upload dir/manifest.json(.minisig) + its files, register
   agent-release <version> <build_id> <channel> <min_agent> [--github-url URL]
                                                    with --github-url: the installer on GitHub
@@ -42,6 +50,7 @@ const USAGE = `zero-farm admin (FARM_URL, FARM_ADMIN_TOKEN)
   diag (--machine <id> | --class <text>) <sweep|profile|stability|logs> [--params JSON]
   diag-list [--machine <id>]
   stats
+  external <report.json|->                         a reporter's numbers for own machines (admin page only)
 `;
 
 const PART = 64 * 1024 * 1024; // multipart part size (R2 needs >= 5 MiB except the last)
@@ -78,6 +87,13 @@ function need(pos: string[], n: number, usage: string): void {
 async function request(method: string, path: string, body?: unknown, headers: Record<string, string> = {}): Promise<Response> {
   const base = env("FARM_URL").replace(/\/+$/, "");
   const h: Record<string, string> = { authorization: `Bearer ${env("FARM_ADMIN_TOKEN")}`, ...headers };
+  // Cloudflare Access service token (only when both are set).
+  const accessId = process.env.CF_ACCESS_CLIENT_ID;
+  const accessSecret = process.env.CF_ACCESS_CLIENT_SECRET;
+  if (accessId && accessSecret) {
+    h["cf-access-client-id"] = accessId;
+    h["cf-access-client-secret"] = accessSecret;
+  }
   let b: BodyInit | undefined;
   if (body instanceof Uint8Array) b = body as Uint8Array<ArrayBuffer>;
   else if (body !== undefined) {
@@ -208,6 +224,17 @@ async function main(argv: string[]): Promise<void> {
     case "build":
       need(pos, 1, "build <build_id>");
       return print(await api("POST", "/v1/admin/build", { build_id: pos[0] }));
+    case "definition": {
+      need(pos, 1, "definition <definition.json>");
+      const file = pos[0];
+      const bytes = readFileSync(file);
+      const d = JSON.parse(bytes.toString("utf8"));
+      const key = `defs/${d.kind}/${d.id}/${d.version}/definition.json`;
+      await putFile(key, file);
+      await putFile(`${key}.minisig`, `${file}.minisig`);
+      const sha256 = createHash("sha256").update(bytes).digest("hex");
+      return print(await api("PUT", "/v1/admin/definition", { kind: d.kind, id: d.id, version: d.version, key, sha256 }));
+    }
     case "upload-build": {
       need(pos, 1, "upload-build <dir>");
       const dir = pos[0];
@@ -289,6 +316,9 @@ async function main(argv: string[]): Promise<void> {
       return print(await api("GET", `/v1/admin/diag${opt.machine ? `?machine_id=${encodeURIComponent(opt.machine)}` : ""}`));
     case "stats":
       return print(await api("GET", "/v1/admin/stats"));
+    case "external":
+      need(pos, 1, "external <report.json|->");
+      return print(await api("POST", "/v1/admin/external", readConfig(pos[0])));
     case undefined:
     case "help":
     case "--help":

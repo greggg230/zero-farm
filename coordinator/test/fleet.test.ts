@@ -7,6 +7,13 @@
 // (rows of `ids` plus rows named by `also`), starts a second batch when the first is complete,
 // and acks.
 //
+// Rev 6 (signed definitions, PROTOCOL 7): four machines run an agent older than DEFINITION_AGENT.
+// The fuzz campaign is signed from the start, the run only once gen 2 is published (the trainer
+// then signs a new version for every gen and eval batch). Legacy agents get legacy self-play
+// leases until then and nothing after; every other lease carries a definition, which the fake
+// agent checks the way a real one does (signature, run/campaign, build, runtime, checkpoints,
+// per-lease fields only). Machines run with the real lease cap (2 active leases).
+//
 // Checked: no game id or seed is lost or counted twice (claims + pool tile every id handed out),
 // every generation is filled exactly by accepted games, the coordinator never has more than
 // quota x (1 + slack) games accepted + in flight, every eval batch ends with every pair credited
@@ -21,8 +28,11 @@ import {
   advance,
   ask,
   beat,
+  checkDefinitionLease,
   clock,
+  define,
   enroll,
+  LEGACY,
   expectTiled,
   finish,
   makeBuild,
@@ -59,6 +69,8 @@ const SEED_BASE = 1_000_000;
 // Eval batches: e1 (gen 2 v gen 1) once gen 2 exists, e2 (current gen v gen 1) once e1 is complete.
 const E1_GAMES = 120;
 const E2_GAMES = 60;
+const N_LEGACY = 4; // machines 1..4 run an agent older than DEFINITION_AGENT
+const CAP = { MAX_ACTIVE_LEASES: "2" }; // the real default (tests otherwise allow more)
 
 interface Chunk {
   seq: number;
@@ -69,6 +81,7 @@ interface Chunk {
 
 interface Work {
   l: any;
+  def: any; // the lease's definition (null: a legacy lease)
   kind: "selfplay" | "fuzz" | "eval";
   todo: number[]; // ids not played yet (self-play: in random order; fuzz: ascending)
   played: { id: number; gen: number }[]; // played, not in a chunk yet
@@ -85,6 +98,7 @@ interface Work {
 interface Sm {
   m: Machine;
   i: number;
+  agent: string;
   gpu: boolean;
   rate: number; // self-play games per step
   fuzzRate: number; // fuzz seeds per step
@@ -116,6 +130,10 @@ const stats = {
   evalVanished: 0, // machines that vanished holding an eval lease
   evalPairsReplayed: 0, // pairs leased again after a lease gave them back
   alignedSkip: 0, // eval batches that had to skip an odd id
+  defLeases: 0, // leases with a definition (checked like an agent does)
+  legacyLeases: 0, // leases without one (legacy agents, before the run had a definition)
+  legacyIdleAfterCutover: 0, // legacy agents' lease requests answered without work after it
+  definitions: 0, // definition versions the trainer signed
 };
 
 describe("simulated fleet", () => {
@@ -133,6 +151,7 @@ describe("simulated fleet", () => {
       fleet.push({
         m: await enroll(`sim-${i}`),
         i,
+        agent: i >= 1 && i <= N_LEGACY ? LEGACY : "0.3.1",
         gpu: i % 3 === 0,
         rate: 0.4 + rnd() * 1.6,
         fuzzRate: 1500 + pick(5000),
@@ -167,10 +186,18 @@ describe("simulated fleet", () => {
     let evalNow: any = null;
     const runPut = (state: "active" | "paused" = "active") =>
       admin("PUT", `/v1/admin/run/${RUN}`, runBody(build, { quota: QUOTA, slack: SLACK, max_stale: MAX_STALE, games_per_lease: "auto", eval: evalNow, state }));
+    // The run's definition: none until gen 2, then a new version for every gen and batch.
+    let runDefined = false;
+    const signRun = async () => {
+      await define("run", RUN);
+      runDefined = true;
+      stats.definitions++;
+    };
     async function startBatch(batch: string, games: number, a: number, b: number) {
       const before = ok(await admin("GET", `/v1/admin/run/${RUN}`)).next_gid;
       evalNow = evalCfg(batch, games, a, b);
       ok(await runPut());
+      if (runDefined) await signRun();
       const st = ok(await admin("GET", `/v1/admin/run/${RUN}`)).eval_state;
       expect(st.lo % 2, "a paired batch starts on an even id").toBe(0);
       expect(st.lo).toBe(before + (before % 2));
@@ -244,7 +271,9 @@ describe("simulated fleet", () => {
               break;
             }
             gen++;
-            await publishCkpt(RUN, gen);
+            await publishCkpt(RUN, gen); // signs the next version itself once the run has one
+            if (runDefined) stats.definitions++;
+            if (gen === 2 && !runDefined) await signRun(); // the cutover: legacy agents are done here
             if (gen === 2 && !batches.has("e1")) await startBatch("e1", E1_GAMES, 2, 1);
             used.set(gen, extras.slice(0, QUOTA));
             extras = extras.slice(QUOTA);
@@ -376,6 +405,8 @@ describe("simulated fleet", () => {
         if (state === "paused") stats.coordGiveBacks++;
         await closeWork(s, true);
       } else if (b.checkpoint && b.checkpoint.gen > w.gen) {
+        // Rev 6: a definition lease switches only to a gen its own definition signs.
+        if (w.def) expect(w.def.checkpoints[String(b.checkpoint.gen)], "a switch the lease's definition signs").toBeTruthy();
         w.gen = b.checkpoint.gen; // at the next game boundary
         stats.checkpointSwitches++;
       }
@@ -399,17 +430,34 @@ describe("simulated fleet", () => {
       }
       if (s.state === "idle") {
         if (draining || rnd() < 0.2) return;
-        const r = ok(await ask(s.m, { caps: { threads: 8, ram_mb: 16000, gpu: s.gpu, disk_mb: 4000 } }));
-        if (!r.lease) return;
+        const r = ok(await ask(s.m, { caps: { threads: 8, ram_mb: 16000, gpu: s.gpu, disk_mb: 4000 }, agent: s.agent, env: CAP }));
+        expect(r.reason, "one lease at a time never meets the cap").not.toBe("too_many_leases");
+        if (!r.lease) {
+          if (s.agent === LEGACY && runDefined) stats.legacyIdleAfterCutover++;
+          return;
+        }
         const l = r.lease;
         stats.leases++;
         const kind = l.kind as "selfplay" | "fuzz" | "eval";
+        // Rev 6: a definition-aware agent gets only definition leases, checked as it would; an
+        // older one only legacy self-play leases, and only before the run had a definition.
+        let def: any = null;
+        if (s.agent === LEGACY) {
+          stats.legacyLeases++;
+          expect(l.definition, "a legacy agent gets no definition").toBeUndefined();
+          expect(kind, "the campaign is signed: no legacy fuzz").toBe("selfplay");
+          expect(runDefined, "no legacy lease once the run has a definition").toBe(false);
+          expect(l.job.settings).toEqual({ sims: 64 });
+        } else {
+          stats.defLeases++;
+          def = await checkDefinitionLease(s.m, l);
+        }
         let todo: number[];
         if (kind === "eval") {
-          // Rev 5: both networks, whole pairs, no single checkpoint.
+          // Rev 5: both networks, whole pairs, no single checkpoint; rev 6: the seats are signed.
           stats.evalLeases++;
           expect(l.checkpoint).toBeNull();
-          expect(l.checkpoints.map((c: any) => c.gen)).toEqual(l.job.seats.map((x: any) => x.net));
+          expect(l.checkpoints.map((c: any) => c.gen)).toEqual(def.jobs.eval.seats.map((x: any) => x.net));
           expect(l.job.gid_base % 2).toBe(0);
           expect(l.job.games % 2).toBe(0);
           for (let g = l.job.gid_base; g < l.job.gid_base + l.job.games; g += 2) {
@@ -424,7 +472,7 @@ describe("simulated fleet", () => {
             [todo[i], todo[j]] = [todo[j], todo[i]];
           }
         } else todo = [];
-        s.work = { l, kind, todo, played: [], fuzzDone: 0, chunks: [], uploaded: [], seq: 0, gen: l.checkpoint?.gen ?? 0, pausedFor: 0, pausedSteps: 0, lastBeat: step };
+        s.work = { l, def, kind, todo, played: [], fuzzDone: 0, chunks: [], uploaded: [], seq: 0, gen: l.checkpoint?.gen ?? 0, pausedFor: 0, pausedSteps: 0, lastBeat: step };
         if (kind === "fuzz") s.work.todo = Array.from({ length: l.job.count }, (_, i) => l.job.first + i);
         s.state = "working";
         return;
@@ -575,7 +623,11 @@ describe("simulated fleet", () => {
     expect(stats.agentGiveBacks + stats.coordGiveBacks).toBeGreaterThan(0);
     expect(stats.idempotent).toBeGreaterThan(0);
     expect(stats.conflicts).toBeGreaterThan(0);
-    expect(stats.checkpointSwitches).toBeGreaterThan(0);
+    // Rev 6: both kinds of lease happened, legacy agents stopped at the cutover.
+    expect(stats.legacyLeases).toBeGreaterThan(5);
+    expect(stats.defLeases).toBeGreaterThan(50);
+    expect(stats.legacyIdleAfterCutover).toBeGreaterThan(10);
+    expect(stats.definitions).toBeGreaterThanOrEqual(GENS);
     expect(stats.leases).toBeGreaterThan(50);
     expect(stats.evalLeases).toBeGreaterThan(10);
     expect(stats.evalHeldUploads).toBeGreaterThan(0);

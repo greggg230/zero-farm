@@ -9,6 +9,7 @@ import {
   advance,
   beat,
   call,
+  checkDefinitionLease,
   clock,
   complete,
   enroll,
@@ -21,6 +22,7 @@ import {
   makeBuild,
   makeCampaign,
   makeRun,
+  LEGACY,
   ok,
   publishCkpt,
   runBody,
@@ -43,10 +45,13 @@ describe("lifecycle", () => {
       build: { build_id: build, manifest: `builds/${build}/manifest.json` },
       runtime: null,
       checkpoint: { gen: 1, model: "ckpt/r/1/model.onnx", reference: "ckpt/r/1/reference.npz" },
-      job: { kind: "selfplay", settings: { sims: 64 }, games: 10, gid_base: 0 },
+      definition: { key: "defs/run/r/1/definition.json" },
+      job: { kind: "selfplay", games: 10, gid_base: 0 },
     });
     expect(l.lease_id).toMatch(/^l_[0-9a-z]{26}$/);
     expect(Number.isInteger(l.job.seed)).toBe(true);
+    // Rev 6: the settings are the signed definition's; the job carries only per-lease fields.
+    expect((await checkDefinitionLease(m, l)).jobs.selfplay).toEqual({ settings: { sims: 64 } });
     advance(60);
     const b = ok(await beat(m, l.lease_id, "running", { stats: { games: 2 } }));
     expect(b).toEqual({ action: "continue", expires_at: clock.now + 180, checkpoint: null });
@@ -100,7 +105,7 @@ describe("lifecycle", () => {
     await makeCampaign("fz");
     const a = await enroll("a");
     const l = await lease(a);
-    expect(await runCron(env, clock.now + 100)).toEqual({ swept: 0, deleted: 0 });
+    expect(await runCron(env, clock.now + 100)).toEqual({ swept: 0, deleted: 0, crashes: 0, diag: 0 });
     expect((await runCron(env, clock.now + 181)).swept).toBe(1);
     const row = await env.DB.prepare(`SELECT state, close_reason FROM leases WHERE lease_id = ?`).bind(l.lease_id).first<any>();
     expect(row).toEqual({ state: "expired", close_reason: "silent" });
@@ -165,10 +170,10 @@ describe("lifecycle", () => {
     expect(ok(await beat(a, l.lease_id)).action).toBe("cancel");
   });
 
-  it("a newer checkpoint reaches self-play leases through the beat answer", async () => {
-    await makeRun("r");
+  it("a newer checkpoint reaches self-play leases through the beat answer (legacy leases)", async () => {
+    await makeRun("r", { define: false });
     const a = await enroll("a");
-    const l = await lease(a);
+    const l = await lease(a, { agent: LEGACY });
     expect(ok(await beat(a, l.lease_id)).checkpoint).toBeNull();
     await publishCkpt("r", 2);
     const b = ok(await beat(a, l.lease_id));
@@ -177,7 +182,18 @@ describe("lifecycle", () => {
     expect(b.checkpoint.sha256).toMatch(/^[0-9a-f]{64}$/);
     expect(ok(await beat(a, l.lease_id)).checkpoint.gen).toBe(2); // repeated until the lease ends
     // New leases start on gen 2.
-    expect((await lease(a)).checkpoint.gen).toBe(2);
+    expect((await lease(a, { agent: LEGACY })).checkpoint.gen).toBe(2);
+  });
+
+  it("rev 6: a definition lease switches only to a gen its own definition signs", async () => {
+    await makeRun("r");
+    const a = await enroll("a");
+    const l = await lease(a); // definition v1: gen 1
+    await publishCkpt("r", 2); // definition v2 signs gen 2
+    expect(ok(await beat(a, l.lease_id)).checkpoint).toBeNull(); // v1 doesn't sign gen 2
+    const l2 = await lease(a);
+    expect([l2.checkpoint.gen, l2.definition.key]).toEqual([2, "defs/run/r/2/definition.json"]);
+    await checkDefinitionLease(a, l2);
   });
 
   it("done with a result the coordinator never got -> 409 with the missing seqs", async () => {
@@ -234,7 +250,8 @@ describe("choosing work", () => {
     const m = await enroll("a");
     expect((await lease(m)).kind).toBe("selfplay");
     const e1 = await lease(m);
-    expect(e1).toMatchObject({ kind: "eval", checkpoint: null, job: { kind: "eval", games: 2, gid_base: 0, seats, paired: true } });
+    expect(e1).toMatchObject({ kind: "eval", checkpoint: null, job: { kind: "eval", games: 2, gid_base: 0 } });
+    expect((await checkDefinitionLease(m, e1)).jobs.eval).toEqual({ settings: {}, seats, paired: true });
     expect(e1.checkpoints.map((c: any) => c.gen)).toEqual([1]);
     expect((await lease(m)).kind).toBe("eval");
     expect((await lease(m)).kind).toBe("fuzz"); // quota full, eval all issued

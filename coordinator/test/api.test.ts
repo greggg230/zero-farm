@@ -17,6 +17,7 @@ import {
   makeBuild,
   makeCampaign,
   makeRun,
+  LEGACY,
   ok,
   PROFILE,
   publishCkpt,
@@ -437,17 +438,19 @@ describe("machines, crashes, diagnostics, stats", () => {
     expect(ok(await ask(m2, { kinds: [] })).upload_diag).toEqual(["logs"]);
   });
 
-  it("runs diag jobs as leases, first, and closes the request when done", async () => {
-    const build = await makeRun("r");
+  it("runs diag jobs as leases, first, and closes the request when done (agents before definitions)", async () => {
+    const build = await makeRun("r", { define: false });
     const m = await enroll("pc");
     const { requests } = ok(await admin("POST", "/v1/admin/diag", { machine_id: m.machine_id, kind: "sweep", params: { threads: [2, 4] } }));
-    const l = await lease(m);
+    // Rev 6: a definition-aware agent never gets a diag lease (it carries no definition).
+    expect(ok(await ask(m)).reason).toBe("no_work");
+    const l = await lease(m, { agent: LEGACY });
     expect(l).toMatchObject({ kind: "diag", build: { build_id: build }, job: { kind: "diag", what: "sweep", params: { threads: [2, 4] } } });
     expect(l.checkpoint.gen).toBe(1);
     // Without "diag" in kinds it gets ordinary work.
     const m2 = await enroll("pc2");
     ok(await admin("POST", "/v1/admin/diag", { machine_id: m2.machine_id, kind: "profile" }));
-    expect((await lease(m2, { kinds: ["selfplay"] })).kind).toBe("selfplay");
+    expect((await lease(m2, { kinds: ["selfplay"], agent: LEGACY })).kind).toBe("selfplay");
     err(await upload(m, l.lease_id, 0, "x", { ids: [[0, 1]] }), 400, "bad_request");
     const res = ok(await upload(m, l.lease_id, 0, "sweep results"));
     expect(res.credited).toBe(0);
@@ -456,7 +459,7 @@ describe("machines, crashes, diagnostics, stats", () => {
     expect(list.requests.find((r: any) => r.id === requests[0].id).done_at).not.toBeNull();
     expect(list.results[0].key).toMatch(new RegExp(`^diag/${m.machine_id}/`));
     // Done: the next lease is ordinary work.
-    expect((await lease(m)).kind).toBe("selfplay");
+    expect((await lease(m, { agent: LEGACY })).kind).toBe("selfplay");
   });
 
   it("stats aggregates machines, runs, campaigns and failures", async () => {

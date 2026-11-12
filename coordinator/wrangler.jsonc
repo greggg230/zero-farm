@@ -29,15 +29,36 @@
   // Per-beat performance samples (DESIGN 5.4). Summaries live in D1 for the dashboard.
   "analytics_engine_datasets": [{ "binding": "TELEMETRY", "dataset": "zero_farm" }],
 
-  // Expire silent leases, delete acked results after 7 days.
+  // Expire silent leases, delete acked results after 7 days, crash rows and diagnostics after
+  // their retention, rate-limit rows once they carry no state.
   "triggers": { "crons": ["* * * * *"] },
 
   "vars": {
     // minisign public keys (the base64 line of minisign.pub), comma separated. Empty = the
     // coordinator only checks that a build's signature file is present, not that it verifies.
-    "RELEASE_PUBKEYS": "RWQAZVT770KTG1hmXk6yJ5i9pF1v5Q4lNLQ9C3fOUo8ynWWfamzJ2LpS"
+    "RELEASE_PUBKEYS": "RWQAZVT770KTG1hmXk6yJ5i9pF1v5Q4lNLQ9C3fOUo8ynWWfamzJ2LpS",
+    // Data keys (PROTOCOL 7): the only keys that may sign definitions. Required to register one.
+    "DATA_PUBKEYS": "RWTImfGffZDbH0xWVxO/H563BYqds0G+D+hJLn79XEo9xU3sbl6lLp9D",
+    // The first agent that verifies definitions: it gets leases only with one, older agents only
+    // for a run or campaign that has none yet.
+    "DEFINITION_AGENT": "0.2.5",
+    // Installers (agent release github_url) must be this repository's agent-v<version> assets.
+    "GITHUB_REPO": "greggg230/zero-farm",
+    // Limits (security review M3, M4): active leases per machine; result chunks and bytes per
+    // lease; how long after a lease closed its results are still taken; crash rows kept per
+    // machine per day; days crash rows and diagnostics uploads are kept.
+    "MAX_ACTIVE_LEASES": "2",
+    "MAX_LEASE_CHUNKS": "2000",
+    "MAX_LEASE_BYTES": "1073741824",
+    "LATE_RESULTS_S": "86400",
+    "MAX_CRASHES_PER_DAY": "100",
+    "CRASH_RETENTION_DAYS": "30",
+    "DIAG_RETENTION_DAYS": "14"
   },
-  // Secret: ADMIN_TOKEN (wrangler secret put ADMIN_TOKEN). Locally: .dev.vars.
+  // Secrets (wrangler secret put NAME; locally .dev.vars): ADMIN_TOKEN; IP_SALT (HMAC key for
+  // client IPs in rate-limit rows); ACCESS_TEAM_DOMAIN, ACCESS_AUD and optionally ACCESS_EMAILS
+  // (Cloudflare Access logins as admin). Secrets, not vars: they stay out of this public file and
+  // a deploy doesn't reset them. See README "Deploy notes".
 
   "observability": { "enabled": true }
 }

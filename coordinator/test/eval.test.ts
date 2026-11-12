@@ -11,7 +11,9 @@ import {
   advance,
   ask,
   beat,
+  checkDefinitionLease,
   clock,
+  define,
   enroll,
   err,
   expectTiled,
@@ -33,14 +35,15 @@ function evalCfg(o: Record<string, unknown> = {}) {
 }
 
 // An ad hoc head-to-head: a run of its own, no self-play, its gens just labels (registered in any
-// order), then the batch.
-async function h2h(run = "h2h-a-80v70", ev: Record<string, unknown> = evalCfg()) {
+// order), then the batch, then (rev 6) the signed definition with both networks and the seats.
+async function h2h(run = "h2h-a-80v70", ev: Record<string, unknown> = evalCfg(), o: { define?: boolean } = {}) {
   const build = await makeBuild({ tag: run });
   const body = (e: unknown) => ({ ...runBody(build, { selfplay: false }), eval: e });
   ok(await admin("PUT", `/v1/admin/run/${run}`, body(null)));
   await publishCkpt(run, 80);
   await publishCkpt(run, 70); // older than 80: registered, not current
   ok(await admin("PUT", `/v1/admin/run/${run}`, body(ev)));
+  if (o.define !== false) await define("run", run);
   return { build, put: (e: unknown) => admin("PUT", `/v1/admin/run/${run}`, body(e)) };
 }
 
@@ -93,8 +96,12 @@ describe("eval batches (rev 5)", () => {
 
     const m = await enroll("a");
     const l = await lease(m);
-    expect(l).toMatchObject({ kind: "eval", run: "h2h-a-80v70", checkpoint: null, job: { kind: "eval", games: 4, gid_base: 0, seats: SEATS, paired: true, settings: { sims: 32 } } });
+    // Rev 6: the seats, pairing and settings come from the signed definition; the job only says
+    // which games.
+    expect(l).toMatchObject({ kind: "eval", run: "h2h-a-80v70", checkpoint: null, job: { kind: "eval", games: 4, gid_base: 0 } });
     expect(typeof l.job.seed).toBe("number");
+    const d = await checkDefinitionLease(m, l);
+    expect(d.jobs.eval).toEqual({ settings: { sims: 32 }, seats: SEATS, paired: true });
     expect(l.checkpoints.map((c: any) => c.gen)).toEqual([80, 70]); // the batch's order
     for (const c of l.checkpoints) {
       expect(c).toEqual({
@@ -142,6 +149,7 @@ describe("eval batches (rev 5)", () => {
     );
     // ...unless its seats are bots only.
     ok(await admin("PUT", "/v1/admin/run/bots", { ...runBody(w, { selfplay: false }), eval: evalCfg({ checkpoints: [], job: job({ seats: [{ bot: "heuristic" }, { bot: "random" }] }) }) }));
+    await define("run", "bots");
     const m = await enroll("a");
     const bl = await lease(m);
     expect([bl.run, bl.checkpoints, bl.checkpoint]).toEqual(["bots", [], null]);
@@ -229,6 +237,7 @@ describe("eval batches (rev 5)", () => {
     const m = await enroll("a");
     expect((await lease(m, { kinds: ["selfplay"] })).job).toMatchObject({ gid_base: 0, games: 3 });
     ok(await admin("PUT", "/v1/admin/run/r", runBody(w, { games_per_lease: 3, eval: evalCfg({ checkpoints: [1], games: 4, job: { seats: [{ net: 1 }, { bot: "random" }], paired: true } }) })));
+    await define("run", "r");
     expect(ok(await admin("GET", "/v1/admin/run/r")).eval_state).toMatchObject({ lo: 4, hi: 8 });
     expect((await lease(m, { kinds: ["eval"] })).job).toMatchObject({ gid_base: 4, games: 4 });
     expect((await lease(m, { kinds: ["selfplay"] })).job).toMatchObject({ gid_base: 3, games: 1 });
@@ -237,6 +246,7 @@ describe("eval batches (rev 5)", () => {
   it("eval chunks ignore max_stale and x-gen", async () => {
     const w = await makeRun("r", { max_stale: 0 });
     ok(await admin("PUT", "/v1/admin/run/r", runBody(w, { max_stale: 0, eval: evalCfg({ checkpoints: [1], games: 4, job: { seats: [{ net: 1 }, { bot: "random" }], paired: true } }) })));
+    await define("run", "r");
     const m = await enroll("a");
     const sp = await lease(m, { kinds: ["selfplay"] });
     const ev = await lease(m, { kinds: ["eval"] });
@@ -249,7 +259,7 @@ describe("eval batches (rev 5)", () => {
   });
 
   it("eval leases need agent 0.2.3: older agents update first, or get other work", async () => {
-    await h2h();
+    await h2h(undefined, undefined, { define: false }); // legacy agents: a run without a definition
     const m = await enroll("pc");
     const id = await makeBuild({ kind: "agent", version: "0.2.2" });
     ok(await admin("POST", "/v1/admin/agent/release", { version: "0.2.2", build_id: id, channel: "stable", min_agent: "0.2.0" }));

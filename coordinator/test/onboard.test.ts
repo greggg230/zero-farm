@@ -39,6 +39,20 @@ describe("onboarding page and download", () => {
     expect(html).toContain("No admin rights");
     expect(html).toContain("Apps &amp; features");
     expect(html).toContain("Stops when you come back");
+    // What Zero Farm collects (the same list as README "What it sends").
+    for (const x of [
+      "<h2>What Zero Farm collects</h2>",
+      "<b>About your PC:</b>",
+      "<b>How it's going:</b>",
+      "<b>Crash reports:</b>",
+      "keeps it scrambled for at most a",
+      "with your Windows account name removed",
+      "<b>Never collected:</b>",
+      "<b>You're in control:</b>",
+      `<a href="https://github.com/greggg230/zero-farm">https://github.com/greggg230/zero-farm</a>`,
+    ]) {
+      expect(html).toContain(x);
+    }
     expect(html).toContain(`<a href="https://github.com/greggg230/zero-farm">Source code and all releases on\nGitHub</a>`);
     const d = err(await get("/download"), 404, "not_found");
     expect(d.message).toContain("no installer");

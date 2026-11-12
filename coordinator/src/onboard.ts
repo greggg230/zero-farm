@@ -3,11 +3,13 @@
 // link here: an unenrolled agent can't update itself). Installers live on GitHub Releases
 // (rev 4): /download redirects to the newest one; the coordinator serves no installer bytes.
 
+import { config } from "./config";
 import type { Ctx } from "./ctx";
 import { CHANNELS } from "./friend";
 import { cmpSemver, notFound, oneOf } from "./util";
 
-export const SOURCE_URL = "https://github.com/greggg230/zero-farm";
+// The public repository (the GITHUB_REPO var, default greggg230/zero-farm).
+export const sourceUrl = (env: object) => `https://github.com/${config(env).githubRepo}`;
 
 export interface Installer {
   channel: string;
@@ -82,7 +84,7 @@ export async function home(c: Ctx): Promise<Response> {
   } else {
     button = `<span class="button off">No download yet</span><p class="small">The first release isn't out yet. Check back soon.</p>`;
   }
-  const page = HOME.replace("{{button}}", button).replaceAll("{{source}}", SOURCE_URL);
+  const page = HOME.replace("{{button}}", button).replaceAll("{{source}}", sourceUrl(c.env));
   return new Response(page, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
 }
 
@@ -148,12 +150,38 @@ games are what the AIs learn from, so every idle hour helps.</p>
   <li>Runs at the lowest priority, so anything you run comes first.</li>
   <li><b>No admin rights.</b> It installs into your own user account; Windows won't ask for
     permission.</li>
-  <li>Uses at most 3 GB of disk and never looks at your files. It reports only hardware facts
-    (processor, memory, graphics card) and how fast the games run.</li>
+  <li>Uses at most 3 GB of disk and never looks at your files. What it sends is listed
+    below.</li>
   <li>Updates itself quietly. Pause it or quit it any time from its round "Z" icon next to the clock.</li>
   <li><b>To remove it</b>: Settings &rsaquo; Apps &rsaquo; Installed apps (Apps &amp; features on
     Windows 10) &rsaquo; Zero Farm &rsaquo; Uninstall. That removes everything.</li>
 </ul>
+
+<h2>What Zero Farm collects</h2>
+<p>Sent to the farm (farm.greggg230.com, run by Gregg on Cloudflare; only Gregg can see it):</p>
+<ul>
+  <li><b>About your PC:</b> Windows version, processor model and core count, memory, free disk
+    space, graphics card model, memory and driver version, the name you gave your PC when you
+    joined, and a random ID.</li>
+  <li><b>How it's going:</b> how many games or tests it ran and how long they took, how busy the
+    processor and graphics card were, memory used, graphics card temperature, how often it paused
+    because you came back (and how fast), and how many hours a day your PC is idle or on.</li>
+  <li><b>Crash reports:</b> if Zero Farm itself crashes, its error message and where in its own
+    code it happened.</li>
+  <li><b>Results</b> of the games and tests it ran.</li>
+  <li><b>Your IP address</b>, which the farm's host (Cloudflare) sees like any website. Zero Farm
+    uses it only to stop people guessing invite codes, and keeps it scrambled for at most a
+    day.</li>
+  <li><b>Only if you press "Send diagnostics" or Gregg asks for them:</b> Zero Farm's own log
+    files (what it did and when), with your Windows account name removed.</li>
+</ul>
+<p><b>Never collected:</b> your files, documents, photos, browsing, passwords, keystrokes, screen,
+microphone or camera; or the names of programs, windows or games you use. Zero Farm only asks
+Windows yes/no questions such as "is something fullscreen?" and "is another program using the
+graphics card?". It reads and writes only its own folder.</p>
+<p><b>You're in control:</b> pause or quit from the tray icon; uninstalling removes everything from
+your PC; ask Gregg to delete your PC's data from the farm. The source code is public:
+<a href="{{source}}">{{source}}</a></p>
 
 <h2>Installing</h2>
 <ol>

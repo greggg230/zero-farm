@@ -1,13 +1,59 @@
 // Request context and authentication.
 
+import { accessEnabled, verifyAccess } from "./access";
+import type { AnyEnv } from "./config";
 import { HttpError, isSemver, safeEqual, sha256Hex } from "./util";
 
 export interface Ctx {
   req: Request;
-  env: Env & { TEST_CLOCK?: string };
+  env: AnyEnv;
   url: URL;
   now: number;
   exec: ExecutionContext;
+  admin?: AdminAuth; // set by authAdmin
+}
+
+// How the admin authenticated: the bearer token (CLI, trainer, release tool, dashboard fallback)
+// or a Cloudflare Access login: its JWT in the Cf-Access-Jwt-Assertion header (a path behind
+// Access) or in the CF_Authorization cookie (the browser's Access session from /admin).
+export interface AdminAuth {
+  via: "token" | "access";
+  cookie?: boolean;
+  email?: string | null;
+  common_name?: string | null;
+}
+
+// The header the admin page sends on every API call. A cross-site form can't set it, and a
+// cross-site script can't send it without a CORS preflight, which the coordinator never grants.
+export const ADMIN_PAGE_HEADER = "x-farm-admin";
+const SAFE_METHODS = ["GET", "HEAD"];
+
+// CSRF checks for a request authenticated only by the Access cookie (which the browser attaches
+// to any request to this host): it must come from this site. Reads: a `Sec-Fetch-Site` other than
+// same-origin (or none: the owner typed the URL) is refused. Changes: `x-farm-admin: 1`, and
+// `Origin` (if sent) this origin, `Sec-Fetch-Site` (if sent) same-origin, and at least one of the
+// two sent.
+export function cookieRequestProblem(c: Ctx): string | null {
+  const site = c.req.headers.get("sec-fetch-site");
+  const origin = c.req.headers.get("origin");
+  if (SAFE_METHODS.includes(c.req.method)) {
+    return site !== null && site !== "same-origin" && site !== "none" ? `a ${site} request` : null;
+  }
+  if (c.req.headers.get(ADMIN_PAGE_HEADER) !== "1") return `no ${ADMIN_PAGE_HEADER}: 1 header`;
+  if (site !== null && site !== "same-origin") return `a ${site} request`;
+  if (origin !== null && origin !== c.url.origin) return `origin ${origin}`;
+  if (site === null && origin === null) return "no Origin or Sec-Fetch-Site header";
+  return null;
+}
+
+// The values of a cookie (a name can appear more than once).
+function cookies(req: Request, name: string): string[] {
+  const out: string[] = [];
+  for (const part of (req.headers.get("cookie") ?? "").split(";")) {
+    const i = part.indexOf("=");
+    if (i > 0 && part.slice(0, i).trim() === name) out.push(part.slice(i + 1).trim());
+  }
+  return out.slice(0, 4);
 }
 
 // Unix seconds. Tests move the clock with an `x-test-now` header, honoured only when the
@@ -63,9 +109,34 @@ export async function authMachine(c: Ctx): Promise<MachineRow> {
   return row;
 }
 
-// The admin token (Worker secret ADMIN_TOKEN). Unset -> nobody is admin.
-export function authAdmin(c: Ctx): void {
+// The admin: the bearer admin token (Worker secret ADMIN_TOKEN; unset -> no token is admin), or,
+// when Cloudflare Access is configured (access.ts), a valid Access JWT: in Cf-Access-Jwt-Assertion,
+// or in the CF_Authorization cookie, the session Access gives the browser for /admin (Access
+// protects only that page; /v1/admin stays outside it). The cookie also passes the CSRF checks
+// above. The same JWT checks apply either way.
+export async function authAdmin(c: Ctx): Promise<AdminAuth> {
   const token = bearer(c.req);
   const want = c.env.ADMIN_TOKEN;
-  if (!want || !token || !safeEqual(token, want)) throw new HttpError(401, "unauthorized", "admin token required");
+  if (want && token && safeEqual(token, want)) return (c.admin = { via: "token" });
+  if (accessEnabled(c.env)) {
+    const jwt = c.req.headers.get("cf-access-jwt-assertion");
+    if (jwt) {
+      const v = await verifyAccess(c.env, jwt, c.now);
+      if ("id" in v) return (c.admin = { via: "access", ...v.id });
+      console.warn("admin: Cloudflare Access JWT refused:", v.why);
+    }
+    for (const value of cookies(c.req, "CF_Authorization")) {
+      const v = await verifyAccess(c.env, value, c.now);
+      if (!("id" in v)) {
+        console.warn("admin: Cloudflare Access cookie refused:", v.why);
+        continue;
+      }
+      const csrf = cookieRequestProblem(c);
+      if (csrf) {
+        throw new HttpError(403, "unauthorized", `an admin request signed in by the Access cookie must come from the admin page (${csrf})`);
+      }
+      return (c.admin = { via: "access", cookie: true, ...v.id });
+    }
+  }
+  throw new HttpError(401, "unauthorized", accessEnabled(c.env) ? "admin token or Cloudflare Access login required" : "admin token required");
 }

@@ -17,6 +17,13 @@ export default defineConfig(async () => {
             // wrangler.jsonc carries the real release key; test builds carry fake signatures
             // (signature checks have their own tests in units.test.ts).
             RELEASE_PUBKEYS: "",
+            // A throwaway data key that only these tests use (its secret half is in
+            // test/helpers.ts); no agent trusts it. Definitions in tests are really signed.
+            DATA_PUBKEYS: "RWT3hsgFThU0IyTBqihmNcFGFp14r/JzL0rYHibveCJB3GW3w6oaYaQs",
+            IP_SALT: "test-ip-salt",
+            // Tests hold several leases per machine on purpose; the cap has its own test (and the
+            // fleet simulation runs with the real default, per request).
+            MAX_ACTIVE_LEASES: "100",
           },
         },
       }),
