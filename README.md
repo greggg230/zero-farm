@@ -10,7 +10,8 @@ to, so you can read exactly what it does before you install it. Start at
 [Releases page](https://github.com/greggg230/zero-farm/releases).
 
 Status: **alpha**. The first jobs are fuzz tests of a game engine (millions of random games looking
-for crashes), on the CPU only. Neural-network games and GPU work come later.
+for crashes), on the CPU only. From version 0.2.3 there are also evaluation jobs, where trained
+networks play each other (below). Self-play training games and GPU work come later.
 
 ## What it does on your PC
 
@@ -42,8 +43,26 @@ of CPU for more than about 10 minutes is handed back to the farm.
 
 **Network use.** About one request every few minutes while idle, a heartbeat every 60 s while
 working, and an update check every 6 hours. Downloads: the job programs (tens of MB, once per
-engine version), and later network files (about 13 MB each). Uploads: results, a few KB per game
-or one small file per fuzz job. A busy PC uploads well under 100 KB/s.
+engine version), and network files for evaluation jobs (about 13 MB each, kept in the cache).
+Uploads: results, a few KB per game or one small file per fuzz job. A busy PC uploads well under
+100 KB/s.
+
+**Evaluation jobs** (from 0.2.3). An evaluation job plays two or more trained networks against
+each other, for example this week's network against an older one, to measure which is stronger.
+Zero Farm downloads every network file the job names (about 13 MB each, plus a small reference
+file the job uses to check that the network computes correctly on your PC), checks each file's
+SHA-256 against the farm's, and keeps them in its cache under the 3 GB cap, so a later job with the
+same networks downloads nothing. The job program first self-tests every network, then plays the
+games on the CPU at the lowest priority, like any other job. What goes back is one small row per
+game: which network played which side, who won, by how much and in how many rounds, a few hundred
+bytes. Network files are never uploaded.
+
+**If Windows blocks the job program.** Windows 11's Smart App Control (or a company's application
+control, or an antivirus) can refuse to run the job program, because it isn't code-signed yet.
+Zero Farm then tells the farm (once a day), waits before trying again (15 minutes, then 1 hour,
+4 hours, 16 hours, then once a day), and the tray says: "Windows is blocking Zero Farm's job
+program (Smart App Control). Zero Farm can't work on this PC until its programs are code-signed.
+Nothing is wrong with your PC." There's nothing you need to do.
 
 **What it doesn't do.** No admin rights (it installs into your user account, no UAC prompt), no
 service, no drivers, no ads. It reads and writes only its own folder and doesn't look at your
@@ -61,7 +80,7 @@ Machine and performance data only ([DESIGN.md](DESIGN.md) 5.4; exact fields in
 | The name you give the PC and a random machine id | at sign-up |
 | Hardware profile: Windows version, CPU model and core counts, RAM, free disk, GPU models / VRAM / driver versions, the ONNX Runtime providers available, hours per day the PC was idle / Zero Farm was running | at sign-up and when it changes (at most daily) |
 | Per-job performance: games or seeds done, timings, CPU %, memory, threads, time paused or starved of CPU, how fast it yielded | with each heartbeat and at the end of a job |
-| Crash reports: the error message and stack trace of a crashed job or of Zero Farm itself, the job's last log lines | when something crashes |
+| Crash reports: the error message and stack trace of a crashed job or of Zero Farm itself, the job's last log lines; if Windows refuses to run the job program, which kind of policy refused it (a Windows error number) | when something crashes; a blocked job program once a day |
 | Logs: Zero Farm's own log files (`%LOCALAPPDATA%\ZeroFarm\logs`) | only when you press **Send diagnostics** in the tray, or when Gregg asks for that machine's logs from the farm |
 | The job results | as jobs finish |
 

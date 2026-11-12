@@ -4,6 +4,24 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>`.
 
+## 0.2.3 (2026-11-12, canary)
+
+- **Evaluation jobs**: two or more trained networks play each other, for example to see whether a
+  new network beats an older one. Zero Farm downloads each network file the job names (about
+  13 MB each, kept in its cache), checks its SHA-256, lets the job program self-test every network
+  before the first game, and sends back one small row per game.
+- **When Windows blocks the job program** (Smart App Control, a company's application control, or
+  an antivirus): the tray now says "Windows is blocking Zero Farm's job program (Smart App
+  Control). Zero Farm can't work on this PC until its programs are code-signed. Nothing is wrong
+  with your PC." Zero Farm tells the farm once a day and then waits before trying again (15 min,
+  1 h, 4 h, 16 h, then once a day). Before, it asked for new work again at once, hundreds of times
+  an hour.
+- Any other job program that fails to start is reported and retried later (1 minute, doubling up
+  to an hour), never in a tight loop.
+- Fix: clicking the tray icon could close Zero Farm ("RefCell already borrowed", seen three times
+  in 10 s on one PC). The tray no longer re-enters itself while a menu or message box is open, and
+  a problem in the tray is now reported to the farm instead of closing the app.
+
 ## 0.2.2 (2026-11-12, canary)
 
 - Release-path check: no user-visible changes. The first version built from this public
