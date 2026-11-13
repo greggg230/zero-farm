@@ -187,10 +187,12 @@ describe("run alternates: per-vendor runtime packs (rev 11)", () => {
     expect(err(await put([{ build_id: s.def, runtime: s.cpuRt, when: { vendor: "nvidia" } }]), 400, "bad_request").message).toMatch(/default/);
     err(await put([1, 2, 3, 4, 5].map(() => altEntry(s))), 400, "bad_request");
     err(await put([{ ...altEntry(s), extra: 1 }]), 400, "bad_request");
-    // the vendor defaults to the pack's; an AMD -> Windows ML entry needs it spelled out
-    ok(await put([{ build_id: s.alt, runtime: s.cuda }, { build_id: wml, runtime: winml, when: { vendor: "amd" } }]));
+    // the vendor defaults to the pack's; a pack without its own gpu takes it spelled out (rev 12: never amd)
+    const intel = await makeBuild({ kind: "runtime", tag: "intel" });
+    const wi = await makeBuild({ tag: "w-intel", requires_runtime: intel });
+    ok(await put([{ build_id: s.alt, runtime: s.cuda }, { build_id: wi, runtime: intel, when: { vendor: "intel" } }]));
     const run = ok(await admin("GET", "/v1/admin/run/r"));
-    expect(run.alternates.map((a: any) => a.when.vendor)).toEqual(["nvidia", "amd"]);
+    expect(run.alternates.map((a: any) => a.when.vendor)).toEqual(["nvidia", "intel"]);
     // a PUT without alternates clears them (a PUT is the whole configuration)
     ok(await admin("PUT", "/v1/admin/run/r", { ...runBody(s.def), runtime: s.cpuRt }));
     expect(ok(await admin("GET", "/v1/admin/run/r")).alternates).toBeNull();
