@@ -623,7 +623,7 @@ Expect many friends' PCs to contribute mainly through the **CPU EP**: these nets
 CPU inference is competitive at small batches (the M4 Max beat its own GPU via MPS for MTG Zero;
 the 5090 needed CUDA graphs plus sparse uploads to pull ahead). Phase 0 measures this.
 
-**Phase 4 result (2026-11-12; zero-farm-notes phase4-gpu.md).** Every session goes through one factory
+**Phase 4 result (2026-11-12; internal report).** Every session goes through one factory
 (PROTOCOL 8, `create_session`); a provider is accepted only through the self-test (2e-5, twice
 bit-identical). Findings, eoe1 iter 80 (`packed`) unless noted:
 
@@ -764,7 +764,7 @@ the Python-only pieces a worker needs moved to Rust (league seats, forked/archiv
 via the `queue_only` driver's tags. Until then `check-config` refuses those runs loudly.
 
 **Phase 4 status (2026-11-12): built, not released** (zero-core `gpu`, mtg-zero `gpu`, zero-farm `gpu`;
-PROTOCOL rev 7 section 8; zero-farm-notes phase4-gpu.md). Left: a canary agent release; the AMD friend's probe
+PROTOCOL rev 7 section 8; internal report). Left: a canary agent release; the AMD friend's probe
 report; a definition naming the Windows ML pack; per-adapter GPU gating; the CUDA pack if NVIDIA's catalog
 provider fails.
 **Phase 4: GPU.** Windows ML provider selection; TensorRT-RTX (or CUDA) EP on NVIDIA behind the
