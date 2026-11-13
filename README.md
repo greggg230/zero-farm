@@ -288,8 +288,10 @@ terms. By installing Zero Farm you accept these terms (the "Join Zero Farm" wind
 | **Microsoft Windows ML runtime** and **DirectML** | `Microsoft.Windows.AI.MachineLearning.dll` and `DirectML.dll`, unmodified, from Microsoft's NuGet package [Microsoft.Windows.AI.MachineLearning 2.5.96](https://www.nuget.org/packages/Microsoft.Windows.AI.MachineLearning/2.5.96) (which also carries DirectML). Distributed only inside Zero Farm's GPU runtime pack | [Microsoft Software License Terms, Microsoft Windows ML Runtime](https://www.nuget.org/packages/Microsoft.Windows.AI.MachineLearning/2.5.96/License) |
 | **Microsoft Visual C++ runtime** | `msvcp140.dll`, `msvcp140_1.dll`, `vcruntime140.dll`, `vcruntime140_1.dll`, Microsoft-signed, in the CPU runtime pack (the GPU pack needs none) | [Microsoft Visual C++ Runtime 2015-2022 license terms](https://visualstudio.microsoft.com/license-terms/vs2022-cruntime/) ([redistribution](https://learn.microsoft.com/en-us/visualstudio/releases/2022/redistribution)) |
 
-The GPU runtime pack ships the package's license files next to its DLLs, byte for byte as Microsoft
-publishes them: `license.txt` (the Microsoft Software License Terms) and `ThirdPartyNotices.txt`.
-After a pack is downloaded they are in `%LOCALAPPDATA%\ZeroFarm\cache\builds\<pack build id>\`.
+Both runtime packs ship their components' license files next to the DLLs, unmodified. The GPU
+pack: Windows ML's `license.txt` (the Microsoft Software License Terms) and `ThirdPartyNotices.txt`.
+The CPU pack: ONNX Runtime's `LICENSE` and `ThirdPartyNotices.txt`, and the Visual C++ runtime's
+license and redistribution list. After a pack is downloaded they are in
+`%LOCALAPPDATA%\ZeroFarm\cache\builds\<pack build id>\`.
 Zero Farm's own code (this repo) is MIT-licensed (above); the job programs are signed builds of a
 private engine (MTG Zero).
