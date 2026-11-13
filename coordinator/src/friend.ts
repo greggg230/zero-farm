@@ -424,6 +424,8 @@ export async function lease(c: Ctx): Promise<Response> {
   // --- agent version: a job whose build needs a newer agent makes the agent update first ---
   // Rev 6: a run or campaign with a definition needs a definition-aware agent, like a build's
   // min_agent; one without a definition gets no definition-aware agent (PROTOCOL 7, rollout).
+  // Rev 9: so does a run's or campaign's own `min_agent` (an update only when the channel offers one
+  // new enough; else that run or campaign is skipped and the agent gets other work).
   let need: string | null = release && cmpSemver(agent, release.min_agent) < 0 ? release.min_agent : null;
   const usable = cands.filter((cd) => {
     const r = cd.run ? runs.find((x) => x.run === cd.run) : null;
@@ -435,7 +437,9 @@ export async function lease(c: Ctx): Promise<Response> {
     const def = defs.get(r ? `run:${r.run}` : `campaign:${camp!.campaign}`);
     if (!def && defAware) return false;
     if (def && defAware && leaseProblem(def, cd.kind as JobKind, ids[0]!, r ? r.runtime : null, c.now)) return false;
-    const req = maxSemver([...infos.map((i) => i!.min_agent), cd.kind === "eval" ? EVAL_MIN_AGENT : null, def ? cfg.definitionAgent : null]);
+    // Rev 9: the run's or campaign's own min_agent counts like a build's.
+    const own = r ? r.min_agent : camp!.min_agent;
+    const req = maxSemver([...infos.map((i) => i!.min_agent), cd.kind === "eval" ? EVAL_MIN_AGENT : null, def ? cfg.definitionAgent : null, own]);
     if (req && !minAgentOk(agent, req)) {
       // Only ask for an update the channel can deliver.
       if (release && cmpSemver(req, release.version) <= 0) need = maxSemver([need, req]);

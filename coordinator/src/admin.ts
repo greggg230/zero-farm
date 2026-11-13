@@ -295,6 +295,14 @@ export function evalOf(v: unknown): book.EvalCfg | null {
   };
 }
 
+// Rev 9: the oldest agent a run's or campaign's leases may go to (null or absent: no such limit).
+export function minAgentOf(v: unknown): string | null {
+  if (v === undefined || v === null) return null;
+  const s = str(v, "min_agent", { max: 64 });
+  if (!isSemver(s)) throw bad("min_agent must be semver (e.g. \"0.2.8\") or null");
+  return s;
+}
+
 export async function putRun(c: Ctx, run: string): Promise<Response> {
   await authAdmin(c);
   slug(run, "run");
@@ -306,6 +314,7 @@ export async function putRun(c: Ctx, run: string): Promise<Response> {
     runtime: str(b.runtime, "runtime", { optional: true, re: BUILD_RE }) ?? null,
     priority: num(b.priority, "priority", { optional: true, min: 0, max: 1000 }) ?? 1,
     state: oneOf(b.state, "state", STATES, { optional: true }) ?? "active",
+    min_agent: minAgentOf(b.min_agent),
     selfplay: selfplayOf(b.selfplay),
     eval: evalOf(b.eval),
   };
@@ -330,6 +339,7 @@ export async function getRunRoute(c: Ctx, run: string): Promise<Response> {
     runtime: r.runtime,
     priority: r.priority,
     state: r.state,
+    min_agent: r.min_agent ?? null,
     selfplay: parseJson(r.selfplay, null),
     eval: parseJson(r.eval, null),
     eval_batch: r.eval_batch,
@@ -501,6 +511,7 @@ export async function putCampaign(c: Ctx, id: string): Promise<Response> {
     state: oneOf(b.state, "state", STATES, { optional: true }) ?? "active",
     needs: b.needs === undefined || b.needs === null ? null : needsOf(b.needs, "needs"),
     ...routingIn(b, ""),
+    min_agent: minAgentOf(b.min_agent),
   };
   await buildOfKind(c.env.DB, cfg.build_id, "worker", "build_id");
   return json(unwrap(await bookFor(c.env, book.campaignScope(id)).putCampaign(cfg, c.now)));
@@ -816,6 +827,7 @@ export async function stats(c: Ctx): Promise<Response> {
       game: r.game,
       state: r.state,
       priority: r.priority,
+      min_agent: r.min_agent ?? null,
       build_id: r.build_id,
       current_gen: r.current_gen,
       next_gid: r.next_gid,
@@ -845,6 +857,7 @@ export async function stats(c: Ctx): Promise<Response> {
       mode: x.mode,
       state: x.state,
       priority: x.priority,
+      min_agent: x.min_agent ?? null,
       build_id: x.build_id,
       seed_base: x.seed_base,
       cursor: x.cursor,

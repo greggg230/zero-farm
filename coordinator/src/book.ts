@@ -108,6 +108,7 @@ export interface RunRow {
   eval_batch: string | null;
   next_gid: number;
   current_gen: number | null;
+  min_agent: string | null; // rev 9: the oldest agent its leases go to (NULL: no such limit)
   created_at: number;
   updated_at: number;
 }
@@ -125,6 +126,7 @@ export interface CampaignRow {
   needs: string | null;
   gpu: string; // rev 7: any | preferred | required
   providers: string | null; // rev 7: JSON allowlist or NULL (any provider)
+  min_agent: string | null; // rev 9: the oldest agent its leases go to (NULL: no such limit)
   created_at: number;
   updated_at: number;
 }
@@ -1230,6 +1232,7 @@ export interface RunCfg {
   runtime: string | null;
   priority: number;
   state: "active" | "paused";
+  min_agent: string | null; // rev 9
   selfplay: SelfplayCfg | null;
   eval: EvalCfg | null;
 }
@@ -1273,18 +1276,18 @@ export async function putRun(env: Env, cfg: RunCfg, now: number): Promise<{ ok: 
     stmts.push(
       db
         .prepare(
-          `INSERT INTO runs (run, game, build_id, runtime, priority, state, selfplay, eval, next_gid, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
+          `INSERT INTO runs (run, game, build_id, runtime, priority, state, selfplay, eval, next_gid, min_agent, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
         )
-        .bind(cfg.run, cfg.game, cfg.build_id, cfg.runtime, cfg.priority, cfg.state, JSON.stringify(cfg.selfplay), JSON.stringify(cfg.eval), now, now),
+        .bind(cfg.run, cfg.game, cfg.build_id, cfg.runtime, cfg.priority, cfg.state, JSON.stringify(cfg.selfplay), JSON.stringify(cfg.eval), cfg.min_agent, now, now),
     );
   } else {
     stmts.push(
       db
         .prepare(
-          `UPDATE runs SET game = ?, build_id = ?, runtime = ?, priority = ?, state = ?, selfplay = ?, eval = ?, updated_at = ? WHERE run = ?`,
+          `UPDATE runs SET game = ?, build_id = ?, runtime = ?, priority = ?, state = ?, selfplay = ?, eval = ?, min_agent = ?, updated_at = ? WHERE run = ?`,
         )
-        .bind(cfg.game, cfg.build_id, cfg.runtime, cfg.priority, cfg.state, JSON.stringify(cfg.selfplay), JSON.stringify(cfg.eval), now, cfg.run),
+        .bind(cfg.game, cfg.build_id, cfg.runtime, cfg.priority, cfg.state, JSON.stringify(cfg.selfplay), JSON.stringify(cfg.eval), cfg.min_agent, now, cfg.run),
     );
   }
   // A new eval batch reserves its game ids now; the old batch's unplayed ids are dropped. A paired
@@ -1339,6 +1342,7 @@ export interface CampaignCfg {
   needs: Needs | null;
   gpu: GpuMode; // rev 7
   providers: Provider[] | null; // rev 7
+  min_agent: string | null; // rev 9
 }
 
 export async function putCampaign(env: Env, cfg: CampaignCfg, now: number): Promise<{ ok: true; created: boolean; cursor: number }> {
@@ -1348,12 +1352,12 @@ export async function putCampaign(env: Env, cfg: CampaignCfg, now: number): Prom
   const cursor = old ? Math.max(old.cursor, cfg.seed_base) : cfg.seed_base;
   await db
     .prepare(
-      `INSERT INTO campaigns (campaign, build_id, mode, env, seed_base, cursor, chunk, priority, state, needs, gpu, providers, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO campaigns (campaign, build_id, mode, env, seed_base, cursor, chunk, priority, state, needs, gpu, providers, min_agent, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (campaign) DO UPDATE SET build_id = excluded.build_id, mode = excluded.mode, env = excluded.env,
          seed_base = excluded.seed_base, cursor = MAX(campaigns.cursor, excluded.cursor), chunk = excluded.chunk,
          priority = excluded.priority, state = excluded.state, needs = excluded.needs, gpu = excluded.gpu,
-         providers = excluded.providers, updated_at = excluded.updated_at`,
+         providers = excluded.providers, min_agent = excluded.min_agent, updated_at = excluded.updated_at`,
     )
     .bind(
       cfg.campaign,
@@ -1368,6 +1372,7 @@ export async function putCampaign(env: Env, cfg: CampaignCfg, now: number): Prom
       cfg.needs ? JSON.stringify(cfg.needs) : null,
       cfg.gpu,
       cfg.providers ? JSON.stringify(cfg.providers) : null,
+      cfg.min_agent,
       now,
       now,
     )

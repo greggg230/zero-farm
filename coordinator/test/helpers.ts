@@ -252,6 +252,7 @@ export interface RunOpts {
   state?: "active" | "paused";
   gen?: number | null; // checkpoint to publish (default 1; null = none)
   define?: boolean; // sign a definition for it (default true; false = legacy agents only)
+  min_agent?: string | null; // rev 9 (absent: not sent)
 }
 
 export function runBody(build: string, o: RunOpts = {}) {
@@ -261,6 +262,7 @@ export function runBody(build: string, o: RunOpts = {}) {
     runtime: null,
     priority: o.priority ?? 1,
     state: o.state ?? "active",
+    ...(o.min_agent !== undefined ? { min_agent: o.min_agent } : {}),
     selfplay:
       o.selfplay === false
         ? null
@@ -290,7 +292,7 @@ export async function makeRun(run: string, o: RunOpts = {}): Promise<string> {
 
 export async function makeCampaign(
   id: string,
-  o: { build?: string; seed_base?: number; chunk?: number | "auto"; priority?: number; state?: string; define?: boolean } = {},
+  o: { build?: string; seed_base?: number; chunk?: number | "auto"; priority?: number; state?: string; define?: boolean; min_agent?: string | null } = {},
 ) {
   const build = o.build ?? (await makeBuild({ tag: `fuzz-${id}` }));
   const ans = ok(
@@ -302,6 +304,7 @@ export async function makeCampaign(
       chunk: o.chunk ?? 1000,
       priority: o.priority ?? 0.2,
       state: o.state ?? "active",
+      ...(o.min_agent !== undefined ? { min_agent: o.min_agent } : {}),
     }),
   );
   if (o.define !== false) await define("campaign", id);
