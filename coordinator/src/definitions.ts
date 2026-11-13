@@ -40,9 +40,12 @@ const TEMPLATE_KEYS: Record<JobKind, string[]> = {
 };
 
 // A string a worker could take for a file path: separators, "..", a drive ("C:"). Templates
-// carry none (the agent refuses them: paths on a job line are only ever its own).
+// carry none (the agent refuses them: paths on a job line are only ever its own). The Oracle
+// name separator " // " (a split, adventure or double-faced card: "Rough // Tumble") is not a
+// separator: a game spec names such cards; any other "/" still is (the agent's rule exactly).
 export function looksLikePath(s: string): boolean {
-  return s.includes("/") || s.includes("\\") || s.includes("..") || /^[A-Za-z]:/.test(s);
+  const t = s.split(" // ").join("");
+  return t.includes("/") || t.includes("\\") || s.includes("..") || /^[A-Za-z]:/.test(s);
 }
 
 function noPaths(v: unknown, at: string, out: string[], depth = 0): void {

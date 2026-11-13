@@ -256,10 +256,12 @@ pub fn lease_keys(kind: &str) -> &'static [&'static str] {
 }
 
 /// A string a worker could take for a file path: separators, `..`, a drive (`C:`). Job
-/// templates carry none; paths on a job line are only ever the agent's own.
+/// templates carry none; paths on a job line are only ever the agent's own. The Oracle name
+/// separator ` // ` (a split, adventure or double-faced card's name: "Rough // Tumble") is not a
+/// separator: a game spec names such cards; any other `/` still is.
 pub fn looks_like_path(s: &str) -> bool {
     let b = s.as_bytes();
-    s.contains(['\\', '/']) || s.contains("..") || (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':')
+    s.replace(" // ", "").contains(['\\', '/']) || s.contains("..") || (b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':')
 }
 
 fn shorten(s: &str) -> String {
@@ -496,10 +498,11 @@ mod tests {
 
     #[test]
     fn path_like_strings() {
-        for p in [r"\\attacker\s\m.onnx", r"C:\Users\x", "c:x", "../x", "a/b", r"x\y", "/etc"] {
+        for p in [r"\\attacker\s\m.onnx", r"C:\Users\x", "c:x", "../x", "a/b", r"x\y", "/etc", "a //b", "a// b", "x // ../y", "/ // /", "a //// b"] {
             assert!(looks_like_path(p), "{p}");
         }
-        for s in ["delver-games", "mcts:400", "random", "0.25", "{\"game_ms\":50}"] {
+        // (cards named with the Oracle separator, in a game spec: not paths)
+        for s in ["delver-games", "mcts:400", "random", "0.25", "{\"game_ms\":50}", "Rough // Tumble", "Tamiyo, Inquisitive Student // Tamiyo, Seasoned Scholar"] {
             assert!(!looks_like_path(s), "{s}");
         }
         assert!(check_no_paths(&json!({"a": [{"b": "ok"}, {"c": "..\\x"}]}), "job").unwrap_err().contains("job.a[1].c"));

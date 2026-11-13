@@ -6,6 +6,7 @@
 
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
+import { looksLikePath } from "../src/definitions";
 import {
   LEGACY,
   admin,
@@ -123,6 +124,11 @@ describe("registering definitions", () => {
     expect(await problems((d) => (d.jobs.selfplay.settings = { book: winPath }))).toEqual([`jobs.selfplay.settings.book: ${JSON.stringify(winPath)} looks like a file path`]);
     expect(await problems((d) => (d.jobs.selfplay.settings = { share: "x" + String.fromCharCode(92) + "y" }))).toHaveLength(1);
     expect(await problems((d) => (d.jobs.selfplay.settings = { "../x": 1 }))).toEqual(['jobs.selfplay.settings: key "../x" looks like a file path']);
+    // Card names with the Oracle separator " // " in a game spec (the Delver 75's "Rough // Tumble") are not paths;
+    // any other "/" still is.
+    expect(looksLikePath(JSON.stringify({ decks: { p0: ["Rough // Tumble", "Tamiyo, Inquisitive Student // Tamiyo, Seasoned Scholar"] } }))).toBe(false);
+    expect(await problems((d) => (d.jobs.selfplay.settings = { spec: "Rough //Tumble" }))).toHaveLength(1);
+    expect(await problems((d) => (d.jobs.selfplay.settings = { spec: "x // ../y" }))).toHaveLength(1);
     expect(await problems((d) => (d.checkpoints["1"].extra = 1))).toEqual(["checkpoints.1.extra: unknown field"]);
     expect(await problems((d) => (d.checkpoints["1"].model_size = 0))).toEqual(["checkpoints.1.model_size must be 1 to 1073741824 bytes"]);
     expect(await problems((d) => (d.expires = d.created))).toContain("expires must be Unix seconds after created, or null");
