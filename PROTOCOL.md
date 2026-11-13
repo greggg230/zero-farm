@@ -288,8 +288,10 @@ lease (else 400). `returned` is how many ids went back. Repeating `done` → 200
   "manifest": "builds/<id>/manifest.json", "min_agent": "0.3.0"}`: the latest release on the
   machine's channel; nothing released on it → 404. Rev 10: `channel` is accepted and ignored. Agents
   send the channel they were enrolled on, which goes stale when `POST /v1/admin/machine/{id}` moves
-  the machine; the machine's channel as the coordinator holds it is the one that counts.
-- `POST /v1/crash` `{"build_id", "kind": "panic" | "crash" | "agent" | "blocked" | "definition",
+  the machine; the machine's channel as the coordinator holds it is the one that counts. Rev 12:
+  `"evict": ["<build_id>", ...]` (only when the owner's evict list is not empty, `POST /v1/admin/evict`):
+  agents from 0.2.11 delete those builds from their cache at once (section 9.8); older agents ignore the key.
+- `POST /v1/crash` `{"build_id", "kind": "panic" | "crash" | "agent" | "blocked" | "definition" | "probe_unfinished",
   "message", "backtrace", "lease_id", "os_error"?}` → `{"ok": true}` (message kept to 4 KB,
   backtrace to 64 KB). Rev 6: at most `MAX_CRASHES_PER_DAY` (100) rows per machine per 24 h are
   kept, for `CRASH_RETENTION_DAYS` (30); past the cap the answer is `{"ok": true, "stored": false}`
@@ -302,7 +304,9 @@ lease (else 400). `returned` is how many ids went back. Repeating `done` → 200
   offering that build to that machine for 24 h, or until the machine asks for work with a newer
   agent than the one that reported it (a newer build is a different `build_id`, so it is offered at
   once); the admin page lists it under the machine, and `POST /v1/admin/machine/{id}` `{"unblock":
-  true}` lifts it. A `blocked` report without `build_id` → 400.
+  true}` lifts it. A `blocked` report without `build_id` → 400. `probe_unfinished` (rev 12, agents from 0.2.11):
+  the agent or the PC stopped during a provider probe or a bench (section 9.8), found at the next start;
+  `build_id` is the worker build that ran it.
 - `POST /v1/diag/{name}` body bytes (≤ 32 MB) → `{"ok": true, "key": "diag/..."}`, when the
   coordinator asked for it in a beat or lease answer (`"upload_diag": ["logs"]`); else, with header
   `x-farm-diag: user` (rev 3: the friend pressed "Send diagnostics"), ≤ 20 MB (else 413) and
@@ -396,6 +400,7 @@ tools also send an Access service token (`CF-Access-Client-Id`, `CF-Access-Clien
 | `GET /v1/admin/machines` · `POST /v1/admin/machine/{id}/revoke` | revoking cancels the machine's active leases at once (their ids go back to the pool) → `{"ok": true, "cancelled"}` |
 | `POST /v1/admin/machine/{id}` | `{"name"?, "channel"?, "paused"?, "unblock"?}`; a paused machine gets `wait_s` / `paused_by_admin`; `"unblock": true` (rev 5) lifts the machine's build blocks (`/v1/crash` kind `blocked`) and answers `{"ok": true, "unblocked": n}` |
 | `POST /v1/admin/pause` | `{"paused": true \| false}`: farm-wide, no new leases while paused |
+| `POST /v1/admin/evict` | rev 12: `{"builds": ["<build_id>", ...]}` (at most 64; `[]` clears it) replaces the evict list → `{"ok": true, "builds"}` (deduplicated). `GET /v1/admin/evict` → `{"builds"}`. It rides on every `GET /v1/agent/latest` (section 3) |
 | `POST /v1/admin/diag` | `{"machine_id" \| "class", "kind": "sweep" \| "profile" \| "stability" \| "logs", "params"}` → `{"requests": [{"id", "machine_id"}]}`. `class` = a hardware class as the stats show it (`"<cpu> / <gpu or 'no gpu'>"`). `logs` goes out as `upload_diag`; the others become `diag` leases (`params.build_id` or `params.run` picks the build) |
 | `GET /v1/admin/diag?machine_id=` | requests, uploads and diag-lease results with their R2 keys |
 | `GET /v1/admin/stats` | aggregates for the dashboard (`/admin`); per machine also `idle_h_day`, `on_h_day`, `starved_s_24h`, `blocked` (rev 5: `[{"build_id", "until", "os_error", "message", "agent_version", "t"}]`); per run `eval` (the current batch's progress, rev 5); `eval_batches` (the 20 newest batches of all runs, with `run`); `releases` (latest per channel, `github_url`), `diag_uploads` (recent, `user`). Rev 6: `auth` (`{"via": "token" \| "access", "email"?, "common_name"?}`), `limits`, per run and campaign `definition` (current version, gens, jobs, builds and `problems`: why a job can't be leased), per machine `refused_24h`, `blocks` (every active block), `contributors` (farm PCs and external sources, below), `totals` (`farm`, `own`, `all`: self-play/eval games and fuzz seeds over 1 h and 24 h), `by_scope` |
@@ -924,7 +929,9 @@ plain sizes plus the largest compressed object (one at a time is unpacked and th
 migration 0009 `runs.alternates`). Checks (400): `build_id` a registered worker build whose manifest's
 `requires_runtime` is `runtime`; `runtime` a registered runtime build; `when.vendor` a vendor name, and equal to
 the pack's `gpu.vendor` when the pack has one (it defaults to it); `when.min_driver` optional (the stricter of it
-and the pack's applies); no alternate equal to the default (`build_id`, `runtime`) or to another alternate. `GET
+and the pack's applies); no alternate equal to the default (`build_id`, `runtime`) or to another alternate; rev 12:
+`when.vendor` not a vendor the farm never uses (`GPU_VENDORS_OFF`: `amd`, section 9.8), and an alternate of such a
+vendor stored before rev 12 is never offered. `GET
 /v1/admin/run/{run}` and the stats show them, with `problems` per alternate when the current definition doesn't
 authorize it.
 
@@ -1026,8 +1033,54 @@ meanwhile), a provider that failed its self-test in a bench stays failed for tha
 |---|---|---|
 | any (default) | the CPU pack (ONNX Runtime 1.31.1 CPU), or the Windows ML pack (DirectML, Windows ML's catalog) | the run's `runtime` |
 | NVIDIA | the **CUDA pack** (`farm_build.py --runtime --pack cuda`): ONNX Runtime 1.24.4 (the last CUDA 12 build; 1.27+ need CUDA 13, driver 580+) with the CUDA provider, the CUDA 12.8 runtime, cuBLAS and cuBLASLt, cuFFT (a load-time import of ONNX Runtime's CUDA provider), cuDNN 9.28 (`cudnn64_9`, `cudnn_graph64_9`, `cudnn_ops64_9`: the only cuDNN libraries our graphs load), the MSVC runtime; `gpu` NVIDIA 527.41 `["cuda"]` | a run alternate, `when.vendor` `nvidia` |
+| AMD | none (rev 12: no GPU work on AMD GPUs, 9.8) | AMD PCs run CPU work on the run's default pack |
+
+### 9.8 Probes the PC never finished, GPU vendors off, the evict list (rev 12, agents from 0.2.11)
+
+**The in-progress marker.** Before a built-in probe or a bench (9.6) starts its worker, the agent writes
+`state\probe-inflight.json` `{"kind": "probe" | "bench", "runtime", "adapters" (the probe key: vendor, name and
+driver of each adapter), "worker", "run"?, "t"}` through to disk (flushed, renamed with write-through), and removes
+it when the probe ends, whatever its outcome (a failed probe, a timeout or the agent quitting are recorded as
+before; Windows logging off or shutting down - `SM_SHUTTINGDOWN` - stops a probe like the agent quitting, so a
+shutdown is never taken for a fault). If it can't be written the probe doesn't run. A marker found at the next start means the agent or the PC
+went down during it - a GPU driver fault, a hard hang ended with a reset, a crash - and counts as an **unfinished
+probe** of that pack on those adapters (`state\unfinished.json`): once, the pack is held for `RETRY_S` (a day);
+twice, it is held for good on those adapters and drivers (a driver update changes the key: one more try). A held
+pack gets no probe (between leases or in a lease) and no bench, its jobs run on the CPU, the guard (9.5) refuses it
+as an alternate (`refused: "runtime"`), and the profile's `runtime_providers` lists it with no provider (`[]`), so
+the coordinator stops offering it as an alternate (9.4 condition 4). The agent reports each one at that start
+(`POST /v1/crash` `probe_unfinished`: the pack, the worker, the count, how long before the start).
+
+**What a probe may load.** The built-in probe and the bench pass `--providers tensorrt_rtx,cuda,openvino,dml,cpu`:
+never AMD's providers (`amdgpu`, `migraphx`), and the measured choice never picks them, even from a bench an older
+agent kept. On a PC with an adapter of a vendor that is off (below) they also pass `--gpu <LUID>` of one usable
+adapter (NVIDIA first, then Intel), so the worker doesn't enumerate the others.
+
+**GPU vendors off.** The owner's decision of 2026-11-13: the farm runs no GPU work on AMD GPUs (the AMD providers
+failed on the RX 9070 XT and a driver fault mid-probe could take a friend's PC down). Agents from 0.2.11 leave AMD
+adapters (`vendor: "amd"`, PCI vendor 0x1002 / 0x1022) out of the profile's `gpus` altogether: no probe, bench or
+GPU job touches them, `caps.gpu` and `caps.gpu_allowed` stay false when they are a PC's only GPUs, and no
+alternate can match them (9.4). The coordinator refuses and skips AMD alternates (9.4). The choice itself (9.6)
+stays vendor-neutral among the adapters that are left.
+
+**The evict list.** `GET /v1/agent/latest` carries the owner's `evict` list (section 3, `POST /v1/admin/evict`).
+Agents from 0.2.11 delete each listed build from `cache\builds\` (and its LRU entry) when they get it: at start,
+before any probe (the update check is the main loop's first step), and every 6 hours after, always between
+leases. Deletion only: a build that is still needed is downloaded again when a lease needs it. It is how a
+withdrawn build (a diagnostic worker, a pack nobody should probe again) leaves PCs that cached it; a worker build
+whose runtime pack is gone is never probed (the pack has to be in the cache and verify).
 
 ## Changes
+- v1 rev 12 (2026-11-13; agent 0.2.11, canary first; coordinator: no migration): **probes the PC never finished,
+  no GPU work on AMD, the evict list** (section 9.8). The agent writes a probe-in-progress marker through to disk
+  before every built-in probe and bench; one left at the next start is an unfinished probe: reported (`/v1/crash`
+  `probe_unfinished`), its pack held a day, for good after a second one on the same adapters and drivers, and listed
+  with no provider in `runtime_providers`. Probes and benches never load `amdgpu` or `migraphx`. AMD adapters are
+  left out of agents' profiles; AMD alternates are refused at `PUT /v1/admin/run` and never offered. `GET
+  /v1/agent/latest` carries the owner's `evict` list (`POST`/`GET /v1/admin/evict`), applied by agents at start
+  before any probe. The launcher no longer counts exits with the Windows session's end codes
+  (STATUS_DLL_INIT_FAILED_LOGOFF, STATUS_CONTROL_C_EXIT) as crashes, and doesn't start the agent again while the
+  session is ending (a logoff rolled a friend's 0.2.8 back to 0.2.5 on 2026-11-13).
 - v1 rev 11 (2026-11-13; coordinator migration 0009, agent 0.2.10, canary first): **runtime packs per GPU vendor
   and the measured CPU-or-GPU choice** (section 9). Runs take `alternates` (a worker build + the pack it requires,
   with a vendor condition), leased only to agents from 0.2.10 on machines that qualify (9.4: an adapter of the

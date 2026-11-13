@@ -23,10 +23,10 @@ import {
   seatGens,
 } from "./definitions";
 import { MAX_EXTERNAL_BODY, type Contributor, type ExternalRow, ownContributor, parseReport, storeReport, totals } from "./external";
-import { CHANNELS, serveObject } from "./friend";
+import { CHANNELS, evictList, serveObject } from "./friend";
 import { bookFor } from "./leasebook";
 import { minisignKeyId, verifyBuild, verifyMinisign } from "./manifest";
-import { type Alternate, DRIVER_RE, GPU_MODES, MAX_ALTERNATES, type Routing, VENDOR_RE, gpuNeedOf, requiresRuntimeOf, routingOf } from "./routing";
+import { type Alternate, DRIVER_RE, GPU_MODES, GPU_VENDORS_OFF, MAX_ALTERNATES, MAX_EVICT, type Routing, VENDOR_RE, gpuNeedOf, requiresRuntimeOf, routingOf } from "./routing";
 import {
   BUILD_RE,
   HEX64_RE,
@@ -352,6 +352,7 @@ async function altCheck(db: D1Database, cfg: book.RunCfg): Promise<Alternate[] |
     if (pack && a.when.vendor && a.when.vendor !== pack.vendor) throw bad(`${at}.when.vendor is ${a.when.vendor}, but runtime ${a.runtime} is for ${pack.vendor} GPUs`);
     const vendor = a.when.vendor || pack?.vendor;
     if (!vendor) throw bad(`${at}.when.vendor is required: runtime ${a.runtime} names no GPU vendor of its own`);
+    if (GPU_VENDORS_OFF.includes(vendor)) throw bad(`${at}: the farm runs no GPU work on ${vendor} GPUs (PROTOCOL 9.4)`);
     out.push({ build_id: a.build_id, runtime: a.runtime, when: { vendor, ...(a.when.min_driver ? { min_driver: a.when.min_driver } : {}) } });
   }
   return out;
@@ -700,6 +701,25 @@ export async function pause(c: Ctx): Promise<Response> {
   const paused = bool(b.paused, "paused");
   await c.env.DB.prepare(`INSERT OR REPLACE INTO settings (key, value) VALUES ('paused', ?)`).bind(paused ? "1" : "0").run();
   return json({ ok: true, paused });
+}
+
+// ---------- rev 12: the evict list (PROTOCOL 2, 4) ----------
+
+// The build ids agents from 0.2.11 delete from their caches (they get the list with `GET /v1/agent/latest`, at start
+// before any probe and every 6 h). Replaces the list; [] clears it.
+export async function evict(c: Ctx): Promise<Response> {
+  await authAdmin(c);
+  const b = await readJson(c.req);
+  if (!Array.isArray(b.builds)) throw bad("builds must be a list of build ids ([] clears it)");
+  if (b.builds.length > MAX_EVICT) throw bad(`builds: at most ${MAX_EVICT}`);
+  const builds = [...new Set(b.builds.map((x: unknown, i: number) => str(x, `builds[${i}]`, { re: BUILD_RE })))];
+  await c.env.DB.prepare(`INSERT OR REPLACE INTO settings (key, value) VALUES ('evict_builds', ?)`).bind(JSON.stringify(builds)).run();
+  return json({ ok: true, builds });
+}
+
+export async function getEvict(c: Ctx): Promise<Response> {
+  await authAdmin(c);
+  return json({ builds: await evictList(c.env.DB) });
 }
 
 // ---------- diagnostics ----------

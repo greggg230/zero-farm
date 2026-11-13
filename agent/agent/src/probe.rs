@@ -85,6 +85,148 @@ impl Probe {
     }
 }
 
+// ---------- 0.2.11: what a probe may load, where it runs, and probes the PC never finished ----------
+
+/// The providers the built-in probe and the bench may load (`--providers`): all the worker knows but AMD's (`amdgpu`,
+/// `migraphx`; profile::GPU_VENDORS_OFF). Every worker with `probe-providers` knows these names. (The AMD session's
+/// diagnostic variants ignore `--providers` by design: the in-progress marker below is what protects there.)
+pub const PROBE_PROVIDERS: [&str; 5] = ["tensorrt_rtx", "cuda", "openvino", "dml", "cpu"];
+
+/// `--gpu <LUID>` for a probe or bench on a PC with adapters this agent never uses (`off`): one usable adapter
+/// (NVIDIA first, then Intel, then any), so the worker doesn't enumerate the others. None: no adapter is off (the
+/// worker probes every adapter, as before), or none is usable (nothing runs then).
+pub fn pin_gpu(gpus: &[Gpu], off: &[Gpu]) -> Option<String> {
+    if off.is_empty() {
+        return None;
+    }
+    let rank = |g: &&Gpu| match g.vendor.as_str() {
+        "nvidia" => 0,
+        "intel" => 1,
+        _ => 2,
+    };
+    gpus.iter().filter(|g| g.luid.is_some()).min_by_key(rank).and_then(|g| g.luid.clone())
+}
+
+/// A probe or bench running now (`state\probe-inflight.json`, written through to disk before its worker starts and
+/// removed when it ends, whatever the outcome). Found at the next start, it means the agent or the PC stopped during
+/// it - a GPU driver fault that took the PC down, a hang the user ended with a reset, an agent crash - and counts as
+/// an unfinished probe of that pack on these adapters.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Inflight {
+    /// "probe" (the built-in graph) or "bench" (a job's network)
+    pub kind: String,
+    pub runtime: String,
+    pub adapters: String,
+    pub worker: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    pub t: i64,
+}
+
+/// The unfinished probes of one pack on these adapters (`state\unfinished.json`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Unfinished {
+    pub runtime: String,
+    pub adapters: String,
+    pub count: u32,
+    /// when the last one was found (the next start)
+    pub t: i64,
+    pub kind: String,
+    pub worker: String,
+}
+
+/// Unfinished this many times: never probed or benched again on these adapters and drivers (a driver update is a new
+/// key: one more try). Once: not again for `RETRY_S`.
+pub const UNFINISHED_NEVER: u32 = 2;
+
+/// Whether Windows is logging off or shutting down (`SM_SHUTTINGDOWN`): a probe or bench running then is stopped and
+/// its marker removed, so a shutdown is never taken for a fault.
+#[cfg(windows)]
+fn session_ending() -> bool {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SHUTTINGDOWN};
+    // SAFETY: GetSystemMetrics has no preconditions.
+    unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) != 0 }
+}
+
+#[cfg(not(windows))]
+fn session_ending() -> bool {
+    false
+}
+
+fn inflight_path(layout: &Layout) -> PathBuf {
+    layout.state().join("probe-inflight.json")
+}
+
+fn unfinished_path(layout: &Layout) -> PathBuf {
+    layout.state().join("unfinished.json")
+}
+
+/// Writes the marker before a probe or bench starts. Err: it couldn't be written - the probe doesn't run then.
+fn mark(layout: &Layout, m: &Inflight) -> Result<(), String> {
+    zerofarm_common::fsutil::durable_write(&inflight_path(layout), &serde_json::to_vec(m).expect("json"))
+        .map_err(|e| format!("could not write the probe marker ({e}); not probing"))
+}
+
+fn unmark(layout: &Layout) {
+    let p = inflight_path(layout);
+    for _ in 0..20 {
+        match std::fs::remove_file(&p) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => std::thread::sleep(Duration::from_millis(50)),
+            _ => return,
+        }
+    }
+}
+
+pub fn load_unfinished(layout: &Layout) -> Vec<Unfinished> {
+    std::fs::read(unfinished_path(layout)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+}
+
+/// At start: a marker the last run left means one more unfinished probe of its pack on its adapters (kept in
+/// `unfinished.json`, at most 64 entries, newest first); returns the marker and that pack's count. The marker is gone
+/// afterwards.
+pub fn take_inflight(layout: &Layout, now: i64) -> Option<(Inflight, u32)> {
+    let path = inflight_path(layout);
+    let bytes = std::fs::read(&path).ok()?;
+    let m: Option<Inflight> = serde_json::from_slice(&bytes).ok();
+    let Some(m) = m else {
+        unmark(layout);
+        return None;
+    };
+    let mut v = load_unfinished(layout);
+    let count = match v.iter_mut().find(|u| u.runtime == m.runtime && u.adapters == m.adapters) {
+        Some(u) => {
+            u.count += 1;
+            u.t = now;
+            u.kind = m.kind.clone();
+            u.worker = m.worker.clone();
+            u.count
+        }
+        None => {
+            v.push(Unfinished { runtime: m.runtime.clone(), adapters: m.adapters.clone(), count: 1, t: now, kind: m.kind.clone(), worker: m.worker.clone() });
+            1
+        }
+    };
+    v.sort_by_key(|u| std::cmp::Reverse(u.t));
+    v.truncate(64);
+    if let Err(e) = zerofarm_common::fsutil::durable_write(&unfinished_path(layout), &serde_json::to_vec_pretty(&v).expect("json")) {
+        // keep the marker: the next start counts it then
+        log::warn!("could not record the unfinished probe ({e})");
+        return Some((m, count));
+    }
+    unmark(layout);
+    Some((m, count))
+}
+
+/// Whether a pack is held on these adapters: unfinished `UNFINISHED_NEVER` times, or once less than `RETRY_S` ago.
+/// A held pack is neither probed nor benched, gets no GPU job (the CPU), the guard refuses it as an alternate, and
+/// the profile lists it with no provider.
+pub fn held(unfinished: &[Unfinished], runtime: &str, adapters: &str, now: i64) -> bool {
+    unfinished
+        .iter()
+        .find(|u| u.runtime == runtime && u.adapters == adapters)
+        .is_some_and(|u| u.count >= UNFINISHED_NEVER || now - u.t < RETRY_S)
+}
+
 /// The adapters part of a probe's key: each adapter's vendor, name and driver version, sorted.
 pub fn adapters_key(gpus: &[Gpu]) -> String {
     let mut v: Vec<String> = gpus.iter().map(|g| format!("{}|{}|{}", g.vendor, g.name, g.driver)).collect();
@@ -153,7 +295,12 @@ pub fn profile_providers(layout: &Layout, gpus: &[Gpu]) -> (Vec<String>, Option<
     let probes: Vec<&Probe> = mine.iter().filter(|p| p.error.is_none()).collect();
     let all = ordered(probes.iter().flat_map(|p| p.passed()));
     let failed: Vec<&Probe> = mine.iter().filter(|p| p.error.is_some() && now - p.t < RETRY_S).collect();
-    if probes.is_empty() && failed.is_empty() {
+    // 0.2.11: packs the PC stopped during (agent or PC down mid-probe) count as failed, and their providers don't
+    let unfinished = load_unfinished(layout);
+    let held_here: Vec<&Unfinished> = unfinished.iter().filter(|u| u.adapters == key && held(&unfinished, &u.runtime, &key, now)).collect();
+    let probes: Vec<&Probe> = probes.into_iter().filter(|p| !held_here.iter().any(|u| u.runtime == p.runtime)).collect();
+    let all = if held_here.is_empty() { all } else { ordered(probes.iter().flat_map(|p| p.passed())) };
+    if probes.is_empty() && failed.is_empty() && held_here.is_empty() {
         return (all, None);
     }
     let mut per: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -168,6 +315,11 @@ pub fn profile_providers(layout: &Layout, gpus: &[Gpu]) -> (Vec<String>, Option<
     for p in failed {
         if per.len() < 16 && !per.contains_key(&p.runtime) {
             per.insert(p.runtime.clone(), vec![]);
+        }
+    }
+    for u in held_here {
+        if per.len() < 16 && !per.contains_key(&u.runtime) {
+            per.insert(u.runtime.clone(), vec![]);
         }
     }
     (all, Some(per))
@@ -370,7 +522,8 @@ pub fn choose(bench: Option<&Bench>, gpus: &[Gpu], allow: Option<&[String]>, gpu
         return c;
     };
     c.rows_per_s.insert("cpu".into(), cpu.round());
-    let allowed = |p: &str| p != "cpu" && allow.is_none_or(|a| a.iter().any(|x| x == p));
+    // (0.2.11: never a provider a probe may not load - AMD's - even from a bench an older agent kept)
+    let allowed = |p: &str| p != "cpu" && PROBE_PROVIDERS.contains(&p) && allow.is_none_or(|a| a.iter().any(|x| x == p));
     let mut best: Option<(&BenchRow, &Gpu, f64)> = None;
     for r in b.results.iter().filter(|r| r.ok && allowed(&r.provider)) {
         let Some(g) = gpus.iter().find(|g| Some(g.name.as_str()) == r.adapter.as_deref()) else { continue };
@@ -451,6 +604,7 @@ pub fn next_probe(layout: &Layout, keys: &zerofarm_common::keys::TrustedKeys, gp
     use zerofarm_common::manifest::{verify_dir, Expect, Kind};
     let key = adapters_key(gpus);
     let probes = load(layout);
+    let unfinished = load_unfinished(layout);
     let mut workers = Vec::new();
     for e in std::fs::read_dir(layout.cache_builds()).ok()?.flatten() {
         let id = e.file_name().to_string_lossy().to_string();
@@ -466,6 +620,10 @@ pub fn next_probe(layout: &Layout, keys: &zerofarm_common::keys::TrustedKeys, gp
     }
     workers.sort_by_key(|w| std::cmp::Reverse(w.0));
     for (_, w, rt) in workers {
+        // 0.2.11: the PC stopped during this pack's probe or bench before (twice: never again for these drivers)
+        if held(&unfinished, &rt, &key, now) {
+            continue;
+        }
         if let Some(p) = find(&probes, &rt, &key) {
             // a fresh result, or a failure tried less than a day ago
             if p.error.is_none() || now - p.t < RETRY_S {
@@ -514,6 +672,7 @@ pub fn from_report(v: &Value, runtime: &str, adapters: &str, worker: &str, t: i6
 
 /// Runs one probe (in a job object, below-normal priority, the runtime pack first on the DLL path),
 /// at most `timeout`; the readable report goes to the worker log.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     layout: &Layout,
     entry: &Path,
@@ -521,6 +680,7 @@ pub fn run(
     runtime: &str,
     rdir: &Path,
     gpus: &[Gpu],
+    off: &[Gpu],
     log: Arc<RotatingFile>,
     timeout: Duration,
     stop: &dyn Fn() -> bool,
@@ -528,10 +688,23 @@ pub fn run(
     let now = zerofarm_common::now_unix();
     let akey = adapters_key(gpus);
     let rdir_s = rdir.to_string_lossy().to_string();
-    let args = ["probe-providers", "--runtime-dir", rdir_s.as_str(), "--ensure-ready", "--threads", "2", "--reps", "2"];
-    match run_worker(layout, "probe", entry, &args, rdir, log, timeout, stop) {
+    let provs = PROBE_PROVIDERS.join(",");
+    let pin = pin_gpu(gpus, off);
+    let mut args = vec!["probe-providers", "--runtime-dir", rdir_s.as_str(), "--ensure-ready", "--threads", "2", "--reps", "2"];
+    args.extend(["--providers", provs.as_str()]);
+    if let Some(l) = &pin {
+        args.extend(["--gpu", l.as_str()]);
+    }
+    let failed = |e: String| Probe { runtime: runtime.into(), adapters: akey.clone(), worker: worker.into(), t: now, providers: vec!["cpu".into()], results: vec![], error: Some(e), need: None, benched: false, real: vec![] };
+    let m = Inflight { kind: "probe".into(), runtime: runtime.into(), adapters: akey.clone(), worker: worker.into(), run: None, t: now };
+    if let Err(e) = mark(layout, &m) {
+        return failed(e);
+    }
+    let r = run_worker(layout, "probe", entry, &args, rdir, log, timeout, stop);
+    unmark(layout);
+    match r {
         Ok(v) => from_report(&v, runtime, &akey, worker, now),
-        Err(e) => Probe { runtime: runtime.into(), adapters: akey, worker: worker.into(), t: now, providers: vec!["cpu".into()], results: vec![], error: Some(e), need: None, benched: false, real: vec![] },
+        Err(e) => failed(e),
     }
 }
 
@@ -556,14 +729,15 @@ fn run_worker(layout: &Layout, dir: &str, entry: &Path, args: &[&str], rdir: &Pa
         if let Some(c) = p.try_wait() {
             break Some(c);
         }
-        if t0.elapsed() > timeout || stop() {
+        if t0.elapsed() > timeout || stop() || session_ending() {
             p.kill();
             break None;
         }
         std::thread::sleep(Duration::from_millis(200));
     };
     let r = match code {
-        None if stop() => Err("stopped".to_string()),
+        // (0.2.11: Windows logging off or shutting down ends a probe like the agent quitting: not an unfinished one)
+        None if stop() || session_ending() => Err("stopped".to_string()),
         None => Err(format!("no answer within {} s", timeout.as_secs())),
         Some(c) => match std::fs::read(&out).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
             Some(v) => Ok(v),
@@ -596,6 +770,7 @@ pub fn run_bench(
     runtime: &str,
     rdir: &Path,
     gpus: &[Gpu],
+    off: &[Gpu],
     log: Arc<RotatingFile>,
     timeout: Duration,
     stop: &dyn Fn() -> bool,
@@ -606,13 +781,25 @@ pub fn run_bench(
     let (rdir_s, model, reference, threads) =
         (rdir.to_string_lossy().to_string(), spec.model.to_string_lossy().to_string(), spec.reference.to_string_lossy().to_string(), spec.threads.max(1).to_string());
     let rows = BENCH_ROWS.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
-    let provs = spec.providers.join(",");
+    // 0.2.11: never AMD's providers (PROBE_PROVIDERS), and the CPU always (the baseline)
+    let provs = ordered(spec.providers.iter().filter(|p| PROBE_PROVIDERS.contains(&p.as_str())).cloned()).join(",");
+    let pin = pin_gpu(gpus, off);
     let mut args = vec!["probe-providers", "--runtime-dir", rdir_s.as_str(), "--model", model.as_str(), "--reference", reference.as_str()];
     args.extend(["--threads", threads.as_str(), "--reps", "3", "--bench-rows", rows.as_str(), "--providers", provs.as_str()]);
-    match run_worker(layout, "bench", entry, &args, rdir, log, timeout, stop) {
+    if let Some(l) = &pin {
+        args.extend(["--gpu", l.as_str()]);
+    }
+    let failed = |e: String| Bench { runtime: runtime.into(), adapters: akey.clone(), run: spec.run.into(), worker: worker.into(), t: now, threads: spec.threads, results: vec![], error: Some(e), gpu_games: None };
+    let m = Inflight { kind: "bench".into(), runtime: runtime.into(), adapters: akey.clone(), worker: worker.into(), run: Some(spec.run.into()), t: now };
+    if let Err(e) = mark(layout, &m) {
+        return Ok(failed(e));
+    }
+    let r = run_worker(layout, "bench", entry, &args, rdir, log, timeout, stop);
+    unmark(layout);
+    match r {
         Ok(v) => Ok(bench_from_report(&v, runtime, &akey, spec.run, worker, spec.threads, now)),
         Err(e) if e == "stopped" => Err(e),
-        Err(e) => Ok(Bench { runtime: runtime.into(), adapters: akey, run: spec.run.into(), worker: worker.into(), t: now, threads: spec.threads, results: vec![], error: Some(e), gpu_games: None }),
+        Err(e) => Ok(failed(e)),
     }
 }
 
@@ -666,7 +853,7 @@ mod tests {
         let layout = Layout::new(d.path());
         let gpus = crate::profile::gpus(None);
         let log = Arc::new(RotatingFile::new(d.path().join("worker.log"), 1 << 20, 1));
-        let p = run(&layout, Path::new(&exe), "w", "rt", Path::new(&rt), &gpus, log, Duration::from_secs(600), &|| false);
+        let p = run(&layout, Path::new(&exe), "w", "rt", Path::new(&rt), &gpus, &[], log, Duration::from_secs(600), &|| false);
         let report = std::fs::read_to_string(d.path().join("worker.log")).unwrap_or_default();
         assert!(p.error.is_none(), "{p:?}
 {report}");
@@ -883,5 +1070,108 @@ mod tests {
         let mut g2 = gpus.clone();
         g2[0].driver = "2.0".into();
         assert_eq!(profile_providers(&layout, &g2), (vec!["cpu".to_string()], None));
+    }
+
+    // ---- 0.2.11 ----
+
+    #[test]
+    fn an_unfinished_probe_holds_its_pack_a_day_then_forever() {
+        let d = tempfile::tempdir().unwrap();
+        let layout = Layout::new(d.path());
+        let gpus = [gpu("RTX 4070 Ti", "nvidia", "000000000000d1f3")];
+        let key = adapters_key(&gpus);
+        // a probe that passed earlier, then a later one the PC never finished
+        let report = json!({"providers": ["cuda", "cpu"], "error": null, "results": [
+            {"provider": "cpu", "gpu": null, "ok": true},
+            {"provider": "cuda", "gpu": {"name": "RTX 4070 Ti", "luid": "000000000000d1f3"}, "ok": true}]});
+        // (profile_providers reads the clock: the unfinished probe is found "now")
+        let now = zerofarm_common::now_unix();
+        record(&layout, from_report(&report, "rt1", &key, "w1", now - 200));
+        assert!(take_inflight(&layout, now).is_none(), "no marker: nothing");
+        let m = Inflight { kind: "probe".into(), runtime: "rt1".into(), adapters: key.clone(), worker: "w1".into(), run: None, t: now - 100 };
+        mark(&layout, &m).unwrap();
+        let (got, n) = take_inflight(&layout, now).unwrap();
+        assert_eq!((got, n), (m.clone(), 1));
+        assert!(!inflight_path(&layout).exists(), "the marker is consumed");
+        assert!(take_inflight(&layout, now + 1).is_none());
+        let u = load_unfinished(&layout);
+        assert!(held(&u, "rt1", &key, now + RETRY_S - 1), "held for a day");
+        assert!(!held(&u, "rt1", &key, now + RETRY_S), "then tried once more");
+        assert!(!held(&u, "rt2", &key, now), "another pack is not");
+        // held: listed with no provider, its providers gone from the profile's union
+        let mut g = gpus.clone();
+        let (all, per) = profile_providers(&layout, &g);
+        assert_eq!(all, vec!["cpu"], "{all:?}");
+        assert_eq!(per.unwrap()["rt1"], Vec::<String>::new());
+        // a second unfinished one: never again for these adapters and drivers ...
+        mark(&layout, &Inflight { kind: "bench".into(), run: Some("h2h-x".into()), t: now + RETRY_S, ..m.clone() }).unwrap();
+        assert_eq!(take_inflight(&layout, now + RETRY_S + 5).unwrap().1, 2);
+        let u = load_unfinished(&layout);
+        assert!(held(&u, "rt1", &key, i64::MAX / 2));
+        assert_eq!(u[0].kind, "bench");
+        // ... a driver update is a new key: one more try
+        g[0].driver = "999.1".into();
+        assert!(!held(&u, "rt1", &adapters_key(&g), now));
+        // a broken marker is dropped, nothing counted
+        std::fs::write(inflight_path(&layout), b"{not json").unwrap();
+        assert!(take_inflight(&layout, now).is_none());
+        assert!(!inflight_path(&layout).exists());
+        assert_eq!(load_unfinished(&layout)[0].count, 2);
+    }
+
+    #[test]
+    fn next_probe_skips_held_packs() {
+        let d = tempfile::tempdir().unwrap();
+        let layout = Layout::new(d.path());
+        let gpus = [gpu("RTX 4070 Ti", "nvidia", "000000000000d1f3")];
+        let key = adapters_key(&gpus);
+        let u = vec![Unfinished { runtime: "rt1".into(), adapters: key.clone(), count: 1, t: 10, kind: "probe".into(), worker: "w".into() }];
+        std::fs::create_dir_all(layout.state()).unwrap();
+        std::fs::write(unfinished_path(&layout), serde_json::to_vec(&u).unwrap()).unwrap();
+        // (no cached builds here: next_probe finds nothing either way; the rule itself)
+        assert!(held(&load_unfinished(&layout), "rt1", &key, 11));
+        let keys = zerofarm_common::keys::TrustedKeys::default();
+        assert!(next_probe(&layout, &keys, &gpus, 11).is_none());
+    }
+
+    #[test]
+    fn amd_providers_are_never_probed_benched_or_chosen() {
+        assert!(!PROBE_PROVIDERS.contains(&"amdgpu") && !PROBE_PROVIDERS.contains(&"migraphx"));
+        assert!(PROBE_PROVIDERS.iter().all(|p| ORDER.contains(p)));
+        // a bench an older agent kept with an AMD provider "passing": never chosen
+        let gpus = [gpu("RX 9070 XT", "amd", "00000000000000a1")];
+        let mut rows = BTreeMap::new();
+        rows.insert("64".to_string(), 1e6);
+        let mut cpu_rows = BTreeMap::new();
+        cpu_rows.insert("64".to_string(), 10.0);
+        let b = Bench {
+            runtime: "rt".into(),
+            adapters: adapters_key(&gpus),
+            run: "r".into(),
+            worker: "w".into(),
+            t: 1,
+            threads: 2,
+            results: vec![
+                BenchRow { provider: "cpu".into(), adapter: None, ok: true, rows: cpu_rows },
+                BenchRow { provider: "amdgpu".into(), adapter: Some("RX 9070 XT".into()), ok: true, rows: rows.clone() },
+                BenchRow { provider: "migraphx".into(), adapter: Some("RX 9070 XT".into()), ok: true, rows },
+            ],
+            error: None,
+            gpu_games: None,
+        };
+        let c = choose(Some(&b), &gpus, None, true, 128, 128, 2);
+        assert_eq!(c.providers, vec!["cpu"], "{c:?}");
+    }
+
+    #[test]
+    fn probes_are_pinned_to_a_usable_adapter_when_one_is_off() {
+        let nv = gpu("RTX 4080", "nvidia", "00000000000000b1");
+        let intel = gpu("UHD 770", "intel", "00000000000000b2");
+        let amd = gpu("RX 9070 XT", "amd", "00000000000000a1");
+        let (both, off) = (vec![intel.clone(), nv], vec![amd]);
+        assert_eq!(pin_gpu(&both, &[]), None, "nothing off: every adapter, as before");
+        assert_eq!(pin_gpu(&both, &off).as_deref(), Some("00000000000000b1"), "NVIDIA first");
+        assert_eq!(pin_gpu(std::slice::from_ref(&intel), &off).as_deref(), Some("00000000000000b2"));
+        assert_eq!(pin_gpu(&[], &off), None, "an AMD-only PC: nothing runs at all");
     }
 }

@@ -63,6 +63,7 @@ pub fn fake_profile() -> Profile {
         runtime_providers: None,
         idle_h_day: None,
         on_h_day: None,
+        gpus_off: vec![],
     }
 }
 
@@ -166,7 +167,11 @@ impl H {
             self.control.clone(),
             {
                 let gpus = self.gpus.clone();
-                Box::new(move || Profile { gpus: gpus.clone(), ..fake_profile() })
+                // as profile::detect: adapters of a vendor the agent never uses are left out (0.2.11)
+                Box::new(move || {
+                    let (gpus, gpus_off) = farm_agent::profile::split_off(gpus.clone());
+                    Profile { gpus, gpus_off, ..fake_profile() }
+                })
             },
         )
         .unwrap();

@@ -4,6 +4,19 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>`.
 
+## 0.2.11 (2026-11-13, canary)
+
+- **A GPU check that takes the PC down is never repeated over and over.** Before testing a graphics card, Zero
+  Farm notes on disk that a test is running. If the PC or the app stops during the test (a graphics driver
+  crash, a frozen PC that had to be restarted), the next start sees the note, tells the farm, and doesn't test
+  that runtime pack on this card again for a day; after a second time, never again with this driver.
+- **AMD graphics cards are not used for farm work.** PCs with only an AMD card run jobs on the processor, as
+  before the GPU support; Zero Farm doesn't test the card at all.
+- Zero Farm removes builds the farm has withdrawn from its download folder when it starts.
+- **Logging off or shutting down Windows no longer counts as a crash.** The launcher could take the app being
+  stopped by Windows at logoff for three crashes and go back to an older version; now it waits for the
+  session to end instead of starting the app again.
+
 ## 0.2.10 (2026-11-13, canary)
 
 - **NVIDIA graphics cards run networks with CUDA**, 5 to 14 times faster than DirectML on the same card. The

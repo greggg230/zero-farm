@@ -28,6 +28,7 @@ import {
   runtimeProvidersOf,
   storedRouting,
   verifiedProviders,
+  GPU_VENDORS_OFF,
 } from "./routing";
 import { cleanStats, telemetry } from "./telemetry";
 import {
@@ -71,7 +72,8 @@ export const CHANNELS = ["canary", "stable"] as const;
 export const EVAL_MIN_AGENT = "0.2.3";
 // Crash kinds (PROTOCOL 3). Rev 6: `definition`, a lease the agent refused because its definition
 // didn't verify or didn't match (PROTOCOL 7), reported once.
-export const CRASH_KINDS = ["panic", "crash", "agent", "blocked", "definition"] as const;
+// `probe_unfinished` (0.2.11): the agent or the PC stopped during a provider probe or a bench, found at the next start.
+export const CRASH_KINDS = ["panic", "crash", "agent", "blocked", "definition", "probe_unfinished"] as const;
 const WAIT_S = 300;
 const LOGS_RESEND_S = 1800; // re-ask for an upload_diag that never arrived
 
@@ -403,6 +405,7 @@ export async function lease(c: Ctx): Promise<Response> {
         if (requiresRuntimeOf(bi.manifest) !== a.runtime) continue;
         const need = gpuNeedOf(ri.manifest);
         if (need && need.vendor !== a.when.vendor) continue;
+        if (GPU_VENDORS_OFF.includes(a.when.vendor)) continue; // (an alternate stored before rev 12)
         if (!hasAdapter(machineProfile, a.when.vendor, [a.when.min_driver, need?.min_driver])) continue; // 2
         const allowed = altProviders(need, routing.providers); // 3
         if (!allowed.length) continue;
@@ -799,6 +802,17 @@ export async function artifact(c: Ctx, rawKey: string): Promise<Response> {
   return serveObject(c, key);
 }
 
+// Rev 12 (PROTOCOL 2): the owner's evict list (`POST /v1/admin/evict`).
+export async function evictList(db: D1Database): Promise<string[]> {
+  const row = await db.prepare(`SELECT value FROM settings WHERE key = 'evict_builds'`).first<{ value: string }>();
+  try {
+    const v = row ? JSON.parse(row.value) : [];
+    return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
 export async function agentLatest(c: Ctx): Promise<Response> {
   const m = await authMachine(c);
   // Rev 10: the machine's own channel, always. Agents send the channel they were enrolled on and
@@ -808,7 +822,15 @@ export async function agentLatest(c: Ctx): Promise<Response> {
   const channel = m.channel;
   const rel = await latestRelease(c.env.DB, channel);
   if (!rel) throw notFound(`no agent release on ${channel}`);
-  return json({ version: rel.version, build_id: rel.build_id, manifest: `builds/${rel.build_id}/manifest.json`, min_agent: rel.min_agent });
+  // Rev 12: the evict list rides along (only when there is one: the answer of before otherwise)
+  const evict = await evictList(c.env.DB);
+  return json({
+    version: rel.version,
+    build_id: rel.build_id,
+    manifest: `builds/${rel.build_id}/manifest.json`,
+    min_agent: rel.min_agent,
+    ...(evict.length ? { evict } : {}),
+  });
 }
 
 export async function crash(c: Ctx): Promise<Response> {

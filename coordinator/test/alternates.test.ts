@@ -196,23 +196,22 @@ describe("run alternates: per-vendor runtime packs (rev 11)", () => {
     expect(ok(await admin("GET", "/v1/admin/run/r")).alternates).toBeNull();
   });
 
-  it("the AMD row: a Windows ML alternate for AMD GPUs goes to the AMD PC only, by the same rules", async () => {
+  it("no AMD row (rev 12: no GPU work on AMD GPUs): PUT refuses an AMD alternate, and one stored before is never offered", async () => {
     const s = await packs();
     const winml = await makeBuild({ kind: "runtime", tag: "winml" });
     const wml = await makeBuild({ tag: "w-winml", requires_runtime: winml });
-    ok(
-      await admin("PUT", "/v1/admin/run/mixed", {
-        ...runBody(s.def, { games_per_lease: "auto", quota: 100000 }),
-        runtime: s.cpuRt,
-        alternates: [altEntry(s), { build_id: wml, runtime: winml, when: { vendor: "amd" } }],
-      }),
-    );
+    const amdAlt = { build_id: wml, runtime: winml, when: { vendor: "amd" } };
+    const body = (alternates: unknown[]) => ({ ...runBody(s.def, { games_per_lease: "auto", quota: 100000 }), runtime: s.cpuRt, alternates });
+    expect(err(await admin("PUT", "/v1/admin/run/mixed", body([altEntry(s), amdAlt])), 400, "bad_request").message).toMatch(/no GPU work on amd/);
+    ok(await admin("PUT", "/v1/admin/run/mixed", body([altEntry(s)])));
+    // an AMD alternate stored by an older coordinator
+    await env.DB.prepare(`UPDATE runs SET alternates = ? WHERE run = 'mixed'`).bind(JSON.stringify([altEntry(s), amdAlt])).run();
     await publishCkpt("mixed", 1);
     await define("run", "mixed", (d) => d.builds.push(s.alt, wml));
     const amd = await enroll("amd", { profile: AMD });
     const nv = await enroll("nv", { profile: NV });
     const cpu = await enroll("cpu", { profile: CPU_ONLY });
-    expect((await lease(amd, { agent: NEW, caps: GPU_OK, kinds: ["selfplay"] })).runtime.build_id).toBe(winml);
+    expect((await lease(amd, { agent: NEW, caps: GPU_OK, kinds: ["selfplay"] })).runtime.build_id).toBe(s.cpuRt);
     expect((await lease(nv, { agent: NEW, caps: GPU_OK, kinds: ["selfplay"] })).runtime.build_id).toBe(s.cuda);
     expect((await lease(cpu, { agent: NEW, caps: GPU_OK, kinds: ["selfplay"] })).runtime.build_id).toBe(s.cpuRt);
   });

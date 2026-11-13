@@ -129,6 +129,13 @@ export interface Alternate {
 
 export const MAX_ALTERNATES = 4;
 export const VENDOR_RE = /^[a-z0-9]{1,32}$/;
+// GPU vendors the farm never uses (the owner's decision of 2026-11-13, after the RX 9070 XT probes: AMD PCs run CPU
+// work only). No run alternate may name them (PROTOCOL 9.4), none stored earlier is offered, and agents from 0.2.11
+// leave such adapters out of their profiles altogether.
+export const GPU_VENDORS_OFF: readonly string[] = ["amd"];
+
+// Rev 12 (PROTOCOL 2): at most this many build ids in the evict list (`settings.evict_builds`).
+export const MAX_EVICT = 64;
 export const DRIVER_RE = /^\d{1,9}(\.\d{1,9}){0,5}$/;
 
 // `have` >= `min` for dotted driver versions ("560.94" >= "527.41"), numeric parts in order, missing parts 0. An

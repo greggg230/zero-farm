@@ -285,6 +285,9 @@ impl Engine {
         if crate::probe::pack_bad(&probes, &rt.build_id, &akey, need.as_ref().map(|n| n.providers.as_slice()), zerofarm_common::now_unix()) {
             return no(format!("runtime pack {} failed on this PC's GPU and driver before", rt.build_id));
         }
+        if crate::probe::held(&crate::probe::load_unfinished(&self.cfg.layout), &rt.build_id, &akey, zerofarm_common::now_unix()) {
+            return no(format!("runtime pack {} stopped this PC during a GPU check before (the agent or the PC went down)", rt.build_id));
+        }
         let mut bytes = 0u64;
         for (r, kind) in [(&lease.build, Kind::Worker), (rt, Kind::Runtime)] {
             if !self.cfg.layout.cache_builds().join(&r.build_id).exists() {
@@ -326,11 +329,18 @@ impl Engine {
         let stop = move || control.quitting();
         let entry = prep.build.entry_path().expect("worker manifests have an entry");
         let akey = crate::probe::adapters_key(&self.profile.gpus);
+        // 0.2.11: a pack the PC stopped during (a probe or bench never finished) is neither probed nor benched here, and
+        // its job runs on the CPU
+        let held = crate::probe::held(&crate::probe::load_unfinished(&self.cfg.layout), &rt.build_id, &akey, zerofarm_common::now_unix());
+        if held {
+            log::warn!("lease {id}: runtime pack {} stopped this PC during a GPU check before: no probe or bench, the CPU only", rt.build_id);
+        }
+        let gpu_ok = gpu_ok && !held;
         if gpu_ok && !self.profile.gpus.is_empty() && crate::probe::find(&crate::probe::load(&self.cfg.layout), &rt.build_id, &akey).is_none() {
             log::info!("lease {id}: probing the execution providers of runtime pack {} (new here) with worker build {}", rt.build_id, prep.build.build_id);
             self.set_status(Phase::Working, "checking the GPU", Some(describe_job(lease)));
             let (stop_pump, pump) = self.beat_pump(lease);
-            let p = crate::probe::run(&self.cfg.layout, &entry, &prep.build.build_id, &rt.build_id, &rt.dir, &self.profile.gpus, self.worker_log.clone(), crate::probe::PROBE_TIMEOUT, &stop);
+            let p = crate::probe::run(&self.cfg.layout, &entry, &prep.build.build_id, &rt.build_id, &rt.dir, &self.profile.gpus, &self.profile.gpus_off, self.worker_log.clone(), crate::probe::PROBE_TIMEOUT, &stop);
             stop_pump.store(true, Ordering::SeqCst);
             let _ = pump.join();
             if p.error.as_deref() != Some("stopped") {
@@ -365,7 +375,7 @@ impl Engine {
             self.set_status(Phase::Working, "checking the GPU", Some(describe_job(lease)));
             let (stop_pump, pump) = self.beat_pump(lease);
             let spec = crate::probe::BenchSpec { model: &net.model, reference, run, threads, providers: candidates.clone() };
-            let r = crate::probe::run_bench(&self.cfg.layout, &entry, &prep.build.build_id, &rt.build_id, &rt.dir, &gpus, self.worker_log.clone(), crate::probe::PROBE_TIMEOUT, &stop, &spec);
+            let r = crate::probe::run_bench(&self.cfg.layout, &entry, &prep.build.build_id, &rt.build_id, &rt.dir, &gpus, &self.profile.gpus_off, self.worker_log.clone(), crate::probe::PROBE_TIMEOUT, &stop, &spec);
             stop_pump.store(true, Ordering::SeqCst);
             let _ = pump.join();
             match r {

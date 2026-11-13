@@ -14,7 +14,7 @@ Decisions (user, 2026-11-11):
 | Question | Decision |
 |---|---|
 | Who installs it | **Invited friends** (single-use invite codes). Not public. |
-| Platforms, v1 | **Windows 10/11 x64**, CPU work on any PC (Intel or AMD CPUs), GPU work on **NVIDIA** RTX cards first; **AMD (and Intel) GPUs** through the same Windows ML path once a friend's PC passes the self-test (8.4). Mac/Linux later. |
+| Platforms, v1 | **Windows 10/11 x64**, CPU work on any PC (Intel or AMD CPUs), GPU work on **NVIDIA** cards (CUDA, PROTOCOL 9) and Intel GPUs (DirectML); **no GPU work on AMD GPUs** (the user's decision of 2026-11-13, after the RX 9070 XT probes: AMD PCs run CPU work only, agents leave AMD adapters out of their profiles, PROTOCOL 9.8). Mac/Linux later. |
 | Network inference | **Native Rust worker + ONNX Runtime now** (no Python, no torch on friends' PCs). |
 | Which runs | **Any run, including runs not conceived yet** — no farm change per run (2.1). |
 | Updates | **Self-update, transparent to the user** (2.2). |
@@ -673,7 +673,16 @@ was not done: ONNX Runtime's CUDA build is useless without them, so nobody would
 |---|---|---|
 | any | the run's default: the CPU pack, or the Windows ML pack (DirectML; the catalog on Windows 11 24H2+) | `runtime` |
 | NVIDIA | the CUDA pack, `gpu` = NVIDIA, driver 527.41+, `["cuda"]` | an alternate with `when.vendor` `nvidia` |
-| AMD | (to be proposed from the AMD session's measurements: the Windows ML pack's AMD GPU provider) | an alternate with `when.vendor` `amd` |
+| AMD | none: no GPU work on AMD GPUs (2026-11-13, PROTOCOL 9.8) | CPU work on the run's default pack |
+
+**Probes that never finish (agent 0.2.11, PROTOCOL 9.8).** A GPU probe runs a vendor's driver on a friend's PC; if
+that driver faults, the PC (or the agent) goes down mid-probe and nothing is recorded, so before 0.2.11 the next
+start probed again - a crash loop on a friend's PC. Now the agent writes a marker through to disk before every probe
+and bench and removes it after; a marker found at start counts against that pack on those adapters and drivers:
+once, a day's pause; twice, never again until the driver changes. It is reported (`probe_unfinished`) and the
+coordinator stops offering the pack there. Probes never load AMD's providers, and the owner can make PCs delete a
+withdrawn build at their next start (the evict list on `GET /v1/agent/latest`), which the agent applies before any
+probe.
 
 ### 8.5 Phases 3 and 4 in parallel (2026-11-12)
 

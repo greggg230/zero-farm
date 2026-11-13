@@ -214,6 +214,17 @@ pub fn gpus(nvml: Option<&nvml_wrapper::Nvml>) -> Vec<Gpu> {
         .collect()
 }
 
+/// GPU vendors this agent never uses: the user's decision of 2026-11-13, after the RX 9070 XT probes (the AMD
+/// execution providers failed on the built-in graph, and a driver fault during a probe could take a friend's PC down).
+/// PCs with only these GPUs run CPU work. The one vendor-specific rule: everything downstream (probes, benches, the
+/// measured choice, `caps`, the coordinator's routing) only ever sees the adapters that are left.
+pub const GPU_VENDORS_OFF: &[&str] = &["amd"];
+
+/// (usable adapters, adapters of a vendor in [`GPU_VENDORS_OFF`]).
+pub fn split_off(gpus: Vec<Gpu>) -> (Vec<Gpu>, Vec<Gpu>) {
+    gpus.into_iter().partition(|g| !GPU_VENDORS_OFF.contains(&g.vendor.as_str()))
+}
+
 /// The ONNX Runtime execution providers that passed this PC's probes (probe.rs, PROTOCOL 8) with
 /// these adapters and drivers: (any runtime pack, per runtime pack). `["cpu"]` before any probe.
 pub fn providers(root: &std::path::Path, gpus: &[Gpu]) -> (Vec<String>, Option<std::collections::BTreeMap<String, Vec<String>>>) {
@@ -227,7 +238,7 @@ pub fn detect(root: &std::path::Path) -> Profile {
     // Rounded to 10 GB so the profile digest doesn't change with every download.
     let free_mb = crate::util::disk_free_bytes(root).map(|b| (b >> 20) / 10240 * 10240).unwrap_or(0);
     let avail = crate::availability::load(&zerofarm_common::layout::Layout::new(root)).means(&crate::util::local_now().0);
-    let gpus = gpus(nvml.as_ref());
+    let (gpus, gpus_off) = split_off(gpus(nvml.as_ref()));
     let (providers, runtime_providers) = providers(root, &gpus);
     Profile {
         os: os_name(),
@@ -243,6 +254,7 @@ pub fn detect(root: &std::path::Path) -> Profile {
         runtime_providers,
         idle_h_day: avail.map(|a| a.0),
         on_h_day: avail.map(|a| a.1),
+        gpus_off,
     }
 }
 
@@ -293,5 +305,15 @@ mod tests {
         // Two identical cards are two adapters (different LUIDs).
         let twins = dedup_by_luid(vec![adapter(1, "nvidia", "RTX 4080"), adapter(2, "nvidia", "RTX 4080")]);
         assert_eq!(twins.len(), 2);
+    }
+
+    #[test]
+    fn amd_adapters_are_left_out() {
+        let g = |vendor: &str, name: &str| Gpu { vendor: vendor.into(), name: name.into(), vram_mb: 1, driver: "1".into(), luid: Some("a1".into()) };
+        let (usable, off) = split_off(vec![g("intel", "UHD 770"), g("amd", "RX 9070 XT"), g("nvidia", "RTX 4080")]);
+        assert_eq!(usable.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), ["UHD 770", "RTX 4080"]);
+        assert_eq!(off.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), ["RX 9070 XT"]);
+        let (usable, off) = split_off(vec![g("amd", "RX 9070 XT")]);
+        assert!(usable.is_empty() && off.len() == 1, "an AMD-only PC has no usable GPU");
     }
 }

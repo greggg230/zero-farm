@@ -50,6 +50,23 @@ const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 const HEALTHY_TIMEOUT: Duration = Duration::from_secs(120);
 const CRASH_WINDOW: Duration = Duration::from_secs(600);
 const CRASHES_FOR_ROLLBACK: usize = 3;
+/// 0.2.11: exit codes Windows gives a process that ends with the user's session - STATUS_DLL_INIT_FAILED_LOGOFF (a
+/// process started while the session logs off: found on a friend's PC 2026-11-13, three of them rolled 0.2.8 back to
+/// 0.2.5) and STATUS_CONTROL_C_EXIT. They never count as crashes.
+const SESSION_END_CODES: [i32; 2] = [0xC000_026Bu32 as i32, 0xC000_013Au32 as i32];
+/// After a session-end exit with the session still on (a cancelled logoff): wait this long, then start the agent again.
+const SESSION_END_RESPAWN: Duration = Duration::from_secs(2);
+
+/// Whether the Windows session is logging off or shutting down (`SM_SHUTTINGDOWN`). Tests set
+/// `ZEROFARM_TEST_SESSION_ENDING` (the launcher they start is the only one that reads it).
+fn session_ending() -> bool {
+    if std::env::var_os("ZEROFARM_TEST_SESSION_ENDING").is_some() {
+        return true;
+    }
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SHUTTINGDOWN};
+    // SAFETY: GetSystemMetrics has no preconditions.
+    unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) != 0 }
+}
 /// A launcher started with `--takeover` confirms once its first agent has run this long.
 const TAKEOVER_CONFIRM: Duration = Duration::from_secs(10);
 /// How long the launcher handing over waits for that confirmation.
@@ -461,6 +478,24 @@ impl Launcher {
         false
     }
 
+    /// 0.2.11: the agent ended with the Windows session (a session-end exit code, or any exit while the session is
+    /// ending): not a crash. No new start while the session is ending (Windows ends the launcher too); if it doesn't
+    /// end after all (a cancelled logoff), the agent starts again. False if a quit came in meanwhile.
+    fn handle_session_end(&mut self, cur: &str, code: i32) -> bool {
+        self.log(&format!("{cur} exited with code {code} as the Windows session ends: not a crash"));
+        let mut said = false;
+        while session_ending() {
+            if !said {
+                self.log("the session is ending: not starting the agent again");
+                said = true;
+            }
+            if !self.sleep(Duration::from_secs(1)) {
+                return false;
+            }
+        }
+        self.sleep(SESSION_END_RESPAWN)
+    }
+
     /// Returns false if a quit came in while backing off.
     fn handle_crash(&mut self, cur: &str, code: i32) -> bool {
         let now = Instant::now();
@@ -508,7 +543,8 @@ impl Launcher {
                 Ok(c) => c,
                 Err(e) => {
                     self.log(&format!("could not start {cur}: {e}"));
-                    if !self.handle_crash(&cur, -1) {
+                    let ok = if session_ending() { self.handle_session_end(&cur, -1) } else { self.handle_crash(&cur, -1) };
+                    if !ok {
                         return 0;
                     }
                     continue;
@@ -527,11 +563,22 @@ impl Launcher {
                         return 0;
                     }
                 }
+                Outcome::Exited(code) if SESSION_END_CODES.contains(&code) || session_ending() => {
+                    if !self.handle_session_end(&cur, code) {
+                        return 0;
+                    }
+                }
                 Outcome::Exited(code) => {
                     if started.elapsed() > CRASH_WINDOW {
                         self.crashes.clear();
                     }
                     if !self.handle_crash(&cur, code) {
+                        return 0;
+                    }
+                }
+                Outcome::NotHealthy if session_ending() => {
+                    // (no verdict on a version while the session ends: it is judged after the next start)
+                    if !self.handle_session_end(&cur, -1) {
                         return 0;
                     }
                 }

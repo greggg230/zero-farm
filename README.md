@@ -305,6 +305,7 @@ The CUDA pack is large (about 1.5 GB on disk, about 0.7 GB to download, compress
 only to a PC with an NVIDIA graphics card and a recent enough driver (527.41 or newer), while "Use the
 GPU" is on and the disk limit has room, and only for jobs that run a network on the GPU; the app checks
 all of this again itself before downloading it, and a PC without an NVIDIA card never downloads it. If the
-pack's GPU test fails on a PC, the pack is removed again and not downloaded for that driver.
+pack's GPU test fails on a PC, the pack is removed again and not downloaded for that driver. AMD graphics
+cards are not used for farm work (from 0.2.11): PCs with only an AMD card run jobs on the processor.
 Zero Farm's own code (this repo) is MIT-licensed (above); the job programs are signed builds of a
 private engine (MTG Zero).

@@ -254,3 +254,43 @@ wait-stop
     assert!(e.starts().is_empty(), "selftest never starts the agent");
     assert!(!e.layout.logs().join("launcher.log").exists(), "nor touches the launcher log");
 }
+
+// ---- 0.2.11: the Windows session ending is not a crash ----
+
+#[test]
+fn session_end_exits_never_roll_back() {
+    // STATUS_DLL_INIT_FAILED_LOGOFF three times within 10 minutes rolled a friend's 0.2.8 back to 0.2.5 (2026-11-13)
+    let e = env();
+    e.version("1.0.0", "healthy\nonce: pending 2.0.0\nonce: exit 75\nwait-stop\n");
+    e.version("2.0.0", "healthy\nexit -1073741205\n");
+    e.layout.set_current("1.0.0").unwrap();
+    let _l = e.launch();
+    assert!(
+        wait_until(Duration::from_secs(30), || e.starts().iter().filter(|v| *v == "2.0.0").count() >= 4),
+        "{:?}\n{}",
+        e.starts(),
+        e.launcher_log()
+    );
+    assert_eq!(e.layout.current().as_deref(), Some("2.0.0"), "no rollback");
+    assert!(e.events().is_empty(), "{:?}", e.events());
+    assert!(e.launcher_log().contains("as the Windows session ends: not a crash"), "{}", e.launcher_log());
+    assert!(!e.starts().iter().skip(2).any(|v| v == "1.0.0"), "{:?}", e.starts());
+}
+
+#[test]
+fn no_new_start_while_the_session_is_ending() {
+    let e = env();
+    e.version("1.0.0", "healthy\ncrash\n");
+    e.layout.set_current("1.0.0").unwrap();
+    let _l = KillOnDrop(
+        Command::new(e.root.join("ZeroFarm.exe"))
+            .env(TEST_KEYS_ENV, &e.key.pubkey)
+            .env("ZEROFARM_TEST_SESSION_ENDING", "1")
+            .spawn()
+            .unwrap(),
+    );
+    assert!(wait_until(Duration::from_secs(10), || e.launcher_log().contains("the session is ending")), "{}", e.launcher_log());
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(e.starts(), ["1.0.0"], "{}", e.launcher_log());
+    assert!(e.events().is_empty());
+}

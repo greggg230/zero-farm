@@ -61,6 +61,8 @@ const routes: [string, RegExp, Handler][] = [
   ["POST", new RegExp(`^/v1/admin/machine/${SEG}/revoke$`), admin.revoke],
   ["POST", new RegExp(`^/v1/admin/machine/${SEG}$`), admin.updateMachine],
   ["POST", /^\/v1\/admin\/pause$/, admin.pause],
+  ["POST", /^\/v1\/admin\/evict$/, admin.evict],
+  ["GET", /^\/v1\/admin\/evict$/, admin.getEvict],
   ["POST", /^\/v1\/admin\/diag$/, admin.diag],
   ["GET", /^\/v1\/admin\/diag$/, admin.diagList],
   ["GET", /^\/v1\/admin\/stats$/, admin.stats],

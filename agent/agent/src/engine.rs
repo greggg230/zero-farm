@@ -297,7 +297,37 @@ impl Engine {
         crate::update::cleanup_versions(&self.cfg.layout, &self.cfg.version);
         let _ = zerofarm_common::fsutil::remove_dir_all_retry(&self.cfg.layout.work(), Duration::from_secs(5));
         let _ = std::fs::create_dir_all(self.cfg.layout.work());
+        self.note_unfinished_probe();
+        if !self.profile.gpus_off.is_empty() {
+            let off: Vec<String> = self.profile.gpus_off.iter().map(|g| format!("{} {}", g.vendor, g.name)).collect();
+            log::info!("GPU work is off on {} (this agent never uses these vendors' GPUs): CPU jobs only there", off.join(", "));
+        }
         self.send_saved_reports();
+    }
+
+    /// 0.2.11: a probe or bench the last run never finished (its marker is still there: the agent or the PC stopped
+    /// during it) - counted against its pack on these adapters (`probe::take_inflight`: once, not again for a day;
+    /// twice, never for these drivers), reported to the coordinator (`probe_unfinished`), and the profile refreshed so
+    /// the coordinator stops offering that pack here.
+    fn note_unfinished_probe(&mut self) {
+        let now = zerofarm_common::now_unix();
+        let Some((m, n)) = crate::probe::take_inflight(&self.cfg.layout, now) else { return };
+        let what = if m.kind == "bench" { format!("bench of {}'s network", m.run.as_deref().unwrap_or("a run")) } else { "provider probe".to_string() };
+        let after = if n >= crate::probe::UNFINISHED_NEVER { "never tried again with these GPUs and drivers".to_string() } else { "not tried again for a day".to_string() };
+        let msg = format!(
+            "the agent or the PC stopped during a {what} of runtime pack {} with worker build {} ({} s before this start; adapters {}): unfinished {n} time(s), {after}",
+            m.runtime,
+            m.worker,
+            (now - m.t).max(0),
+            m.adapters
+        );
+        log::warn!("{msg}");
+        save_crash_file(
+            &self.cfg.layout,
+            &CrashReq { build_id: Some(m.worker.clone()), kind: "probe_unfinished".into(), message: msg, backtrace: None, lease_id: None, exit_code: None, agent: Some(self.cfg.version.clone()), os_error: None },
+        );
+        self.profile = (self.profile_fn)();
+        self.profile_refreshed = Instant::now();
     }
 
     /// Bytes we may still download: the cap minus everything that can't be evicted, bounded by
@@ -364,7 +394,7 @@ impl Engine {
         self.set_status(Phase::Working, "checking the GPU", None);
         let control = self.control.clone();
         let stop = move || control.quitting();
-        let p = crate::probe::run(&self.cfg.layout, &entry, &worker, &runtime, &rdir, &self.profile.gpus, self.worker_log.clone(), crate::probe::PROBE_TIMEOUT, &stop);
+        let p = crate::probe::run(&self.cfg.layout, &entry, &worker, &runtime, &rdir, &self.profile.gpus, &self.profile.gpus_off, self.worker_log.clone(), crate::probe::PROBE_TIMEOUT, &stop);
         if p.error.as_deref() == Some("stopped") {
             return true;
         }

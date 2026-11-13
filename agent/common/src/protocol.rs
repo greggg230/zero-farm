@@ -41,6 +41,10 @@ pub struct Profile {
     pub idle_h_day: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_h_day: Option<f64>,
+    /// 0.2.11: adapters of a vendor this agent never uses (`profile::GPU_VENDORS_OFF`), left out of `gpus`. Local only
+    /// (never sent): a probe or bench is then pinned to one usable adapter, so the worker doesn't touch these either.
+    #[serde(skip)]
+    pub gpus_off: Vec<Gpu>,
 }
 
 impl Profile {
@@ -246,6 +250,10 @@ pub struct AgentLatest {
     pub manifest: String,
     #[serde(default)]
     pub min_agent: Option<String>,
+    /// rev 12 (PROTOCOL 2): build ids to remove from this PC's cache (the owner's list: a diagnostic or withdrawn
+    /// build). Agents from 0.2.11 delete them at start, before any probe, and after every check; older agents ignore it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evict: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]

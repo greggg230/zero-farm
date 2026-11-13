@@ -36,6 +36,51 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     })
 }
 
+/// Like [`atomic_write`], but the bytes are on disk when it returns, even if the PC loses power or crashes right after
+/// (0.2.11: the probe-in-progress marker must survive a driver fault that takes the PC down): the temp file is
+/// flushed (`sync_all`) and renamed with `MOVEFILE_WRITE_THROUGH`.
+pub fn durable_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    use std::io::Write;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_file_name(format!(
+        ".{}.{}.tmp",
+        path.file_name().and_then(|s| s.to_str()).unwrap_or("f"),
+        std::process::id()
+    ));
+    {
+        let mut f = fs::File::create(&tmp)?;
+        f.write_all(bytes)?;
+        f.sync_all()?;
+    }
+    retry(|| rename_write_through(&tmp, path)).inspect_err(|_| {
+        let _ = fs::remove_file(&tmp);
+    })
+}
+
+#[cfg(windows)]
+fn rename_write_through(from: &Path, to: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH};
+    let wide = |p: &Path| p.as_os_str().encode_wide().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let (f, t) = (wide(from), wide(to));
+    // SAFETY: both are NUL-terminated wide strings that live across the call.
+    if unsafe { MoveFileExW(f.as_ptr(), t.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn rename_write_through(from: &Path, to: &Path) -> io::Result<()> {
+    fs::rename(from, to)?;
+    if let Some(dir) = to.parent() {
+        let _ = fs::File::open(dir).and_then(|d| d.sync_all());
+    }
+    Ok(())
+}
+
 /// Reads a small text file and trims it; `None` if missing or empty.
 pub fn read_trimmed(path: &Path) -> Option<String> {
     let s = fs::read_to_string(path).ok()?;
@@ -103,4 +148,21 @@ pub fn copy_dir(from: &Path, to: &Path) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn durable_write_creates_and_replaces() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("state").join("marker.json");
+        durable_write(&p, b"one").unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"one");
+        durable_write(&p, b"two").unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"two");
+        let left: Vec<_> = fs::read_dir(p.parent().unwrap()).unwrap().flatten().map(|e| e.file_name()).collect();
+        assert_eq!(left.len(), 1, "no temp file left: {left:?}");
+    }
 }

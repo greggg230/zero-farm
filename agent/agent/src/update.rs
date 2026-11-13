@@ -81,6 +81,7 @@ impl Engine {
             Err(e) if e.status() == Some(404) => return Ok(()),
             Err(e) => return Err(e.to_string()),
         };
+        self.apply_evict(&latest.evict);
         if let Some(min) = min_agent {
             if !is_newer(&latest.version, min) && parse_version(&latest.version) != parse_version(min) {
                 return Err(format!("latest agent {} is older than the required {min}", latest.version));
@@ -103,6 +104,18 @@ impl Engine {
         self.prepare_version(&latest)?;
         self.pending_update = Some(latest.version.clone());
         Ok(())
+    }
+
+    /// Rev 12 (PROTOCOL 2): the coordinator's evict list - cached builds the owner withdrew (diagnostic workers, packs
+    /// nobody should probe again) are deleted. It comes with `latest`, which the agent asks for at start before any
+    /// probe and every 6 h after, always between leases; deletion only (a build still needed is downloaded again).
+    pub(crate) fn apply_evict(&mut self, ids: &[String]) {
+        for id in ids.iter().take(64).filter(|id| zerofarm_common::is_build_id(id)) {
+            if self.cfg.layout.cache_builds().join(id).exists() {
+                log::info!("removing build {id} from the cache (the coordinator's evict list)");
+                self.cache.evict(&format!("builds/{id}"));
+            }
+        }
     }
 
     fn prepare_version(&mut self, latest: &AgentLatest) -> Result<(), String> {

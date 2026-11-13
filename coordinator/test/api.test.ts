@@ -303,6 +303,30 @@ describe("builds and agent releases", () => {
     expect(ok(await call("GET", "/v1/agent/latest?channel=nightly", { token: m.token })).version).toBe("0.3.1");
   });
 
+  it("rev 12: the evict list rides on /v1/agent/latest (absent while empty); admin replaces it", async () => {
+    const m = await enroll("pc");
+    const a1 = await makeBuild({ kind: "agent", version: "0.3.1" });
+    ok(await admin("POST", "/v1/admin/agent/release", { version: "0.3.1", build_id: a1, channel: "stable", min_agent: "0.3.0" }));
+    expect(ok(await call("GET", "/v1/agent/latest", { token: m.token })).evict).toBeUndefined();
+    expect(ok(await admin("GET", "/v1/admin/evict")).builds).toEqual([]);
+    const [x, y] = ["d27809faeb648b649f2e4e44", "e42372bfcddef9dcb148b21e"];
+    expect(ok(await admin("POST", "/v1/admin/evict", { builds: [x, y, x] })).builds).toEqual([x, y]);
+    expect(ok(await call("GET", "/v1/agent/latest", { token: m.token }))).toEqual({
+      version: "0.3.1",
+      build_id: a1,
+      manifest: `builds/${a1}/manifest.json`,
+      min_agent: "0.3.0",
+      evict: [x, y],
+    });
+    err(await admin("POST", "/v1/admin/evict", { builds: ["not-a-build"] }), 400, "bad_request");
+    err(await admin("POST", "/v1/admin/evict", { builds: x }), 400, "bad_request");
+    err(await admin("POST", "/v1/admin/evict", { builds: Array.from({ length: 65 }, (_, i) => i.toString(16).padStart(24, "0")) }), 400, "bad_request");
+    err(await call("POST", "/v1/admin/evict", { token: m.token, body: { builds: [] } }), 401, "unauthorized");
+    expect(ok(await admin("GET", "/v1/admin/evict")).builds).toEqual([x, y]);
+    ok(await admin("POST", "/v1/admin/evict", { builds: [] }));
+    expect(ok(await call("GET", "/v1/agent/latest", { token: m.token })).evict).toBeUndefined();
+  });
+
   it("a machine moved to another channel updates from that channel, whatever it asks for (rev 10)", async () => {
     const m = await enroll("pc"); // enrolled on stable, so its agent asks ?channel=stable
     const a1 = await makeBuild({ kind: "agent", version: "0.3.1" });
@@ -421,6 +445,8 @@ describe("machines, crashes, diagnostics, stats", () => {
     const m = await enroll("pc");
     ok(await call("POST", "/v1/crash", { token: m.token, body: { build_id: "a".repeat(24), kind: "panic", message: "x".repeat(10000), backtrace: "bt" } }));
     err(await call("POST", "/v1/crash", { token: m.token, body: { kind: "oops" } }), 400, "bad_request");
+    // 0.2.11: a probe or bench the agent or the PC never finished
+    ok(await call("POST", "/v1/crash", { token: m.token, body: { build_id: "b".repeat(24), kind: "probe_unfinished", message: "the agent or the PC stopped during a provider probe" } }));
     err(await call("POST", "/v1/crash", { token: m.token, body: { kind: "crash", build_id: "short" } }), 400, "bad_request");
     const row = await env.DB.prepare(`SELECT * FROM crashes`).first<any>();
     expect(row).toMatchObject({ machine_id: m.machine_id, kind: "panic", agent_version: AGENT });

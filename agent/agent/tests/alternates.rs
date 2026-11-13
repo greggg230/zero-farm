@@ -253,6 +253,9 @@ fn a_pack_whose_probe_fails_runs_the_job_on_the_cpu_then_is_removed_and_never_fe
     let log = h.agent_log();
     let probe_at = log.find("fakeworker: probe-providers --runtime-dir").expect("the built-in probe ran");
     assert!(!log[probe_at..].lines().next().unwrap().contains("--model"), "the built-in graph, not the job's");
+    // 0.2.11: never AMD's providers, and (no adapter is off here) not pinned to one adapter
+    let probe_line = log[probe_at..].lines().next().unwrap();
+    assert!(probe_line.contains("--providers tensorrt_rtx,cuda,openvino,dml,cpu") && !probe_line.contains("--gpu"), "{probe_line}");
     assert!(log.find("fakeworker: job ").unwrap() > probe_at, "probed before the first job line");
     // the built-in graph is not the last word: the pack's own provider is tried on the job's network too, and fails there
     let bench_at = log.find("--bench-rows").expect("the job's network was benched");

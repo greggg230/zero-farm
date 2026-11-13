@@ -363,6 +363,13 @@ Agent exit codes: 0 quit, 75 switch to `state\pending`, 76 hand over to the new 
   zstd copies of build files (`cache.rs`, `zerofarm_common::zst`), probe-first and the bench of the job's own
   network (`state\bench.json`) and the measured CPU-or-GPU choice (`probe.rs` `choose`), `caps.gpu_allowed`,
   `caps.gpu_games`, a failed GPU pack marked bad per driver and evicted.
+- Rev 12 (PROTOCOL 9.8, agent 0.2.11): the probe-in-progress marker (`probe.rs` `mark` / `take_inflight`,
+  `state\probe-inflight.json` written with `fsutil::durable_write`; an unfinished probe holds its pack in
+  `state\unfinished.json`: a day, then for good per adapters and drivers; reported as `probe_unfinished` at
+  start by `engine.rs` `note_unfinished_probe`), `--providers` without AMD's providers for probes and benches
+  (`PROBE_PROVIDERS`), AMD adapters left out of the profile (`profile.rs` `GPU_VENDORS_OFF`, `split_off`; a probe
+  is then pinned to a usable adapter, `pin_gpu`), the coordinator's evict list applied at start
+  (`update.rs` `apply_evict`), and the launcher's session-end handling (`SESSION_END_CODES`, `SM_SHUTTINGDOWN`).
 - GPU work (phase 4, PROTOCOL 8) is built but not released: provider probes between leases
   (`probe.rs`: a cached worker build's `probe-providers` per runtime pack, results in
   `state\probes.json`, the readable report in the worker log), the profile's `providers` /
