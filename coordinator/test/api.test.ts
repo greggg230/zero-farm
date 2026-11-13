@@ -298,8 +298,24 @@ describe("builds and agent releases", () => {
       manifest: `builds/${a1}/manifest.json`,
       min_agent: "0.3.0",
     });
-    expect(ok(await call("GET", "/v1/agent/latest?channel=canary", { token: m.token })).version).toBe("0.4.0");
-    err(await call("GET", "/v1/agent/latest?channel=nightly", { token: m.token }), 400, "bad_request");
+    // Rev 10: the query is ignored; the machine's channel counts.
+    expect(ok(await call("GET", "/v1/agent/latest?channel=canary", { token: m.token })).version).toBe("0.3.1");
+    expect(ok(await call("GET", "/v1/agent/latest?channel=nightly", { token: m.token })).version).toBe("0.3.1");
+  });
+
+  it("a machine moved to another channel updates from that channel, whatever it asks for (rev 10)", async () => {
+    const m = await enroll("pc"); // enrolled on stable, so its agent asks ?channel=stable
+    const a1 = await makeBuild({ kind: "agent", version: "0.3.1" });
+    const a2 = await makeBuild({ kind: "agent", version: "0.4.0" });
+    ok(await admin("POST", "/v1/admin/agent/release", { version: "0.3.1", build_id: a1, channel: "stable", min_agent: "0.3.0" }));
+    ok(await admin("POST", "/v1/admin/agent/release", { version: "0.4.0", build_id: a2, channel: "canary", min_agent: "0.4.0" }));
+    expect(ok(await call("GET", "/v1/agent/latest?channel=stable", { token: m.token })).version).toBe("0.3.1");
+    ok(await admin("POST", `/v1/admin/machine/${m.machine_id}`, { channel: "canary" }));
+    // Before rev 10 this answered 0.3.1, and the agent, told by every lease answer to update to
+    // canary's min_agent 0.4.0, could never find it.
+    expect(ok(await call("GET", "/v1/agent/latest?channel=stable", { token: m.token }))).toMatchObject({ version: "0.4.0", build_id: a2, min_agent: "0.4.0" });
+    ok(await admin("POST", `/v1/admin/machine/${m.machine_id}`, { channel: "stable" }));
+    expect(ok(await call("GET", "/v1/agent/latest?channel=canary", { token: m.token })).version).toBe("0.3.1");
   });
 });
 

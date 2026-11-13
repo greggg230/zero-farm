@@ -665,7 +665,11 @@ export async function artifact(c: Ctx, rawKey: string): Promise<Response> {
 
 export async function agentLatest(c: Ctx): Promise<Response> {
   const m = await authMachine(c);
-  const channel = oneOf(c.url.searchParams.get("channel") ?? m.channel, "channel", CHANNELS);
+  // Rev 10: the machine's own channel, always. Agents send the channel they were enrolled on and
+  // never learn of a later move (POST /v1/admin/machine/{id} "channel"), so honouring the query
+  // left a machine moved to canary asking for stable forever while its leases demanded canary's
+  // min_agent (found 2026-11-12). The query is still accepted, and ignored.
+  const channel = m.channel;
   const rel = await latestRelease(c.env.DB, channel);
   if (!rel) throw notFound(`no agent release on ${channel}`);
   return json({ version: rel.version, build_id: rel.build_id, manifest: `builds/${rel.build_id}/manifest.json`, min_agent: rel.min_agent });

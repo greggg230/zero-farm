@@ -274,8 +274,10 @@ lease (else 400). `returned` is how many ids went back. Repeating `done` → 200
   `builds/`, `ckpt/` and, rev 6, `defs/<kind>/<id>/<version>/definition.json` and its `.minisig`;
   anything else → 404; supports `range` → 206 and `if-none-match` → 304).
 - `GET /v1/agent/latest?channel=stable` → `{"version": "0.3.1", "build_id": "...",
-  "manifest": "builds/<id>/manifest.json", "min_agent": "0.3.0"}`. `channel` defaults to the
-  machine's; nothing released on it → 404.
+  "manifest": "builds/<id>/manifest.json", "min_agent": "0.3.0"}`: the latest release on the
+  machine's channel; nothing released on it → 404. Rev 10: `channel` is accepted and ignored. Agents
+  send the channel they were enrolled on, which goes stale when `POST /v1/admin/machine/{id}` moves
+  the machine; the machine's channel as the coordinator holds it is the one that counts.
 - `POST /v1/crash` `{"build_id", "kind": "panic" | "crash" | "agent" | "blocked" | "definition",
   "message", "backtrace", "lease_id", "os_error"?}` → `{"ok": true}` (message kept to 4 KB,
   backtrace to 64 KB). Rev 6: at most `MAX_CRASHES_PER_DAY` (100) rows per machine per 24 h are
@@ -850,6 +852,11 @@ routed first, then self-play (within a tier); fuzz stays the backfill. Every lea
 allowlist as `providers` (null on diag leases).
 
 ## Changes
+- v1 rev 10 (2026-11-12, coordinator): **`GET /v1/agent/latest` follows the machine's channel and ignores `?channel=`.**
+  An agent asks for the channel it was enrolled on and never learns of a move, so a machine moved from stable to canary
+  kept being offered stable's latest while its lease answers demanded canary's `min_agent`: it could neither update nor
+  get work, retrying every 5 minutes (one canary test PC, found 2026-11-12). A machine moved back to stable likewise
+  stops being offered canary builds. No agent change is needed; old agents' query is simply ignored.
 - v1 rev 9 (2026-11-12, coordinator; migration 0007): **`min_agent` on runs and campaigns** - `PUT /v1/admin/run/{run}` and
   `PUT /v1/admin/campaign/{id}` take an optional `"min_agent"` (semver or null); a lease of that run or campaign goes only
   to an agent at or above it, with a build's `min_agent` rule (section 3: `{"update"}` when the agent's channel offers a
