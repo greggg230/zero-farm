@@ -51,10 +51,18 @@ fn cuda_pack(dir: &Path, key: &SigningKey) -> (String, Vec<u8>) {
 
 /// The fakeworker signed again with `requires_runtime` = `pack` (one signed worker manifest per pack, 9.1).
 fn worker_for(dir: &Path, key: &SigningKey, pack: &str, probe: Option<&Value>) -> String {
+    worker_for2(dir, key, pack, probe, None)
+}
+
+/// `probe`: the fakeworker's report of the built-in graph; `on_model`: its report on a job's network (the bench).
+fn worker_for2(dir: &Path, key: &SigningKey, pack: &str, probe: Option<&Value>, on_model: Option<&Value>) -> String {
     std::fs::create_dir_all(dir).unwrap();
     std::fs::copy(mockcoord::testkit::bin("fakeworker"), dir.join("fakeworker.exe")).unwrap();
     if let Some(p) = probe {
         std::fs::write(dir.join("probe.json"), p.to_string()).unwrap();
+    }
+    if let Some(p) = on_model {
+        std::fs::write(dir.join("probe_model.json"), p.to_string()).unwrap();
     }
     let mut t = template(Kind::Worker, "fake-cuda");
     t.game = Some("fake".into());
@@ -91,9 +99,13 @@ fn cuda_passes() -> Value {
 }
 
 fn setup_with(h: &H, probe: Option<&Value>, conc: u64) -> Setup {
+    setup_with2(h, probe, None, conc)
+}
+
+fn setup_with2(h: &H, probe: Option<&Value>, on_model: Option<&Value>, conc: u64) -> Setup {
     let (pack, big) = cuda_pack(&h.dir.path().join("pack"), &h.key.key);
     h.mock.add_build_dir(&h.dir.path().join("pack"));
-    let alt = worker_for(&h.dir.path().join("wcuda"), &h.key.key, &pack, probe);
+    let alt = worker_for2(&h.dir.path().join("wcuda"), &h.key.key, &pack, probe, on_model);
     h.mock.add_build_dir(&h.dir.path().join("wcuda"));
     let (m, r) = (b"onnx graph cuda 1".to_vec(), b"reference rows cuda 1".to_vec());
     let (ml, rl) = (m.len(), r.len());
@@ -212,7 +224,7 @@ fn gpu_work_not_allowed_a_fuzz_job_or_a_failed_pack_refuse_it_too() {
     let akey = farm_agent::probe::adapters_key(&h.gpus);
     farm_agent::probe::record(
         &h.layout,
-        farm_agent::probe::Probe { runtime: s.pack.clone(), adapters: akey, worker: "w".into(), t: zerofarm_common::now_unix(), providers: vec!["cpu".into()], results: vec![], error: None },
+        farm_agent::probe::Probe { runtime: s.pack.clone(), adapters: akey, worker: "w".into(), t: zerofarm_common::now_unix(), providers: vec!["cpu".into()], results: vec![], error: None, need: Some(vec!["cuda".into()]), benched: true, real: vec![] },
     );
     h.push(alt_lease(&h, &s, "l_B3", "selfplay"));
     h.start();
@@ -242,8 +254,12 @@ fn a_pack_whose_probe_fails_runs_the_job_on_the_cpu_then_is_removed_and_never_fe
     let probe_at = log.find("fakeworker: probe-providers --runtime-dir").expect("the built-in probe ran");
     assert!(!log[probe_at..].lines().next().unwrap().contains("--model"), "the built-in graph, not the job's");
     assert!(log.find("fakeworker: job ").unwrap() > probe_at, "probed before the first job line");
-    assert!(!log.contains("--bench-rows"), "nothing to bench: no GPU provider passed");
+    // the built-in graph is not the last word: the pack's own provider is tried on the job's network too, and fails there
+    let bench_at = log.find("--bench-rows").expect("the job's network was benched");
+    assert!(log[bench_at..].lines().next().unwrap().contains("--providers cuda,cpu"), "the pack's own provider despite the built-in FAIL");
     assert_eq!(h.job_line()["providers"], json!(["cpu"]));
+    let p = farm_agent::probe::find(&farm_agent::probe::load(&h.layout), &s.pack, &farm_agent::probe::adapters_key(&h.gpus)).cloned().unwrap();
+    assert!(p.benched && p.real.is_empty() && p.need == Some(vec!["cuda".to_string()]), "both verdicts recorded: {p:?}");
     // marked bad for this driver, removed from the cache after the lease, refused next time without a download
     assert!(wait(|| !h.layout.cache_builds().join(&s.pack).exists()), "the failed pack is evicted");
     let n = pack_file_gets(&h, &s.pack).len();
@@ -287,6 +303,36 @@ fn an_nvidia_pc_fetches_the_pack_compressed_benches_and_runs_cuda_when_it_pays()
     let g = req["caps"]["gpu_games"][RUN].as_u64().unwrap();
     assert!((1..=32).contains(&g), "CUDA reaches 2x the CPU at a few rows: {g}");
     assert_eq!(req["caps"]["gpu_allowed"], true);
+    h.stop();
+}
+
+#[test]
+fn cuda_failing_the_built_in_graph_but_passing_the_jobs_network_is_used_and_kept() {
+    // the built-in probe graph's CUDA false negative (duplicate scatter slots): the job's own network decides
+    let mut h = H::new();
+    quick(&mut h);
+    h.version = "0.2.10".into();
+    h.gpus = vec![nvidia("560.94")];
+    gpu_signal(&h, true);
+    let builtin_fails = json!({"probe": 1, "providers": ["cpu"], "error": null, "results": [
+        {"provider": "cpu", "gpu": null, "ok": true, "rows_per_s_by_batch": {"1": 1000.0}},
+        {"provider": "cuda", "gpu": {"name": "RTX 4070 Ti", "luid": "000000000000d1f3"}, "ok": false,
+         "selftest": {"max_abs": 0.0024, "ok": false}}]});
+    let s = setup_with2(&h, Some(&builtin_fails), Some(&cuda_passes()), 8);
+    h.push(alt_lease_n(&h, &s, "l_F1", "selfplay", 128));
+    h.start();
+    let done = h.wait_done("l_F1");
+    assert!(done.get("refused").is_none_or(Value::is_null), "{done}
+{}", h.agent_log());
+    let log = h.agent_log();
+    assert!(log.contains("built-in probe FAIL, cuda-run's network PASS"), "both verdicts in the worker log:
+{log}");
+    assert_eq!(h.job_line()["providers"], json!(["cuda", "cpu"]));
+    let p = farm_agent::probe::find(&farm_agent::probe::load(&h.layout), &s.pack, &farm_agent::probe::adapters_key(&h.gpus)).cloned().unwrap();
+    assert!(p.providers == vec!["cpu"] && p.real == vec!["cuda"] && p.benched, "both verdicts recorded: {p:?}");
+    assert!(h.layout.cache_builds().join(&s.pack).exists(), "kept: it passed on a real network");
+    // (what the profile then tells the coordinator - runtime_providers [cuda, cpu] - is probe.rs's unit test: the harness
+    // profile is a fixed one)
     h.stop();
 }
 

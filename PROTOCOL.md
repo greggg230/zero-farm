@@ -1006,9 +1006,19 @@ job's batch size ever runs. From the same numbers the agent works out `caps.gpu_
 and `done`) carry `batch_rows` (`b` as chosen) and `rows_per_s` (`{"<provider>": rows/s at b}` for the CPU and
 each GPU candidate), which the coordinator keeps with the lease's stats.
 
-A pack with `gpu` in which none of its providers passed is marked bad for these adapters and drivers (its probe
-record), the lease runs on the CPU (its pack's CPU provider), and the pack is evicted from the cache when the lease
-ends; it is not downloaded again until the driver or the adapters change (9.4 condition 4, 9.5).
+The built-in graph is not the last word: the bench also tries a pack's own `gpu.providers` when the built-in probe
+failed them (that graph fails CUDA's priors, max abs 2.4e-3 from duplicate scatter slots in its reference rows, where
+real exports pass at ~2e-6). A pass there is the factory's full self-test on the job's own network and reference set
+(the same `try_one` as `create_session`: 2e-5 on every output, twice bit-identical, a node on the GPU; rows/s never
+count), and it counts for the pack: the probe record keeps both verdicts (`providers` of the built-in probe, `real`
+and `benched` of the job's network; `need` the pack's providers), the worker log says `built-in probe FAIL, <run>'s
+network PASS`, and `runtime_providers` lists the provider. A GPU pack whose own providers failed the built-in probe
+but were never tried on a real network here is left out of `runtime_providers` (unknown, not failed). The job's own
+`create_session` self-test stays the final gate for every network. A pack with `gpu` in which none of its providers
+passed, on the built-in graph or a job's network, is marked bad for these adapters and drivers, the lease runs on the
+CPU (its pack's CPU provider), and the pack is evicted from the cache when the lease ends; it is not downloaded again
+until the driver or the adapters change (9.4 condition 4, 9.5). A bench that failed to run is kept a day (the CPU
+meanwhile), a provider that failed its self-test in a bench stays failed for that (pack, adapters, run) for 7 days.
 
 ### 9.7 Packs
 

@@ -64,6 +64,25 @@ pub struct Probe {
     pub results: Vec<Pass>,
     #[serde(default)]
     pub error: Option<String>,
+    /// rev 11 (PROTOCOL 9.6): the GPU providers the pack's manifest says it brings (its `gpu` requirement); None: none
+    /// declared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub need: Option<Vec<String>>,
+    /// rev 11: the job's own network was benched on this pack here, with the providers that passed the built-in probe
+    /// and the pack's own (the built-in graph is not the last word: CUDA fails its priors, 2.4e-3, where real networks
+    /// pass at 1e-5) ...
+    #[serde(default)]
+    pub benched: bool,
+    /// ... and these GPU providers passed there.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub real: Vec<String>,
+}
+
+impl Probe {
+    /// Providers that passed here: the built-in probe's and those that passed on a job's network.
+    pub fn passed(&self) -> Vec<String> {
+        ordered(self.providers.iter().chain(self.real.iter()).cloned())
+    }
 }
 
 /// The adapters part of a probe's key: each adapter's vendor, name and driver version, sorted.
@@ -89,6 +108,19 @@ fn save(layout: &Layout, v: &[Probe]) {
 /// Records `p`, replacing the probe of the same key; at most 32 kept (newest).
 pub fn record(layout: &Layout, p: Probe) {
     let mut v = load(layout);
+    let mut p = p;
+    // a real network's verdict for the same pack and adapters outlives a re-probe of the built-in graph (9.6)
+    if let Some(old) = v.iter().find(|x| x.runtime == p.runtime && x.adapters == p.adapters) {
+        p.benched |= old.benched;
+        for r in &old.real {
+            if !p.real.contains(r) {
+                p.real.push(r.clone());
+            }
+        }
+        if p.need.is_none() {
+            p.need = old.need.clone();
+        }
+    }
     v.retain(|x| !(x.runtime == p.runtime && x.adapters == p.adapters));
     v.push(p);
     v.sort_by_key(|x| std::cmp::Reverse(x.t));
@@ -101,7 +133,8 @@ pub fn find<'a>(probes: &'a [Probe], runtime: &str, adapters: &str) -> Option<&'
     probes.iter().find(|p| p.runtime == runtime && p.adapters == adapters)
 }
 
-fn ordered(set: impl IntoIterator<Item = String>) -> Vec<String> {
+/// Provider names in the order of preference (`ORDER`), the CPU last (and always there).
+pub fn ordered(set: impl IntoIterator<Item = String>) -> Vec<String> {
     let set: Vec<String> = set.into_iter().collect();
     let mut out: Vec<String> = ORDER.iter().filter(|p| set.iter().any(|s| s == *p)).map(|s| s.to_string()).collect();
     if !out.iter().any(|p| p == "cpu") {
@@ -118,14 +151,19 @@ pub fn profile_providers(layout: &Layout, gpus: &[Gpu]) -> (Vec<String>, Option<
     let now = zerofarm_common::now_unix();
     let mine: Vec<Probe> = load(layout).into_iter().filter(|p| p.adapters == key).collect();
     let probes: Vec<&Probe> = mine.iter().filter(|p| p.error.is_none()).collect();
-    let all = ordered(probes.iter().flat_map(|p| p.providers.clone()));
+    let all = ordered(probes.iter().flat_map(|p| p.passed()));
     let failed: Vec<&Probe> = mine.iter().filter(|p| p.error.is_some() && now - p.t < RETRY_S).collect();
     if probes.is_empty() && failed.is_empty() {
         return (all, None);
     }
     let mut per: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for p in probes.iter().take(16) {
-        per.insert(p.runtime.clone(), ordered(p.providers.clone()));
+        // a GPU pack whose own providers failed the built-in probe but were never tried on a real network here is
+        // unknown, not failed (left out, so the coordinator may still offer it: the first lease benches it, 9.6)
+        if p.need.is_some() && !p.benched && pack_bad_probe(p, 0) == Some(true) {
+            continue;
+        }
+        per.insert(p.runtime.clone(), p.passed());
     }
     for p in failed {
         if per.len() < 16 && !per.contains_key(&p.runtime) {
@@ -143,7 +181,37 @@ pub fn pack_bad(probes: &[Probe], runtime: &str, adapters: &str, need: Option<&[
     if p.error.is_some() {
         return now - p.t < RETRY_S;
     }
-    !p.providers.iter().any(|x| x != "cpu" && need.is_none_or(|n| n.iter().any(|y| y == x)))
+    let pays = p.passed().iter().any(|x| x != "cpu" && need.is_none_or(|n| n.iter().any(|y| y == x)));
+    // without a real network's verdict a failed built-in probe doesn't condemn a pack (PROTOCOL 9.6)
+    !pays && p.benched
+}
+
+/// Whether a probe alone (no bench yet) failed every GPU provider of its pack: Some(true) failed, Some(false) one
+/// passed, None it crashed. `now` 0: ignore the retry window.
+fn pack_bad_probe(p: &Probe, _now: i64) -> Option<bool> {
+    if p.error.is_some() {
+        return None;
+    }
+    let need = p.need.as_deref();
+    Some(!p.passed().iter().any(|x| x != "cpu" && need.is_none_or(|n| n.iter().any(|y| y == x))))
+}
+
+/// Records a bench's verdict in the pack's probe (PROTOCOL 9.6): benched, and the GPU providers that passed on the
+/// job's network. No probe for these adapters: nothing (the bench only follows a probe).
+pub fn record_real(layout: &Layout, runtime: &str, adapters: &str, need: Option<&[String]>, passed: &[String]) {
+    let mut v = load(layout);
+    if let Some(p) = v.iter_mut().find(|p| p.runtime == runtime && p.adapters == adapters) {
+        p.benched = true;
+        if need.is_some() {
+            p.need = need.map(|n| n.to_vec());
+        }
+        for x in passed.iter().filter(|x| *x != "cpu") {
+            if !p.real.contains(x) {
+                p.real.push(x.clone());
+            }
+        }
+        save(layout, &v);
+    }
 }
 
 // ---------- rev 11 (PROTOCOL 9.6): benches of the job's own network, and the measured choice ----------
@@ -207,9 +275,12 @@ pub fn record_bench(layout: &Layout, b: Bench) {
     let _ = zerofarm_common::fsutil::atomic_write(&bench_path(layout), &serde_json::to_vec_pretty(&v).expect("json"));
 }
 
-/// A fresh bench of `run`'s network on `runtime` for these adapters.
+/// A fresh bench of `run`'s network on `runtime` for these adapters: one that ran, for 7 days; one that failed to
+/// run, for a day (it isn't retried every lease; `choose` takes it as no bench: the CPU).
 pub fn find_bench<'a>(benches: &'a [Bench], runtime: &str, adapters: &str, run: &str, now: i64) -> Option<&'a Bench> {
-    benches.iter().find(|b| b.runtime == runtime && b.adapters == adapters && b.run == run && b.error.is_none() && now - b.t < BENCH_MAX_AGE_S)
+    benches.iter().find(|b| {
+        b.runtime == runtime && b.adapters == adapters && b.run == run && now - b.t < if b.error.is_none() { BENCH_MAX_AGE_S } else { RETRY_S }
+    })
 }
 
 /// The worker's JSON report of `probe-providers --model --bench-rows` -> a `Bench`.
@@ -435,6 +506,9 @@ pub fn from_report(v: &Value, runtime: &str, adapters: &str, worker: &str, t: i6
         providers: ordered(providers),
         results,
         error: v["error"].as_str().map(String::from),
+        need: None,
+        benched: false,
+        real: vec![],
     }
 }
 
@@ -457,7 +531,7 @@ pub fn run(
     let args = ["probe-providers", "--runtime-dir", rdir_s.as_str(), "--ensure-ready", "--threads", "2", "--reps", "2"];
     match run_worker(layout, "probe", entry, &args, rdir, log, timeout, stop) {
         Ok(v) => from_report(&v, runtime, &akey, worker, now),
-        Err(e) => Probe { runtime: runtime.into(), adapters: akey, worker: worker.into(), t: now, providers: vec!["cpu".into()], results: vec![], error: Some(e) },
+        Err(e) => Probe { runtime: runtime.into(), adapters: akey, worker: worker.into(), t: now, providers: vec!["cpu".into()], results: vec![], error: Some(e), need: None, benched: false, real: vec![] },
     }
 }
 
@@ -566,6 +640,9 @@ mod tests {
             providers: vec!["amdgpu".into(), "dml".into(), "cpu".into()],
             results: vec![pass("cpu", None, true), pass("amdgpu", Some("RX 9070 XT"), true), pass("dml", Some("RX 9070 XT"), true), pass("dml", Some("UHD 770"), true), pass("openvino", Some("UHD 770"), false)],
             error: None,
+            need: None,
+            benched: false,
+            real: vec![],
         };
         let (list, gpu) = plan_providers(Some(&p), &gpus, None, true);
         assert_eq!(list, vec!["amdgpu", "dml", "cpu"]);
@@ -682,8 +759,23 @@ mod tests {
         assert_eq!(choose(Some(&gone), &gpus, None, true, 128, 16, 2).providers, vec!["cpu"]);
     }
 
+    fn probe_rec(runtime: &str, key: &str, t: i64, providers: &[&str], error: Option<&str>, need: Option<&[&str]>) -> Probe {
+        Probe {
+            runtime: runtime.into(),
+            adapters: key.into(),
+            worker: "w".into(),
+            t,
+            providers: providers.iter().map(|x| x.to_string()).collect(),
+            results: vec![],
+            error: error.map(String::from),
+            need: need.map(|n| n.iter().map(|x| x.to_string()).collect()),
+            benched: false,
+            real: vec![],
+        }
+    }
+
     #[test]
-    fn failed_packs_are_marked_bad_and_listed_empty() {
+    fn failed_packs_are_marked_bad_only_with_a_real_networks_verdict() {
         let d = tempfile::tempdir().unwrap();
         let layout = Layout::new(d.path());
         let gpus = [gpu("RTX 4070 Ti", "nvidia", "000000000000d1f3")];
@@ -692,22 +784,51 @@ mod tests {
         let cuda = vec!["cuda".to_string()];
         // never probed: not bad
         assert!(!pack_bad(&load(&layout), "cuda-pack", &key, Some(&cuda), now));
-        // probed, only the CPU passed: bad for this driver, listed with no GPU provider
-        record(&layout, Probe { runtime: "cuda-pack".into(), adapters: key.clone(), worker: "w".into(), t: now, providers: vec!["cpu".into()], results: vec![], error: None });
-        assert!(pack_bad(&load(&layout), "cuda-pack", &key, Some(&cuda), now));
-        assert_eq!(profile_providers(&layout, &gpus).1.unwrap()["cuda-pack"], vec!["cpu"]);
+        // the built-in graph failed cuda (the CUDA false negative): not bad yet, and unknown to the coordinator
+        record(&layout, probe_rec("cuda-pack", &key, now, &["cpu"], None, Some(&["cuda"])));
+        assert!(!pack_bad(&load(&layout), "cuda-pack", &key, Some(&cuda), now));
+        assert!(profile_providers(&layout, &gpus).1.is_none_or(|m| !m.contains_key("cuda-pack")), "left out: unknown");
+        // the job's network passed cuda: it counts, the pack is listed with it, a re-probe keeps that verdict
+        record_real(&layout, "cuda-pack", &key, Some(&cuda), &cuda);
+        assert!(!pack_bad(&load(&layout), "cuda-pack", &key, Some(&cuda), now));
+        assert_eq!(profile_providers(&layout, &gpus).1.unwrap()["cuda-pack"], vec!["cuda", "cpu"]);
+        record(&layout, probe_rec("cuda-pack", &key, now + 1, &["cpu"], None, None));
+        let p = find(&load(&layout), "cuda-pack", &key).cloned().unwrap();
+        assert!(p.benched && p.real == cuda && p.need.as_deref() == Some(&cuda[..]), "{p:?}");
+        // a pack that failed both: bad for this driver, listed without a GPU provider
+        record(&layout, probe_rec("cuda-2", &key, now, &["cpu"], None, Some(&["cuda"])));
+        record_real(&layout, "cuda-2", &key, Some(&cuda), &[]);
+        assert!(pack_bad(&load(&layout), "cuda-2", &key, Some(&cuda), now));
+        assert_eq!(profile_providers(&layout, &gpus).1.unwrap()["cuda-2"], vec!["cpu"]);
         // another driver: a fresh start
         let mut g2 = gpus.clone();
         g2[0].driver = "2.0".into();
-        assert!(!pack_bad(&load(&layout), "cuda-pack", &adapters_key(&g2), Some(&cuda), now));
-        // a probe that failed: bad for a day, listed as [] meanwhile, then left out
-        record(&layout, Probe { runtime: "p2".into(), adapters: key.clone(), worker: "w".into(), t: now - 10, providers: vec!["cpu".into()], results: vec![], error: Some("crashed".into()) });
+        assert!(!pack_bad(&load(&layout), "cuda-2", &adapters_key(&g2), Some(&cuda), now));
+        // a probe that crashed: bad for a day, listed as [] meanwhile, then left out
+        record(&layout, probe_rec("p2", &key, now - 10, &["cpu"], Some("crashed"), None));
         assert!(pack_bad(&load(&layout), "p2", &key, None, now));
         assert_eq!(profile_providers(&layout, &gpus).1.unwrap()["p2"], Vec::<String>::new());
         assert!(!pack_bad(&load(&layout), "p2", &key, None, now + RETRY_S));
-        // cuda passed: fine
-        record(&layout, Probe { runtime: "cuda-pack".into(), adapters: key.clone(), worker: "w".into(), t: now, providers: vec!["cuda".into(), "cpu".into()], results: vec![], error: None });
-        assert!(!pack_bad(&load(&layout), "cuda-pack", &key, Some(&cuda), now));
+        // a pack without a declared requirement (the Windows ML pack): its built-in probe is listed as it is
+        record(&layout, probe_rec("winml", &key, now, &["dml", "cpu"], None, None));
+        assert_eq!(profile_providers(&layout, &gpus).1.unwrap()["winml"], vec!["dml", "cpu"]);
+    }
+
+    #[test]
+    fn only_a_passed_self_test_counts_never_rows_per_second() {
+        // a bench row whose self-test failed (ok false) is never chosen, however fast, nor recorded as a pass
+        let gpus = [gpu("RTX 4070 Ti", "nvidia", "00000000000000d1")];
+        let mut b = bench(&[("cpu", None, CPU), ("cuda", Some("RTX 4070 Ti"), CUDA)]);
+        b.results[1].ok = false;
+        b.results[1].rows = [("1".to_string(), 1e9), ("1024".to_string(), 1e9)].into_iter().collect();
+        let c = choose(Some(&b), &gpus, None, true, 1024, 1024, 1);
+        assert_eq!(c.providers, vec!["cpu"]);
+        assert!(!c.rows_per_s.contains_key("cuda"));
+        assert_eq!(c.gpu_games, None);
+        // the report's own `ok` (the factory's self-test) is what a bench row carries
+        let report = json!({"results": [{"provider": "cuda", "gpu": {"name": "RTX 4070 Ti"}, "ok": false,
+            "selftest": {"max_abs": 2.4e-3, "ok": false}, "rows_per_s_by_batch": {"1024": 1e9}}]});
+        assert!(!bench_from_report(&report, "rt", "a", "r", "w", 4, 0).results[0].ok);
     }
 
     #[test]
@@ -726,6 +847,19 @@ mod tests {
         assert!(find_bench(&load_benches(&layout), "rt", "a", "run1", now).is_some());
         assert!(find_bench(&load_benches(&layout), "rt", "a", "run2", now).is_none(), "per run");
         assert!(find_bench(&load_benches(&layout), "rt", "a", "run1", 100 + BENCH_MAX_AGE_S).is_none(), "stale after a week");
+        // a bench that failed to run is kept a day (no re-run every lease) and chooses the CPU; a provider that failed
+        // its self-test there stays failed for that (pack, adapters, run) until the bench is a week old
+        let mut bad = b.clone();
+        bad.run = "run3".into();
+        bad.error = Some("crashed".into());
+        record_bench(&layout, bad);
+        let found = find_bench(&load_benches(&layout), "rt", "a", "run3", now).cloned();
+        assert!(found.as_ref().is_some_and(|x| x.error.is_some()));
+        assert_eq!(choose(found.as_ref(), &[], None, true, 128, 16, 2).providers, vec!["cpu"]);
+        assert!(find_bench(&load_benches(&layout), "rt", "a", "run3", 100 + RETRY_S).is_none(), "tried again after a day");
+        let all = load_benches(&layout);
+        let dml_failed = find_bench(&all, "rt", "a", "run1", now).unwrap();
+        assert!(!dml_failed.results.iter().find(|r| r.provider == "dml").unwrap().ok);
     }
 
     #[test]

@@ -335,6 +335,8 @@ impl Engine {
             let _ = pump.join();
             if p.error.as_deref() != Some("stopped") {
                 log::info!("lease {id}: provider probe of runtime pack {}: {} {}", rt.build_id, p.providers.join(", "), p.error.as_deref().unwrap_or(""));
+                let mut p = p;
+                p.need = need.map(|n| n.providers.clone());
                 crate::probe::record(&self.cfg.layout, p);
                 self.profile = (self.profile_fn)();
                 self.profile_refreshed = Instant::now();
@@ -344,25 +346,63 @@ impl Engine {
         let akey = crate::probe::adapters_key(&gpus);
         let now = zerofarm_common::now_unix();
         let probes = crate::probe::load(&self.cfg.layout);
-        let passed: Vec<String> = crate::probe::find(&probes, &rt.build_id, &akey).filter(|p| p.error.is_none()).map(|p| p.providers.clone()).unwrap_or_default();
+        let probe = crate::probe::find(&probes, &rt.build_id, &akey).filter(|p| p.error.is_none());
+        let builtin: Vec<String> = probe.map(|p| p.providers.clone()).unwrap_or_default();
+        let passed: Vec<String> = probe.map(|p| p.passed()).unwrap_or_default();
+        // what the bench tries: the providers that passed here, and a GPU pack's own providers even when the built-in
+        // probe failed them (its graph is not the job's; the bench is the factory's full self-test on the job's own
+        // network and reference set, 2e-5, twice bit-identical, a node on the GPU - rows/s alone never count)
+        let mut candidates = passed.clone();
+        for p in need.map(|n| n.providers.as_slice()).unwrap_or(&[]) {
+            if !candidates.contains(p) {
+                candidates.push(p.clone());
+            }
+        }
+        let candidates = crate::probe::ordered(candidates);
         let mut bench = crate::probe::find_bench(&crate::probe::load_benches(&self.cfg.layout), &rt.build_id, &akey, run, now).cloned();
-        if let (true, None, Some(reference)) = (gpu_ok && crate::probe::has_gpu_provider(&passed), &bench, net.reference.as_ref()) {
-            log::info!("lease {id}: measuring {run}'s network on runtime pack {} ({})", rt.build_id, passed.join(", "));
+        if let (true, None, Some(reference)) = (gpu_ok && probe.is_some() && crate::probe::has_gpu_provider(&candidates), &bench, net.reference.as_ref()) {
+            log::info!("lease {id}: measuring {run}'s network on runtime pack {} ({})", rt.build_id, candidates.join(", "));
             self.set_status(Phase::Working, "checking the GPU", Some(describe_job(lease)));
             let (stop_pump, pump) = self.beat_pump(lease);
-            let spec = crate::probe::BenchSpec { model: &net.model, reference, run, threads, providers: passed.clone() };
+            let spec = crate::probe::BenchSpec { model: &net.model, reference, run, threads, providers: candidates.clone() };
             let r = crate::probe::run_bench(&self.cfg.layout, &entry, &prep.build.build_id, &rt.build_id, &rt.dir, &gpus, self.worker_log.clone(), crate::probe::PROBE_TIMEOUT, &stop, &spec);
             stop_pump.store(true, Ordering::SeqCst);
             let _ = pump.join();
             match r {
-                Ok(b) if b.error.is_none() => bench = Some(b),
-                Ok(b) => log::warn!("lease {id}: the bench failed: {}", b.error.as_deref().unwrap_or("")),
+                Ok(b) if b.error.is_none() => {
+                    // the verdict of the job's network goes into the pack's probe record next to the built-in one
+                    let real: Vec<String> = b.results.iter().filter(|x| x.ok && x.provider != "cpu").map(|x| x.provider.clone()).collect();
+                    crate::probe::record_real(&self.cfg.layout, &rt.build_id, &akey, need.map(|n| n.providers.as_slice()), &real);
+                    for x in b.results.iter().filter(|x| x.provider != "cpu") {
+                        let builtin_ok = builtin.contains(&x.provider);
+                        let line = format!(
+                            "runtime pack {} provider {} on {}: built-in probe {}, {run}'s network {}",
+                            rt.build_id,
+                            x.provider,
+                            x.adapter.as_deref().unwrap_or("?"),
+                            if builtin_ok { "PASS" } else { "FAIL" },
+                            if x.ok { "PASS" } else { "FAIL" }
+                        );
+                        log::info!("lease {id}: {line}");
+                        self.worker_log.write_line(&format!("bench: {line}"));
+                    }
+                    self.profile = (self.profile_fn)();
+                    self.profile_refreshed = Instant::now();
+                    bench = Some(b);
+                }
+                Ok(b) => {
+                    log::warn!("lease {id}: the bench failed: {}", b.error.as_deref().unwrap_or(""));
+                    crate::probe::record_real(&self.cfg.layout, &rt.build_id, &akey, need.map(|n| n.providers.as_slice()), &[]);
+                    // kept a day, so it isn't run again every lease (the CPU meanwhile)
+                    crate::probe::record_bench(&self.cfg.layout, b);
+                }
                 Err(_) => {}
             }
         }
-        // A GPU pack none of whose providers passed here: marked bad for this driver (its probe), run on the CPU, and
-        // evicted when the lease ends (PROTOCOL 9.6).
+        // A GPU pack none of whose providers passed here, on the built-in graph or the job's own network: marked bad for
+        // this driver (its probe), run on the CPU, and evicted when the lease ends (PROTOCOL 9.6).
         if let Some(n) = need {
+            let probes = crate::probe::load(&self.cfg.layout);
             if crate::probe::pack_bad(&probes, &rt.build_id, &akey, Some(&n.providers), now) {
                 log::warn!("lease {id}: runtime pack {} failed on this GPU: running on the CPU, removing the pack afterwards", rt.build_id);
                 self.evict_after.push(format!("builds/{}", rt.build_id));

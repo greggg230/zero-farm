@@ -376,6 +376,16 @@ impl Engine {
                 p.results.iter().map(|r| format!("{}{}: {}", r.provider, r.adapter.as_ref().map(|a| format!(" on {a}")).unwrap_or_default(), if r.ok { "ok" } else { "no" })).collect::<Vec<_>>().join("; ")
             ),
         }
+        // rev 11 (PROTOCOL 9.6): a GPU pack's own providers, so its verdict waits for a real network's when the
+        // built-in graph fails them
+        let mut p = p;
+        p.need = zerofarm_common::manifest::verify_dir(
+            &rdir,
+            &self.cfg.keys,
+            &zerofarm_common::manifest::Expect { build_id: Some(&runtime), kind: Some(zerofarm_common::manifest::Kind::Runtime), version: None },
+        )
+        .ok()
+        .and_then(|v| v.manifest.gpu.map(|g| g.providers));
         crate::probe::record(&self.cfg.layout, p);
         self.profile = (self.profile_fn)();
         self.profile_refreshed = Instant::now();
