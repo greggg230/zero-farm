@@ -253,6 +253,8 @@ describe("GPU lease sizes (rev 11, PROTOCOL 9.4)", () => {
   it("auto: the machine's measured break-even, never past the staleness window", async () => {
     await delverLike({ gpu_gpl: "auto" });
     const nv = await enroll("nv", { profile: NV });
+    // the machine measured that no GPU pays for this network (0): the normal size
+    expect(gamesOf(await lease(nv, { agent: NEW, caps: { ...GPU_OK, gpu_games: { bo3: 0 } }, kinds: ["selfplay"] }))).toBe(6);
     // no rate measured yet: the agent's hint (or 64 before any bench)
     expect(gamesOf(await lease(nv, { agent: NEW, caps: { ...GPU_OK, gpu_games: { bo3: 40 } }, kinds: ["selfplay"] }))).toBe(40);
     expect(gamesOf(await lease(nv, { agent: NEW, caps: GPU_OK, kinds: ["selfplay"] }))).toBe(64);
@@ -270,6 +272,6 @@ describe("GPU lease sizes (rev 11, PROTOCOL 9.4)", () => {
     await delverLike();
     const nv = await enroll("nv", { profile: NV });
     err(await ask(nv, { agent: NEW, caps: { ...GPU_OK, gpu_games: { "Not A Run": 3 } } as any }), 400, "bad_request");
-    err(await ask(nv, { agent: NEW, caps: { ...GPU_OK, gpu_games: { bo3: 0 } } as any }), 400, "bad_request");
+    err(await ask(nv, { agent: NEW, caps: { ...GPU_OK, gpu_games: { bo3: -1 } } as any }), 400, "bad_request");
   });
 });

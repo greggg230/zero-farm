@@ -294,7 +294,7 @@ export async function lease(c: Ctx): Promise<Response> {
     if (Object.keys(g).length > 32) throw bad("caps.gpu_games names more than 32 runs");
     for (const [run, n] of Object.entries(g)) {
       if (!SLUG_RE.test(run)) throw bad(`caps.gpu_games: ${JSON.stringify(run.slice(0, 64))} is not a run`);
-      gpuGames.set(run, int(n, `caps.gpu_games.${run}`, { min: 1, max: 100000 }));
+      gpuGames.set(run, int(n, `caps.gpu_games.${run}`, { min: 0, max: 100000 })); // 0: no GPU pays here
     }
   }
   const cachedIn = obj(b.cached, "cached", { optional: true }) ?? {};
@@ -598,6 +598,7 @@ export async function gpuLeaseSize(db: D1Database, cd: Candidate, normal: number
   const kind = cd.kind as "selfplay" | "eval";
   if (typeof cd.gpu_configured === "number") return cd.gpu_configured;
   if (cd.gpu_configured === undefined && cd.configured !== "auto") return normal;
+  if (paysAt === 0) return normal; // the machine measured that no GPU provider pays for this run's network
   const gpu = Math.min(paysAt ?? GPU_LEASE_MIN[kind], GPU_LEASE_MAX);
   if (kind === "selfplay" && rate !== null && rate > 0) {
     const interval = await iterationInterval(db, cd.run!);
