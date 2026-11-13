@@ -21,6 +21,7 @@ import {
   gpuEligible,
   gpuNeedOf,
   hasAdapter,
+  isGpuProvider,
   kindRank,
   place,
   requiresRuntimeOf,
@@ -413,12 +414,15 @@ export async function lease(c: Ctx): Promise<Response> {
         if (bi.aw !== null && bi.aw !== aw) continue;
         const def = defs.get(`run:${r.run}`); // 7: the definition authorizes it
         if (!def || leaseProblem(def, kind, a.build_id, a.runtime, c.now, a.runtime)) continue;
-        return { build_id: a.build_id, runtime: a.runtime as string | null, alt: true, eligible: true };
+        return { build_id: a.build_id, runtime: a.runtime as string | null, alt: true, eligible: true, gpuLease: true };
       }
     }
     if (!packFits(r.runtime)) return null;
     const eligible = gpuEligible(caps.gpu, verifiedProviders(machineProfile, r.runtime), routing.providers);
-    return { build_id: r.build_id, runtime: r.runtime, alt: false, eligible };
+    // a GPU lease (its own size, 9.4) only when a GPU provider passed with this very pack here
+    const withPack = r.runtime ? (runtimeProvidersOf(machineProfile, r.runtime) ?? []) : [];
+    const gpuLease = eligible && withPack.some((p) => isGpuProvider(p) && (!routing.providers || (routing.providers as string[]).includes(p)));
+    return { build_id: r.build_id, runtime: r.runtime, alt: false, eligible, gpuLease };
   };
   for (const r of runs) {
     const scope = book.runScope(r.run);
@@ -443,7 +447,7 @@ export async function lease(c: Ctx): Promise<Response> {
           build_id: v.build_id,
           runtime: v.runtime,
           alt: v.alt,
-          gpu_lease: altAware && (v.alt || v.eligible),
+          gpu_lease: altAware && v.gpuLease,
         });
       }
     }
@@ -478,7 +482,7 @@ export async function lease(c: Ctx): Promise<Response> {
             build_id: v.build_id,
             runtime: v.runtime,
             alt: v.alt,
-            gpu_lease: altAware && (v.alt || v.eligible),
+            gpu_lease: altAware && v.gpuLease,
           });
         }
       }
