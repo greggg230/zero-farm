@@ -26,6 +26,7 @@ use std::thread::JoinHandle;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::UI::Controls::{InitCommonControlsEx, ICC_LINK_CLASS, INITCOMMONCONTROLSEX, LWS_TRANSPARENT, NMHDR, NM_CLICK, NM_RETURN};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, SetFocus};
 use windows_sys::Win32::UI::Shell::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
@@ -558,6 +559,14 @@ struct Dlg {
 
 const IDC_CODE: usize = 101;
 const IDC_NAME: usize = 102;
+const IDC_LICENSES: usize = 103;
+
+/// The README's list of the third-party components Zero Farm ships (ONNX Runtime, the Windows ML
+/// runtime and DirectML, the MSVC runtime) with their license terms.
+pub const THIRD_PARTY_URL: &str = "https://github.com/greggg230/zero-farm#third-party-components";
+/// The invite dialog's one line about them (a SysLink: the link part opens [`THIRD_PARTY_URL`]).
+pub const THIRD_PARTY_LINE: &str =
+    "By installing, you accept the <a href=\"https://github.com/greggg230/zero-farm#third-party-components\">license terms of the included third-party components</a>.";
 const IDOK_: usize = 1;
 const IDCANCEL_: usize = 2;
 
@@ -616,6 +625,15 @@ unsafe fn dlg_message(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
             DestroyWindow(hwnd);
             return 0;
         }
+        WM_NOTIFY => {
+            // the third-party line's link (clicked, or Enter on it): the README's section in the browser
+            let hdr = &*(lp as *const NMHDR);
+            if hdr.idFrom == IDC_LICENSES && (hdr.code == NM_CLICK || hdr.code == NM_RETURN) {
+                let (op, url) = (wide("open"), wide(THIRD_PARTY_URL));
+                ShellExecuteW(hwnd, op.as_ptr(), url.as_ptr(), std::ptr::null(), std::ptr::null(), SW_SHOWNORMAL);
+                return 0;
+            }
+        }
         WM_CTLCOLORSTATIC => {
             SetBkMode(wp as HDC, TRANSPARENT as i32);
             return GetSysColorBrush(COLOR_WINDOW) as LRESULT;
@@ -661,7 +679,10 @@ pub fn invite_dialog(default_name: &str, try_enroll: &mut TryEnroll) -> bool {
             hIconSm: std::ptr::null_mut(),
         };
         RegisterClassExW(&wc);
-        let (w, h) = (sc(460), sc(250));
+        // (the SysLink class of the third-party line)
+        let icc = INITCOMMONCONTROLSEX { dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32, dwICC: ICC_LINK_CLASS };
+        InitCommonControlsEx(&icc);
+        let (w, h) = (sc(460), sc(290));
         let (sw, sh) = (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN));
         let title = wide("Join Zero Farm");
         let hwnd = CreateWindowExW(
@@ -696,8 +717,9 @@ pub fn invite_dialog(default_name: &str, try_enroll: &mut TryEnroll) -> bool {
         mk("STATIC", "A name for this PC (shown on the contributors page):", 0, 16, 74, 420, 20, 0, 0);
         let name = mk("EDIT", default_name, WS_TABSTOP | WS_BORDER | ES_AUTOHSCROLL as u32, 16, 98, 420, 26, IDC_NAME, WS_EX_CLIENTEDGE);
         let err = mk("STATIC", "", 0, 16, 132, 420, 40, 0, 0);
-        let join = mk("BUTTON", "Join", WS_TABSTOP | BS_DEFPUSHBUTTON as u32, 236, 176, 96, 30, IDOK_, 0);
-        mk("BUTTON", "Cancel", WS_TABSTOP | BS_PUSHBUTTON as u32, 340, 176, 96, 30, IDCANCEL_, 0);
+        mk("SysLink", THIRD_PARTY_LINE, WS_TABSTOP | LWS_TRANSPARENT, 16, 176, 420, 34, IDC_LICENSES, 0);
+        let join = mk("BUTTON", "Join", WS_TABSTOP | BS_DEFPUSHBUTTON as u32, 236, 216, 96, 30, IDOK_, 0);
+        mk("BUTTON", "Cancel", WS_TABSTOP | BS_PUSHBUTTON as u32, 340, 216, 96, 30, IDCANCEL_, 0);
         let ptr: *mut TryEnroll<'static> = std::mem::transmute::<*mut TryEnroll<'_>, *mut TryEnroll<'static>>(try_enroll as *mut _);
         DLG.with(|d| *d.borrow_mut() = Some(Dlg { code, name, err, join, try_enroll: ptr, result: None }));
         ShowWindow(hwnd, SW_SHOW);
@@ -786,6 +808,24 @@ mod tests {
             }
         }
         unsafe { DestroyWindow(hwnd) };
+    }
+
+    #[test]
+    fn the_invite_dialog_names_the_third_party_terms_and_links_the_readme_section() {
+        // The owner's wording (2026-11-12), one line; the link is the README's "Third-party components".
+        let text: String = {
+            let mut out = String::new();
+            let mut rest = THIRD_PARTY_LINE;
+            while let Some(i) = rest.find('<') {
+                out.push_str(&rest[..i]);
+                rest = &rest[rest[i..].find('>').map(|j| i + j + 1).unwrap()..];
+            }
+            out + rest
+        };
+        assert_eq!(text, "By installing, you accept the license terms of the included third-party components.");
+        assert!(THIRD_PARTY_LINE.contains(&format!("href=\"{THIRD_PARTY_URL}\"")));
+        let readme = include_str!("../../../README.md");
+        assert!(readme.lines().any(|l| l.trim() == "## Third-party components"), "README.md has the section the link names");
     }
 
     #[test]

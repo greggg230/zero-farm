@@ -857,8 +857,8 @@ allowlist as `providers` (null on diag leases).
   the stats' `runs` / `campaigns` show it. Why: a self-play run whose signed template names a split or double-faced card
   (rev 8) must reach only agents that accept it, while agents of an older stable release keep their fuzz leases. The
   trainer's pool remote sets it (`pool_min_agent`, zero-core). No agent change.
-- v1 rev 8 (2026-11-12, phase 3 self-play; agent and coordinator code on branch `selfplay`, not yet released or
-  deployed): **records** - a self-play job's result files are game records (`records` events; the job line's optional
+- v1 rev 8 (2026-11-12, phase 3 self-play; coordinator deployed 2026-11-12, agent 0.2.8, canary first):
+  **records** - a self-play job's result files are game records (`records` events; the job line's optional
   `output`: `records`, the default of a worker build from phase 3, `shards` the shards of before, `both`), gzip'd
   JSON lines: a header `{"records": 1, "game", "spec", "aux", "features", "actions", "aux_width", "seed" (the lease's),
   "lease", "build_id", "games", "rows", "gids", "gen"}` then one game per line (zero-core docs/search.md 2.17: its

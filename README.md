@@ -274,3 +274,22 @@ npm run dev        # local server on port 5400
 ## License
 
 [MIT](LICENSE). Copyright (c) 2026 greggg230.
+
+## Third-party components
+
+Zero Farm's job programs run networks with Microsoft's ONNX Runtime, which Zero Farm downloads as a
+*runtime pack*: a signed build like every other (see [What code runs](#what-code-runs)), verified
+file by file before use. The packs contain components made by others, under their own license
+terms. By installing Zero Farm you accept these terms (the "Join Zero Farm" window links here).
+
+| Component | Where it comes from, where it ships | License |
+|---|---|---|
+| **ONNX Runtime** (Microsoft) | `onnxruntime.dll`: in the CPU runtime pack (ONNX Runtime 1.31.1) and, as Windows ML's own build (1.28.3), in the GPU runtime pack | [MIT License](https://github.com/microsoft/onnxruntime/blob/main/LICENSE) ([third-party notices](https://github.com/microsoft/onnxruntime/blob/main/ThirdPartyNotices.txt)) |
+| **Microsoft Windows ML runtime** and **DirectML** | `Microsoft.Windows.AI.MachineLearning.dll` and `DirectML.dll`, unmodified, from Microsoft's NuGet package [Microsoft.Windows.AI.MachineLearning 2.5.96](https://www.nuget.org/packages/Microsoft.Windows.AI.MachineLearning/2.5.96) (which also carries DirectML). Distributed only inside Zero Farm's GPU runtime pack | [Microsoft Software License Terms, Microsoft Windows ML Runtime](https://www.nuget.org/packages/Microsoft.Windows.AI.MachineLearning/2.5.96/License) |
+| **Microsoft Visual C++ runtime** | `msvcp140.dll`, `msvcp140_1.dll`, `vcruntime140.dll`, `vcruntime140_1.dll`, Microsoft-signed, in the CPU runtime pack (the GPU pack needs none) | [Microsoft Visual C++ Runtime 2015-2022 license terms](https://visualstudio.microsoft.com/license-terms/vs2022-cruntime/) ([redistribution](https://learn.microsoft.com/en-us/visualstudio/releases/2022/redistribution)) |
+
+The GPU runtime pack ships the package's license files next to its DLLs, byte for byte as Microsoft
+publishes them: `license.txt` (the Microsoft Software License Terms) and `ThirdPartyNotices.txt`.
+After a pack is downloaded they are in `%LOCALAPPDATA%\ZeroFarm\cache\builds\<pack build id>\`.
+Zero Farm's own code (this repo) is MIT-licensed (above); the job programs are signed builds of a
+private engine (MTG Zero).

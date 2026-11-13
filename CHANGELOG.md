@@ -4,18 +4,16 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>`.
 
-## Unreleased (GPU work)
+## 0.2.8 (2026-11-12, canary)
 
-- **Your graphics card can help, whatever its make.** With "Use the GPU" on, Zero Farm checks once
-  which ways of running networks on your GPU work on your PC (NVIDIA, AMD or Intel; DirectML on any
-  DirectX 12 card, and on Windows 11 24H2 or newer the GPU maker's own Windows ML provider, which
-  Windows downloads the first time). A way is used only if it computes the same answers as the
-  reference, to the last decimal places that matter, every time. The check runs between jobs, takes
-  seconds, and is repeated after a driver update; its readable report is in the logs "Send
-  diagnostics" sends.
-- **Stopping for other GPU use works on every GPU.** Zero Farm now sees other programs' GPU use the way
-  Task Manager does (no longer only on NVIDIA cards) and reads the GPU temperature where the driver
-  reports it; a card listed twice by Windows is counted once.
+- **Jobs that name split and double-faced cards can run.** A job's signed instructions may now name
+  cards such as "Rough // Tumble" or "Tamiyo, Inquisitive Student // Tamiyo, Seasoned Scholar".
+  Earlier versions refused them, taking the " // " in the card's name for part of a file path.
+  Anything else that looks like a path is still refused.
+- **The "Join Zero Farm" window names the third-party license terms.** One line says that by
+  installing you accept the license terms of the third-party components Zero Farm includes
+  (Microsoft's ONNX Runtime, Windows ML runtime and DirectML, and the Visual C++ runtime), with a link
+  to their list in the [README](README.md#third-party-components).
 
 ## 0.2.7 (2026-11-12, canary)
 
