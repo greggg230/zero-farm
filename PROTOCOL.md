@@ -159,13 +159,14 @@ day, so the profile is resent at most daily for them.
 Request:
 ```json
 {"profile_digest": "<sha256 of canonical Profile>", "profile": Profile | null,
- "caps": {"threads": 6, "ram_mb": 12000, "gpu": true, "gpu_allowed": true, "disk_mb": 2500},
+ "caps": {"threads": 6, "ram_mb": 12000, "gpu": true, "gpu_allowed": true, "disk_mb": 2500, "gpu_games": {"eoe2": 24}},
  "cached": {"builds": ["<build_id>", ...], "ckpts": ["<run>/<gen>", ...]},
  "kinds": ["fuzz", "eval", "selfplay", "diag"]}
 ```
 `caps.gpu_allowed` (rev 11, agents from 0.2.10, optional): the policy and the user's "Use the GPU" setting allow
 GPU work right now, whether or not a GPU provider has passed a probe (`caps.gpu` keeps its meaning: allowed and a
-GPU provider passed; section 9.4 uses `gpu_allowed`).
+GPU provider passed; section 9.4 uses `gpu_allowed`). `caps.gpu_games` (rev 11, optional): per run, the fewest games per lease
+at which this PC's GPU pays, from its bench (section 9.4).
 `profile` is sent only when the digest changed (the coordinator answers 409 `conflict` with
 `{"need_profile": true}` if it doesn't know the digest). The digest is opaque to the coordinator:
 it only compares it with the last one it stored, so the agent may compute it any stable way
@@ -383,7 +384,7 @@ tools also send an Access service token (`CF-Access-Client-Id`, `CF-Access-Clien
 | `POST /v1/admin/build` | `{"build_id"}` after its manifest, signature and files are uploaded; the coordinator checks presence + sizes + hashes, and the signature and its trusted comment (`build_id=`, `kind=`) when the Worker var `RELEASE_PUBKEYS` is set → `{"ok": true, "build_id", "kind", "version", "size", "sig_verified"}`; failures → 400 with `"problems": [...]` |
 | `POST /v1/admin/agent/release` | `{"version", "build_id", "channel": "canary" \| "stable", "min_agent", "github_url": "<url>" \| null}`: `build_id` must be a registered agent build of that version, `min_agent` ≤ `version`. `github_url` (rev 4): the installer asset of the release's GitHub Release, where `GET /download` redirects; create the GitHub Release first. Rev 6: exactly `https://github.com/<GITHUB_REPO>/releases/download/agent-v<version>/ZeroFarmSetup.exe` (the var defaults to `greggg230/zero-farm`), else 400. `setup` (rev 3) → 400 → `{"ok": true, "channel", "version", "build_id", "min_agent", "github_url"}` |
 | `PUT /v1/admin/definition` | rev 6, section 7: `{"kind": "run" \| "campaign", "id", "version", "key", "sha256"}` after `definition.json` and `.minisig` are uploaded to `key` = `defs/<kind>/<id>/<version>/definition.json` → `{"ok": true, "kind", "id", "version", "key", "sha256", "unchanged", "current": true}`; failures → 400 with `"problems"`, a version not above the current one (or the same with other bytes) → 409 |
-| `PUT /v1/admin/run/{run}` | `{"game", "build_id", "runtime", "priority": 1.0, "min_agent": "0.2.8" \| null, "alternates": [{"build_id", "runtime", "when": {"vendor", "min_driver"?}}] \| null (rev 11, section 9.4), "selfplay": {"quota": 600, "slack": 0.1, "max_stale": 1, "games_per_lease": "auto", "gpu": "any" \| "preferred" \| "required", "providers": ["dml", "cpu"] \| null, "needs": {"threads", "ram_mb"}, "job": {...}} \| null, "eval": {"batch": "it81", "games": 110, "checkpoints": [81, 70], "games_per_lease": "auto", "gpu", "providers", "needs", "job": {"settings", "seats", "paired"}} \| null, "state": "active" \| "paused"}` → `{"ok": true, "created"}`. `build_id` must be a registered worker build, `runtime` a runtime build. A new eval `batch` reserves `games` fresh game ids (the old batch's unissued ones are dropped); its rules and checks are in section 5.2 (rev 5: `checkpoints` replaces `gen`, which is now refused). Pausing a run, or dropping its `selfplay`/`eval`, cancels those leases at their next beat. Rev 9: `min_agent` (semver, optional; absent or null: none) - the run's leases (self-play and eval) go only to agents at or above it (section 3's update rule); a PUT is the whole configuration, so a PUT without it removes the limit; leases already issued run on (migration 0007) |
+| `PUT /v1/admin/run/{run}` | `{"game", "build_id", "runtime", "priority": 1.0, "min_agent": "0.2.8" \| null, "alternates": [{"build_id", "runtime", "when": {"vendor", "min_driver"?}}] \| null (rev 11, section 9.4), "selfplay": {"quota": 600, "slack": 0.1, "max_stale": 1, "games_per_lease": "auto", "gpu_games_per_lease": 24 | "auto" (rev 11, optional, section 9.4), "gpu": "any" \| "preferred" \| "required", "providers": ["dml", "cpu"] \| null, "needs": {"threads", "ram_mb"}, "job": {...}} \| null, "eval": {"batch": "it81", "games": 110, "checkpoints": [81, 70], "games_per_lease": "auto", "gpu", "providers", "needs", "job": {"settings", "seats", "paired"}} \| null, "state": "active" \| "paused"}` → `{"ok": true, "created"}`. `build_id` must be a registered worker build, `runtime` a runtime build. A new eval `batch` reserves `games` fresh game ids (the old batch's unissued ones are dropped); its rules and checks are in section 5.2 (rev 5: `checkpoints` replaces `gen`, which is now refused). Pausing a run, or dropping its `selfplay`/`eval`, cancels those leases at their next beat. Rev 9: `min_agent` (semver, optional; absent or null: none) - the run's leases (self-play and eval) go only to agents at or above it (section 3's update rule); a PUT is the whole configuration, so a PUT without it removes the limit; leases already issued run on (migration 0007) |
 | `GET /v1/admin/run/{run}` | config (rev 9: with `min_agent`) + state: `current_gen`, `next_gid`, `pool`, `selfplay_state` (`cap`, `accepted`, `leased`, `pending`, `in_flight`, `headroom`), `checkpoints` (registered gens, rev 5), `eval_state` (the current batch's progress, section 5.2) and `eval_batches` (every batch of the run, newest first, same fields); rev 6 `definition` (as in stats; `GET /v1/admin/campaign/{id}` too) |
 | `PUT /v1/admin/run/{run}/checkpoint/{gen}` | `{"model", "sha256", "reference", "reference_sha256"}` (files under `ckpt/<run>/`, uploaded first); makes `gen` current for self-play and resets that generation's quota counter → `{"ok": true, "unchanged", "current"}`. Rev 5: a `gen` older than the current one is registered without becoming current (`"current": false`: an eval opponent or a head-to-head label); the same `gen` with other files → 409. Rev 6: a gen the current definition already signs must be exactly those files (else 400); self-play with a definition plays the new current gen once a definition signs it |
 | `GET /v1/admin/run/{run}/results?after={cursor}&limit=500` | → `{"results": [{"id", "key", "lease_id", "seq", "machine_id", "kind", "gen", "games", "ids", "dup_ids", "sha256", "size", "t"}], "cursor"}`. `ids`/`games`: the game ids credited to this chunk; `dup_ids`: ids in it that an earlier chunk was credited with (skip those games). Eval chunks (rev 5) also carry `batch`, `held` and `also`, and their `games` counts `also` too (section 5.2). `limit` ≤ 1000 |
@@ -945,10 +946,26 @@ machine qualifies when all hold:
    definition's or the build's `requires_runtime`).
 Otherwise the lease carries the default. Fuzz (campaigns) and diag leases never carry an alternate. For GPU
 routing (section 8) a machine counts as GPU-eligible for an alternate it qualifies for while condition 4 is "no
-entry" (it probes the pack before its first job line, 9.6). A lease with an alternate, or for a machine that is
-GPU-eligible for the job, of a job whose `games_per_lease` is `auto`, is at least `GPU_LEASE_MIN` games
-(self-play 64, eval 128): a GPU only pays with hundreds of rows per batch, and a batch never has more rows than
-games in flight.
+entry" (it probes the pack before its first job line, 9.6).
+
+**GPU lease sizes.** A batch has one row per game in flight per group, so it never has more rows than the lease
+has games, and a GPU only pays from some batch size on (measured: CUDA on a 4070 Ti from ~10-16 rows, DirectML
+from ~200-300). For a *GPU lease* - an agent from 0.2.10 that gets an alternate, or whose probe of the run's default
+pack passed a GPU provider the job allows (`runtime_providers`) - a run's `selfplay` / `eval` may set `gpu_games_per_lease` (number | `"auto"`; absent: as
+before):
+- a number: exactly that many games (the owner picks it against the run's staleness window);
+- `"auto"`, or absent while `games_per_lease` is `"auto"`: the larger of the normal size and the machine's
+  `caps.gpu_games[<run>]` (agents from 0.2.10: per run, from its bench of that run's network, the fewest games
+  per lease at which its best GPU reaches 2x the CPU, else 1.1x, with its GPU `groups`, 9.6), or before any
+  bench `GPU_LEASE_MIN` (self-play 64, eval 128); at most 4,096. For self-play, once the machine has a measured
+  rate, at most 0.8 x that rate x the run's iteration interval (the median gap of its last checkpoint
+  registrations) x `max_stale`: a self-play lease keeps the gen it started with and its results are refused
+  past `max_stale` gens. When the GPU's games don't fit under that cap the lease keeps its normal size, and the
+  agent's measurement (9.6) runs it on the CPU;
+- absent while `games_per_lease` is a number: that number (unchanged; GPU leases of such a run are no bigger, so
+  the agent's measurement usually picks the CPU there).
+`caps.gpu_games`: `{"<run>": games}`, at most 32 runs, games 0 to 100,000; 0: benched, and no GPU provider pays
+there at any size (the lease keeps its normal size).
 
 ### 9.5 The agent's guard (defense in depth)
 
@@ -966,25 +983,28 @@ rule, section 7), before downloading anything.
 ### 9.6 Probe first, then choose CPU or GPU by measured speed
 
 Before the first job line of a self-play or eval lease with a runtime pack, while the policy allows GPU work and
-the PC has a GPU, the agent makes sure it has a **bench** of the job's network on this pack: `<worker>
-probe-providers --runtime-dir <pack> --model <the lease's model> --reference <its reference set> --bench-rows
-1,8,32,128,512,1024 --reps 3 --threads <the job's threads> --json <file>` (plus `--ensure-ready` and every provider
-when the pack has no probe for these adapters yet; otherwise `--providers` = the GPU providers that passed and
-`cpu`), at most 15 minutes, beating meanwhile. It is kept per (runtime build, adapters with drivers, run) in
-`state\bench.json` for 7 days. A pack that had no probe gets this run's result as its probe (`state\probes.json`;
-the profile's `runtime_providers` then tells the coordinator, rev 11 also `[]` when nothing passed or the probe
-failed), so a newly downloaded pack is never judged unprobed (`["cpu"]`) on its first lease.
+the PC has a GPU: a pack that has no probe here yet gets the **built-in probe** first, exactly the between-lease
+one of section 8 (`probe-providers --runtime-dir <pack> --ensure-ready ...`, the built-in graph, recorded in
+`state\probes.json`, the profile refreshed), so a newly downloaded pack is never judged unprobed (`["cpu"]`) on
+its first lease; the between-lease probe itself is unchanged. Then, if a GPU provider passed that probe, the
+agent makes sure it has a **bench** of the job's own network on this pack: `<worker> probe-providers
+--runtime-dir <pack> --model <the lease's model> --reference <its reference set> --providers <the providers that
+passed, cpu included> --bench-rows 1,8,32,128,512,1024 --reps 3 --threads <the job's threads> --json <file>`, at
+most 15 minutes, beating meanwhile; a record of its own, per (runtime build, adapters with drivers, run), in
+`state\bench.json`, kept 7 days. The profile's `runtime_providers` lists `[]` (rev 11) for a pack whose probe
+failed less than a day ago.
 
 The choice, the same for every vendor and provider: the job's batch size is `b = ceil(min(conc, games) /
 groups)` rows (one leaf per game in flight per batch; `conc` and `groups` from the template's settings, `groups`
 default 1). For each (provider, adapter) of the bench whose self-test passed, the rows per second at `b` are
-interpolated log-linearly between the benched sizes (clamped at the ends); a GPU candidate is rated at its own `b`
-with `conc` raised to `min(games, max(conc, 512))`. The fastest wins, and a GPU provider only if it is at least
-1.1 times the CPU. The job line then has `providers` = `[winner, "cpu"]`, `gpu` = the winner's adapter and, for a
-GPU winner, that raised `conc`; else `["cpu"]`, `gpu` null and the template's `conc`. No GPU provider slower than
-the CPU at the job's batch size ever runs. Stats (beats and `done`) carry `batch_rows` (`b` as chosen) and
-`rows_per_s` (`{"<provider>": rows/s at b}` for the CPU and each GPU candidate), which the coordinator keeps with
-the lease's stats.
+interpolated log-linearly between the benched sizes (clamped at the ends); a GPU candidate is rated at its own `b`,
+with `conc` raised to `min(games, max(conc, 512))` and `groups` lowered to at most 2. The fastest wins, and a GPU
+provider only if it is at least 1.1 times the CPU. The job line then has `providers` = `[winner, "cpu"]`, `gpu` =
+the winner's adapter and, for a GPU winner, those `conc` and `groups` (the agent's tuning fields, section 5);
+else `["cpu"]`, `gpu` null and the template's `conc` and `groups`. No GPU provider slower than the CPU at the
+job's batch size ever runs. From the same numbers the agent works out `caps.gpu_games[<run>]` (9.4). Stats (beats
+and `done`) carry `batch_rows` (`b` as chosen) and `rows_per_s` (`{"<provider>": rows/s at b}` for the CPU and
+each GPU candidate), which the coordinator keeps with the lease's stats.
 
 A pack with `gpu` in which none of its providers passed is marked bad for these adapters and drivers (its probe
 record), the lease runs on the CPU (its pack's CPU provider), and the pack is evicted from the cache when the lease
@@ -1011,7 +1031,8 @@ ends; it is not downloaded again until the driver or the adapters change (9.4 co
   "runtime"`, 9.5), probes a new pack before its first job line, benches the job's own network per (pack, adapters,
   run) and runs a GPU provider only when it is at least 1.1x the CPU at the job's batch size, with `conc` raised for
   GPU jobs (9.6; Stats `batch_rows`, `rows_per_s`); a pack that fails is marked bad for that driver and evicted.
-  `runtime_providers` may list `[]`. GPU leases of `auto` runs are at least 64 (self-play) / 128 (eval) games.
+  `runtime_providers` may list `[]`. GPU leases get their own size (`gpu_games_per_lease`, or `auto` from the
+  machine's `caps.gpu_games`, capped by the staleness window); GPU jobs run in at most 2 groups.
 - v1 rev 10 (2026-11-12, coordinator): **`GET /v1/agent/latest` follows the machine's channel and ignores `?channel=`.**
   An agent asks for the channel it was enrolled on and never learns of a move, so a machine moved from stable to canary
   kept being offered stable's latest while its lease answers demanded canary's `min_agent`: it could neither update nor

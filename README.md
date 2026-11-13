@@ -286,12 +286,25 @@ terms. By installing Zero Farm you accept these terms (the "Join Zero Farm" wind
 |---|---|---|
 | **ONNX Runtime** (Microsoft) | `onnxruntime.dll`: in the CPU runtime pack (ONNX Runtime 1.31.1) and, as Windows ML's own build (1.28.3), in the GPU runtime pack | [MIT License](https://github.com/microsoft/onnxruntime/blob/main/LICENSE) ([third-party notices](https://github.com/microsoft/onnxruntime/blob/main/ThirdPartyNotices.txt)) |
 | **Microsoft Windows ML runtime** and **DirectML** | `Microsoft.Windows.AI.MachineLearning.dll` and `DirectML.dll`, unmodified, from Microsoft's NuGet package [Microsoft.Windows.AI.MachineLearning 2.5.96](https://www.nuget.org/packages/Microsoft.Windows.AI.MachineLearning/2.5.96) (which also carries DirectML). Distributed only inside Zero Farm's GPU runtime pack | [Microsoft Software License Terms, Microsoft Windows ML Runtime](https://www.nuget.org/packages/Microsoft.Windows.AI.MachineLearning/2.5.96/License) |
-| **Microsoft Visual C++ runtime** | `msvcp140.dll`, `msvcp140_1.dll`, `vcruntime140.dll`, `vcruntime140_1.dll`, Microsoft-signed, in the CPU runtime pack (the GPU pack needs none) | [Microsoft Visual C++ Runtime 2015-2022 license terms](https://visualstudio.microsoft.com/license-terms/vs2022-cruntime/) ([redistribution](https://learn.microsoft.com/en-us/visualstudio/releases/2022/redistribution)) |
+| **Microsoft Visual C++ runtime** | `msvcp140.dll`, `msvcp140_1.dll`, `vcruntime140.dll`, `vcruntime140_1.dll`, Microsoft-signed, in the CPU runtime pack and the CUDA runtime pack (the Windows ML pack needs none) | [Microsoft Visual C++ Runtime 2015-2022 license terms](https://visualstudio.microsoft.com/license-terms/vs2022-cruntime/) ([redistribution](https://learn.microsoft.com/en-us/visualstudio/releases/2022/redistribution)) |
+| **ONNX Runtime with the CUDA provider** (Microsoft) | `onnxruntime.dll`, `onnxruntime_providers_cuda.dll`, `onnxruntime_providers_shared.dll`, unmodified, from the PyPI package [onnxruntime-gpu 1.24.4](https://pypi.org/project/onnxruntime-gpu/1.24.4/). Only in the CUDA runtime pack | [MIT License](https://github.com/microsoft/onnxruntime/blob/main/LICENSE) ([third-party notices](https://github.com/microsoft/onnxruntime/blob/main/ThirdPartyNotices.txt)) |
+| **NVIDIA CUDA runtime, cuBLAS, cuFFT** (NVIDIA) | `cudart64_12.dll`, `cublas64_12.dll`, `cublasLt64_12.dll`, `cufft64_11.dll`, unmodified (NVIDIA doesn't Authenticode-sign these libraries; their sha256 is checked against the packages), from NVIDIA's PyPI packages nvidia-cuda-runtime-cu12 12.8.90, nvidia-cublas-cu12 12.8.4.1 and nvidia-cufft-cu12 11.3.3.83. Only in the CUDA runtime pack, which goes only to PCs with an NVIDIA graphics card | [NVIDIA CUDA Toolkit End User License Agreement](https://docs.nvidia.com/cuda/eula/index.html) (these files are in its Attachment A, the files applications may distribute) |
+| **NVIDIA cuDNN** (NVIDIA) | `cudnn64_9.dll`, `cudnn_graph64_9.dll`, `cudnn_ops64_9.dll`, NVIDIA-signed, unmodified, from NVIDIA's PyPI package nvidia-cudnn-cu12 9.28.1.4. Only in the CUDA runtime pack | [NVIDIA cuDNN Software License Agreement](https://docs.nvidia.com/deeplearning/cudnn/latest/reference/eula.html) (its supplement makes the runtime `.dll` files distributable) |
 
-Both runtime packs ship their components' license files next to the DLLs, unmodified. The GPU
+Every runtime pack ships its components' license files next to the DLLs, unmodified. The Windows ML
 pack: Windows ML's `license.txt` (the Microsoft Software License Terms) and `ThirdPartyNotices.txt`.
 The CPU pack: ONNX Runtime's `LICENSE` and `ThirdPartyNotices.txt`, and the Visual C++ runtime's
-license and redistribution list. After a pack is downloaded they are in
+license and redistribution list. The CUDA pack: ONNX Runtime's `LICENSE` and `ThirdPartyNotices.txt`,
+NVIDIA's CUDA Toolkit license (`NVIDIA_CUDA_EULA.txt`, the `License.txt` of NVIDIA's CUDA packages, the
+same file in each) and cuDNN license (`NVIDIA_cuDNN_LICENSE.txt`, that package's `LICENSE`), and the
+Visual C++ runtime's license and redistribution list. Each pack's `runtime.json` names where every file
+came from and its sha256. After a pack is downloaded they are in
 `%LOCALAPPDATA%\ZeroFarm\cache\builds\<pack build id>\`.
+
+The CUDA pack is large (about 1.5 GB on disk, about 0.7 GB to download, compressed). Zero Farm offers it
+only to a PC with an NVIDIA graphics card and a recent enough driver (527.41 or newer), while "Use the
+GPU" is on and the disk limit has room, and only for jobs that run a network on the GPU; the app checks
+all of this again itself before downloading it, and a PC without an NVIDIA card never downloads it. If the
+pack's GPU test fails on a PC, the pack is removed again and not downloaded for that driver.
 Zero Farm's own code (this repo) is MIT-licensed (above); the job programs are signed builds of a
 private engine (MTG Zero).

@@ -205,14 +205,14 @@ uninstall removes the folder.
 |---|---|---|
 | launcher + agent | ~20 MB per version | last 2 versions |
 | ONNX Runtime, CPU | ~20–30 MB | 1 |
-| ONNX Runtime, NVIDIA providers (GPU PCs only) | TensorRT-RTX: a few hundred MB (measured in phase 0; on Windows 11 24H2+ Windows ML may already provide it); CUDA EP: ~1–1.5 GB (CUDA runtime + cuBLAS + cuDNN) | 1 |
+| ONNX Runtime, NVIDIA providers (NVIDIA PCs only) | the CUDA pack (rev 11, 8.4): ~1.5 GB on disk, ~0.7 GB downloaded (zstd copies of its files, PROTOCOL 9.3); fetched only by an NVIDIA PC with a new enough driver, GPU work allowed and room under the cap, for a job that runs a network on the GPU; a PC without an NVIDIA card never downloads it; a pack that fails the PC's probe is evicted and not fetched again for that driver | 1 |
 | worker builds (engine + fuzz build) | ~25–30 MB per run commit | least recently used evicted |
 | checkpoints (ONNX) | ~13 MB each | current + the evaluation's opponents |
 | TensorRT engine cache (GPU PCs) | about the net's size per GPU | newest checkpoint only |
 | unsent results | ~5–10 KB per game | capped at 200 MB: past that (e.g. offline) no new self-play leases |
 | logs | rotating | 20 MB cap |
 
-Typical total: **~150–300 MB on a CPU-only PC, ~0.5–2 GB on an NVIDIA PC**, under a hard cap
+Typical total: **~150–300 MB on a CPU-only PC, ~2 GB on an NVIDIA PC with the CUDA pack**, under a hard cap
 (default 3 GB, user-settable) that includes everything; the agent evicts least-recently-used
 files and then declines jobs that would need more. Write volume is a few MB per hour (no SSD-wear
 concern). RAM is capped separately (3.2).
@@ -304,6 +304,19 @@ Both contribute; the coordinator routes by measured rate.
 GPU-heavy self-play goes preferentially to GPU PCs and fuzzing preferentially to CPU-only PCs.
 A GPU PC whose GPU is busy (a game running) can still take CPU work, if the user's settings allow
 work while they are active.
+
+**Rev 11 (PROTOCOL 9): measured, not assumed.** A GPU runs a job only when it is measurably faster than
+the CPU at that job's batch size: the agent benches the job's own network on the lease's runtime pack per
+(pack, adapters, run) and picks the fastest provider, a GPU one only at 1.1x the CPU or better, for every
+vendor alike. A batch holds one row per game in flight per group, so it never has more rows than the lease
+has games: a GPU job runs all its games at once in at most 2 groups, and GPU leases are sized by what the
+machine measured. Phase 4's canary numbers: CUDA on a 4070 Ti beats the 4-core CPU from ~10-16 rows and
+reaches 2x it around 20 rows; DirectML only from ~200-300 rows. Small leases (the Delver run's 6 matches)
+therefore stay on the CPU unless the run gives GPU leases more games (`gpu_games_per_lease`, PROTOCOL 9.4),
+which the run's staleness window limits: a self-play lease keeps the gen it started with, so it has to
+finish within about `max_stale` iterations. The coordinator's `auto` GPU size is capped at 0.8 x the
+machine's rate x the iteration interval x `max_stale`; when the GPU's break-even doesn't fit under that,
+the lease keeps its normal size and the agent's measurement picks the CPU.
 
 ### 5.3 Dropouts are normal, not errors
 
@@ -641,6 +654,27 @@ densify without a ScatterElements reduction (TensorRT's parser refused the whole
 allowzero=1). A GPU wins only on big batches: below ~200 rows the CPU is as fast; agents should give GPU
 jobs a high `conc`.
 
+**Decided (user, 2026-11-12): CUDA is the NVIDIA answer (rev 11, PROTOCOL 9).** TensorRT-RTX 1.2 refused
+both graphs; the Windows ML catalog's newer TensorRT-RTX needs Windows 11 24H2+ and is unverified on our
+graphs; DirectML passes but ran ~10x slower than the CPU on real leases (batches of ~1 row, and its
+ScatterElements on the CPU). So an NVIDIA PC gets the **CUDA pack** (`farm_build.py --runtime --pack cuda`):
+ONNX Runtime 1.24.4 (the last CUDA 12 build: 1.27+ need CUDA 13, driver 580+), the CUDA 12.8 runtime,
+cuBLAS/cuBLASLt and cuFFT (a load-time import of the CUDA provider DLL: Windows loads it whatever the graph
+does, so it can't be dropped without a stub DLL of our own), cuDNN 9.28 trimmed to `cudnn64_9`,
+`cudnn_graph64_9` and `cudnn_ops64_9` (2.3 GB -> ~0.2 GB; session start 82 s -> 2 s), and the MSVC runtime;
+every file an official redistributable (PyPI wheels from Microsoft and NVIDIA, NVIDIA's EULA Attachment A /
+cuDNN supplement; sources and sha256 in its `runtime.json`). Without a protocol change a definition names one
+runtime, which would have meant NVIDIA-only runs; instead a run names **alternates** (a worker build signed
+for the CUDA pack, plus a vendor condition), which only agents from 0.2.10 on qualifying NVIDIA PCs ever get;
+everyone else keeps the default pack (PROTOCOL 9.4). Splitting the NVIDIA libraries into a pack of their own
+was not done: ONNX Runtime's CUDA build is useless without them, so nobody would take one without the other.
+
+| GPU vendor | Pack | How it's chosen |
+|---|---|---|
+| any | the run's default: the CPU pack, or the Windows ML pack (DirectML; the catalog on Windows 11 24H2+) | `runtime` |
+| NVIDIA | the CUDA pack, `gpu` = NVIDIA, driver 527.41+, `["cuda"]` | an alternate with `when.vendor` `nvidia` |
+| AMD | (to be proposed from the AMD session's measurements: the Windows ML pack's AMD GPU provider) | an alternate with `when.vendor` `amd` |
+
 ### 8.5 Phases 3 and 4 in parallel (2026-11-12)
 
 The user's go-ahead covers both phases at once: self-play (3) and GPU for all vendors (4 + 4b,
@@ -685,9 +719,10 @@ through it. The risk features: int64 identity decoding runs on DirectML once its
 operand; GatherElements and boolean-mask attention run on every provider tried; ScatterElements stays on
 the CPU under DirectML (opset 18) and runs on CUDA. Not measurable here: the catalog's providers (this
 desktop is Windows 11 23H2, the canary Windows 10) - the friends' Windows 11 PCs probe them. The CUDA
-pack is measured (5-14x DirectML on the same NVIDIA cards) but not shipped: 1.4 GB, NVIDIA only, and a
-definition names one runtime. If the catalog's TensorRT-RTX fails on the friends' NVIDIA PCs, a CUDA pack
-is the NVIDIA answer, with a definition that may name a runtime per worker build (a protocol change).
+pack is measured (5-14x DirectML on the same NVIDIA cards). **Shipped in rev 11 (2026-11-13):** the user
+chose CUDA as the NVIDIA answer; a run names it as an alternate runtime (a worker build per pack, PROTOCOL
+9), offered only to NVIDIA PCs, and the agent runs any GPU provider only when it measures it faster than the
+CPU at the job's batch size (8.4, 5.2).
 
 **Self-play run.** Phase 3 needs a run to feed. Options: (a) a short throwaway run forked from an
 EoE checkpoint, with a desktop-only twin as an A/B; (b) joining EoE run 2 (`eoe2e`, live,

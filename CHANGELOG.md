@@ -4,6 +4,20 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>`.
 
+## 0.2.10 (2026-11-13, canary)
+
+- **NVIDIA graphics cards run networks with CUDA**, 5 to 14 times faster than DirectML on the same card. The
+  CUDA runtime pack is large (about 1.5 GB on disk, 0.7 GB to download, compressed), so it is fetched only on a
+  PC with an NVIDIA card and a recent enough driver, while "Use the GPU" is on and the disk limit has room, and
+  only for jobs that use the GPU. Before downloading it, Zero Farm checks all of this itself: a PC without an
+  NVIDIA card never downloads it. It is downloaded once and kept; if its GPU test fails on this PC, it is
+  removed and not downloaded again for that driver.
+- **The GPU is used only when it is faster.** Before a job's first game, Zero Farm measures the job's own
+  network on the processor and on each graphics provider that passed its test, at the job's batch sizes, and
+  runs the GPU only if it is clearly faster than the processor (small jobs often run faster on the processor).
+  GPU jobs then play many games at once, so the card gets big batches.
+- Build files can be downloaded compressed (zstd), checked before and after unpacking.
+
 ## 0.2.9 (2026-11-12, canary)
 
 - Release-path check: no user-visible changes. 0.2.8 must update itself to it before 0.2.8 goes
