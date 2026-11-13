@@ -178,7 +178,7 @@ dependencies = [
 
 [[package]]
 name = "farm-agent"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",
@@ -1099,7 +1099,7 @@ dependencies = [
 
 [[package]]
 name = "zerofarm-launcher"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "miniz_oxide",
  "mockcoord",

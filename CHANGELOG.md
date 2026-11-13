@@ -4,6 +4,11 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>`.
 
+## 0.2.9 (2026-11-12, canary)
+
+- Release-path check: no user-visible changes. 0.2.8 must update itself to it before 0.2.8 goes
+  to the stable channel.
+
 ## 0.2.8 (2026-11-12, canary)
 
 - **Jobs that name split and double-faced cards can run.** A job's signed instructions may now name
