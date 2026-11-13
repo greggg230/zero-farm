@@ -320,12 +320,17 @@ export function parseDefinition(text: string): DefinitionDoc {
 // ---------- what a definition allows ----------
 
 // Why a `kind` lease with this build and runtime can't be issued under `d` (null: it can). The
-// checkpoints are checked separately (checkpointProblem, evalProblem).
-export function leaseProblem(d: Def, kind: JobKind, build: string, runtime: string | null, now: number): string | null {
+// checkpoints are checked separately (checkpointProblem, evalProblem). Rev 11 (PROTOCOL 7, 9): for an
+// alternate (agents from ALT_RUNTIME_AGENT), `buildRuntime` is the build's own `requires_runtime`, which
+// the definition authorizes too by listing the build.
+export function leaseProblem(d: Def, kind: JobKind, build: string, runtime: string | null, now: number, buildRuntime?: string | null): string | null {
   if (d.expires !== null && d.expires <= now) return `definition v${d.version} expired`;
   if (!d.jobs[kind]) return `definition v${d.version} has no ${kind} job`;
   if (!d.builds.includes(build)) return `build ${build} is not in definition v${d.version}`;
-  if ((d.runtime ?? null) !== (runtime ?? null)) return `runtime ${runtime ?? "none"} is not definition v${d.version}'s (${d.runtime ?? "none"})`;
+  const viaBuild = buildRuntime !== undefined && buildRuntime !== null && runtime === buildRuntime;
+  if ((d.runtime ?? null) !== (runtime ?? null) && !viaBuild) {
+    return `runtime ${runtime ?? "none"} is not definition v${d.version}'s (${d.runtime ?? "none"})${buildRuntime !== undefined ? " nor the one its build requires" : ""}`;
+  }
   return null;
 }
 

@@ -27,7 +27,7 @@ import {
   leaseProblem,
 } from "./definitions";
 import { intersect, normalize, parseRanges, subtract, total, type Range } from "./ranges";
-import type { GpuMode, Provider } from "./routing";
+import { type Alternate, type GpuMode, type Provider, requiresRuntimeOf } from "./routing";
 import {
   HttpError,
   type Json,
@@ -58,6 +58,7 @@ export interface SelfplayCfg {
   slack: number;
   max_stale: number;
   games_per_lease: "auto" | number;
+  gpu_games_per_lease?: "auto" | number; // rev 11 (PROTOCOL 9.4): GPU leases of agents from 0.2.10 (absent: games_per_lease)
   gpu: GpuMode;
   providers?: Provider[] | null; // rev 7: allowlist (null or absent: any provider)
   needs: Needs;
@@ -68,6 +69,7 @@ export interface EvalCfg {
   games: number;
   checkpoints: number[]; // rev 5: every network the seats name (rev 2's single `gen` is refused)
   games_per_lease: "auto" | number;
+  gpu_games_per_lease?: "auto" | number; // rev 11 (PROTOCOL 9.4)
   gpu: GpuMode;
   providers?: Provider[] | null; // rev 7: allowlist (null or absent: any provider)
   needs: Needs;
@@ -109,6 +111,7 @@ export interface RunRow {
   next_gid: number;
   current_gen: number | null;
   min_agent: string | null; // rev 9: the oldest agent its leases go to (NULL: no such limit)
+  alternates?: string | null; // rev 11: JSON list of alternates (PROTOCOL 9.4; NULL or absent: none)
   created_at: number;
   updated_at: number;
 }
@@ -477,6 +480,9 @@ export interface GrantReq {
   // The agent verifies definitions (it is DEFINITION_AGENT or newer): it gets leases only with a
   // definition; an older agent only legacy leases, for a scope without one (PROTOCOL 7).
   def_aware: boolean;
+  // Rev 11 (PROTOCOL 9.4): one of the run's alternates, chosen for this machine by friend.ts (absent:
+  // the run's default build and runtime). Checked again here against the run's stored alternates.
+  alt?: { build_id: string; runtime: string };
 }
 
 export interface Lease {
@@ -561,11 +567,12 @@ async function grantDef(
   jobKind: JobKind,
   build: string,
   runtime: string | null,
+  buildRuntime?: string | null,
 ): Promise<Def | undefined | null> {
   const d = await currentDef(db, kind, id);
   if (!d) return req.def_aware ? null : undefined;
   if (!req.def_aware) return null;
-  return leaseProblem(d, jobKind, build, runtime, req.now) === null ? d : null;
+  return leaseProblem(d, jobKind, build, runtime, req.now, buildRuntime) === null ? d : null;
 }
 
 async function grantRunGames(env: Env, req: GrantReq): Promise<Lease | null> {
@@ -574,7 +581,20 @@ async function grantRunGames(env: Env, req: GrantReq): Promise<Lease | null> {
   await sweep(env, scope, req.now);
   const run = await getRun(db, req.run!);
   if (!run || run.state !== "active") return null;
-  const def = await grantDef(db, req, "run", run.run, req.kind as JobKind, run.build_id, run.runtime);
+  // Rev 11: an alternate replaces the default build and runtime; it must still be one of the run's.
+  let buildId = run.build_id;
+  let runtime = run.runtime;
+  let buildRuntime: string | null | undefined;
+  if (req.alt) {
+    const alts = parseJson<Alternate[] | null>(run.alternates ?? null, null) ?? [];
+    if (!alts.some((a) => a.build_id === req.alt!.build_id && a.runtime === req.alt!.runtime)) return null;
+    const b = await db.prepare(`SELECT manifest FROM builds WHERE build_id = ?`).bind(req.alt.build_id).first<{ manifest: string }>();
+    buildRuntime = requiresRuntimeOf(b?.manifest);
+    if (buildRuntime !== req.alt.runtime) return null;
+    buildId = req.alt.build_id;
+    runtime = req.alt.runtime;
+  }
+  const def = await grantDef(db, req, "run", run.run, req.kind as JobKind, buildId, runtime, buildRuntime);
   if (def === null) return null;
   const stmts: Stmt[] = [];
   let range: Range;
@@ -636,8 +656,8 @@ async function grantRunGames(env: Env, req: GrantReq): Promise<Lease | null> {
     ...baseLease(req.now, req.kind),
     run: run.run,
     campaign: null,
-    build: buildRef(run.build_id),
-    runtime: run.runtime ? buildRef(run.runtime) : null,
+    build: buildRef(buildId),
+    runtime: runtime ? buildRef(runtime) : null,
     checkpoint: ckpt ? checkpointOf(ckpt) : null,
     checkpoints: evalCkpts ? evalCkpts.map(checkpointOf) : null,
     ...(def ? { definition: defRef(def) } : {}),
@@ -1225,6 +1245,9 @@ export async function done(env: Env, r: DoneReq): Promise<DoneAnswer> {
 
 // ---------- desktop calls ----------
 
+// Rev 11: a run's alternates as stored (NULL when there are none, so a run without any reads as before).
+const altJson = (a: Alternate[] | null): string | null => (a && a.length ? JSON.stringify(a) : null);
+
 export interface RunCfg {
   run: string;
   game: string;
@@ -1233,6 +1256,7 @@ export interface RunCfg {
   priority: number;
   state: "active" | "paused";
   min_agent: string | null; // rev 9
+  alternates: Alternate[] | null; // rev 11 (PROTOCOL 9.4)
   selfplay: SelfplayCfg | null;
   eval: EvalCfg | null;
 }
@@ -1276,18 +1300,18 @@ export async function putRun(env: Env, cfg: RunCfg, now: number): Promise<{ ok: 
     stmts.push(
       db
         .prepare(
-          `INSERT INTO runs (run, game, build_id, runtime, priority, state, selfplay, eval, next_gid, min_agent, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?)`,
+          `INSERT INTO runs (run, game, build_id, runtime, priority, state, selfplay, eval, next_gid, min_agent, alternates, created_at, updated_at)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?)`,
         )
-        .bind(cfg.run, cfg.game, cfg.build_id, cfg.runtime, cfg.priority, cfg.state, JSON.stringify(cfg.selfplay), JSON.stringify(cfg.eval), cfg.min_agent, now, now),
+        .bind(cfg.run, cfg.game, cfg.build_id, cfg.runtime, cfg.priority, cfg.state, JSON.stringify(cfg.selfplay), JSON.stringify(cfg.eval), cfg.min_agent, altJson(cfg.alternates), now, now),
     );
   } else {
     stmts.push(
       db
         .prepare(
-          `UPDATE runs SET game = ?, build_id = ?, runtime = ?, priority = ?, state = ?, selfplay = ?, eval = ?, min_agent = ?, updated_at = ? WHERE run = ?`,
+          `UPDATE runs SET game = ?, build_id = ?, runtime = ?, priority = ?, state = ?, selfplay = ?, eval = ?, min_agent = ?, alternates = ?, updated_at = ? WHERE run = ?`,
         )
-        .bind(cfg.game, cfg.build_id, cfg.runtime, cfg.priority, cfg.state, JSON.stringify(cfg.selfplay), JSON.stringify(cfg.eval), cfg.min_agent, now, cfg.run),
+        .bind(cfg.game, cfg.build_id, cfg.runtime, cfg.priority, cfg.state, JSON.stringify(cfg.selfplay), JSON.stringify(cfg.eval), cfg.min_agent, altJson(cfg.alternates), now, cfg.run),
     );
   }
   // A new eval batch reserves its game ids now; the old batch's unplayed ids are dropped. A paired

@@ -89,6 +89,9 @@ export interface BuildOpts {
   aw?: number;
   register?: boolean;
   tag?: string; // makes the manifest (and so the build id) unique
+  requires_runtime?: string; // worker: the runtime pack it loads
+  gpu?: { vendor: string; min_driver?: string; providers: string[] }; // runtime, rev 11 (PROTOCOL 9.2)
+  size?: number; // the file's declared size (the manifest's; default: the real one)
 }
 
 // Uploads a manifest, its signature file and one file, and registers the build. Returns its id.
@@ -111,6 +114,8 @@ export async function makeBuild(o: BuildOpts = {}): Promise<string> {
     manifest.zero_onnx = [1];
   }
   if (o.min_agent) manifest.min_agent = o.min_agent;
+  if (o.requires_runtime) manifest.requires_runtime = o.requires_runtime;
+  if (o.gpu) manifest.gpu = o.gpu;
   const text = JSON.stringify(manifest, null, 2);
   const id = (await sha256(text)).slice(0, 24);
   await putArtifact(`builds/${id}/manifest.json`, text);
@@ -346,7 +351,7 @@ export async function enroll(name = "pc", o: { channel?: string; profile?: objec
 
 export interface AskOpts {
   kinds?: string[];
-  caps?: Partial<{ threads: number; ram_mb: number; gpu: boolean; disk_mb: number }>;
+  caps?: Partial<{ threads: number; ram_mb: number; gpu: boolean; disk_mb: number; gpu_allowed: boolean; gpu_games: Record<string, number> }>;
   cached?: { builds?: string[]; ckpts?: string[] };
   agent?: string;
   digest?: string;

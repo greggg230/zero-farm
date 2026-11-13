@@ -10,14 +10,21 @@ import { minAgentOk } from "./manifest";
 import { parseRanges, total } from "./ranges";
 import { ipKey, take } from "./ratelimit";
 import {
+  type Alternate,
+  GPU_LEASE_MIN,
   LUID_RE,
   MAX_RUNTIME_PROVIDERS,
   MAX_RUNTIMES,
   type Provider,
   type Routing,
+  altProviders,
   gpuEligible,
+  gpuNeedOf,
+  hasAdapter,
   kindRank,
   place,
+  requiresRuntimeOf,
+  runtimeProvidersOf,
   storedRouting,
   verifiedProviders,
 } from "./routing";
@@ -29,6 +36,7 @@ import {
   INVITE_RE,
   type Json,
   LEASE_RE,
+  SLUG_RE,
   bad,
   bool,
   checkKey,
@@ -204,6 +212,7 @@ interface BuildInfo {
   min_agent: string | null;
   aw: number | null;
   size: number;
+  manifest: string;
 }
 
 interface Candidate {
@@ -215,7 +224,14 @@ interface Candidate {
   tier: number; // 1: a run's games; 2: backfill (fuzz, or a GPU-preferring job on a PC that isn't GPU-eligible)
   fit: number;
   configured: "auto" | number;
+  gpu_configured?: "auto" | number; // rev 11: the job's gpu_games_per_lease (absent: none)
+  max_stale?: number; // self-play: the run's staleness window in gens
   providers: Provider[] | null; // rev 7: the job's allowlist, sent with the lease
+  // Rev 11 (PROTOCOL 9.4): the worker build and runtime the lease carries (a run's default, or an alternate)
+  build_id: string;
+  runtime: string | null;
+  alt: boolean;
+  gpu_lease: boolean; // an alternate, or a machine GPU-eligible for the job: `auto` leases get GPU_LEASE_MIN
 }
 
 // Lease sizing: about TARGET_S seconds of this machine's measured rate (ids per running second),
@@ -268,6 +284,19 @@ export async function lease(c: Ctx): Promise<Response> {
     gpu: bool(capsIn.gpu, "caps.gpu"),
     disk_mb: int(capsIn.disk_mb, "caps.disk_mb", { min: 0 }),
   };
+  // Rev 11 (PROTOCOL 3, 9.4): GPU work allowed now, whether or not a GPU provider passed a probe yet (agents
+  // 0.2.10+; older ones send only `gpu`).
+  const gpuAllowed = bool(capsIn.gpu_allowed, "caps.gpu_allowed", { optional: true }) ?? caps.gpu;
+  // Rev 11 (PROTOCOL 9.4): per run, the fewest games per lease at which this machine's GPU pays (its bench).
+  const gpuGames = new Map<string, number>();
+  if (capsIn.gpu_games !== undefined && capsIn.gpu_games !== null) {
+    const g = obj(capsIn.gpu_games, "caps.gpu_games");
+    if (Object.keys(g).length > 32) throw bad("caps.gpu_games names more than 32 runs");
+    for (const [run, n] of Object.entries(g)) {
+      if (!SLUG_RE.test(run)) throw bad(`caps.gpu_games: ${JSON.stringify(run.slice(0, 64))} is not a run`);
+      gpuGames.set(run, int(n, `caps.gpu_games.${run}`, { min: 1, max: 100000 }));
+    }
+  }
   const cachedIn = obj(b.cached, "cached", { optional: true }) ?? {};
   const cachedBuilds = new Set(strList(cachedIn.builds, "cached.builds", { optional: true, max: 1000, itemMax: 64 }));
   const cachedCkpts = new Set(strList(cachedIn.ckpts, "cached.ckpts", { optional: true, max: 1000, itemMax: 128 }));
@@ -281,6 +310,8 @@ export async function lease(c: Ctx): Promise<Response> {
   const cfg = config(c.env);
   // Rev 6 (PROTOCOL 7): this agent verifies definitions, so it gets leases only with one.
   const defAware = cmpSemver(agent, cfg.definitionAgent) >= 0;
+  // Rev 11 (PROTOCOL 9): this agent takes run alternates and packs with a GPU requirement.
+  const altAware = defAware && cmpSemver(agent, cfg.altRuntimeAgent) >= 0;
 
   // Profile: the digest is the agent's; we only compare it with the last one.
   if (digest !== m.profile_digest) {
@@ -328,15 +359,22 @@ export async function lease(c: Ctx): Promise<Response> {
   const camps = campsR.results as book.CampaignRow[];
   const release = (releaseR.results[0] ?? null) as { version: string; min_agent: string } | null;
 
-  const buildIds = [...new Set([...runs.flatMap((r) => [r.build_id, r.runtime]), ...camps.map((x) => x.build_id)].filter(Boolean))] as string[];
+  const altsOf = (r: book.RunRow) => parseJson<Alternate[] | null>(r.alternates ?? null, null) ?? [];
+  const buildIds = [
+    ...new Set(
+      [...runs.flatMap((r) => [r.build_id, r.runtime, ...altsOf(r).flatMap((a) => [a.build_id, a.runtime])]), ...camps.map((x) => x.build_id)].filter(Boolean),
+    ),
+  ] as string[];
   const builds = new Map<string, BuildInfo>();
   if (buildIds.length) {
     const { results } = await db
-      .prepare(`SELECT build_id, kind, min_agent, aw, size FROM builds WHERE build_id IN (${buildIds.map(() => "?").join(",")})`)
+      .prepare(`SELECT build_id, kind, min_agent, aw, size, manifest FROM builds WHERE build_id IN (${buildIds.map(() => "?").join(",")})`)
       .bind(...buildIds)
       .all<BuildInfo>();
     for (const x of results) builds.set(x.build_id, x);
   }
+  // --- builds Windows refused to start on this machine (rev 5): not offered to it for a while ---
+  const blocked = await blockedBuilds(db, m.machine_id, agent, c.now);
 
   // --- candidates: kinds the agent offers, that fit its caps ---
   const cands: Candidate[] = [];
@@ -346,14 +384,50 @@ export async function lease(c: Ctx): Promise<Response> {
     const need = ids.reduce((s, id) => s + (id && !cachedBuilds.has(id) ? (builds.get(id)?.size ?? 0) : 0), extra);
     return need <= caps.disk_mb * 1024 * 1024;
   };
+  // Rev 11 (PROTOCOL 9.2): a runtime pack with a GPU requirement goes only to agents that read it, on a machine
+  // with a matching adapter (default and alternate alike).
+  const needOf = (id: string | null) => (id ? gpuNeedOf(builds.get(id)?.manifest) : null);
+  const packFits = (id: string | null) => {
+    const need = needOf(id);
+    return !need || (altAware && hasAdapter(machineProfile, need.vendor, [need.min_driver]));
+  };
+  // The build and runtime a run's job lease carries here (PROTOCOL 9.4): the first alternate this machine
+  // qualifies for, else the default (null: neither may go to this machine).
+  const variantFor = (r: book.RunRow, kind: "selfplay" | "eval", routing: Routing) => {
+    if (altAware && gpuAllowed) {
+      for (const a of altsOf(r)) {
+        const bi = builds.get(a.build_id);
+        const ri = builds.get(a.runtime);
+        if (!bi || !ri || bi.kind !== "worker" || ri.kind !== "runtime") continue; // 6: registered
+        if (requiresRuntimeOf(bi.manifest) !== a.runtime) continue;
+        const need = gpuNeedOf(ri.manifest);
+        if (need && need.vendor !== a.when.vendor) continue;
+        if (!hasAdapter(machineProfile, a.when.vendor, [a.when.min_driver, need?.min_driver])) continue; // 2
+        const allowed = altProviders(need, routing.providers); // 3
+        if (!allowed.length) continue;
+        const rp = runtimeProvidersOf(machineProfile, a.runtime); // 4: never probed here, or a provider passed
+        if (rp !== undefined && !rp.some((p) => (allowed as string[]).includes(p))) continue;
+        if (!diskOk([a.build_id, a.runtime])) continue; // 5
+        if (blocked.has(a.build_id) || blocked.has(a.runtime)) continue; // 6
+        if ([bi.min_agent, ri.min_agent].some((v) => v && !minAgentOk(agent, v))) continue;
+        if (bi.aw !== null && bi.aw !== aw) continue;
+        const def = defs.get(`run:${r.run}`); // 7: the definition authorizes it
+        if (!def || leaseProblem(def, kind, a.build_id, a.runtime, c.now, a.runtime)) continue;
+        return { build_id: a.build_id, runtime: a.runtime as string | null, alt: true, eligible: true };
+      }
+    }
+    if (!packFits(r.runtime)) return null;
+    const eligible = gpuEligible(caps.gpu, verifiedProviders(machineProfile, r.runtime), routing.providers);
+    return { build_id: r.build_id, runtime: r.runtime, alt: false, eligible };
+  };
   for (const r of runs) {
     const scope = book.runScope(r.run);
-    const cachedBonus = cachedBuilds.has(r.build_id) ? 1.2 : 1;
     if (kinds.has("selfplay") && r.selfplay && r.current_gen !== null) {
       const sp = JSON.parse(r.selfplay) as book.SelfplayCfg;
       const routing = sp ? storedRouting(sp.gpu, sp.providers) : null;
-      const at = routing ? placeFor("selfplay", routing, r.runtime) : null;
-      if (sp && routing && at && needsOk(sp.needs) && diskOk([r.build_id, r.runtime])) {
+      const v = routing ? variantFor(r, "selfplay", routing) : null;
+      const at = routing && v ? place("selfplay", routing, v.eligible, caps.gpu) : null;
+      if (sp && routing && v && at && needsOk(sp.needs) && diskOk([v.build_id, v.runtime])) {
         const ckptBonus = cachedCkpts.has(`${r.run}/${r.current_gen}`) ? 1.1 : 1;
         cands.push({
           scope,
@@ -361,17 +435,24 @@ export async function lease(c: Ctx): Promise<Response> {
           run: r.run,
           priority: r.priority,
           tier: at.tier,
-          fit: at.fit * cachedBonus * ckptBonus,
+          fit: at.fit * (cachedBuilds.has(v.build_id) ? 1.2 : 1) * ckptBonus,
           configured: sp.games_per_lease,
+          gpu_configured: sp.gpu_games_per_lease,
+          max_stale: sp.max_stale,
           providers: routing.providers,
+          build_id: v.build_id,
+          runtime: v.runtime,
+          alt: v.alt,
+          gpu_lease: altAware && (v.alt || v.eligible),
         });
       }
     }
     if (kinds.has("eval") && r.eval) {
       const ev = JSON.parse(r.eval) as book.EvalCfg | null;
       const routing = ev ? storedRouting(ev.gpu, ev.providers) : null;
-      const at = routing ? placeFor("eval", routing, r.runtime) : null;
-      if (ev && routing && at && Array.isArray(ev.checkpoints) && (poolN.get(`${scope}|eval:${ev.batch}`) ?? 0) > 0 && needsOk(ev.needs)) {
+      const v = routing ? variantFor(r, "eval", routing) : null;
+      const at = routing && v ? place("eval", routing, v.eligible, caps.gpu) : null;
+      if (ev && routing && v && at && Array.isArray(ev.checkpoints) && (poolN.get(`${scope}|eval:${ev.batch}`) ?? 0) > 0 && needsOk(ev.needs)) {
         // Rev 5: the lease brings every network the seats name; uncached ones count against the disk.
         const keys = ev.checkpoints.map((g) => `${r.run}/${g}`);
         let ckptBytes = 0;
@@ -382,7 +463,7 @@ export async function lease(c: Ctx): Promise<Response> {
             .all<{ gen: number; size: number | null }>();
           ckptBytes = results.reduce((s, x) => s + (cachedCkpts.has(`${r.run}/${x.gen}`) ? 0 : (x.size ?? 0)), 0);
         }
-        if (diskOk([r.build_id, r.runtime], ckptBytes)) {
+        if (diskOk([v.build_id, v.runtime], ckptBytes)) {
           const ckptBonus = keys.length && keys.every((k) => cachedCkpts.has(k)) ? 1.1 : 1;
           cands.push({
             scope,
@@ -390,9 +471,14 @@ export async function lease(c: Ctx): Promise<Response> {
             run: r.run,
             priority: r.priority,
             tier: at.tier,
-            fit: at.fit * cachedBonus * ckptBonus,
+            fit: at.fit * (cachedBuilds.has(v.build_id) ? 1.2 : 1) * ckptBonus,
             configured: ev.games_per_lease,
+            gpu_configured: ev.gpu_games_per_lease,
             providers: routing.providers,
+            build_id: v.build_id,
+            runtime: v.runtime,
+            alt: v.alt,
+            gpu_lease: altAware && (v.alt || v.eligible),
           });
         }
       }
@@ -414,12 +500,13 @@ export async function lease(c: Ctx): Promise<Response> {
         fit: at.fit * (cachedBuilds.has(x.build_id) ? 1.2 : 1),
         configured: x.chunk === "auto" ? "auto" : Number(x.chunk),
         providers: routing.providers,
+        build_id: x.build_id,
+        runtime: null,
+        alt: false,
+        gpu_lease: false,
       });
     }
   }
-
-  // --- builds Windows refused to start on this machine (rev 5): not offered to it for a while ---
-  const blocked = await blockedBuilds(db, m.machine_id, agent, c.now);
 
   // --- agent version: a job whose build needs a newer agent makes the agent update first ---
   // Rev 6: a run or campaign with a definition needs a definition-aware agent, like a build's
@@ -430,13 +517,14 @@ export async function lease(c: Ctx): Promise<Response> {
   const usable = cands.filter((cd) => {
     const r = cd.run ? runs.find((x) => x.run === cd.run) : null;
     const camp = r ? null : camps.find((x) => x.campaign === cd.campaign)!;
-    const ids = r ? [r.build_id, r.runtime] : [camp!.build_id];
+    // Rev 11: the candidate's own build and runtime (a run's default, or the alternate variantFor chose).
+    const ids = r ? [cd.build_id, cd.runtime] : [camp!.build_id];
     if (ids.some((id) => id && blocked.has(id))) return false;
     const infos = ids.filter(Boolean).map((id) => builds.get(id!));
     if (infos.some((i) => !i)) return false; // build not registered
     const def = defs.get(r ? `run:${r.run}` : `campaign:${camp!.campaign}`);
     if (!def && defAware) return false;
-    if (def && defAware && leaseProblem(def, cd.kind as JobKind, ids[0]!, r ? r.runtime : null, c.now)) return false;
+    if (def && defAware && leaseProblem(def, cd.kind as JobKind, ids[0]!, r ? cd.runtime : null, c.now, cd.alt ? cd.runtime : undefined)) return false;
     // Rev 9: the run's or campaign's own min_agent counts like a build's.
     const own = r ? r.min_agent : camp!.min_agent;
     const req = maxSemver([...infos.map((i) => i!.min_agent), cd.kind === "eval" ? EVAL_MIN_AGENT : null, def ? cfg.definitionAgent : null, own]);
@@ -477,14 +565,57 @@ export async function lease(c: Ctx): Promise<Response> {
   usable.sort((a, b) => a.tier - b.tier || kindRank(a.kind) - kindRank(b.kind) || score(b) - score(a) || a.scope.localeCompare(b.scope));
   for (const cd of usable) {
     const key = `${cd.scope}|${cd.kind}`;
-    const want = leaseSize(cd.kind as Exclude<book.Kind, "diag">, cd.configured, rate.get(key) ?? classRate.get(key) ?? null);
+    let want = leaseSize(cd.kind as Exclude<book.Kind, "diag">, cd.configured, rate.get(key) ?? classRate.get(key) ?? null);
+    // Rev 11 (PROTOCOL 9.4): a GPU lease gets enough games for big batches.
+    if (cd.gpu_lease && cd.run && (cd.kind === "selfplay" || cd.kind === "eval")) {
+      want = await gpuLeaseSize(db, cd, want, rate.get(key) ?? null, gpuGames.get(cd.run));
+    }
     const l = unwrap(
-      await bookFor(c.env, cd.scope).grant({ now: c.now, machine_id: m.machine_id, kind: cd.kind, want, run: cd.run, campaign: cd.campaign, def_aware: defAware }),
+      await bookFor(c.env, cd.scope).grant({
+        now: c.now,
+        machine_id: m.machine_id,
+        kind: cd.kind,
+        want,
+        run: cd.run,
+        campaign: cd.campaign,
+        def_aware: defAware,
+        ...(cd.alt ? { alt: { build_id: cd.build_id, runtime: cd.runtime! } } : {}),
+      }),
     );
     // Rev 7: the job's provider allowlist rides along (a routing hint, not part of the signed job).
     if (l) return withDiag({ lease: { ...l, providers: cd.providers } });
   }
   return withDiag({ wait_s: WAIT_S, reason: "no_work" });
+}
+
+// Rev 11 (PROTOCOL 9.4): the size of a GPU lease. `gpu_games_per_lease` a number: exactly that. "auto", or absent
+// with `games_per_lease` "auto": the larger of the normal size and the games at which this machine's GPU pays
+// (`caps.gpu_games`, else GPU_LEASE_MIN before its first bench), at most GPU_LEASE_MAX; for self-play no more than
+// 0.8 x the machine's measured rate x the run's iteration interval x max_stale - if the GPU's games don't fit under
+// that, the normal size (the agent then measures and runs the CPU). Absent with a number: that number (unchanged).
+export const GPU_LEASE_MAX = 4096;
+export async function gpuLeaseSize(db: D1Database, cd: Candidate, normal: number, rate: number | null, paysAt: number | undefined): Promise<number> {
+  const kind = cd.kind as "selfplay" | "eval";
+  if (typeof cd.gpu_configured === "number") return cd.gpu_configured;
+  if (cd.gpu_configured === undefined && cd.configured !== "auto") return normal;
+  const gpu = Math.min(paysAt ?? GPU_LEASE_MIN[kind], GPU_LEASE_MAX);
+  if (kind === "selfplay" && rate !== null && rate > 0) {
+    const interval = await iterationInterval(db, cd.run!);
+    if (interval !== null) {
+      const cap = Math.floor(0.8 * rate * interval * Math.max(1, cd.max_stale ?? 1));
+      if (gpu > cap) return normal;
+      return Math.min(Math.max(normal, gpu), Math.max(cap, 1));
+    }
+  }
+  return Math.max(normal, gpu);
+}
+
+// A run's iteration interval: the median gap between its last checkpoint registrations (null before 3 of them).
+export async function iterationInterval(db: D1Database, run: string): Promise<number | null> {
+  const { results } = await db.prepare(`SELECT t FROM checkpoints WHERE run = ? ORDER BY gen DESC LIMIT 6`).bind(run).all<{ t: number }>();
+  if (results.length < 3) return null;
+  const gaps = results.slice(1).map((r, i) => results[i].t - r.t).filter((g) => g > 0).sort((a, b) => a - b);
+  return gaps.length ? gaps[Math.floor(gaps.length / 2)] : null;
 }
 
 // ---------- leases ----------

@@ -110,3 +110,96 @@ export function storedRouting(gpu: unknown, providers: unknown): Routing {
   const list = Array.isArray(providers) && providers.length ? (providers.filter(isProvider) as Provider[]) : null;
   return { gpu: mode, providers: list };
 }
+
+// ---------- rev 11 (PROTOCOL 9): runtime packs per GPU vendor ----------
+
+// A runtime pack's hard hardware requirement (its manifest's `gpu`, PROTOCOL 9.2).
+export interface GpuNeed {
+  vendor: string;
+  min_driver: string | null;
+  providers: Provider[];
+}
+
+// A run alternate (PROTOCOL 9.4): a worker build, the runtime pack it requires and the vendor condition.
+export interface Alternate {
+  build_id: string;
+  runtime: string;
+  when: { vendor: string; min_driver?: string | null };
+}
+
+export const MAX_ALTERNATES = 4;
+export const VENDOR_RE = /^[a-z0-9]{1,32}$/;
+export const DRIVER_RE = /^\d{1,9}(\.\d{1,9}){0,5}$/;
+
+// `have` >= `min` for dotted driver versions ("560.94" >= "527.41"), numeric parts in order, missing parts 0. An
+// empty or non-numeric version is unknown: false (the agent's rule, manifest.rs `driver_at_least`).
+export function driverAtLeast(have: unknown, min: string): boolean {
+  if (typeof have !== "string" || !DRIVER_RE.test(have.trim()) || !DRIVER_RE.test(min)) return false;
+  const h = have.trim().split(".").map(Number);
+  const m = min.split(".").map(Number);
+  for (let i = 0; i < Math.max(h.length, m.length); i++) {
+    const a = h[i] ?? 0;
+    const b = m[i] ?? 0;
+    if (a !== b) return a > b;
+  }
+  return true;
+}
+
+// The `gpu` of a runtime manifest (its stored JSON text), or null (none, or not a runtime manifest).
+export function gpuNeedOf(manifestText: string | null | undefined): GpuNeed | null {
+  if (!manifestText) return null;
+  let m: any;
+  try {
+    m = JSON.parse(manifestText);
+  } catch {
+    return null;
+  }
+  const g = m?.gpu;
+  if (m?.kind !== "runtime" || !g || typeof g !== "object" || typeof g.vendor !== "string") return null;
+  return {
+    vendor: g.vendor,
+    min_driver: typeof g.min_driver === "string" ? g.min_driver : null,
+    providers: Array.isArray(g.providers) ? (g.providers.filter(isProvider) as Provider[]) : [],
+  };
+}
+
+// The `requires_runtime` of a worker manifest (its stored JSON text), or null.
+export function requiresRuntimeOf(manifestText: string | null | undefined): string | null {
+  if (!manifestText) return null;
+  try {
+    const m = JSON.parse(manifestText);
+    return m?.kind === "worker" && typeof m.requires_runtime === "string" ? m.requires_runtime : null;
+  } catch {
+    return null;
+  }
+}
+
+// What vendor matching reads of a machine's stored profile.
+export interface VendorProfile {
+  gpus?: unknown;
+}
+
+// The machine has an adapter of `vendor` whose driver is at least every given minimum (null: none).
+export function hasAdapter(profile: VendorProfile | null, vendor: string, mins: (string | null | undefined)[]): boolean {
+  const gpus = Array.isArray(profile?.gpus) ? (profile!.gpus as Record<string, unknown>[]) : [];
+  return gpus.some((g) => g && g.vendor === vendor && mins.every((m) => !m || driverAtLeast(g.driver, m)));
+}
+
+// The machine's probe result for one runtime pack: undefined when it has none (never probed there), else
+// the providers that passed (possibly none: rev 11 sends [] for a pack that failed).
+export function runtimeProvidersOf(profile: RoutingProfile | null, runtime: string): string[] | undefined {
+  const per = profile?.runtime_providers;
+  if (!per || typeof per !== "object" || Array.isArray(per) || !Object.hasOwn(per, runtime)) return undefined;
+  return strings((per as Record<string, unknown>)[runtime]);
+}
+
+// The GPU providers an alternate's pack brings that the job's allowlist allows (a pack without `gpu`: every GPU
+// provider the allowlist allows).
+export function altProviders(need: GpuNeed | null, allow: readonly string[] | null): Provider[] {
+  const brings = need ? need.providers.filter(isGpuProvider) : PROVIDERS.filter(isGpuProvider);
+  return brings.filter((p) => !allow || allow.includes(p));
+}
+
+// GPU leases of `auto` jobs are at least this many games (PROTOCOL 9.4): a batch never has more rows than games
+// in flight, and a GPU only pays with hundreds of rows per batch.
+export const GPU_LEASE_MIN = { selfplay: 64, eval: 128 } as const;

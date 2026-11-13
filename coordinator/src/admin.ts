@@ -26,7 +26,7 @@ import { MAX_EXTERNAL_BODY, type Contributor, type ExternalRow, ownContributor, 
 import { CHANNELS, serveObject } from "./friend";
 import { bookFor } from "./leasebook";
 import { minisignKeyId, verifyBuild, verifyMinisign } from "./manifest";
-import { GPU_MODES, type Routing, routingOf } from "./routing";
+import { type Alternate, DRIVER_RE, GPU_MODES, MAX_ALTERNATES, type Routing, VENDOR_RE, gpuNeedOf, requiresRuntimeOf, routingOf } from "./routing";
 import {
   BUILD_RE,
   HEX64_RE,
@@ -243,6 +243,12 @@ function perLease(v: unknown, name: string, max: number): "auto" | number {
   return int(v, name, { min: 1, max });
 }
 
+// Rev 11 (PROTOCOL 9.4): the lease size of GPU leases (absent: none set, the key is left out of the stored config).
+function gpuPerLease(v: unknown, name: string): { gpu_games_per_lease?: "auto" | number } {
+  if (v === undefined || v === null) return {};
+  return { gpu_games_per_lease: perLease(v, name, 100000) };
+}
+
 function jobOf(v: unknown, name: string): Record<string, Json> {
   return opaque(obj(v, name, { optional: true }) ?? {}, name) as Record<string, Json>;
 }
@@ -255,6 +261,7 @@ function selfplayOf(v: unknown): book.SelfplayCfg | null {
     slack: num(o.slack, "selfplay.slack", { optional: true, min: 0, max: 10 }) ?? 0.1,
     max_stale: int(o.max_stale, "selfplay.max_stale", { optional: true, min: 0, max: 1000 }) ?? 1,
     games_per_lease: perLease(o.games_per_lease, "selfplay.games_per_lease", 100000),
+    ...gpuPerLease(o.gpu_games_per_lease, "selfplay.gpu_games_per_lease"),
     ...routingIn(o, "selfplay."),
     needs: needsOf(o.needs, "selfplay.needs"),
     job: jobOf(o.job, "selfplay.job"),
@@ -289,6 +296,7 @@ export function evalOf(v: unknown): book.EvalCfg | null {
     games,
     checkpoints,
     games_per_lease: perLease(o.games_per_lease, "eval.games_per_lease", 100000),
+    ...gpuPerLease(o.gpu_games_per_lease, "eval.gpu_games_per_lease"),
     ...routingIn(o, "eval."),
     needs: needsOf(o.needs, "eval.needs"),
     job,
@@ -303,6 +311,52 @@ export function minAgentOf(v: unknown): string | null {
   return s;
 }
 
+// Rev 11 (PROTOCOL 9.4): a run's alternates as put (shape only; altCheck checks them against the builds).
+export function alternatesOf(v: unknown): Alternate[] | null {
+  if (v === undefined || v === null) return null;
+  if (!Array.isArray(v) || v.length > MAX_ALTERNATES) throw bad(`alternates must be a list of at most ${MAX_ALTERNATES} or null`);
+  if (!v.length) return null;
+  return v.map((x: unknown, i: number) => {
+    const o = obj(x, `alternates[${i}]`);
+    for (const k of Object.keys(o)) if (!["build_id", "runtime", "when"].includes(k)) throw bad(`alternates[${i}].${k}: unknown field`);
+    const w = obj(o.when, `alternates[${i}].when`, { optional: true }) ?? {};
+    for (const k of Object.keys(w)) if (!["vendor", "min_driver"].includes(k)) throw bad(`alternates[${i}].when.${k}: unknown field`);
+    const vendor = str(w.vendor, `alternates[${i}].when.vendor`, { optional: true, re: VENDOR_RE });
+    const minDriver = str(w.min_driver, `alternates[${i}].when.min_driver`, { optional: true, re: DRIVER_RE });
+    return {
+      build_id: str(o.build_id, `alternates[${i}].build_id`, { re: BUILD_RE }),
+      runtime: str(o.runtime, `alternates[${i}].runtime`, { re: BUILD_RE }),
+      when: { vendor: vendor ?? "", ...(minDriver ? { min_driver: minDriver } : {}) },
+    };
+  });
+}
+
+// Each alternate against the registered builds: a worker build requiring exactly its runtime, a runtime build, a
+// vendor (the pack's own `gpu.vendor` when it has one, which `when.vendor` defaults to); none twice, none the
+// default. Returns them with the vendor filled in.
+async function altCheck(db: D1Database, cfg: book.RunCfg): Promise<Alternate[] | null> {
+  if (!cfg.alternates) return null;
+  const seen = new Set([`${cfg.build_id}|${cfg.runtime}`]);
+  const out: Alternate[] = [];
+  for (const [i, a] of cfg.alternates.entries()) {
+    const at = `alternates[${i}]`;
+    if (seen.has(`${a.build_id}|${a.runtime}`)) throw bad(`${at} is the run's default or another alternate`);
+    seen.add(`${a.build_id}|${a.runtime}`);
+    await buildOfKind(db, a.build_id, "worker", `${at}.build_id`);
+    await buildOfKind(db, a.runtime, "runtime", `${at}.runtime`);
+    const rows = await db.prepare(`SELECT build_id, manifest FROM builds WHERE build_id IN (?, ?)`).bind(a.build_id, a.runtime).all<{ build_id: string; manifest: string }>();
+    const text = (id: string) => rows.results.find((r) => r.build_id === id)?.manifest;
+    const need = requiresRuntimeOf(text(a.build_id));
+    if (need !== a.runtime) throw bad(`${at}: worker build ${a.build_id} requires runtime ${need ?? "none"}, not ${a.runtime} (sign its executable once per pack, PROTOCOL 9.1)`);
+    const pack = gpuNeedOf(text(a.runtime));
+    if (pack && a.when.vendor && a.when.vendor !== pack.vendor) throw bad(`${at}.when.vendor is ${a.when.vendor}, but runtime ${a.runtime} is for ${pack.vendor} GPUs`);
+    const vendor = a.when.vendor || pack?.vendor;
+    if (!vendor) throw bad(`${at}.when.vendor is required: runtime ${a.runtime} names no GPU vendor of its own`);
+    out.push({ build_id: a.build_id, runtime: a.runtime, when: { vendor, ...(a.when.min_driver ? { min_driver: a.when.min_driver } : {}) } });
+  }
+  return out;
+}
+
 export async function putRun(c: Ctx, run: string): Promise<Response> {
   await authAdmin(c);
   slug(run, "run");
@@ -315,11 +369,13 @@ export async function putRun(c: Ctx, run: string): Promise<Response> {
     priority: num(b.priority, "priority", { optional: true, min: 0, max: 1000 }) ?? 1,
     state: oneOf(b.state, "state", STATES, { optional: true }) ?? "active",
     min_agent: minAgentOf(b.min_agent),
+    alternates: alternatesOf(b.alternates),
     selfplay: selfplayOf(b.selfplay),
     eval: evalOf(b.eval),
   };
   await buildOfKind(c.env.DB, cfg.build_id, "worker", "build_id");
   if (cfg.runtime) await buildOfKind(c.env.DB, cfg.runtime, "runtime", "runtime");
+  cfg.alternates = await altCheck(c.env.DB, cfg);
   return json(unwrap(await bookFor(c.env, book.runScope(run)).putRun(cfg, c.now)));
 }
 
@@ -352,7 +408,31 @@ export async function getRunRoute(c: Ctx, run: string): Promise<Response> {
     eval_batches: batches,
     pool: await book.poolSize(c.env.DB, scope),
     definition: await definitionStatus(c, "run", r.run, r, null),
+    alternates: await alternatesStatus(c, r),
   });
+}
+
+// Rev 11: a run's alternates, each with why its current definition doesn't authorize it (`problems`).
+async function alternatesStatus(c: Ctx, r: book.RunRow): Promise<(Alternate & { problems: string[] })[] | null> {
+  const alts = parseJson<Alternate[] | null>(r.alternates ?? null, null);
+  if (!alts) return null;
+  const d = await currentDef(c.env.DB, "run", r.run);
+  const out = [];
+  for (const a of alts) {
+    const b = await c.env.DB.prepare(`SELECT manifest FROM builds WHERE build_id = ?`).bind(a.build_id).first<{ manifest: string }>();
+    const viaBuild = requiresRuntimeOf(b?.manifest);
+    const problems: string[] = [];
+    if (!d) problems.push("the run has no definition");
+    else {
+      for (const k of ["selfplay", "eval"] as const) {
+        if (!d.jobs[k]) continue;
+        const p = leaseProblem(d, k, a.build_id, a.runtime, c.now, viaBuild);
+        if (p) problems.push(`${k}: ${p}`);
+      }
+    }
+    out.push({ ...a, problems });
+  }
+  return out;
 }
 
 // A run's eval batches with their progress, newest first.

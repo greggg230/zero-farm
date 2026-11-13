@@ -44,7 +44,7 @@ export const DOUBLES = [
 ] as const;
 
 // Numeric Stats fields kept in D1 (the lease's last Stats) but not sent to AE.
-export const EXTRA_NUMS = ["paused_ms", "resume_ms_max"] as const;
+export const EXTRA_NUMS = ["paused_ms", "resume_ms_max", "batch_rows"] as const; // batch_rows: rev 11 (PROTOCOL 9.6)
 
 const noop: Telemetry = { write() {} };
 
@@ -100,6 +100,14 @@ export function cleanStats(v: unknown): Record<string, Json> | undefined {
       st[gen] = e;
     }
     out.selftest = st;
+  }
+  // Rev 11 (PROTOCOL 9.6): the measured rows per second at the job's batch size, per provider.
+  if (src.rows_per_s && typeof src.rows_per_s === "object" && !Array.isArray(src.rows_per_s)) {
+    const r: Record<string, Json> = {};
+    for (const [p, x] of Object.entries(src.rows_per_s as Record<string, unknown>).slice(0, 16)) {
+      if (/^[a-z][a-z0-9_]{0,31}$/.test(p) && typeof x === "number" && Number.isFinite(x) && x >= 0) r[p] = Math.round(x);
+    }
+    out.rows_per_s = r;
   }
   return out;
 }

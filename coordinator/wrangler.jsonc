@@ -42,6 +42,9 @@
     // The first agent that verifies definitions: it gets leases only with one, older agents only
     // for a run or campaign that has none yet.
     "DEFINITION_AGENT": "0.2.5",
+    // Rev 11 (PROTOCOL 9): the first agent that takes run alternates (per-vendor runtime packs) and
+    // runtime packs with a GPU requirement; older agents only ever get a run's default runtime.
+    "ALT_RUNTIME_AGENT": "0.2.10",
     // Installers (agent release github_url) must be this repository's agent-v<version> assets.
     "GITHUB_REPO": "greggg230/zero-farm",
     // Limits (security review M3, M4): active leases per machine; result chunks and bytes per
