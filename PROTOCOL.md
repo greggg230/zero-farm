@@ -722,7 +722,7 @@ that, a lease without a definition is never issued, and a definition-aware agent
 One worker-side function creates every inference session; the GPU work and the self-play work
 both build on it, and nothing else in a worker creates an ONNX Runtime session.
 
-**Worker API** (`zero_worker::session`, Rust; owned by the GPU work; zero-core `gpu` 1ed81c0):
+**Worker API** (`zero_worker::session`, Rust; owned by the GPU work; zero-core `gpu` 3727b3b):
 
 ```rust
 pub enum ProviderKind { Cpu, TensorRtRtx, Cuda, MiGraphX, AmdGpu, OpenVino, DirectMl }
@@ -845,7 +845,7 @@ routed first, then self-play (within a tier); fuzz stays the backfill. Every lea
 allowlist as `providers` (null on diag leases).
 
 ## Changes
-- v1 rev 7 (2026-11-12, as built; zero-core `gpu` 1ed81c0, agent and coordinator on zero-farm `gpu`): GPU inference
+- v1 rev 7 (2026-11-12, as built; zero-core `gpu` 3727b3b, agent and coordinator on zero-farm `gpu`): GPU inference
   (section 8). Worker: `create_session` the one session factory (`SessionSpec` gains `runtime`, `spinning`,
   `expect`; `ProviderKind` gains `AmdGpu` - Windows ML 2.x's AMD GPU provider; MIGraphX is deprecated there);
   a provider is accepted only through the self-test (twice, bit-identical, 2e-5; a GPU provider needs the
