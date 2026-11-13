@@ -324,6 +324,17 @@ impl Engine {
         }
         let d = self.decide(None);
         let caps = self.caps(&d);
+        // rev 7 (PROTOCOL 8): the providers this PC verified with the lease's runtime pack, narrowed by
+        // the lease's allowlist; the CPU alone when the GPU may not be used right now
+        let plan_providers = {
+            let probes = crate::probe::load(&self.cfg.layout);
+            let akey = crate::probe::adapters_key(&self.profile.gpus);
+            let probe = lease.runtime.as_ref().and_then(|r| crate::probe::find(&probes, &r.build_id, &akey));
+            crate::probe::plan_providers(probe, &self.profile.gpus, lease.providers.as_deref(), caps.gpu)
+        };
+        if plan_providers.0 != ["cpu"] {
+            log::info!("lease {id}: providers {:?} on {}", plan_providers.0, plan_providers.1["name"].as_str().unwrap_or("?"));
+        }
         let (tx, rx) = mpsc::channel::<Ev>();
         let txw = tx.clone();
         let entry = build.entry_path().expect("worker manifests have an entry");
@@ -332,9 +343,10 @@ impl Engine {
             None => WorkerProc::spawn(
                 SpawnOpts {
                     exe: &entry,
+                    args: &["serve"],
                     cwd: &work,
                     mem_limit_mb: caps.ram_mb.max(256),
-                    cpu_job: !caps.gpu,
+                    cpu_job: plan_providers.0 == ["cpu"],
                     log: self.worker_log.clone(),
                     tag: id.clone(),
                     runtime_dir: prep.runtime.as_ref().map(|r| r.dir.as_path()),
@@ -376,6 +388,7 @@ impl Engine {
             end_ev: None,
             after: None,
             threads: caps.threads,
+            providers: plan_providers,
             killed: false,
             eof: false,
             job_sent: false,
@@ -463,6 +476,8 @@ struct Run {
     end_ev: Option<Value>,
     after: Option<After>,
     threads: u32,
+    /// The job line's `providers` and `gpu` (PROTOCOL 8).
+    providers: (Vec<String>, Value),
     killed: bool,
     eof: bool,
     /// The worker has its job (before that, nothing of the lease has been played).
@@ -802,6 +817,9 @@ impl Run {
             j.remove("models");
         }
         j.insert("threads".into(), json!(self.threads));
+        // rev 7 (PROTOCOL 8): the agent's own, never the coordinator's
+        j.insert("providers".into(), json!(self.providers.0));
+        j.insert("gpu".into(), self.providers.1.clone());
         j.insert("out_dir".into(), json!("out"));
         j.insert("runtime_dir".into(), self.prep.runtime.as_ref().map(|r| json!(r.dir)).unwrap_or(Value::Null));
         Value::Object(j)

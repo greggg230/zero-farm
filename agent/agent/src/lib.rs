@@ -13,6 +13,7 @@ pub mod launcher_update;
 pub mod lease;
 pub mod logging;
 pub mod policy;
+pub mod probe;
 pub mod profile;
 pub mod results;
 pub mod settings;

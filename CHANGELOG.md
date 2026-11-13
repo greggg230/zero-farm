@@ -4,6 +4,19 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>`.
 
+## Unreleased (GPU work)
+
+- **Your graphics card can help, whatever its make.** With "Use the GPU" on, Zero Farm checks once
+  which ways of running networks on your GPU work on your PC (NVIDIA, AMD or Intel; DirectML on any
+  DirectX 12 card, and on Windows 11 24H2 or newer the GPU maker's own Windows ML provider, which
+  Windows downloads the first time). A way is used only if it computes the same answers as the
+  reference, to the last decimal places that matter, every time. The check runs between jobs, takes
+  seconds, and is repeated after a driver update; its readable report is in the logs "Send
+  diagnostics" sends.
+- **Stopping for other GPU use works on every GPU.** Zero Farm now sees other programs' GPU use the way
+  Task Manager does (no longer only on NVIDIA cards) and reads the GPU temperature where the driver
+  reports it; a card listed twice by Windows is counted once.
+
 ## 0.2.6 (2026-11-12, canary)
 
 - Release-path check: no user-visible changes. 0.2.5 must update itself to it before 0.2.5 goes

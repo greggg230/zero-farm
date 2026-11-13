@@ -66,7 +66,8 @@ fn the_job_line_comes_from_the_signed_template_only() {
     // The coordinator's job carries the per-lease fields plus everything an attacker would add.
     let job = json!({"gid_base": 40, "games": 6, "seed": 9, "settings": {"sims": 1, "book": "\\\\attacker\\s\\b"},
                      "prefix": "..\\..\\Desktop\\x", "models": {"1": {"model": "\\\\attacker\\s\\m.onnx"}},
-                     "out_dir": "C:\\Windows", "runtime_dir": "\\\\attacker\\rt", "threads": 64, "uniform": true});
+                     "out_dir": "C:\\Windows", "runtime_dir": "\\\\attacker\\rt", "threads": 64, "uniform": true,
+                     "providers": ["cuda"], "gpu": {"luid": "0000000000000001", "vendor": "nvidia", "name": "x"}});
     let mut l = signed_lease(&h, "l_D1", "selfplay", dref.clone(), job);
     l["checkpoint"] = c1;
     h.push(l);
@@ -84,7 +85,7 @@ fn the_job_line_comes_from_the_signed_template_only() {
     keys.sort_unstable();
     assert_eq!(
         keys,
-        ["games", "gid_base", "kind", "lease_id", "model", "op", "out_dir", "reference", "runtime_dir", "seed", "settings", "threads"],
+        ["games", "gid_base", "gpu", "kind", "lease_id", "model", "op", "out_dir", "providers", "reference", "runtime_dir", "seed", "settings", "threads"],
         "{j}"
     );
     assert_eq!(j["settings"], json!({"sims": 64, "fake": {"game_ms": 100, "shard_every": 2}}), "the signed settings, not the coordinator's");
@@ -93,6 +94,8 @@ fn the_job_line_comes_from_the_signed_template_only() {
     assert_eq!(j["out_dir"], "out");
     assert!(j["runtime_dir"].is_null());
     assert_eq!(j["threads"], 6, "the agent's own thread count");
+    // rev 7 (PROTOCOL 8): the agent's own providers (no probe here: the CPU), never the coordinator's
+    assert_eq!((j["providers"].clone(), j["gpu"].clone()), (json!(["cpu"]), Value::Null), "{j}");
     let model = std::path::PathBuf::from(j["model"].as_str().unwrap());
     assert!(model.is_absolute() && model.ends_with(format!("{RUN}\\1\\model.onnx")), "{j}");
 

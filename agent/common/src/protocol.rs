@@ -29,7 +29,12 @@ pub struct Profile {
     pub ram_mb: u64,
     pub disk_free_mb: u64,
     pub gpus: Vec<Gpu>,
+    /// rev 7 (PROTOCOL 8): the execution providers that passed this PC's probe with any runtime pack,
+    /// preference order, `cpu` last (`["cpu"]` before any probe).
     pub providers: Vec<String>,
+    /// rev 7: per runtime pack build_id, the providers that passed with it (absent before any probe).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_providers: Option<std::collections::BTreeMap<String, Vec<String>>>,
     /// Availability: hours per day the idle policy let this PC work / the agent was running,
     /// 7-day means of complete days (absent before the first complete day).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -160,6 +165,10 @@ pub struct Lease {
     /// leases (coordinators before rev 6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition: Option<DefinitionRef>,
+    /// rev 7 (PROTOCOL 8): the job's execution-provider allowlist (null: any). The agent only narrows
+    /// its verified providers with it; it is a routing hint, not part of the signed job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub providers: Option<Vec<String>>,
     /// The per-lease fields (`gid_base`, `games`, `seed` / `first`, `count`); before rev 6 the
     /// whole job. The agent never forwards anything else from it (PROTOCOL 7).
     pub job: Value,

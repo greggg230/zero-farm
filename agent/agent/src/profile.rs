@@ -214,10 +214,10 @@ pub fn gpus(nvml: Option<&nvml_wrapper::Nvml>) -> Vec<Gpu> {
         .collect()
 }
 
-/// ONNX Runtime execution providers available on this PC. The runtime pack will report the real
-/// list (Windows ML catalog); until then only the CPU provider is claimed.
-pub fn providers() -> Vec<String> {
-    vec!["cpu".into()]
+/// The ONNX Runtime execution providers that passed this PC's probes (probe.rs, PROTOCOL 8) with
+/// these adapters and drivers: (any runtime pack, per runtime pack). `["cpu"]` before any probe.
+pub fn providers(root: &std::path::Path, gpus: &[Gpu]) -> (Vec<String>, Option<std::collections::BTreeMap<String, Vec<String>>>) {
+    crate::probe::profile_providers(&zerofarm_common::layout::Layout::new(root), gpus)
 }
 
 pub fn detect(root: &std::path::Path) -> Profile {
@@ -227,6 +227,8 @@ pub fn detect(root: &std::path::Path) -> Profile {
     // Rounded to 10 GB so the profile digest doesn't change with every download.
     let free_mb = crate::util::disk_free_bytes(root).map(|b| (b >> 20) / 10240 * 10240).unwrap_or(0);
     let avail = crate::availability::load(&zerofarm_common::layout::Layout::new(root)).means(&crate::util::local_now().0);
+    let gpus = gpus(nvml.as_ref());
+    let (providers, runtime_providers) = providers(root, &gpus);
     Profile {
         os: os_name(),
         cpu: cpu_brand(),
@@ -236,8 +238,9 @@ pub fn detect(root: &std::path::Path) -> Profile {
         eff_cores: eff,
         ram_mb: total,
         disk_free_mb: free_mb,
-        gpus: gpus(nvml.as_ref()),
-        providers: providers(),
+        gpus,
+        providers,
+        runtime_providers,
         idle_h_day: avail.map(|a| a.0),
         on_h_day: avail.map(|a| a.1),
     }

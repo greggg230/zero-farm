@@ -316,9 +316,42 @@ impl Engine {
         Caps {
             threads: s.threads(self.profile.cores, self.profile.threads),
             ram_mb: s.ram_cap_mb(self.profile.ram_mb).min(if total > 0 { ram_free } else { u64::MAX }),
-            gpu: d.gpu && !self.profile.gpus.is_empty(),
+            // rev 7 (PROTOCOL 8): only when a GPU provider passed this PC's probe
+            gpu: d.gpu && !self.profile.gpus.is_empty() && crate::probe::has_gpu_provider(&self.profile.providers),
             disk_mb: self.disk_budget_mb(&s),
         }
+    }
+
+    /// Between leases, when the GPU may be used: probe one cached runtime pack this PC has no fresh
+    /// result for (probe.rs; PROTOCOL 8), then refresh the profile. True if a probe ran.
+    pub(crate) fn maybe_probe(&mut self, d: &Decision) -> bool {
+        if !d.gpu || self.profile.gpus.is_empty() {
+            return false;
+        }
+        let now = zerofarm_common::now_unix();
+        let Some((entry, worker, runtime, rdir)) = crate::probe::next_probe(&self.cfg.layout, &self.cfg.keys, &self.profile.gpus, now) else {
+            return false;
+        };
+        log::info!("probing the execution providers of runtime pack {runtime} with worker build {worker}");
+        self.set_status(Phase::Working, "checking the GPU", None);
+        let control = self.control.clone();
+        let stop = move || control.quitting();
+        let p = crate::probe::run(&self.cfg.layout, &entry, &worker, &runtime, &rdir, &self.profile.gpus, self.worker_log.clone(), crate::probe::PROBE_TIMEOUT, &stop);
+        if p.error.as_deref() == Some("stopped") {
+            return true;
+        }
+        match &p.error {
+            Some(e) => log::warn!("provider probe of runtime pack {runtime}: {e}"),
+            None => log::info!(
+                "provider probe of runtime pack {runtime}: {} ({})",
+                p.providers.join(", "),
+                p.results.iter().map(|r| format!("{}{}: {}", r.provider, r.adapter.as_ref().map(|a| format!(" on {a}")).unwrap_or_default(), if r.ok { "ok" } else { "no" })).collect::<Vec<_>>().join("; ")
+            ),
+        }
+        crate::probe::record(&self.cfg.layout, p);
+        self.profile = (self.profile_fn)();
+        self.profile_refreshed = Instant::now();
+        true
     }
 
     fn profile_digest_path(&self) -> std::path::PathBuf {
@@ -418,6 +451,9 @@ impl Engine {
                 let why = d.block.map(|b| b.describe()).unwrap_or("");
                 self.set_status(Phase::Idle, why, None);
                 self.control.sleep(self.cfg.timings.idle_poll);
+                continue;
+            }
+            if self.maybe_probe(&d) {
                 continue;
             }
             let answer = self.request_lease(&d);

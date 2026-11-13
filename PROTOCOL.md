@@ -132,10 +132,17 @@ up; `download` names the invite's channel, `?channel=canary`, when that isn't st
 ```json
 {"os": "Windows 11 26100", "cpu": "AMD Ryzen 7 7800X3D", "cores": 8, "threads": 16,
  "perf_cores": 8, "eff_cores": 0, "ram_mb": 32768, "disk_free_mb": 412000,
- "gpus": [{"vendor": "nvidia", "name": "RTX 4070", "vram_mb": 12282, "driver": "610.88"}],
- "providers": ["cpu", "tensorrt_rtx", "cuda", "migraphx", "dml", "openvino"],
+ "gpus": [{"vendor": "nvidia", "name": "RTX 4070", "vram_mb": 12282, "driver": "610.88", "luid": "000000000000d1f3"}],
+ "providers": ["dml", "cpu"],
+ "runtime_providers": {"<runtime build_id>": ["dml", "cpu"]},
  "idle_h_day": 9.5, "on_h_day": 14.2}
 ```
+Rev 7 (section 8): `gpus[]` has one entry per adapter LUID (`luid`: 16 lowercase hex digits; DXGI may
+list one card twice); `providers` lists only the execution providers that passed this PC's probe, with
+any runtime pack, in the agent's order of preference, `cpu` last (`["cpu"]` before any probe);
+`runtime_providers` (optional, at most 16 runtime builds x 16 names) the same per runtime pack. Provider
+names: `cpu`, `tensorrt_rtx`, `cuda`, `migraphx`, `amdgpu`, `openvino`, `dml`; names a coordinator doesn't
+know are kept and ignored for routing. LUIDs change when Windows restarts, so the profile is resent then.
 `idle_h_day` / `on_h_day` (rev 3, optional, 0..24): availability, the mean hours per day over the
 last 7 complete local days that the agent's idle policy allowed work / the agent was running
 (days it didn't run count 0); absent before the first complete day. They change at most once a
@@ -176,9 +183,9 @@ Any of the three may also carry `"upload_diag": ["logs"]` (as a beat answer can)
 lease hears about a diagnostics request on its next `/v1/lease`.
 
 How the coordinator picks (DESIGN 5.1): diagnostics asked for this machine first; then runs'
-self-play (short of quota) and evaluation (unissued games), by run priority × fit ÷ (1 + that job's
-active leases); then fuzz, the backfill (also where a run with `"gpu": "preferred"` goes on a
-CPU-only PC). Caps must cover the job's `needs` and the disk its uncached builds (and, rev 5, an
+evaluation (unissued games) and self-play (short of quota), by run priority × fit ÷ (1 + that job's
+active leases), evaluation before self-play at the same tier (rev 7); then fuzz, the backfill (also where a
+job with `"gpu": "preferred"` goes on a PC that isn't GPU-eligible for it, section 8). Caps must cover the job's `needs` and the disk its uncached builds (and, rev 5, an
 eval job's uncached checkpoints) take. A lease is
 sized to about 450 s of this machine's measured rate for that job (ids per running second, from its
 past leases; its hardware class's average before it has one; 16 games / 10 eval games / 20000
@@ -199,6 +206,8 @@ Lease = {
                                                        // network the job's seats name, by gen
   "definition": {"key": "defs/<kind>/<id>/<version>/definition.json", "sha256": "..."},
                                                        // rev 6, section 7; absent on legacy leases
+  "providers": ["dml", "cpu"] | null,                  // rev 7, section 8: the job's provider allowlist
+                                                       // (null: any); a routing hint, not signed
   "job": Job                                           // section 5; with a definition only
                                                        // {"kind", "gid_base", "games", "seed"} or
                                                        // {"kind", "first", "count"}
@@ -359,13 +368,13 @@ tools also send an Access service token (`CF-Access-Client-Id`, `CF-Access-Clien
 | `POST /v1/admin/build` | `{"build_id"}` after its manifest, signature and files are uploaded; the coordinator checks presence + sizes + hashes, and the signature and its trusted comment (`build_id=`, `kind=`) when the Worker var `RELEASE_PUBKEYS` is set → `{"ok": true, "build_id", "kind", "version", "size", "sig_verified"}`; failures → 400 with `"problems": [...]` |
 | `POST /v1/admin/agent/release` | `{"version", "build_id", "channel": "canary" \| "stable", "min_agent", "github_url": "<url>" \| null}`: `build_id` must be a registered agent build of that version, `min_agent` ≤ `version`. `github_url` (rev 4): the installer asset of the release's GitHub Release, where `GET /download` redirects; create the GitHub Release first. Rev 6: exactly `https://github.com/<GITHUB_REPO>/releases/download/agent-v<version>/ZeroFarmSetup.exe` (the var defaults to `greggg230/zero-farm`), else 400. `setup` (rev 3) → 400 → `{"ok": true, "channel", "version", "build_id", "min_agent", "github_url"}` |
 | `PUT /v1/admin/definition` | rev 6, section 7: `{"kind": "run" \| "campaign", "id", "version", "key", "sha256"}` after `definition.json` and `.minisig` are uploaded to `key` = `defs/<kind>/<id>/<version>/definition.json` → `{"ok": true, "kind", "id", "version", "key", "sha256", "unchanged", "current": true}`; failures → 400 with `"problems"`, a version not above the current one (or the same with other bytes) → 409 |
-| `PUT /v1/admin/run/{run}` | `{"game", "build_id", "runtime", "priority": 1.0, "selfplay": {"quota": 600, "slack": 0.1, "max_stale": 1, "games_per_lease": "auto", "gpu": "any" \| "preferred" \| "required", "needs": {"threads", "ram_mb"}, "job": {...}} \| null, "eval": {"batch": "it81", "games": 110, "checkpoints": [81, 70], "games_per_lease": "auto", "gpu", "needs", "job": {"settings", "seats", "paired"}} \| null, "state": "active" \| "paused"}` → `{"ok": true, "created"}`. `build_id` must be a registered worker build, `runtime` a runtime build. A new eval `batch` reserves `games` fresh game ids (the old batch's unissued ones are dropped); its rules and checks are in section 5.2 (rev 5: `checkpoints` replaces `gen`, which is now refused). Pausing a run, or dropping its `selfplay`/`eval`, cancels those leases at their next beat |
+| `PUT /v1/admin/run/{run}` | `{"game", "build_id", "runtime", "priority": 1.0, "selfplay": {"quota": 600, "slack": 0.1, "max_stale": 1, "games_per_lease": "auto", "gpu": "any" \| "preferred" \| "required", "providers": ["dml", "cpu"] \| null, "needs": {"threads", "ram_mb"}, "job": {...}} \| null, "eval": {"batch": "it81", "games": 110, "checkpoints": [81, 70], "games_per_lease": "auto", "gpu", "providers", "needs", "job": {"settings", "seats", "paired"}} \| null, "state": "active" \| "paused"}` → `{"ok": true, "created"}`. `build_id` must be a registered worker build, `runtime` a runtime build. A new eval `batch` reserves `games` fresh game ids (the old batch's unissued ones are dropped); its rules and checks are in section 5.2 (rev 5: `checkpoints` replaces `gen`, which is now refused). Pausing a run, or dropping its `selfplay`/`eval`, cancels those leases at their next beat |
 | `GET /v1/admin/run/{run}` | config + state: `current_gen`, `next_gid`, `pool`, `selfplay_state` (`cap`, `accepted`, `leased`, `pending`, `in_flight`, `headroom`), `checkpoints` (registered gens, rev 5), `eval_state` (the current batch's progress, section 5.2) and `eval_batches` (every batch of the run, newest first, same fields); rev 6 `definition` (as in stats; `GET /v1/admin/campaign/{id}` too) |
 | `PUT /v1/admin/run/{run}/checkpoint/{gen}` | `{"model", "sha256", "reference", "reference_sha256"}` (files under `ckpt/<run>/`, uploaded first); makes `gen` current for self-play and resets that generation's quota counter → `{"ok": true, "unchanged", "current"}`. Rev 5: a `gen` older than the current one is registered without becoming current (`"current": false`: an eval opponent or a head-to-head label); the same `gen` with other files → 409. Rev 6: a gen the current definition already signs must be exactly those files (else 400); self-play with a definition plays the new current gen once a definition signs it |
 | `GET /v1/admin/run/{run}/results?after={cursor}&limit=500` | → `{"results": [{"id", "key", "lease_id", "seq", "machine_id", "kind", "gen", "games", "ids", "dup_ids", "sha256", "size", "t"}], "cursor"}`. `ids`/`games`: the game ids credited to this chunk; `dup_ids`: ids in it that an earlier chunk was credited with (skip those games). Eval chunks (rev 5) also carry `batch`, `held` and `also`, and their `games` counts `also` too (section 5.2). `limit` ≤ 1000 |
 | `POST /v1/admin/run/{run}/accept` | `{"gen", "games": n}`: the trainer's total of games accepted for `gen` (a total, not an increment; include games held over for the next generation). Self-play stops when accepted + in flight (unclaimed ids in active self-play leases + credited self-play games not yet acked) reaches `quota × (1 + slack)`. Call it before `ack` |
 | `POST /v1/admin/run/{run}/ack` | `{"cursor"}`: results up to it are ingested (R2 objects deleted after 7 days) → `{"ok": true, "acked"}` |
-| `PUT /v1/admin/campaign/{id}` | `{"build_id", "mode", "env": {"FUZZ_POOL": "delver", ...}, "seed_base": 10000000, "chunk": "auto" \| n, "priority": 0.2, "state", "needs": {"threads", "ram_mb"} \| null}` → `{"ok": true, "created", "cursor"}`. The seed cursor never rewinds: a lower `seed_base` is ignored, a higher one moves it up |
+| `PUT /v1/admin/campaign/{id}` | `{"build_id", "mode", "env": {"FUZZ_POOL": "delver", ...}, "seed_base": 10000000, "chunk": "auto" \| n, "priority": 0.2, "state", "needs": {"threads", "ram_mb"} \| null, "gpu": "any" (default) \| "preferred" \| "required", "providers": [...] \| null}` → `{"ok": true, "created", "cursor"}`. The seed cursor never rewinds: a lower `seed_base` is ignored, a higher one moves it up. Rev 7: `gpu` and `providers` (section 8; migration 0006) |
 | `GET /v1/admin/campaign/{id}` · `GET …/results?after=` · `POST …/ack` | config + `cursor`, `seeds_done`, `pool`, `failures`, `sites`; results and ack as for runs (`ids` are seeds) |
 | `GET /v1/admin/campaign/{id}/failures?after=&limit=` | → `{"failures": [{"id", "seed", "mode", "site", "panic", "repro", "output_tail", "build_id", "engine_commit", "machine_id", "lease_id", "first_of_site", "t"}], "cursor"}` (section 5.1; one row per (seed, site)) |
 | `GET /v1/admin/machines` · `POST /v1/admin/machine/{id}/revoke` | revoking cancels the machine's active leases at once (their ids go back to the pool) → `{"ok": true, "cancelled"}` |
@@ -713,58 +722,147 @@ that, a lease without a definition is never issued, and a definition-aware agent
 One worker-side function creates every inference session; the GPU work and the self-play work
 both build on it, and nothing else in a worker creates an ONNX Runtime session.
 
-**Worker API** (`zero_worker::session`, Rust; owned by the GPU work):
+**Worker API** (`zero_worker::session`, Rust; owned by the GPU work; zero-core `gpu` 1ed81c0):
 
 ```rust
-pub enum ProviderKind { Cpu, TensorRtRtx, Cuda, MiGraphX, OpenVino, DirectMl }
+pub enum ProviderKind { Cpu, TensorRtRtx, Cuda, MiGraphX, AmdGpu, OpenVino, DirectMl }
 pub struct GpuDevice { pub luid: u64, pub vendor: String, pub name: String }
 pub struct SessionSpec<'a> {
     pub model: &'a Path,               // a zero-onnx/1 graph
     pub reference: Option<&'a Path>,   // reference.npz; required to accept any GPU provider
     pub providers: &'a [ProviderKind], // preference order from the job line; Cpu always last
-    pub device: Option<GpuDevice>,     // the adapter to use (job line `gpu`)
+    pub device: Option<GpuDevice>,     // the adapter to use (job line `gpu`); None: the first it serves
     pub intra_threads: usize,
+    pub runtime: &'a Path,             // the runtime pack's onnxruntime.dll
+    pub spinning: bool,
+    pub expect: Option<&'a Expect>,    // the job's game (None: the graph's own metadata; tools)
 }
 pub struct SelfTest { pub provider: ProviderKind, pub max_abs: f32, pub ok: bool,
-                      pub cpu_fallback_nodes: Vec<String> }
+                      pub cpu_fallback_nodes: Vec<String>, pub deterministic: bool, pub rows: usize,
+                      pub items: [f64; 4], pub device: Option<GpuDevice>, pub build_s: f64, pub pass_s: [f64; 2], .. }
 pub fn create_session(spec: &SessionSpec) -> Result<InferenceSession, SessionError>;
+pub fn try_one(rt, spec, reference, p: ProviderKind, want: Option<&GpuDevice>, adapters) -> Tried; // one provider (the probe)
 impl InferenceSession {
     pub fn provider(&self) -> ProviderKind;
     pub fn selftest(&self) -> &SelfTest;
+    pub fn attempts(&self) -> &[Attempt];   // providers tried before it, and why each was not used
     pub fn eval(&mut self, batch: &LeafBatch) -> Result<Answer, SessionError>; // zero-onnx/1 in, the
-                                                // generic post-processed answer out (section 5)
-    pub fn release_device(&mut self);  // on `yield`: free all GPU memory; rebuilt on the next eval
+                                            // generic post-processed answer out (section 5)
+    pub fn release_device(&mut self);       // on `yield`: free all GPU memory; rebuilt on the next eval
 }
+// InferenceSession also implements the worker's Evaluator (release = release_device; `provider()` is the
+// Stats `provider` the agent reads: "cpu", "dml", ...).
 ```
 
 `create_session` tries `providers` in order. A provider is accepted only if its session builds and
 the self-test on `reference` passes: max abs difference at most 2e-5 against the reference answers
-on every output, run twice and bit-identical. Nodes the provider leaves to the CPU are listed in
-`cpu_fallback_nodes`. Otherwise it moves to the next provider, ending with `Cpu`. The worker emits
-one `selftest` event per model with `gen`, `provider`, `max_abs`, `ok` and `cpu_fallback_nodes`.
+on every output (priors after the generic step, value, margin, aux), the whole set answered twice and
+bit-identical. A GPU provider is never accepted without a reference set, and one to which ONNX
+Runtime gives no node of the graph is refused. Nodes the provider leaves to the CPU are listed in
+`cpu_fallback_nodes` ("OpType (name)", from ONNX Runtime's verbose node placement while the session is
+built). Otherwise it moves to the next provider, ending with `Cpu`; a CPU session that fails the
+self-test ends the job, as before. GPU sessions run with deterministic compute on (and CUDA's TF32
+off): a provider that drops below float32 fails the self-test. The worker emits one `selftest` event
+per model with `gen`, `provider`, `max_abs`, `ok`, `cpu_fallback_nodes`, plus `deterministic`, `rows`,
+`items`, `gpu`, `build_s`, `pass_s` and `tried` (the providers not used, with why). On the CPU a batch
+over 64 rows is answered in 64-row pieces (section 5); a GPU provider takes whole batches (pieces of
+at most 1,024 rows; TensorRT-RTX also at most 1,048,576 non-zeros, its optimisation profile's maximum).
+A row's answer depends on its piece only by float rounding, and each provider passes its self-test
+with its own pieces.
 
-**Job line (aw/1 additions):** `providers: ["migraphx", "dml", "cpu"]` (what the agent allows, in
-order, from its verified provider list and the user's "Use the GPU" setting) and
-`gpu: {"luid": "<hex>", "vendor", "name"} | null`. A job line without `providers` means
-`["cpu"]`.
+**How each provider is bound** (zero-core `session.rs`): `dml` - built into the runtime pack's ONNX
+Runtime, on the adapter's DXGI index or ONNX Runtime's EP device with the adapter's LUID; `cuda` and a
+standalone `tensorrt_rtx` - compiled into the pack's ONNX Runtime build, device ordinal = the adapter's
+index among its vendor's; `tensorrt_rtx`, `amdgpu`, `migraphx`, `openvino` from Windows ML's catalog -
+plugin libraries registered with ONNX Runtime and bound to the ONNX Runtime EP device whose `LUID`
+metadata is the adapter's. TensorRT-RTX gets an explicit optimisation profile (min 1 row, opt 256 rows /
+65,536 non-zeros, max 1,024 rows / 1,048,576 non-zeros) and `nv_op_types_to_exclude=NonZero` where the
+provider takes that option.
+
+**Job line (aw/1 additions):** `providers: ["dml", "cpu"]` (what the agent allows, in order, from its
+verified provider list, the lease's allowlist and the user's "Use the GPU" setting; unknown names are
+skipped, `cpu` is added last) and `gpu: {"luid": "<hex>", "vendor", "name"} | null`. A job line
+without `providers` means `["cpu"]`. The worker's CLI has `--providers a,b` and `--gpu <luid>`.
+
+**`probe-providers`** (`<worker> probe-providers [--runtime-dir D] [--model M --reference R]
+[--providers a,b] [--gpu LUID] [--threads T] [--reps N] [--bench-rows 64,256,...] [--ensure-ready]
+[--json FILE]`): the CPU first, then every candidate GPU provider on every adapter it serves, each
+through the factory's own steps (`try_one`: build, self-test, node placement) and a timing; the graph is
+built in (a small token network with every operator of the real networks' graphs, and its reference
+set) unless `--model`/`--reference` name a real one. `--ensure-ready` lets Windows ML download and
+install the catalog providers this PC's adapters could use (a job never does). Output: one JSON object
+(`probe` 1, `build_id`, `ort`, `available`, `modules`, `adapters` [{luid, vendor, vendor_id, device_id,
+name, vram_mb, dxgi_index}], `catalog` {present, eps [{name, version, ready, certified, ensure}],
+registered, errors}, `ep_devices`, `graph`, `rows`, `results` [{provider, gpu, ok, why | selftest,
+cpu_fallback_ops, placed, chunk, rows_per_s, rows_per_s_by_batch, vs_cpu}], `providers` (passed, in
+order, `cpu` last), `error`, `seconds`) on stdout or in FILE, and a readable report on stderr (the worker
+log a friend's "Send diagnostics" uploads). Exit 0 even when only the CPU passes; 2 when not even the
+CPU does.
+
+**Runtime packs** (DESIGN 8.4-8.5): the CPU pack (ONNX Runtime 1.31.1); the **Windows ML pack**
+(`farm_build.py --runtime --pack winml`: NuGet Microsoft.Windows.AI.MachineLearning 2.5.96 - ONNX Runtime
+1.28.3 with the CPU and DirectML providers, DirectML.dll, and Microsoft.Windows.AI.MachineLearning.dll,
+whose flat C API (`WinMLEpCatalog*`) is the execution-provider catalog: usable from an unpackaged,
+per-user, medium-integrity process with no Windows App SDK runtime and no WinRT registration; the
+catalog offers its providers on Windows 11 24H2+ and nothing on older Windows, where DirectML and the
+CPU remain). A worker build names the pack it loads (`requires_runtime`), a definition names one
+runtime for its builds. The worker loads `DirectML.dll` and the MSVC runtime from the pack by full path
+before ONNX Runtime (System32 has an older DirectML). The worker's `ort` binding asks for the C API of
+ONNX Runtime 1.23, so a pack may carry any ONNX Runtime from 1.23 on.
 
 **Agent profile:** `gpus[]` gains `luid` (hex), and entries are de-duplicated by LUID. `providers` lists
-only providers that passed a probe on this PC: `mtgz-worker probe-providers` runs a small built-in
-graph and self-test per candidate provider and adapter. Results are cached per (runtime build,
-driver version, adapter). `caps.gpu` is true only when a GPU provider passed the probe.
+only providers that passed a probe on this PC; `runtime_providers` the same per runtime pack. Probes
+(agent `probe.rs`): between leases, while the policy allows GPU work, for each cached runtime pack that a
+cached release worker build requires and that has no result for this PC's adapters (vendor, name and
+driver version of each: a new driver or pack is probed again, a restart is not), the agent runs that
+build's `probe-providers --runtime-dir <pack> --ensure-ready --json ...` in a job object at below-normal
+priority (at most 15 min); results go to `state\probes.json` (provider names, adapter names, max abs,
+nodes on the CPU, rows/s, why), a failed probe is tried again after a day, and the readable report goes
+to the worker log. `caps.gpu` is true only when the policy allows GPU work and a GPU provider passed a
+probe. The job line's `providers`/`gpu`: from the probe of the lease's runtime pack, narrowed by the
+lease's `providers` allowlist; the adapter with the most video memory among those where an allowed GPU
+provider passed, then every allowed provider that passed on it in order, then `cpu`; `["cpu"]` and
+`gpu: null` when the GPU may not be used when the lease starts, the pack was never probed, or nothing
+else passed. A worker whose Stats `provider` is not `cpu` runs a GPU job: it is yielded (its session
+released) whenever the GPU rules block GPU work, and gets below-normal priority without EcoQoS.
 
-**GPU busy signal:** vendor-neutral, from the Windows PDH "GPU Engine" counters (per-process
-utilization), excluding Zero Farm's own worker processes. It replaces NVML as the gate for GPU work.
-Temperature comes from a vendor-neutral source where available (see DESIGN 8.5).
+**GPU busy signal:** vendor-neutral, from the Windows PDH "GPU Engine" counters (`\GPU
+Engine(*)\Utilization Percentage`, per process: what Task Manager shows): per engine the sum over every
+process except the agent and its worker, per adapter its busiest engine; the gate is the busiest
+adapter (more than 10 % for 30 s blocks GPU work; 30 s quiet clears it). It replaces NVML as the gate for
+GPU work; NVML only gives the NVIDIA driver version and a cross-check of the adapter count. Temperature:
+`D3DKMTQueryAdapterInfo(KMTQAITYPE_ADAPTERPERFDATA)` per adapter LUID (DESIGN 8.5, decided); a GPU whose
+driver reports none (0, or the query fails) has no temperature rule.
 
-**Coordinator routing:** a run's or campaign's `gpu` setting (`any` | `preferred` | `required`) and
-an optional `providers` allowlist are matched against each machine's verified `providers` and
-`gpus`. Evaluation is routed first, then self-play.
+**Coordinator routing:** a run's (`selfplay`, `eval`) or campaign's `gpu` setting (`any` |
+`preferred` | `required`) and an optional `providers` allowlist (a non-empty list of known names, or
+null for any) are matched against each machine's verified providers: `runtime_providers[<the job's
+runtime>]` when the profile has it, else `providers`. A machine is **GPU-eligible** for a job when
+`caps.gpu` and it verified a GPU provider the allowlist allows. `required`: only GPU-eligible machines;
+`preferred`: GPU-eligible machines at the job's tier, others as backfill (fit 0.25); `any`: no filter.
+`gpu: preferred | required` with an allowlist that holds no GPU provider is refused (400). Evaluation is
+routed first, then self-play (within a tier); fuzz stays the backfill. Every lease carries the job's
+allowlist as `providers` (null on diag leases).
 
 ## Changes
-- v1 rev 7 (2026-11-12, planned): GPU inference contract (section 8): `create_session` as the one session factory,
-  `providers`/`gpu` in the job line, probed providers and adapter LUIDs in the profile, the PDH busy signal,
-  provider routing.
+- v1 rev 7 (2026-11-12, as built; zero-core `gpu` 1ed81c0, agent and coordinator on zero-farm `gpu`): GPU inference
+  (section 8). Worker: `create_session` the one session factory (`SessionSpec` gains `runtime`, `spinning`,
+  `expect`; `ProviderKind` gains `AmdGpu` - Windows ML 2.x's AMD GPU provider; MIGraphX is deprecated there);
+  a provider is accepted only through the self-test (twice, bit-identical, 2e-5; a GPU provider needs the
+  reference set, and one that runs no node is refused); the `selftest` event gains `cpu_fallback_nodes`,
+  `deterministic`, `gpu`, `tried`, `build_s`, `pass_s`; GPU providers take whole batches (pieces of up to
+  1,024 rows; TensorRT-RTX also up to 1M non-zeros); `probe-providers` (command, JSON, report). Job line:
+  `providers` (absent = `["cpu"]`; unknown names skipped) and `gpu`. Runtime packs: the Windows ML pack
+  (ONNX Runtime 1.28.3 with DirectML, the catalog's C API; usable from an unpackaged per-user process, no
+  Windows App SDK runtime). Exporter: graphs without a scatter-add, `portable()` (bit-identical on the
+  CPU). Agent: probes between leases, cached per (runtime build, adapters with drivers) in
+  `state\probes.json`; profile `gpus[].luid` (de-duplicated by LUID), `providers` from the probes,
+  `runtime_providers`; `caps.gpu` only with a verified GPU provider; the job line's `providers`/`gpu` from
+  the probe, the lease's allowlist and the policy (the adapter with the most video memory); PDH busy gate
+  for every vendor, D3DKMT temperature (none = no rule). Coordinator: GPU eligibility from verified
+  providers (per runtime when known), `required`/`preferred`/`any`, the run's or campaign's `providers`
+  allowlist (also on the lease), campaign `gpu`/`providers` (migration 0006), evaluation before
+  self-play.
 - v1 rev 6 (2026-11-12): signed definitions (section 7): data keys, `definition/1`, the agent builds the job line
   from the signed template, coordinator-settable fields limited, versions never roll back.
 - v1 rev 6, coordinator side (2026-11-12, from building it; agent 0.2.5): section 7's coordinator
