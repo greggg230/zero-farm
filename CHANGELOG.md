@@ -17,6 +17,16 @@ version is a GitHub Release tagged `agent-v<version>`.
   Task Manager does (no longer only on NVIDIA cards) and reads the GPU temperature where the driver
   reports it; a card listed twice by Windows is counted once.
 
+## 0.2.7 (2026-11-12, canary)
+
+- **Graphics cards from every vendor** (NVIDIA, AMD, Intel) can now be used for network jobs. Zero Farm
+  only uses a GPU after testing it on this PC: the network's answers on the GPU must match the processor's
+  exactly (within a tiny tolerance), or the GPU isn't used.
+- **It stays out of your way on the GPU too:** it notices when any other program uses the graphics card
+  (for every vendor, the way Task Manager does) and waits, and it watches the card's temperature where
+  Windows reports it.
+- PCs with one graphics card listed twice by Windows now report it once.
+
 ## 0.2.6 (2026-11-12, canary)
 
 - Release-path check: no user-visible changes. 0.2.5 must update itself to it before 0.2.5 goes
