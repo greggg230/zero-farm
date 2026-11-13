@@ -72,7 +72,7 @@ const routes: [string, RegExp, Handler][] = [
   ["HEAD", /^\/download$/, onboard.download],
 ];
 
-export const COORDINATOR_HEADER = "x-zerofarm-coordinator";
+const COORDINATOR_HEADER = "x-zerofarm-coordinator";
 
 // Marks an answer as the coordinator's own (every /v1/* path, PROTOCOL 1).
 function mark(res: Response): Response {

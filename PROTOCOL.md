@@ -411,7 +411,7 @@ Worker → agent (`"ev"`):
 | `selftest` | `provider`, `max_abs`, `ok` (before the first real batch with a model); `gen` (rev 5): the network it tested, one event per gen of an eval job's `models` |
 | `status` | `stats`: Stats (section 3) |
 | `fin` | `n`: games finished since the last `fin` |
-| `shard` / `records` | `seq`, `path` (relative, under out_dir), `games`, `rows`, `bytes`, `gids`, `gen`? — a result file ready to upload (`shard` until phase 3, then `records`); the agent moves the file away and sends `gids` as `x-ids`, `gen` (the oldest checkpoint generation of its games) as `x-gen` |
+| `shard` / `records` | `seq`, `path` (relative, under out_dir), `games`, `rows`, `bytes`, `gids`, `gen`? — a result file ready to upload (`shard` until phase 3, then `records`: rev 8, below); the agent moves the file away and sends `gids` as `x-ids`, `gen` (the oldest checkpoint generation of its games) as `x-gen` |
 | `evals` | eval (rev 5): `seq`, `path`, `games`, `gids` (as `shard`, no `gen`): a file of eval rows (section 5.2); the agent uploads it with `gids` as `x-ids` |
 | `failure` | fuzz: `seed` (integer), `mode`, `panic`, `site` (string), `repro`, `output_tail` |
 | `yielded` · `resumed` | |
@@ -683,7 +683,9 @@ Coordinator details (from building it, rev 6):
   and `expires` after it; 1 to 64 worker builds; at most 1024 checkpoints, files of 1 byte to
   1 GiB, `reference_sha256` and `reference_size` together; templates with only their kind's keys:
   self-play `settings`, eval `settings`, `seats`, `paired` (required), fuzz `mode`, `env`,
-  `announce_result`; no per-lease fields such as `seed`; no path-like strings or keys; eval seats
+  `announce_result`; no per-lease fields such as `seed`; no path-like strings or keys (rev 8: a `\` or `/`
+  - the Oracle name separator ` // ` of a split, adventure or double-faced card's name excepted, as a game spec
+  names such cards -, `..`, or a drive prefix `X:`); eval seats
   name only listed gens; a run defines self-play and eval, a campaign fuzz) plus the
   coordinator's: the body names the requested kind, id and version, it hasn't expired, its builds
   are registered worker builds of its `game`, its runtime a registered runtime, and gens already
@@ -845,6 +847,19 @@ routed first, then self-play (within a tier); fuzz stays the backfill. Every lea
 allowlist as `providers` (null on diag leases).
 
 ## Changes
+- v1 rev 8 (2026-11-12, phase 3 self-play; agent and coordinator code on branch `selfplay`, not yet released or
+  deployed): **records** - a self-play job's result files are game records (`records` events; the job line's optional
+  `output`: `records`, the default of a worker build from phase 3, `shards` the shards of before, `both`), gzip'd
+  JSON lines: a header `{"records": 1, "game", "spec", "aux", "features", "actions", "aux_width", "seed" (the lease's),
+  "lease", "build_id", "games", "rows", "gids", "gen"}` then one game per line (zero-core docs/search.md 2.17: its
+  seed, every real move - a best-of-three's game boundaries included -, each training row's step, decider, kind,
+  policy and root value as float16, network id; per game of a match its outcome and decks); the agent uploads them
+  as any result (`gids` as `x-ids`, `gen` as `x-gen`), the coordinator never reads them, the trainer's pool remote
+  replays every credited game and refuses a chunk whose any game does not replay. **The path-like rule** of
+  definitions (section 7) excepts the Oracle name separator ` // `: MTG Zero's Delver spec names "Rough // Tumble"
+  and "Tamiyo, Inquisitive Student // Tamiyo, Seasoned Scholar", so its self-play template was refused by every
+  check (agent, coordinator, farm-release); `a//b`, `/x`, `x // ../y` stay refused. An agent before this change
+  refuses such a definition: the best-of-three run's farm self-play needs this agent released first.
 - v1 rev 7 (2026-11-12, as built; zero-core `gpu` 3727b3b, agent and coordinator on zero-farm `gpu`): GPU inference
   (section 8). Worker: `create_session` the one session factory (`SessionSpec` gains `runtime`, `spinning`,
   `expect`; `ProviderKind` gains `AmdGpu` - Windows ML 2.x's AMD GPU provider; MIGraphX is deprecated there);
@@ -863,6 +878,9 @@ allowlist as `providers` (null on diag leases).
   providers (per runtime when known), `required`/`preferred`/`any`, the run's or campaign's `providers`
   allowlist (also on the lease), campaign `gpu`/`providers` (migration 0006), evaluation before
   self-play.
+- v1 rev 7 (2026-11-12, planned): GPU inference contract (section 8): `create_session` as the one session factory,
+  `providers`/`gpu` in the job line, probed providers and adapter LUIDs in the profile, the PDH busy signal,
+  provider routing.
 - v1 rev 6 (2026-11-12): signed definitions (section 7): data keys, `definition/1`, the agent builds the job line
   from the signed template, coordinator-settable fields limited, versions never roll back.
 - v1 rev 6, coordinator side (2026-11-12, from building it; agent 0.2.5): section 7's coordinator
