@@ -1068,7 +1068,10 @@ Agents from 0.2.11 delete each listed build from `cache\builds\` (and its LRU en
 before any probe (the update check is the main loop's first step), and every 6 hours after, always between
 leases. Deletion only: a build that is still needed is downloaded again when a lease needs it. It is how a
 withdrawn build (a diagnostic worker, a pack nobody should probe again) leaves PCs that cached it; a worker build
-whose runtime pack is gone is never probed (the pack has to be in the cache and verify).
+whose runtime pack is gone is never probed (the pack has to be in the cache and verify). The list is global (every
+machine, every channel): before a run uses a listed build again, take it off the list (`POST /v1/admin/evict` with
+the rest, or `[]`), or every agent deletes it at each start and each update check and downloads it again for every
+lease.
 
 ## Changes
 - v1 rev 12 (2026-11-13; agent 0.2.11, canary first; coordinator: no migration): **probes the PC never finished,
