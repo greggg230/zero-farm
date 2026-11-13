@@ -61,9 +61,15 @@ Everything executable reaches a friend's PC only through a manifest signed with 
   "min_agent": "0.3.0",                     // worker/runtime: oldest agent that can run it
   "requires_runtime": "<build_id>",         // worker: the ONNX Runtime pack it links (optional)
   "entry": "mtgz-worker.exe",               // worker/agent: the executable to run
-  "files": [ {"path": "mtgz-worker.exe", "sha256": "...", "size": 26214400} ]
+  "gpu": {"vendor": "nvidia", "min_driver": "527.41", "providers": ["cuda"]},  // runtime only, rev 11 (9.2)
+  "files": [ {"path": "mtgz-worker.exe", "sha256": "...", "size": 26214400,
+              "zst": {"sha256": "...", "size": 9000000}} ]                    // `zst`: rev 11 (9.3), optional
 }
 ```
+
+Rev 11 (section 9): a runtime manifest's optional `gpu` is a hard hardware requirement (9.2); a file's optional
+`zst` names its zstd-compressed copy at `builds/<build_id>/<path>.zst` (9.3). Both appear only in manifests with
+`min_agent` 0.2.10 or newer. To run one engine with several packs, its executable is signed once per pack (9.1).
 
 - **Bytes signed** = the manifest file exactly as stored (`manifest.json`); never re-serialised.
 - **build_id** = first 24 hex chars of sha256(manifest.json bytes).
@@ -140,7 +146,8 @@ up; `download` names the invite's channel, `?channel=canary`, when that isn't st
 Rev 7 (section 8): `gpus[]` has one entry per adapter LUID (`luid`: 16 lowercase hex digits; DXGI may
 list one card twice); `providers` lists only the execution providers that passed this PC's probe, with
 any runtime pack, in the agent's order of preference, `cpu` last (`["cpu"]` before any probe);
-`runtime_providers` (optional, at most 16 runtime builds x 16 names) the same per runtime pack. Provider
+`runtime_providers` (optional, at most 16 runtime builds x 16 names) the same per runtime pack (rev 11: an empty
+list when that pack was probed here and nothing passed, or its probe failed). Provider
 names: `cpu`, `tensorrt_rtx`, `cuda`, `migraphx`, `amdgpu`, `openvino`, `dml`; names a coordinator doesn't
 know are kept and ignored for routing. LUIDs change when Windows restarts, so the profile is resent then.
 `idle_h_day` / `on_h_day` (rev 3, optional, 0..24): availability, the mean hours per day over the
@@ -152,10 +159,13 @@ day, so the profile is resent at most daily for them.
 Request:
 ```json
 {"profile_digest": "<sha256 of canonical Profile>", "profile": Profile | null,
- "caps": {"threads": 6, "ram_mb": 12000, "gpu": true, "disk_mb": 2500},
+ "caps": {"threads": 6, "ram_mb": 12000, "gpu": true, "gpu_allowed": true, "disk_mb": 2500},
  "cached": {"builds": ["<build_id>", ...], "ckpts": ["<run>/<gen>", ...]},
  "kinds": ["fuzz", "eval", "selfplay", "diag"]}
 ```
+`caps.gpu_allowed` (rev 11, agents from 0.2.10, optional): the policy and the user's "Use the GPU" setting allow
+GPU work right now, whether or not a GPU provider has passed a probe (`caps.gpu` keeps its meaning: allowed and a
+GPU provider passed; section 9.4 uses `gpu_allowed`).
 `profile` is sent only when the digest changed (the coordinator answers 409 `conflict` with
 `{"need_profile": true}` if it doesn't know the digest). The digest is opaque to the coordinator:
 it only compares it with the last one it stored, so the agent may compute it any stable way
@@ -373,7 +383,7 @@ tools also send an Access service token (`CF-Access-Client-Id`, `CF-Access-Clien
 | `POST /v1/admin/build` | `{"build_id"}` after its manifest, signature and files are uploaded; the coordinator checks presence + sizes + hashes, and the signature and its trusted comment (`build_id=`, `kind=`) when the Worker var `RELEASE_PUBKEYS` is set → `{"ok": true, "build_id", "kind", "version", "size", "sig_verified"}`; failures → 400 with `"problems": [...]` |
 | `POST /v1/admin/agent/release` | `{"version", "build_id", "channel": "canary" \| "stable", "min_agent", "github_url": "<url>" \| null}`: `build_id` must be a registered agent build of that version, `min_agent` ≤ `version`. `github_url` (rev 4): the installer asset of the release's GitHub Release, where `GET /download` redirects; create the GitHub Release first. Rev 6: exactly `https://github.com/<GITHUB_REPO>/releases/download/agent-v<version>/ZeroFarmSetup.exe` (the var defaults to `greggg230/zero-farm`), else 400. `setup` (rev 3) → 400 → `{"ok": true, "channel", "version", "build_id", "min_agent", "github_url"}` |
 | `PUT /v1/admin/definition` | rev 6, section 7: `{"kind": "run" \| "campaign", "id", "version", "key", "sha256"}` after `definition.json` and `.minisig` are uploaded to `key` = `defs/<kind>/<id>/<version>/definition.json` → `{"ok": true, "kind", "id", "version", "key", "sha256", "unchanged", "current": true}`; failures → 400 with `"problems"`, a version not above the current one (or the same with other bytes) → 409 |
-| `PUT /v1/admin/run/{run}` | `{"game", "build_id", "runtime", "priority": 1.0, "min_agent": "0.2.8" \| null, "selfplay": {"quota": 600, "slack": 0.1, "max_stale": 1, "games_per_lease": "auto", "gpu": "any" \| "preferred" \| "required", "providers": ["dml", "cpu"] \| null, "needs": {"threads", "ram_mb"}, "job": {...}} \| null, "eval": {"batch": "it81", "games": 110, "checkpoints": [81, 70], "games_per_lease": "auto", "gpu", "providers", "needs", "job": {"settings", "seats", "paired"}} \| null, "state": "active" \| "paused"}` → `{"ok": true, "created"}`. `build_id` must be a registered worker build, `runtime` a runtime build. A new eval `batch` reserves `games` fresh game ids (the old batch's unissued ones are dropped); its rules and checks are in section 5.2 (rev 5: `checkpoints` replaces `gen`, which is now refused). Pausing a run, or dropping its `selfplay`/`eval`, cancels those leases at their next beat. Rev 9: `min_agent` (semver, optional; absent or null: none) - the run's leases (self-play and eval) go only to agents at or above it (section 3's update rule); a PUT is the whole configuration, so a PUT without it removes the limit; leases already issued run on (migration 0007) |
+| `PUT /v1/admin/run/{run}` | `{"game", "build_id", "runtime", "priority": 1.0, "min_agent": "0.2.8" \| null, "alternates": [{"build_id", "runtime", "when": {"vendor", "min_driver"?}}] \| null (rev 11, section 9.4), "selfplay": {"quota": 600, "slack": 0.1, "max_stale": 1, "games_per_lease": "auto", "gpu": "any" \| "preferred" \| "required", "providers": ["dml", "cpu"] \| null, "needs": {"threads", "ram_mb"}, "job": {...}} \| null, "eval": {"batch": "it81", "games": 110, "checkpoints": [81, 70], "games_per_lease": "auto", "gpu", "providers", "needs", "job": {"settings", "seats", "paired"}} \| null, "state": "active" \| "paused"}` → `{"ok": true, "created"}`. `build_id` must be a registered worker build, `runtime` a runtime build. A new eval `batch` reserves `games` fresh game ids (the old batch's unissued ones are dropped); its rules and checks are in section 5.2 (rev 5: `checkpoints` replaces `gen`, which is now refused). Pausing a run, or dropping its `selfplay`/`eval`, cancels those leases at their next beat. Rev 9: `min_agent` (semver, optional; absent or null: none) - the run's leases (self-play and eval) go only to agents at or above it (section 3's update rule); a PUT is the whole configuration, so a PUT without it removes the limit; leases already issued run on (migration 0007) |
 | `GET /v1/admin/run/{run}` | config (rev 9: with `min_agent`) + state: `current_gen`, `next_gid`, `pool`, `selfplay_state` (`cap`, `accepted`, `leased`, `pending`, `in_flight`, `headroom`), `checkpoints` (registered gens, rev 5), `eval_state` (the current batch's progress, section 5.2) and `eval_batches` (every batch of the run, newest first, same fields); rev 6 `definition` (as in stats; `GET /v1/admin/campaign/{id}` too) |
 | `PUT /v1/admin/run/{run}/checkpoint/{gen}` | `{"model", "sha256", "reference", "reference_sha256"}` (files under `ckpt/<run>/`, uploaded first); makes `gen` current for self-play and resets that generation's quota counter → `{"ok": true, "unchanged", "current"}`. Rev 5: a `gen` older than the current one is registered without becoming current (`"current": false`: an eval opponent or a head-to-head label); the same `gen` with other files → 409. Rev 6: a gen the current definition already signs must be exactly those files (else 400); self-play with a definition plays the new current gen once a definition signs it |
 | `GET /v1/admin/run/{run}/results?after={cursor}&limit=500` | → `{"results": [{"id", "key", "lease_id", "seq", "machine_id", "kind", "gen", "games", "ids", "dup_ids", "sha256", "size", "t"}], "cursor"}`. `ids`/`games`: the game ids credited to this chunk; `dup_ids`: ids in it that an earlier chunk was credited with (skip those games). Eval chunks (rev 5) also carry `batch`, `held` and `also`, and their `games` counts `also` too (section 5.2). `limit` ≤ 1000 |
@@ -666,7 +676,9 @@ fuzz `first`, `count`.
 2. verifies the signature against the trusted data keys;
 3. checks `kind`/`id` against the lease's run/campaign, `expires`, and that `version` is at least
    the highest it has seen for that (kind, id) (stored in its state, so no rollback);
-4. checks the lease's worker build is in `builds` and its runtime equals `runtime`, and that every
+4. checks the lease's worker build is in `builds` and its runtime equals `runtime` (rev 11, agents from
+   0.2.10: or equals the `requires_runtime` of the lease's worker build, from that build's signed manifest: a
+   definition authorizes each build it lists with the pack that build requires; section 9), and that every
    checkpoint file's size and sha256 equal the definition's;
 5. **builds the job line itself** from the definition's job template, plus only the per-lease fields
    above, plus its own local paths (`models`, `model`, `reference`, `runtime_dir`, `out_dir`) and
@@ -699,7 +711,8 @@ Coordinator details (from building it, rev 6):
   higher than the current one; re-registering the current one with the same bytes answers
   `"unchanged": true`. Once registered, its files can't be replaced.
 - **Leasing.** A lease uses the current (highest) version, and only if it hasn't expired, names the
-  run's (or campaign's) build and runtime (a campaign's runtime is null), has a template for the
+  run's (or campaign's) build and runtime (a campaign's runtime is null; rev 11: or, for agents from 0.2.10, one
+  of the run's alternates, whose runtime is its build's `requires_runtime`, section 9), has a template for the
   job kind, signs the checkpoint files exactly as registered (self-play: the current gen; eval:
   every network of the batch, which must be exactly the gens the signed seats name, and the
   batch's pairing must equal the template's `paired`). Otherwise that job gets no lease (the admin
@@ -851,7 +864,154 @@ runtime>]` when the profile has it, else `providers`. A machine is **GPU-eligibl
 routed first, then self-play (within a tier); fuzz stays the backfill. Every lease carries the job's
 allowlist as `providers` (null on diag leases).
 
+## 9. Runtime packs per GPU vendor, compressed build files, the measured provider choice (rev 11)
+
+A run names one **default** runtime pack, which every PC can load (the CPU pack, or the Windows ML pack), and
+may name **alternates**: a worker build and the runtime pack it requires, offered only to PCs that meet a
+condition (an NVIDIA GPU usable for this job, for the CUDA pack). A PC that doesn't meet the condition never
+gets, and never downloads, the alternate's pack. Agents from **0.2.10** (`ALT_RUNTIME_AGENT`) take alternates;
+older agents only ever see the default runtime, exactly as before.
+
+### 9.1 One signed worker manifest per runtime pack
+
+A worker build names exactly one pack (`requires_runtime`, unchanged). To run the same engine with another pack,
+the same `mtgz-worker.exe` bytes are signed again with the other `requires_runtime`: a second worker build (a
+different build_id, about 1 KB more in R2; a PC that takes both caches the executable twice, ~25 MB). Chosen over
+a list of packs in one manifest because a build id then still pins exactly what runs (the executable and the
+DLLs it loads), `requires_runtime` keeps its meaning for every agent and tool that reads it, the probe cache stays
+keyed by (pack, adapters), and agents 0.2.5-0.2.9 can keep verifying the default build (a new manifest field
+would be an unknown field there; they never see the alternate builds).
+
+### 9.2 Runtime manifests: a hard hardware requirement (`gpu`)
+
+```json
+{"manifest": 1, "kind": "runtime", "version": "cuda-12.8-cudnn-9.28-ort-1.24.4", "min_agent": "0.2.10",
+ "gpu": {"vendor": "nvidia", "min_driver": "527.41", "providers": ["cuda"]}, "files": [...]}
+```
+
+`gpu` (optional): the pack is useful only on a PC with an adapter of `vendor` (a profile `gpus[].vendor` name:
+`nvidia`, `amd`, `intel`) whose driver version (the profile's `gpus[].driver`: NVML's for NVIDIA, e.g. `560.94`;
+DXGI's user-mode driver version for other vendors) is at least `min_driver` (dot-separated numbers compared
+numerically, missing parts 0; absent: any), and it adds `providers` (known provider names, at least one GPU
+provider). The coordinator never leases such a pack to an agent older than 0.2.10 or to a PC without such an
+adapter (default or alternate alike), and the agent refuses it (9.5). For the CUDA pack: NVIDIA, 527.41 (cuDNN
+9.28's Windows minimum for CUDA 12.x, above CUDA 12's own minor-version minimum of 525; Blackwell cards need
+570.65+, which every driver that supports them is), `["cuda"]`. A pack without `gpu` (CPU, Windows ML) loads
+anywhere.
+
+### 9.3 Compressed build files (`files[].zst`)
+
+```json
+{"path": "cublasLt64_12.dll", "sha256": "<the file's>", "size": 531812352,
+ "zst": {"sha256": "<the compressed object's>", "size": 172000000}}
+```
+
+`zst` (optional): the file is also stored zstd-compressed (one frame, window at most 2^27 bytes) at
+`builds/<build_id>/<path>.zst`. An agent from 0.2.10 downloads that object instead, checks its `zst.size` and
+`zst.sha256` before decompressing it, decompresses it next to the build's staging directory and checks the file's
+own `size` and `sha256` (whose meaning is unchanged: the bytes on the PC). `farm-release publish` uploads the
+plain file too (agents before 0.2.10, which never get such a build, and tools read it); the coordinator checks
+both objects at registration (`POST /v1/admin/build`). A manifest with any `zst` entry has `min_agent` 0.2.10 or
+newer (`farm-release sign --zst` refuses less). Files of at most 64 KiB, or that compress by less than 5 %, get no
+`zst`. Files over 64 MiB are uploaded in parts (section 4's multipart upload). Disk: the agent makes room for the
+plain sizes plus the largest compressed object (one at a time is unpacked and then deleted).
+
+### 9.4 Run alternates and how the coordinator picks one
+
+`PUT /v1/admin/run/{run}` takes `"alternates": [{"build_id": "<worker build>", "runtime": "<runtime build>",
+"when": {"vendor": "nvidia", "min_driver": "560.0"?}}, ...] | null` (at most 4, in order of preference;
+migration 0009 `runs.alternates`). Checks (400): `build_id` a registered worker build whose manifest's
+`requires_runtime` is `runtime`; `runtime` a registered runtime build; `when.vendor` a vendor name, and equal to
+the pack's `gpu.vendor` when the pack has one (it defaults to it); `when.min_driver` optional (the stricter of it
+and the pack's applies); no alternate equal to the default (`build_id`, `runtime`) or to another alternate. `GET
+/v1/admin/run/{run}` and the stats show them, with `problems` per alternate when the current definition doesn't
+authorize it.
+
+For a run's self-play or eval job and an agent of at least `ALT_RUNTIME_AGENT`, the coordinator puts the **first
+alternate the machine qualifies for** in the lease (its `build` and `runtime`) instead of the run's default. A
+machine qualifies when all hold:
+1. `caps.gpu_allowed` (agents 0.2.10+: the policy and "Use the GPU" allow GPU work now, whether or not a GPU
+   provider has passed a probe yet; else `caps.gpu`);
+2. its profile lists an adapter of `when.vendor` with a driver at least the minimum (9.2);
+3. the job's `providers` allowlist (section 8) allows one of the pack's `gpu.providers` (a pack without `gpu`: any
+   GPU provider);
+4. its profile's `runtime_providers` has no entry for the pack (never probed here: the first lease probes it), or
+   one listing a provider of 3 (an entry without one means the pack failed here: never offered again for these
+   adapters and drivers);
+5. the alternate's uncached build and pack fit `caps.disk_mb` (their plain sizes);
+6. neither build is blocked for this machine (`/v1/crash` `blocked`), both are registered, and their `min_agent` is
+   at most the agent's;
+7. the run's current definition authorizes it (section 7, rev 11: the build is in `builds` and the runtime is the
+   definition's or the build's `requires_runtime`).
+Otherwise the lease carries the default. Fuzz (campaigns) and diag leases never carry an alternate. For GPU
+routing (section 8) a machine counts as GPU-eligible for an alternate it qualifies for while condition 4 is "no
+entry" (it probes the pack before its first job line, 9.6). A lease with an alternate, or for a machine that is
+GPU-eligible for the job, of a job whose `games_per_lease` is `auto`, is at least `GPU_LEASE_MIN` games
+(self-play 64, eval 128): a GPU only pays with hundreds of rows per batch, and a batch never has more rows than
+games in flight.
+
+### 9.5 The agent's guard (defense in depth)
+
+An agent from 0.2.10, for a lease whose runtime differs from its definition's `runtime` (an alternate), or whose
+pack's manifest has `gpu`: fetches and verifies the build's and the pack's signed manifests alone (no other file),
+and refuses the lease before anything else is downloaded unless all hold: the build's `requires_runtime` is the
+lease's runtime (for an alternate); the job is self-play or eval; the policy allows GPU work now; this PC has an
+adapter that meets the pack's `gpu` (vendor and driver); the pack is not marked bad here (a probe of it for these
+adapters and drivers in which none of its GPU providers passed, or for a pack without `gpu` no GPU provider); and
+the build's and pack's files fit under the disk cap. A refusal is `done` with `refused: "runtime"` (the lease is
+closed as given back), a crash report of kind `definition` at most once a day per pack and reason, and the
+start-failure wait (1 min doubling to 1 h). Agents before 0.2.10 refuse such a lease anyway (their exact runtime
+rule, section 7), before downloading anything.
+
+### 9.6 Probe first, then choose CPU or GPU by measured speed
+
+Before the first job line of a self-play or eval lease with a runtime pack, while the policy allows GPU work and
+the PC has a GPU, the agent makes sure it has a **bench** of the job's network on this pack: `<worker>
+probe-providers --runtime-dir <pack> --model <the lease's model> --reference <its reference set> --bench-rows
+1,8,32,128,512,1024 --reps 3 --threads <the job's threads> --json <file>` (plus `--ensure-ready` and every provider
+when the pack has no probe for these adapters yet; otherwise `--providers` = the GPU providers that passed and
+`cpu`), at most 15 minutes, beating meanwhile. It is kept per (runtime build, adapters with drivers, run) in
+`state\bench.json` for 7 days. A pack that had no probe gets this run's result as its probe (`state\probes.json`;
+the profile's `runtime_providers` then tells the coordinator, rev 11 also `[]` when nothing passed or the probe
+failed), so a newly downloaded pack is never judged unprobed (`["cpu"]`) on its first lease.
+
+The choice, the same for every vendor and provider: the job's batch size is `b = ceil(min(conc, games) /
+groups)` rows (one leaf per game in flight per batch; `conc` and `groups` from the template's settings, `groups`
+default 1). For each (provider, adapter) of the bench whose self-test passed, the rows per second at `b` are
+interpolated log-linearly between the benched sizes (clamped at the ends); a GPU candidate is rated at its own `b`
+with `conc` raised to `min(games, max(conc, 512))`. The fastest wins, and a GPU provider only if it is at least
+1.1 times the CPU. The job line then has `providers` = `[winner, "cpu"]`, `gpu` = the winner's adapter and, for a
+GPU winner, that raised `conc`; else `["cpu"]`, `gpu` null and the template's `conc`. No GPU provider slower than
+the CPU at the job's batch size ever runs. Stats (beats and `done`) carry `batch_rows` (`b` as chosen) and
+`rows_per_s` (`{"<provider>": rows/s at b}` for the CPU and each GPU candidate), which the coordinator keeps with
+the lease's stats.
+
+A pack with `gpu` in which none of its providers passed is marked bad for these adapters and drivers (its probe
+record), the lease runs on the CPU (its pack's CPU provider), and the pack is evicted from the cache when the lease
+ends; it is not downloaded again until the driver or the adapters change (9.4 condition 4, 9.5).
+
+### 9.7 Packs
+
+| GPU vendor | Pack | How it's chosen |
+|---|---|---|
+| any (default) | the CPU pack (ONNX Runtime 1.31.1 CPU), or the Windows ML pack (DirectML, Windows ML's catalog) | the run's `runtime` |
+| NVIDIA | the **CUDA pack** (`farm_build.py --runtime --pack cuda`): ONNX Runtime 1.24.4 (the last CUDA 12 build; 1.27+ need CUDA 13, driver 580+) with the CUDA provider, the CUDA 12.8 runtime, cuBLAS and cuBLASLt, cuFFT (a load-time import of ONNX Runtime's CUDA provider), cuDNN 9.28 (`cudnn64_9`, `cudnn_graph64_9`, `cudnn_ops64_9`: the only cuDNN libraries our graphs load), the MSVC runtime; `gpu` NVIDIA 527.41 `["cuda"]` | a run alternate, `when.vendor` `nvidia` |
+
 ## Changes
+- v1 rev 11 (2026-11-13; coordinator migration 0009, agent 0.2.10, canary first): **runtime packs per GPU vendor
+  and the measured CPU-or-GPU choice** (section 9). Runs take `alternates` (a worker build + the pack it requires,
+  with a vendor condition), leased only to agents from 0.2.10 on machines that qualify (9.4: an adapter of the
+  vendor with a new enough driver, GPU work allowed now - `caps.gpu_allowed` -, a provider of the pack the job
+  allows, the pack not failed here, disk room, not blocked, authorized by the definition); agents 0.2.5-0.2.9 only
+  ever get the default runtime. Definitions keep their bytes (`definition/1`; agents before 0.2.10 refuse unknown
+  fields, so a new field would have cut them off every run that names an alternate): from 0.2.10 a lease's runtime
+  may also be its build's `requires_runtime` (section 7). One signed worker manifest per pack (9.1). Runtime
+  manifests may carry a hard requirement `gpu` (9.2), files a zstd copy `zst` (9.3; the CUDA pack: 1.4 GB on disk,
+  about 0.6 GB to download). The agent's guard refuses a misrouted alternate before downloading it (`refused:
+  "runtime"`, 9.5), probes a new pack before its first job line, benches the job's own network per (pack, adapters,
+  run) and runs a GPU provider only when it is at least 1.1x the CPU at the job's batch size, with `conc` raised for
+  GPU jobs (9.6; Stats `batch_rows`, `rows_per_s`); a pack that fails is marked bad for that driver and evicted.
+  `runtime_providers` may list `[]`. GPU leases of `auto` runs are at least 64 (self-play) / 128 (eval) games.
 - v1 rev 10 (2026-11-12, coordinator): **`GET /v1/agent/latest` follows the machine's channel and ignores `?channel=`.**
   An agent asks for the channel it was enrolled on and never learns of a move, so a machine moved from stable to canary
   kept being offered stable's latest while its lease answers demanded canary's `min_agent`: it could neither update nor
