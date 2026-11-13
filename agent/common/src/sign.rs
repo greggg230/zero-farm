@@ -163,7 +163,7 @@ pub fn list_files(dir: &Path) -> Result<Vec<FileEntry>, String> {
             }
             check_rel_path(&rel).map_err(|e| e.to_string())?;
             let (sha256, size) = sha256_file(&p).map_err(|e| format!("{rel}: {e}"))?;
-            out.push(FileEntry { path: rel, sha256, size });
+            out.push(FileEntry { path: rel, sha256, size, zst: None });
         }
     }
     out.sort_by(|a, b| a.path.cmp(&b.path));
@@ -172,8 +172,24 @@ pub fn list_files(dir: &Path) -> Result<Vec<FileEntry>, String> {
 
 /// Fills `template.files` from `dir`, writes `manifest.json` (pretty JSON, stored bytes are what
 /// is signed) and `manifest.json.minisig`. Returns the build id and the manifest.
-pub fn sign_dir(dir: &Path, mut template: Manifest, key: &SigningKey) -> Result<(String, Manifest), String> {
+pub fn sign_dir(dir: &Path, template: Manifest, key: &SigningKey) -> Result<(String, Manifest), String> {
+    sign_dir_zst(dir, template, key, &std::collections::BTreeMap::new())
+}
+
+/// [`sign_dir`], with compressed copies (PROTOCOL 9.3) for the files `zst` names (by manifest path).
+pub fn sign_dir_zst(
+    dir: &Path,
+    mut template: Manifest,
+    key: &SigningKey,
+    zst: &std::collections::BTreeMap<String, crate::manifest::Packed>,
+) -> Result<(String, Manifest), String> {
     template.files = list_files(dir)?;
+    for f in &mut template.files {
+        f.zst = zst.get(&f.path).cloned();
+    }
+    if let Some(p) = zst.keys().find(|p| !template.files.iter().any(|f| &f.path == *p)) {
+        return Err(format!("a compressed copy of {p}, which is not in the build"));
+    }
     template.validate().map_err(|e| e.to_string())?;
     let mut bytes = serde_json::to_vec_pretty(&template).map_err(|e| e.to_string())?;
     bytes.push(b'\n');
@@ -200,6 +216,7 @@ pub fn template(kind: Kind, version: &str) -> Manifest {
         min_agent: None,
         requires_runtime: None,
         entry: None,
+        gpu: None,
         files: vec![],
     }
 }

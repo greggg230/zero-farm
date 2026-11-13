@@ -13,4 +13,4 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 minisign-verify.workspace = true
-zerofarm-common = { path = "../common", features = ["sign"] }
+zerofarm-common = { path = "../common", features = ["sign", "zst-pack"] }

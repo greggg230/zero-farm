@@ -99,6 +99,14 @@ pub struct Caps {
     pub ram_mb: u64,
     pub gpu: bool,
     pub disk_mb: u64,
+    /// rev 11 (PROTOCOL 3, 9.4): GPU work is allowed right now (the policy and "Use the GPU"), whether or not a GPU
+    /// provider passed a probe yet (`gpu` keeps its meaning: allowed and one passed).
+    #[serde(default)]
+    pub gpu_allowed: bool,
+    /// rev 11 (PROTOCOL 9.4): per run, the fewest games per lease at which this PC's GPU pays (from its bench of that
+    /// run's network); the coordinator sizes `auto` GPU leases by it.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub gpu_games: std::collections::BTreeMap<String, u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]

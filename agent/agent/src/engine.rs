@@ -85,7 +85,9 @@ pub struct Engine {
     pub worker_log: Arc<RotatingFile>,
     pub profile_fn: Box<dyn Fn() -> Profile + Send>,
     pub profile: Profile,
-    profile_refreshed: Instant,
+    pub(crate) profile_refreshed: Instant,
+    /// rev 11 (PROTOCOL 9.6): cache entries to remove when the current lease ends (a GPU pack that failed here).
+    pub(crate) evict_after: Vec<String>,
     pub(crate) last_update_check: Option<Instant>,
     pub pending_update: Option<String>,
     /// The launcher replacement check ran this run (launcher_update.rs).
@@ -149,6 +151,7 @@ impl Engine {
             profile_fn,
             profile,
             profile_refreshed: Instant::now(),
+            evict_after: Vec::new(),
             last_update_check: None,
             pending_update: None,
             launcher_checked: false,
@@ -319,7 +322,32 @@ impl Engine {
             // rev 7 (PROTOCOL 8): only when a GPU provider passed this PC's probe
             gpu: d.gpu && !self.profile.gpus.is_empty() && crate::probe::has_gpu_provider(&self.profile.providers),
             disk_mb: self.disk_budget_mb(&s),
+            // rev 11 (PROTOCOL 9.4): the coordinator may then offer a GPU vendor's runtime pack not probed here yet
+            gpu_allowed: d.gpu && !self.profile.gpus.is_empty(),
+            gpu_games: self.gpu_games(),
         }
+    }
+
+    /// rev 11 (PROTOCOL 9.4): `caps.gpu_games` - per run, from the fresh benches of these adapters, the fewest games per
+    /// lease at which a GPU pays here (at most 32 runs).
+    fn gpu_games(&self) -> std::collections::BTreeMap<String, u64> {
+        let akey = crate::probe::adapters_key(&self.profile.gpus);
+        let now = zerofarm_common::now_unix();
+        let mut m = std::collections::BTreeMap::new();
+        for b in crate::probe::load_benches(&self.cfg.layout) {
+            if b.adapters != akey || b.error.is_some() || now - b.t >= crate::probe::BENCH_MAX_AGE_S || !zerofarm_common::is_slug(&b.run) {
+                continue;
+            }
+            // (0: benched, and no GPU provider pays at any size here)
+            let g = b.gpu_games.unwrap_or(0);
+            let e = m.entry(b.run.clone()).or_insert(g);
+            *e = if *e == 0 || g == 0 { (*e).max(g) } else { (*e).min(g) };
+        }
+        while m.len() > 32 {
+            let k = m.keys().next_back().cloned().unwrap();
+            m.remove(&k);
+        }
+        m
     }
 
     /// Between leases, when the GPU may be used: probe one cached runtime pack this PC has no fresh

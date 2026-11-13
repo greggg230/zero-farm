@@ -562,7 +562,8 @@ const IDC_NAME: usize = 102;
 const IDC_LICENSES: usize = 103;
 
 /// The README's list of the third-party components Zero Farm ships (ONNX Runtime, the Windows ML
-/// runtime and DirectML, the MSVC runtime) with their license terms.
+/// runtime and DirectML, the MSVC runtime, and for NVIDIA PCs the CUDA runtime, cuBLAS, cuFFT and cuDNN)
+/// with their license terms.
 pub const THIRD_PARTY_URL: &str = "https://github.com/greggg230/zero-farm#third-party-components";
 /// The invite dialog's one line about them (a SysLink: the link part opens [`THIRD_PARTY_URL`]).
 pub const THIRD_PARTY_LINE: &str =

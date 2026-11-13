@@ -56,6 +56,72 @@ pub struct FileEntry {
     pub path: String,
     pub sha256: String,
     pub size: u64,
+    /// rev 11 (PROTOCOL 9.3): a zstd-compressed copy at `builds/<build_id>/<path>.zst`, downloaded instead of
+    /// the file by agents from 0.2.10; `sha256`/`size` above stay the file's own (the bytes on the PC).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub zst: Option<Packed>,
+}
+
+/// A compressed copy of a build file (PROTOCOL 9.3): the compressed object's size and sha256.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct Packed {
+    pub sha256: String,
+    pub size: u64,
+}
+
+/// rev 11 (PROTOCOL 9.2): a runtime pack's hard hardware requirement: an adapter of `vendor` with a driver of at
+/// least `min_driver` (dotted numbers); `providers`: the execution providers the pack adds.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+pub struct GpuNeed {
+    pub vendor: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub min_driver: Option<String>,
+    #[serde(default)]
+    pub providers: Vec<String>,
+}
+
+impl GpuNeed {
+    /// Whether an adapter of this vendor with this driver meets the requirement.
+    pub fn met_by(&self, vendor: &str, driver: &str) -> bool {
+        vendor == self.vendor && self.min_driver.as_deref().is_none_or(|m| driver_at_least(driver, m))
+    }
+}
+
+/// The largest zstd window a compressed build file may use (PROTOCOL 9.3): 2^27 bytes.
+pub const ZST_WINDOW_LOG_MAX: u32 = 27;
+/// The first agent that reads `zst` and `gpu` (PROTOCOL 9).
+pub const ZST_MIN_AGENT: &str = "0.2.10";
+
+/// Provider names a manifest may list (PROTOCOL 3).
+pub const PROVIDERS: [&str; 7] = ["cpu", "tensorrt_rtx", "cuda", "migraphx", "amdgpu", "openvino", "dml"];
+
+/// `have` >= `min` for dotted driver versions ("560.94" >= "527.41"; "32.0.15.6094"): numeric parts compared in
+/// order, missing parts 0. An empty version, or a part that isn't a number, is unknown: false.
+pub fn driver_at_least(have: &str, min: &str) -> bool {
+    let parse = |s: &str| -> Option<Vec<u64>> {
+        if s.trim().is_empty() {
+            return None;
+        }
+        s.trim().split('.').map(|p| p.parse::<u64>().ok()).collect()
+    };
+    let (Some(h), Some(m)) = (parse(have), parse(min)) else { return false };
+    for i in 0..h.len().max(m.len()) {
+        let (a, b) = (h.get(i).copied().unwrap_or(0), m.get(i).copied().unwrap_or(0));
+        if a != b {
+            return a > b;
+        }
+    }
+    true
+}
+
+/// `v` >= `min` for semver strings ("0.2.10" >= "0.2.9"); pre-release and build suffixes ignored.
+pub fn semver_at_least(v: &str, min: &str) -> bool {
+    let core = |s: &str| -> Option<[u64; 3]> {
+        let c = s.split(['-', '+']).next()?;
+        let p: Vec<u64> = c.split('.').map(|x| x.parse().ok()).collect::<Option<_>>()?;
+        (p.len() == 3).then(|| [p[0], p[1], p[2]])
+    };
+    matches!((core(v), core(min)), (Some(a), Some(b)) if a >= b)
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
@@ -82,6 +148,9 @@ pub struct Manifest {
     pub requires_runtime: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<String>,
+    /// rev 11 (PROTOCOL 9.2), runtime packs only: the hardware the pack needs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gpu: Option<GpuNeed>,
     pub files: Vec<FileEntry>,
 }
 
@@ -201,6 +270,33 @@ impl Manifest {
             }
             if !seen.insert(f.path.replace('\\', "/").to_ascii_lowercase()) {
                 return inv(&format!("duplicate file {}", f.path));
+            }
+            if let Some(z) = &f.zst {
+                if !crate::is_sha256_hex(&z.sha256) || z.size == 0 {
+                    return inv(&format!("{}: zst needs a sha256 and a size", f.path));
+                }
+                check_rel_path(&format!("{}.zst", f.path))?;
+            }
+        }
+        let new_enough = self.min_agent.as_deref().is_some_and(|m| semver_at_least(m, ZST_MIN_AGENT));
+        if self.files.iter().any(|f| f.zst.is_some()) && !new_enough {
+            return inv(&format!("a manifest with compressed files needs min_agent {ZST_MIN_AGENT} or newer"));
+        }
+        if let Some(g) = &self.gpu {
+            if self.kind != Kind::Runtime {
+                return inv("only runtime manifests have gpu");
+            }
+            if g.vendor.is_empty() || g.vendor.len() > 32 || !g.vendor.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit()) {
+                return inv(&format!("gpu.vendor {:?} must be a lowercase vendor name", g.vendor));
+            }
+            if g.min_driver.as_deref().is_some_and(|d| !driver_at_least(d, "0")) {
+                return inv("gpu.min_driver must be dotted numbers");
+            }
+            if g.providers.iter().any(|p| !PROVIDERS.contains(&p.as_str())) || !g.providers.iter().any(|p| p != "cpu") {
+                return inv("gpu.providers must name known providers, at least one GPU provider");
+            }
+            if !new_enough {
+                return inv(&format!("a runtime manifest with gpu needs min_agent {ZST_MIN_AGENT} or newer"));
             }
         }
         match self.kind {
@@ -384,7 +480,7 @@ mod tests {
 
     #[test]
     fn validate_rules() {
-        let f = FileEntry { path: "w.exe".into(), sha256: "0".repeat(64), size: 1 };
+        let f = FileEntry { path: "w.exe".into(), sha256: "0".repeat(64), size: 1, zst: None };
         let mut m = Manifest {
             manifest: 1,
             kind: Kind::Worker,
@@ -399,6 +495,7 @@ mod tests {
             min_agent: None,
             requires_runtime: None,
             entry: Some("w.exe".into()),
+            gpu: None,
             files: vec![f.clone()],
         };
         assert!(m.validate().is_ok());
@@ -413,6 +510,75 @@ mod tests {
         m.files.pop();
         m.manifest = 2;
         assert!(m.validate().is_err());
+    }
+
+    #[test]
+    fn driver_and_semver_comparisons() {
+        assert!(driver_at_least("560.94", "527.41"));
+        assert!(driver_at_least("527.41", "527.41"));
+        assert!(!driver_at_least("527.40", "527.41"));
+        assert!(!driver_at_least("516.94", "527.41"));
+        assert!(driver_at_least("610.88", "570.65"));
+        assert!(driver_at_least("32.0.15.6094", "31"));
+        assert!(driver_at_least("528", "527.41"), "missing parts are 0");
+        assert!(!driver_at_least("", "1"), "unknown driver");
+        assert!(!driver_at_least("abc", "1"));
+        assert!(semver_at_least("0.2.10", "0.2.9"));
+        assert!(semver_at_least("0.2.10", "0.2.10"));
+        assert!(!semver_at_least("0.2.9", "0.2.10"));
+        assert!(!semver_at_least("x", "0.2.10"));
+        let g = GpuNeed { vendor: "nvidia".into(), min_driver: Some("527.41".into()), providers: vec!["cuda".into()] };
+        assert!(g.met_by("nvidia", "560.94"));
+        assert!(!g.met_by("nvidia", "516.94"));
+        assert!(!g.met_by("amd", "999.0"));
+        assert!(!g.met_by("nvidia", ""), "no driver version: not met");
+    }
+
+    #[test]
+    fn zst_and_gpu_need_agent_0_2_10() {
+        let f = FileEntry { path: "a.dll".into(), sha256: "0".repeat(64), size: 9, zst: Some(Packed { sha256: "1".repeat(64), size: 4 }) };
+        let mut m = Manifest {
+            manifest: 1,
+            kind: Kind::Runtime,
+            version: "cuda".into(),
+            created: 0,
+            game: None,
+            engine_commit: None,
+            core_commit: None,
+            profile: None,
+            aw: None,
+            zero_onnx: None,
+            min_agent: Some("0.2.9".into()),
+            requires_runtime: None,
+            entry: None,
+            gpu: None,
+            files: vec![f],
+        };
+        assert!(m.validate().unwrap_err().to_string().contains("min_agent"), "zst before 0.2.10");
+        m.min_agent = Some("0.2.10".into());
+        assert!(m.validate().is_ok());
+        m.gpu = Some(GpuNeed { vendor: "nvidia".into(), min_driver: Some("527.41".into()), providers: vec!["cuda".into()] });
+        assert!(m.validate().is_ok());
+        let back: Manifest = serde_json::from_slice(&serde_json::to_vec(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+        m.gpu.as_mut().unwrap().providers = vec!["cpu".into()];
+        assert!(m.validate().is_err(), "no GPU provider");
+        m.gpu.as_mut().unwrap().providers = vec!["cuda".into()];
+        m.gpu.as_mut().unwrap().vendor = "NVIDIA".into();
+        assert!(m.validate().is_err(), "vendor names are lowercase");
+        m.gpu.as_mut().unwrap().vendor = "nvidia".into();
+        m.gpu.as_mut().unwrap().min_driver = Some("5x".into());
+        assert!(m.validate().is_err());
+        m.gpu.as_mut().unwrap().min_driver = None;
+        m.kind = Kind::Worker;
+        m.aw = Some(1);
+        m.entry = Some("a.dll".into());
+        assert!(m.validate().is_err(), "gpu is for runtime manifests");
+        // Older agents' manifests (no new fields) read as before, and the new fields are left out when absent.
+        let old = r#"{"manifest":1,"kind":"runtime","version":"v","created":1,"files":[{"path":"a.dll","sha256":"0000000000000000000000000000000000000000000000000000000000000000","size":1}]}"#;
+        let m2 = Manifest::parse(old.as_bytes()).unwrap();
+        assert!(m2.gpu.is_none() && m2.files[0].zst.is_none());
+        assert!(!String::from_utf8(serde_json::to_vec(&m2).unwrap()).unwrap().contains("zst"));
     }
 
     #[test]

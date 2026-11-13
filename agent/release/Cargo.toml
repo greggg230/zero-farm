@@ -16,7 +16,7 @@ name = "farm-release"
 path = "src/main.rs"
 
 [dependencies]
-zerofarm-common = { path = "../common", features = ["http", "dpapi", "sign"] }
+zerofarm-common = { path = "../common", features = ["http", "dpapi", "sign", "zst-pack"] }
 serde.workspace = true
 serde_json.workspace = true
 base64.workspace = true
@@ -27,4 +27,4 @@ mockcoord = { path = "../mockcoord" }
 tempfile.workspace = true
 minisign-verify.workspace = true
 minisign.workspace = true
-zerofarm-common = { path = "../common", features = ["http", "dpapi", "sign"] }
+zerofarm-common = { path = "../common", features = ["http", "dpapi", "sign", "zst-pack"] }

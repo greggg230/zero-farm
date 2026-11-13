@@ -230,6 +230,22 @@ impl MockCoord {
                 self.with(|s| s.artifacts.insert(format!("builds/{id}/{rel}"), std::fs::read(e.path()).unwrap()));
             }
         }
+        // rev 11 (PROTOCOL 9.3): the compressed copies `farm-release sign --zst` puts next to the directory
+        let mut z = dir.as_os_str().to_owned();
+        z.push(".zst");
+        let zdir = std::path::PathBuf::from(z);
+        let mut stack = if zdir.is_dir() { vec![zdir.clone()] } else { vec![] };
+        while let Some(d) = stack.pop() {
+            for e in std::fs::read_dir(&d).unwrap() {
+                let e = e.unwrap();
+                if e.file_type().unwrap().is_dir() {
+                    stack.push(e.path());
+                    continue;
+                }
+                let rel = e.path().strip_prefix(&zdir).unwrap().to_string_lossy().replace('\\', "/");
+                self.with(|s| s.artifacts.insert(format!("builds/{id}/{rel}"), std::fs::read(e.path()).unwrap()));
+            }
+        }
         id
     }
 

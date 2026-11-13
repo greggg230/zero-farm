@@ -105,7 +105,13 @@ pub fn download_build(
         })
         .map(|f| f.size)
         .sum();
-    before_files(missing)?;
+    // rev 11 (PROTOCOL 9.3): a file with a zstd copy is fetched compressed (staged next to `tmp`, so `tmp` holds
+    // only listed files) and unpacked; room for the largest compressed copy too, one is unpacked at a time.
+    let zmax = m.files.iter().filter_map(|f| f.zst.as_ref().map(|z| z.size)).max().unwrap_or(0);
+    before_files(if missing > 0 { missing + zmax } else { 0 })?;
+    let mut ztmp = tmp.as_os_str().to_owned();
+    ztmp.push(".zst");
+    let ztmp = PathBuf::from(ztmp);
     for f in &m.files {
         if stop() {
             return Err(CacheError::Stopped);
@@ -119,8 +125,24 @@ pub fn download_build(
             let _ = std::fs::remove_file(&p);
         }
         let key = format!("{prefix}{}", f.path.replace('\\', "/"));
+        if let Some(z) = &f.zst {
+            let zp = ztmp.join(format!("{}.zst", rel.to_string_lossy()));
+            for parent in [zp.parent(), p.parent()].into_iter().flatten() {
+                std::fs::create_dir_all(parent).map_err(|e| CacheError::Bad(e.to_string()))?;
+            }
+            client.download(&format!("{key}.zst"), &zp, &Want { size: Some(z.size), sha256: Some(z.sha256.clone()), max: z.size }, stop)?;
+            let r = zerofarm_common::zst::unpack(&zp, &p, f.size, &f.sha256, stop);
+            let _ = std::fs::remove_file(&zp);
+            match r {
+                Ok(()) => {}
+                Err(_) if stop() => return Err(CacheError::Stopped),
+                Err(e) => return Err(CacheError::Bad(format!("unpacking {}: {e}", f.path))),
+            }
+            continue;
+        }
         client.download(&key, &p, &Want { size: Some(f.size), sha256: Some(f.sha256.clone()), max: f.size }, stop)?;
     }
+    let _ = remove_dir_all_retry(&ztmp, std::time::Duration::from_secs(5));
     let v = verify_dir(tmp, keys, expect).map_err(CacheError::Verify)?;
     if dest.exists() {
         remove_dir_all_retry(dest, std::time::Duration::from_secs(10)).map_err(|e| CacheError::Bad(e.to_string()))?;
@@ -280,6 +302,15 @@ impl Cache {
         let v = download_build(client, &self.keys, &r.manifest, &expect, &dir, &tmp, &mut room, stop)?;
         self.touch(&key);
         Ok(v)
+    }
+
+    /// Removes a cache entry now (rev 11: a GPU runtime pack that failed on this PC, PROTOCOL 9.6).
+    pub fn evict(&self, key: &str) {
+        let _ = remove_dir_all_retry(&self.entry_dir(key), std::time::Duration::from_secs(5));
+        let mut m = self.lru();
+        if m.remove(key).is_some() {
+            let _ = atomic_write(&self.lru_path(), &serde_json::to_vec(&m).expect("json"));
+        }
     }
 
     /// Re-verifies a cached build right before a worker starts (PROTOCOL 2).

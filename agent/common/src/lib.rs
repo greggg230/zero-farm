@@ -22,6 +22,8 @@ pub mod dpapi;
 pub mod http;
 #[cfg(feature = "sign")]
 pub mod sign;
+#[cfg(feature = "zst")]
+pub mod zst;
 
 /// Agent↔worker protocol version this code speaks (PROTOCOL 5).
 pub const AW_VERSION: u32 = 1;

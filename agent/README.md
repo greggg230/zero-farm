@@ -204,6 +204,7 @@ Worker builds and runtime packs:
 ```
 farm-release sign <dir> --kind worker --game mtg --engine-commit <sha> --core-commit <sha> [--profile fuzz] [--min-agent 0.2.0]
 farm-release sign <dir> --kind runtime --version ort-1.23-cpu
+farm-release sign <dir> --kind runtime --version cuda-... --min-agent 0.2.10 --gpu-vendor nvidia --gpu-min-driver 527.41 --gpu-providers cuda --zst
 farm-release verify <dir>
 farm-release publish <dir> --url ... --token ...
 ```
@@ -357,6 +358,11 @@ Agent exit codes: 0 quit, 75 switch to `state\pending`, 76 hand over to the new 
 - Worker sandbox (DESIGN 4: no network, only its work directory): see the design note below. Today
   the worker runs in a job object (kill on close, memory cap, no crash dialogs, no UI: clipboard,
   atoms, desktops, settings, logoff) at idle priority with EcoQoS, as the friend's user.
+- Rev 11 (PROTOCOL 9, agent 0.2.10): run alternates and the agent's guard (`lease.rs` `runtime_guard`: a GPU
+  vendor's runtime pack is refused before anything but its manifest is downloaded unless the PC qualifies),
+  zstd copies of build files (`cache.rs`, `zerofarm_common::zst`), probe-first and the bench of the job's own
+  network (`state\bench.json`) and the measured CPU-or-GPU choice (`probe.rs` `choose`), `caps.gpu_allowed`,
+  `caps.gpu_games`, a failed GPU pack marked bad per driver and evicted.
 - GPU work (phase 4, PROTOCOL 8) is built but not released: provider probes between leases
   (`probe.rs`: a cached worker build's `probe-providers` per runtime pack, results in
   `state\probes.json`, the readable report in the worker log), the profile's `providers` /

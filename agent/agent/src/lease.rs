@@ -22,6 +22,8 @@ use std::time::{Duration, Instant};
 use zerofarm_common::http::CallError;
 use zerofarm_common::manifest::{check_rel_path, Kind, VerifiedBuild};
 use zerofarm_common::protocol::{BeatReq, BeatResp, CheckpointRef, CrashReq, DoneReq, Lease, Progress, Stats};
+use zerofarm_common::manifest::GpuNeed;
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LeaseEnd {
@@ -132,6 +134,11 @@ impl Engine {
         if end == LeaseEnd::Cancelled {
             self.results.discard(&id);
         }
+        // rev 11 (PROTOCOL 9.6): a GPU pack that failed here goes (it is not downloaded again for this driver)
+        for key in std::mem::take(&mut self.evict_after) {
+            log::info!("removing {key} from the cache (it failed on this PC)");
+            self.cache.evict(&key);
+        }
         self.uploader.set_active(None);
         let _ = zerofarm_common::fsutil::remove_dir_all_retry(&self.cfg.layout.work().join(&id), Duration::from_secs(5));
         log::info!("lease {id} ended: {end:?}");
@@ -159,18 +166,25 @@ impl Engine {
     /// engine waits before asking again (1 min doubling to 1 h), so a bad definition never makes
     /// a lease storm.
     fn refuse(&mut self, lease: &Lease, why: &str) -> LeaseEnd {
+        self.refuse_as(lease, why, "definition")
+    }
+
+    /// `refuse`, with the `refused` reason `done` sends: `definition` (PROTOCOL 7) or, rev 11, `runtime` (the agent's
+    /// guard refused a runtime pack this PC shouldn't download, PROTOCOL 9.5).
+    fn refuse_as(&mut self, lease: &Lease, why: &str, reason: &str) -> LeaseEnd {
         let id = &lease.lease_id;
-        log::error!("lease {id}: refused: {why}");
+        log::error!("lease {id}: refused ({reason}): {why}");
         let mut stats = Stats::new();
         stats.insert("error".into(), json!(format!("refused: {why}")));
-        let done = DoneReq { results: vec![], stats: redacted(stats), given_back: true, unfinished: None, refused: Some("definition".into()) };
+        let done = DoneReq { results: vec![], stats: redacted(stats), given_back: true, unfinished: None, refused: Some(reason.into()) };
         if let Err(e) = self.results.write_done(id, &done) {
             log::error!("lease {id}: could not write done: {e}");
         }
         self.uploader.wake();
-        let scope = match &lease.definition {
-            Some(d) => d.key.clone(),
-            None => format!("legacy {}", lease.run.as_deref().or(lease.campaign.as_deref()).unwrap_or(&lease.kind)),
+        let scope = match (&lease.definition, reason) {
+            (_, "runtime") => format!("runtime {}", lease.runtime.as_ref().map(|r| r.build_id.as_str()).unwrap_or("none")),
+            (Some(d), _) => d.key.clone(),
+            (None, _) => format!("legacy {}", lease.run.as_deref().or(lease.campaign.as_deref()).unwrap_or(&lease.kind)),
         };
         if crate::startfail::take_report(&self.cfg.layout, &format!("definition {scope}: {why}"), zerofarm_common::now_unix()) {
             self.report_crash(CrashReq {
@@ -213,11 +227,9 @@ impl Engine {
         keep
     }
 
-    fn prepare(&mut self, lease: &Lease, plan: &Plan) -> Result<Prepared, CacheError> {
-        let s = self.settings();
-        let cap = s.disk_cap_mb << 20;
-        let keep = Self::keep_list(lease);
-        // Beat while downloading so a big first download doesn't let the lease expire.
+    /// Beats `running` (0 games) from another thread until the returned pump is stopped: while a lease downloads its
+    /// files, or benches its network before the first job line (PROTOCOL 9.6), it must not expire.
+    fn beat_pump(&self, lease: &Lease) -> (Arc<AtomicBool>, std::thread::JoinHandle<()>) {
         let pump_stop = Arc::new(AtomicBool::new(false));
         let pump = {
             let (client, stop, id, beat_s) = (self.client.clone(), pump_stop.clone(), lease.lease_id.clone(), lease.beat_s.max(5));
@@ -234,6 +246,144 @@ impl Engine {
                 }
             })
         };
+        (pump_stop, pump)
+    }
+
+    /// The agent's guard (rev 11, PROTOCOL 9.5), before anything but manifests is downloaded: a lease whose runtime is
+    /// an alternate, or whose pack declares a GPU requirement, needs a self-play or eval job, GPU work allowed now, an
+    /// adapter that meets the pack's requirement, the pack not failed here, and room under the disk cap. Returns the
+    /// pack's requirement.
+    fn runtime_guard(&mut self, lease: &Lease, plan: &Plan) -> Result<Option<GpuNeed>, PlanError> {
+        use zerofarm_common::manifest::Kind;
+        let Some(rt) = &lease.runtime else { return Ok(None) };
+        let pack = self.signed_manifest(rt, Kind::Runtime)?;
+        let need = pack.gpu.clone();
+        if !plan.alternate && need.is_none() {
+            return Ok(None);
+        }
+        let no = |m: String| Err(PlanError::Refused(m));
+        if !matches!(lease.kind.as_str(), "selfplay" | "eval") {
+            return no(format!("a {} lease can't use runtime pack {} (only self-play and evaluation get a GPU pack)", lease.kind, rt.build_id));
+        }
+        if !self.decide(None).gpu {
+            return no(format!("runtime pack {} is for GPU work, which isn't allowed here right now", rt.build_id));
+        }
+        if let Some(n) = &need {
+            if !self.profile.gpus.iter().any(|g| n.met_by(&g.vendor, &g.driver)) {
+                let have: Vec<String> = self.profile.gpus.iter().map(|g| format!("{} {} (driver {})", g.vendor, g.name, g.driver)).collect();
+                return no(format!(
+                    "runtime pack {} needs a {} GPU with driver {} or newer; this PC has {}",
+                    rt.build_id,
+                    n.vendor,
+                    n.min_driver.as_deref().unwrap_or("any"),
+                    if have.is_empty() { "none".to_string() } else { have.join(", ") }
+                ));
+            }
+        }
+        let probes = crate::probe::load(&self.cfg.layout);
+        let akey = crate::probe::adapters_key(&self.profile.gpus);
+        if crate::probe::pack_bad(&probes, &rt.build_id, &akey, need.as_ref().map(|n| n.providers.as_slice()), zerofarm_common::now_unix()) {
+            return no(format!("runtime pack {} failed on this PC's GPU and driver before", rt.build_id));
+        }
+        let mut bytes = 0u64;
+        for (r, kind) in [(&lease.build, Kind::Worker), (rt, Kind::Runtime)] {
+            if !self.cfg.layout.cache_builds().join(&r.build_id).exists() {
+                bytes += if kind == Kind::Runtime { pack.total_size() } else { self.signed_manifest(r, kind)?.total_size() };
+            }
+        }
+        let budget = self.disk_budget_mb(&self.settings()) << 20;
+        if bytes > budget {
+            return no(format!("runtime pack {} and its worker need {} MB, more than the disk cap leaves ({} MB)", rt.build_id, bytes >> 20, budget >> 20));
+        }
+        Ok(need)
+    }
+
+    /// The job's shape for the batch size (PROTOCOL 9.6): (games, conc, groups) from the plan's per-lease `games` and
+    /// its template's settings (`groups` default 1).
+    fn job_shape(plan: &Plan) -> (u64, u64, u64) {
+        let games = plan.job.get("games").and_then(Value::as_u64).unwrap_or(1);
+        let st = plan.job.get("settings");
+        let conc = st.and_then(|s| s.get("conc")).and_then(Value::as_u64).unwrap_or(64);
+        let groups = st.and_then(|s| s.get("groups")).and_then(Value::as_u64).unwrap_or(1);
+        (games, conc, groups)
+    }
+
+    /// Before the first job line (rev 11, PROTOCOL 9.6): a pack with no probe here yet gets the built-in probe first
+    /// (exactly the between-lease one, recorded as the pack's probe); then, if a GPU provider passed and there is no
+    /// fresh bench of this run's network on the pack, the bench (a record of its own); then CPU or GPU by measured speed.
+    fn choose_providers(&mut self, lease: &Lease, plan: &Plan, prep: &Prepared, gpu_ok: bool, threads: u32, need: Option<&GpuNeed>) -> crate::probe::Choice {
+        let (games, conc, groups) = Self::job_shape(plan);
+        let net = match lease.kind.as_str() {
+            "selfplay" => prep.ckpt.as_ref().map(|(_, f)| f),
+            "eval" => prep.models.first().map(|(_, f)| f),
+            _ => None,
+        };
+        let (Some(rt), Some(net), Some(run)) = (&prep.runtime, net, lease.run.as_deref()) else {
+            return crate::probe::choose(None, &self.profile.gpus, lease.providers.as_deref(), gpu_ok, games, conc, groups);
+        };
+        let id = lease.lease_id.clone();
+        let control = self.control.clone();
+        let stop = move || control.quitting();
+        let entry = prep.build.entry_path().expect("worker manifests have an entry");
+        let akey = crate::probe::adapters_key(&self.profile.gpus);
+        if gpu_ok && !self.profile.gpus.is_empty() && crate::probe::find(&crate::probe::load(&self.cfg.layout), &rt.build_id, &akey).is_none() {
+            log::info!("lease {id}: probing the execution providers of runtime pack {} (new here) with worker build {}", rt.build_id, prep.build.build_id);
+            self.set_status(Phase::Working, "checking the GPU", Some(describe_job(lease)));
+            let (stop_pump, pump) = self.beat_pump(lease);
+            let p = crate::probe::run(&self.cfg.layout, &entry, &prep.build.build_id, &rt.build_id, &rt.dir, &self.profile.gpus, self.worker_log.clone(), crate::probe::PROBE_TIMEOUT, &stop);
+            stop_pump.store(true, Ordering::SeqCst);
+            let _ = pump.join();
+            if p.error.as_deref() != Some("stopped") {
+                log::info!("lease {id}: provider probe of runtime pack {}: {} {}", rt.build_id, p.providers.join(", "), p.error.as_deref().unwrap_or(""));
+                crate::probe::record(&self.cfg.layout, p);
+                self.profile = (self.profile_fn)();
+                self.profile_refreshed = Instant::now();
+            }
+        }
+        let gpus = self.profile.gpus.clone();
+        let akey = crate::probe::adapters_key(&gpus);
+        let now = zerofarm_common::now_unix();
+        let probes = crate::probe::load(&self.cfg.layout);
+        let passed: Vec<String> = crate::probe::find(&probes, &rt.build_id, &akey).filter(|p| p.error.is_none()).map(|p| p.providers.clone()).unwrap_or_default();
+        let mut bench = crate::probe::find_bench(&crate::probe::load_benches(&self.cfg.layout), &rt.build_id, &akey, run, now).cloned();
+        if let (true, None, Some(reference)) = (gpu_ok && crate::probe::has_gpu_provider(&passed), &bench, net.reference.as_ref()) {
+            log::info!("lease {id}: measuring {run}'s network on runtime pack {} ({})", rt.build_id, passed.join(", "));
+            self.set_status(Phase::Working, "checking the GPU", Some(describe_job(lease)));
+            let (stop_pump, pump) = self.beat_pump(lease);
+            let spec = crate::probe::BenchSpec { model: &net.model, reference, run, threads, providers: passed.clone() };
+            let r = crate::probe::run_bench(&self.cfg.layout, &entry, &prep.build.build_id, &rt.build_id, &rt.dir, &gpus, self.worker_log.clone(), crate::probe::PROBE_TIMEOUT, &stop, &spec);
+            stop_pump.store(true, Ordering::SeqCst);
+            let _ = pump.join();
+            match r {
+                Ok(b) if b.error.is_none() => bench = Some(b),
+                Ok(b) => log::warn!("lease {id}: the bench failed: {}", b.error.as_deref().unwrap_or("")),
+                Err(_) => {}
+            }
+        }
+        // A GPU pack none of whose providers passed here: marked bad for this driver (its probe), run on the CPU, and
+        // evicted when the lease ends (PROTOCOL 9.6).
+        if let Some(n) = need {
+            if crate::probe::pack_bad(&probes, &rt.build_id, &akey, Some(&n.providers), now) {
+                log::warn!("lease {id}: runtime pack {} failed on this GPU: running on the CPU, removing the pack afterwards", rt.build_id);
+                self.evict_after.push(format!("builds/{}", rt.build_id));
+            }
+        }
+        let c = crate::probe::choose(bench.as_ref(), &gpus, lease.providers.as_deref(), gpu_ok, games, conc, groups);
+        if let Some(mut b) = bench.filter(|b| b.error.is_none()) {
+            // what the coordinator sizes this run's GPU leases by (PROTOCOL 9.4: caps.gpu_games)
+            b.gpu_games = c.gpu_games;
+            crate::probe::record_bench(&self.cfg.layout, b);
+        }
+        log::info!("lease {id}: providers {:?} ({}); rows/s at the batch size {:?}; a GPU pays from {:?} games", c.providers, c.why, c.rows_per_s, c.gpu_games);
+        c
+    }
+
+    fn prepare(&mut self, lease: &Lease, plan: &Plan) -> Result<Prepared, CacheError> {
+        let s = self.settings();
+        let cap = s.disk_cap_mb << 20;
+        let keep = Self::keep_list(lease);
+        // Beat while downloading so a big first download doesn't let the lease expire.
+        let (pump_stop, pump) = self.beat_pump(lease);
         let control = self.control.clone();
         let stop = move || control.quitting();
         let result = (|| {
@@ -280,6 +430,16 @@ impl Engine {
             }
             Err(PlanError::Refused(why)) => return self.refuse(lease, &why),
         };
+        // rev 11 (PROTOCOL 9.5): a GPU vendor's runtime pack only where it can run, before it is downloaded
+        let need = match self.runtime_guard(lease, &plan) {
+            Ok(n) => n,
+            Err(PlanError::Stopped) => {
+                self.give_back_unstarted(lease, "agent quitting");
+                return LeaseEnd::Quit;
+            }
+            Err(PlanError::Unavailable(why)) => return self.setup_failed(lease, &format!("runtime pack manifest unavailable: {why}")),
+            Err(PlanError::Refused(why)) => return self.refuse_as(lease, &why, "runtime"),
+        };
         let prep = match self.prepare(lease, &plan) {
             Ok(p) => p,
             Err(CacheError::Stopped) => {
@@ -324,14 +484,10 @@ impl Engine {
         }
         let d = self.decide(None);
         let caps = self.caps(&d);
-        // rev 7 (PROTOCOL 8): the providers this PC verified with the lease's runtime pack, narrowed by
-        // the lease's allowlist; the CPU alone when the GPU may not be used right now
-        let plan_providers = {
-            let probes = crate::probe::load(&self.cfg.layout);
-            let akey = crate::probe::adapters_key(&self.profile.gpus);
-            let probe = lease.runtime.as_ref().and_then(|r| crate::probe::find(&probes, &r.build_id, &akey));
-            crate::probe::plan_providers(probe, &self.profile.gpus, lease.providers.as_deref(), caps.gpu)
-        };
+        // rev 11 (PROTOCOL 9.6): CPU or GPU by measured speed at the job's batch size (the providers this PC verified
+        // with the lease's pack, narrowed by the lease's allowlist; the CPU alone when the GPU may not be used now)
+        let choice = self.choose_providers(lease, &plan, &prep, d.gpu && !self.profile.gpus.is_empty(), caps.threads, need.as_ref());
+        let plan_providers = (choice.providers.clone(), choice.gpu.clone());
         if plan_providers.0 != ["cpu"] {
             log::info!("lease {id}: providers {:?} on {}", plan_providers.0, plan_providers.1["name"].as_str().unwrap_or("?"));
         }
@@ -389,6 +545,10 @@ impl Engine {
             after: None,
             threads: caps.threads,
             providers: plan_providers,
+            conc: choice.conc,
+            groups: choice.groups,
+            batch_rows: choice.batch_rows,
+            rows_per_s: choice.rows_per_s.clone(),
             killed: false,
             eof: false,
             job_sent: false,
@@ -478,6 +638,11 @@ struct Run {
     threads: u32,
     /// The job line's `providers` and `gpu` (PROTOCOL 8).
     providers: (Vec<String>, Value),
+    /// rev 11 (PROTOCOL 9.6): a GPU job's raised `conc`, the batch size as chosen and the measured rows/s.
+    conc: Option<u64>,
+    groups: Option<u64>,
+    batch_rows: u64,
+    rows_per_s: BTreeMap<String, f64>,
     killed: bool,
     eof: bool,
     /// The worker has its job (before that, nothing of the lease has been played).
@@ -525,6 +690,11 @@ impl Run {
         s.insert("resume_ms_max".into(), json!(self.resume_ms_max));
         s.insert("paused_ms".into(), json!(paused));
         s.insert("starved_ms".into(), json!(self.starved_ms));
+        // rev 11 (PROTOCOL 9.6)
+        s.insert("batch_rows".into(), json!(self.batch_rows));
+        if !self.rows_per_s.is_empty() {
+            s.insert("rows_per_s".into(), json!(self.rows_per_s));
+        }
         if !self.selftests.is_empty() {
             let max = self.selftests.values().filter_map(|t| t.get("max_abs").and_then(Value::as_f64)).fold(None, |m: Option<f64>, x| {
                 Some(m.map_or(x, |m| m.max(x)))
@@ -820,6 +990,17 @@ impl Run {
         // rev 7 (PROTOCOL 8): the agent's own, never the coordinator's
         j.insert("providers".into(), json!(self.providers.0));
         j.insert("gpu".into(), self.providers.1.clone());
+        // rev 11 (PROTOCOL 9.6): a GPU job runs at a high conc (the agent's tuning field, PROTOCOL 5)
+        for (k, v) in [("conc", self.conc), ("groups", self.groups)] {
+            match v {
+                Some(x) => {
+                    j.insert(k.into(), json!(x));
+                }
+                None => {
+                    j.remove(k);
+                }
+            }
+        }
         j.insert("out_dir".into(), json!("out"));
         j.insert("runtime_dir".into(), self.prep.runtime.as_ref().map(|r| json!(r.dir)).unwrap_or(Value::Null));
         Value::Object(j)

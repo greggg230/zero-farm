@@ -1,6 +1,6 @@
 [package]
 name = "farm-agent"
-version = "0.2.9"
+version = "0.2.10"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -16,7 +16,7 @@ name = "farm-agent"
 path = "src/main.rs"
 
 [dependencies]
-zerofarm-common = { path = "../common", features = ["http", "dpapi"] }
+zerofarm-common = { path = "../common", features = ["http", "dpapi", "zst"] }
 serde.workspace = true
 serde_json.workspace = true
 semver.workspace = true
@@ -42,5 +42,5 @@ miniz_oxide.workspace = true
 
 [dev-dependencies]
 mockcoord = { path = "../mockcoord" }
-zerofarm-common = { path = "../common", features = ["http", "dpapi", "sign"] }
+zerofarm-common = { path = "../common", features = ["http", "dpapi", "sign", "zst-pack"] }
 tempfile.workspace = true

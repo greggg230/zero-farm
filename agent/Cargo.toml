@@ -27,6 +27,7 @@ getrandom = "0.3"
 log = { version = "0.4", features = ["std"] }
 tempfile = "3"
 miniz_oxide = "0.9"
+zstd = { version = "0.13", default-features = false }
 
 # scrypt (farm-release export-key / import-key) is ~100x slower unoptimised; keep tests quick.
 [profile.dev.package.scrypt]

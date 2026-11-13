@@ -43,6 +43,8 @@ pub struct H {
     pub launcher_level: u32,
     /// Starting a worker fails with this raw Windows error (`AgentConfig::test_spawn_error`).
     pub spawn_error: Option<i32>,
+    /// The PC's graphics adapters in its profile (rev 11 tests; none by default).
+    pub gpus: Vec<zerofarm_common::protocol::Gpu>,
     thread: Option<JoinHandle<EngineExit>>,
 }
 
@@ -128,6 +130,7 @@ impl H {
             version: "0.1.0".into(),
             launcher_level: 2,
             spawn_error: None,
+            gpus: vec![],
             thread: None,
         }
     }
@@ -161,7 +164,10 @@ impl H {
             self.status.clone(),
             Box::new(self.signals.clone()),
             self.control.clone(),
-            Box::new(fake_profile),
+            {
+                let gpus = self.gpus.clone();
+                Box::new(move || Profile { gpus: gpus.clone(), ..fake_profile() })
+            },
         )
         .unwrap();
         self.thread = Some(std::thread::spawn(move || eng.run()));

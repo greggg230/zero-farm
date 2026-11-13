@@ -22,8 +22,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use zerofarm_common::http::{with_retry, Backoff, Client};
 use zerofarm_common::keys::TrustedKeys;
-use zerofarm_common::manifest::{verify_dir, Expect, Kind, Manifest, VerifiedBuild, MANIFEST_FILE, SIG_FILE};
-use zerofarm_common::sign::{sign_dir, template, SigningKey};
+use zerofarm_common::manifest::{verify_dir, Expect, GpuNeed, Kind, Manifest, Packed, VerifiedBuild, MANIFEST_FILE, SIG_FILE, ZST_MIN_AGENT};
+use zerofarm_common::sign::{list_files, sign_dir_zst, template, SigningKey};
 
 pub const KEY_FORMAT: &str = "zero-farm-release-key/1";
 pub const KEY_PURPOSE: &str = "zero-farm release key";
@@ -180,6 +180,54 @@ pub struct SignOpts {
     pub min_agent: Option<String>,
     pub requires_runtime: Option<String>,
     pub entry: Option<String>,
+    /// rev 11 (PROTOCOL 9.2), runtime packs: the hardware the pack needs.
+    pub gpu: Option<GpuNeed>,
+    /// rev 11 (PROTOCOL 9.3): make zstd copies of the files at this level (in `<dir>.zst`, see [`zst_dir`]).
+    pub zst_level: Option<i32>,
+}
+
+/// Where `sign --zst` puts a build directory's compressed copies (next to it, so the build directory itself
+/// holds exactly the listed files): `<dir>.zst/<path>.zst`.
+pub fn zst_dir(dir: &Path) -> PathBuf {
+    let mut s = dir.as_os_str().to_owned();
+    s.push(".zst");
+    PathBuf::from(s)
+}
+
+/// Files of at most this size get no compressed copy (PROTOCOL 9.3) ...
+pub const ZST_MIN_FILE: u64 = 64 << 10;
+/// ... nor files that shrink by less than 5 %.
+pub const ZST_MIN_GAIN_PCT: u64 = 5;
+
+fn local(rel: &str) -> String {
+    rel.replace('/', std::path::MAIN_SEPARATOR_STR)
+}
+
+/// Compressed copies of `dir`'s files into [`zst_dir`] -> by manifest path.
+fn pack_dir(dir: &Path, level: i32) -> Result<std::collections::BTreeMap<String, Packed>, String> {
+    let zdir = zst_dir(dir);
+    if zdir.exists() {
+        std::fs::remove_dir_all(&zdir).map_err(|e| format!("{}: {e}", zdir.display()))?;
+    }
+    // (at most 2 workers: level 19 with a 2^27 window takes several hundred MB of memory per worker)
+    let threads = std::thread::available_parallelism().map(|n| n.get() as u32).unwrap_or(2).clamp(1, 2);
+    let mut out = std::collections::BTreeMap::new();
+    for f in list_files(dir)? {
+        if f.size <= ZST_MIN_FILE {
+            continue;
+        }
+        let src = dir.join(local(&f.path));
+        let dest = zdir.join(format!("{}.zst", local(&f.path)));
+        let t0 = std::time::Instant::now();
+        let p = zerofarm_common::zst::pack(&src, &dest, level, threads)?;
+        if p.size * 100 >= f.size * (100 - ZST_MIN_GAIN_PCT) {
+            let _ = std::fs::remove_file(&dest);
+            continue;
+        }
+        eprintln!("zst {}: {} -> {} bytes ({:.1}%) in {:.0} s", f.path, f.size, p.size, p.size as f64 * 100.0 / f.size as f64, t0.elapsed().as_secs_f64());
+        out.insert(f.path.clone(), p);
+    }
+    Ok(out)
 }
 
 fn is_full_sha(s: &str) -> bool {
@@ -229,14 +277,32 @@ pub fn sign(dir: &Path, opts: &SignOpts, key: &SigningKey) -> Result<(String, Ma
             t.version = opts.version.clone().ok_or("runtime packs need --version")?;
             t.min_agent = opts.min_agent.clone();
             t.entry = opts.entry.clone();
+            t.gpu = opts.gpu.clone();
         }
+    }
+    if opts.gpu.is_some() && kind != Kind::Runtime {
+        return Err("--gpu-vendor/--gpu-providers: only a runtime pack declares the GPU it needs".into());
+    }
+    let new_enough = t.min_agent.as_deref().is_some_and(|m| zerofarm_common::manifest::semver_at_least(m, ZST_MIN_AGENT));
+    if (opts.zst_level.is_some() || t.gpu.is_some()) && !new_enough {
+        return Err(format!("--zst and --gpu-* need --min-agent {ZST_MIN_AGENT} or newer (older agents don't read them)"));
     }
     if let Some(r) = &t.requires_runtime {
         if !zerofarm_common::is_build_id(r) {
             return Err(format!("--requires-runtime {r:?} is not a build id"));
         }
     }
-    let (id, m) = sign_dir(dir, t, key)?;
+    let zst = match opts.zst_level {
+        Some(level) => pack_dir(dir, level)?,
+        None => {
+            let zdir = zst_dir(dir);
+            if zdir.exists() {
+                std::fs::remove_dir_all(&zdir).map_err(|e| format!("{}: {e}", zdir.display()))?;
+            }
+            Default::default()
+        }
+    };
+    let (id, m) = sign_dir_zst(dir, t, key, &zst)?;
     // Self-check exactly as an agent will.
     let keys = TrustedKeys::parse(&[key.public_b64()])?;
     verify_dir(dir, &keys, &Expect { build_id: Some(&id), kind: Some(kind), version: None }).map_err(|e| format!("self-check failed: {e}"))?;
@@ -292,24 +358,77 @@ pub fn admin_client(url: &str, token: &str) -> Result<Client, String> {
 pub fn publish(dir: &Path, keys: &TrustedKeys, client: &Client) -> Result<String, String> {
     let v = verify(dir, keys)?;
     let id = v.build_id.clone();
-    let mut backoff = Backoff::default();
-    let never = || false;
-    let mut put = |rel: &str| -> Result<(), String> {
-        let bytes = std::fs::read(dir.join(rel.replace('/', "\\"))).map_err(|e| format!("{rel}: {e}"))?;
-        let path = format!("/v1/admin/artifact/builds/{id}/{rel}");
-        with_retry(&mut backoff, Some(6), &never, || client.put_bytes(&path, &bytes, &[])).map_err(|e| format!("PUT {rel}: {e}"))?;
-        Ok(())
-    };
+    let zdir = zst_dir(dir);
     for f in &v.manifest.files {
-        put(&f.path.replace('\\', "/"))?;
+        let rel = f.path.replace('\\', "/");
+        put_object(client, &format!("builds/{id}/{rel}"), &dir.join(local(&rel)), Some(&f.sha256))?;
+        // rev 11 (PROTOCOL 9.3): the compressed copy too (the plain file stays, for older agents and tools)
+        if let Some(z) = &f.zst {
+            let zp = zdir.join(format!("{}.zst", local(&rel)));
+            let (h, n) = zerofarm_common::hash::sha256_file(&zp).map_err(|e| format!("{}: {e} (sign it again with --zst)", zp.display()))?;
+            if h != z.sha256 || n != z.size {
+                return Err(format!("{}: not the compressed copy the manifest names (sign it again with --zst)", zp.display()));
+            }
+            put_object(client, &format!("builds/{id}/{rel}.zst"), &zp, Some(&z.sha256))?;
+        }
     }
-    put(MANIFEST_FILE)?;
-    put(SIG_FILE)?;
+    put_object(client, &format!("builds/{id}/{MANIFEST_FILE}"), &dir.join(MANIFEST_FILE), None)?;
+    put_object(client, &format!("builds/{id}/{SIG_FILE}"), &dir.join(SIG_FILE), None)?;
+    let never = || false;
     with_retry(&mut Backoff::default(), Some(6), &never, || {
         client.post_json::<_, serde_json::Value>("/v1/admin/build", &serde_json::json!({"build_id": id}))
     })
     .map_err(|e| format!("POST /v1/admin/build: {e}"))?;
     Ok(id)
+}
+
+/// Objects up to this size go up in one PUT; bigger ones in parts (a Worker request's body is limited).
+pub const SIMPLE_PUT_MAX: u64 = 64 << 20;
+/// The part size of a multipart upload (R2: every part but the last the same size, at least 5 MiB).
+pub const PART_SIZE: u64 = 32 << 20;
+
+fn pct(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-._~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
+/// Uploads one file to the R2 key `key` (PROTOCOL 4): one PUT (with `x-sha256` when given), or a multipart upload
+/// for a file over [`SIMPLE_PUT_MAX`].
+pub fn put_object(client: &Client, key: &str, file: &Path, sha256: Option<&str>) -> Result<(), String> {
+    use std::io::{Read, Seek, SeekFrom};
+    let never = || false;
+    let len = std::fs::metadata(file).map_err(|e| format!("{}: {e}", file.display()))?.len();
+    let path = format!("/v1/admin/artifact/{key}");
+    if len <= SIMPLE_PUT_MAX {
+        let bytes = std::fs::read(file).map_err(|e| format!("{}: {e}", file.display()))?;
+        let extra: Vec<(&str, String)> = sha256.map(|h| vec![("x-sha256", h.to_string())]).unwrap_or_default();
+        with_retry(&mut Backoff::default(), Some(6), &never, || client.put_bytes(&path, &bytes, &extra)).map_err(|e| format!("PUT {key}: {e}"))?;
+        return Ok(());
+    }
+    let start: serde_json::Value = with_retry(&mut Backoff::default(), Some(6), &never, || client.post_json(&format!("{path}?uploads"), &serde_json::json!({})))
+        .map_err(|e| format!("POST {key}?uploads: {e}"))?;
+    let uid = start["upload_id"].as_str().ok_or_else(|| format!("POST {key}?uploads: no upload_id in {start}"))?.to_string();
+    let mut f = std::fs::File::open(file).map_err(|e| format!("{}: {e}", file.display()))?;
+    let mut parts = Vec::new();
+    let n_parts = len.div_ceil(PART_SIZE);
+    for i in 0..n_parts {
+        let off = i * PART_SIZE;
+        let mut buf = vec![0u8; PART_SIZE.min(len - off) as usize];
+        f.seek(SeekFrom::Start(off)).map_err(|e| e.to_string())?;
+        f.read_exact(&mut buf).map_err(|e| format!("{}: {e}", file.display()))?;
+        let url = format!("{path}?upload_id={}&part={}", pct(&uid), i + 1);
+        let r = with_retry(&mut Backoff::default(), Some(8), &never, || client.put_bytes(&url, &buf, &[])).map_err(|e| format!("PUT {key} part {}: {e}", i + 1))?;
+        let etag = r["etag"].as_str().ok_or_else(|| format!("PUT {key} part {}: no etag in {r}", i + 1))?.to_string();
+        parts.push(serde_json::json!({"part": i + 1, "etag": etag}));
+        eprintln!("uploaded {key} part {}/{n_parts}", i + 1);
+    }
+    let done: serde_json::Value = with_retry(&mut Backoff::default(), Some(6), &never, || {
+        client.post_json(&format!("{path}?upload_id={}", pct(&uid)), &serde_json::json!({"parts": parts}))
+    })
+    .map_err(|e| format!("completing {key}: {e}"))?;
+    if done["size"].as_u64() != Some(len) {
+        return Err(format!("completing {key}: the coordinator says {done}, the file has {len} bytes"));
+    }
+    Ok(())
 }
 
 /// The installer for an agent release.

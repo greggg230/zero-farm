@@ -490,6 +490,24 @@ impl W {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // `probe-providers ... --json FILE` (PROTOCOL 8, 9.6): writes the build's `probe.json` (next to the exe) as the
+    // report, else one where only the CPU passes; the arguments it got go to the log.
+    if args.get(1).map(String::as_str) == Some("probe-providers") {
+        eprintln!("fakeworker: probe-providers {}", args[2..].join(" "));
+        let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default();
+        let report = std::fs::read_to_string(exe_dir.join("probe.json")).unwrap_or_else(|_| {
+            json!({"probe": 1, "providers": ["cpu"], "error": null, "results": [
+                {"provider": "cpu", "gpu": null, "ok": true, "rows_per_s": 1000.0,
+                 "rows_per_s_by_batch": {"1": 1000.0, "8": 1000.0, "32": 1000.0, "128": 1000.0, "512": 1000.0, "1024": 1000.0}}]})
+            .to_string()
+        });
+        if let Some(i) = args.iter().position(|a| a == "--json") {
+            std::fs::write(&args[i + 1], report).unwrap();
+        } else {
+            println!("{report}");
+        }
+        return;
+    }
     if args.get(1).map(String::as_str) != Some("serve") {
         eprintln!("usage: fakeworker serve");
         std::process::exit(64);

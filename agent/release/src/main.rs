@@ -7,8 +7,12 @@
 //! farm-release sign DIR --kind worker|agent|runtime [--key FILE] [--version V] [--game G]
 //!              [--engine-commit SHA] [--core-commit SHA] [--profile release|fuzz] [--aw 1]
 //!              [--zero-onnx 1] [--min-agent V] [--requires-runtime BUILD_ID] [--entry FILE]
+//!              [--gpu-vendor V --gpu-providers a,b [--gpu-min-driver D]]   runtime packs, rev 11 (PROTOCOL 9.2)
+//!              [--zst | --zst-level N]   zstd copies of the files in DIR.zst (rev 11, PROTOCOL 9.3; both need
+//!                                        --min-agent 0.2.10 or newer)
 //! farm-release verify DIR [--pubkey B64 | --key FILE]
-//! farm-release publish DIR --url URL [--token T] [--pubkey B64 | --key FILE]
+//! farm-release publish DIR --url URL [--token T] [--pubkey B64 | --key FILE]   (files over 64 MiB in parts; the
+//!              compressed copies of DIR.zst too)
 //! farm-release release-agent [--url URL] [--token T] [--key FILE] [--channel canary|stable]
 //!              [--min-agent V] [--workspace DIR] [--bin-dir DIR] [--out DIR] [--no-publish]
 //!              [--setup | --setup-exe FILE] [--github OWNER/REPO [--notes-file F] [--gh PATH]]
@@ -173,6 +177,22 @@ fn run(a: &Args) -> Result<(), String> {
                 min_agent: a.get("min-agent"),
                 requires_runtime: a.get("requires-runtime"),
                 entry: a.get("entry"),
+                // rev 11 (PROTOCOL 9.2): --gpu-vendor nvidia --gpu-min-driver 527.41 --gpu-providers cuda
+                gpu: match a.get("gpu-vendor") {
+                    Some(vendor) => Some(zerofarm_common::manifest::GpuNeed {
+                        vendor,
+                        min_driver: a.get("gpu-min-driver"),
+                        providers: a.get("gpu-providers").ok_or("--gpu-vendor needs --gpu-providers (the GPU providers the pack adds)")?.split(',').map(|x| x.trim().to_string()).filter(|x| !x.is_empty()).collect(),
+                    }),
+                    None if a.has("gpu-min-driver") || a.has("gpu-providers") => return Err("--gpu-min-driver/--gpu-providers need --gpu-vendor".into()),
+                    None => None,
+                },
+                // rev 11 (PROTOCOL 9.3): --zst (level 19) or --zst-level N: zstd copies in <dir>.zst
+                zst_level: match (a.has("zst"), a.get("zst-level")) {
+                    (_, Some(l)) => Some(l.parse().map_err(|_| "--zst-level must be a number (1-22)")?),
+                    (true, None) => Some(19),
+                    _ => None,
+                },
             };
             let (id, m) = sign(&dir, &opts, &key)?;
             println!("signed {} {} ({} files) build_id {id}", m.kind, m.version, m.files.len());

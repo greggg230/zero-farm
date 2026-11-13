@@ -22,7 +22,8 @@ use std::path::PathBuf;
 use zerofarm_common::definition::{self as def, CheckpointDef, Definition};
 use zerofarm_common::http::{CallError, Want};
 use zerofarm_common::layout::Layout;
-use zerofarm_common::protocol::{CheckpointRef, Lease};
+use zerofarm_common::manifest::{verify_dir, verify_manifest_bytes, Expect, Kind, Manifest, MAX_MANIFEST_BYTES, MAX_SIG_BYTES};
+use zerofarm_common::protocol::{ArtifactRef, CheckpointRef, Lease};
 
 /// What the worker of a lease will be told, before the agent's local fields.
 #[derive(Debug, Clone)]
@@ -31,6 +32,9 @@ pub struct Plan {
     pub job: Map<String, Value>,
     /// The verified definition; None for a legacy lease.
     pub def: Option<Definition>,
+    /// rev 11 (PROTOCOL 7, 9): the lease's runtime is not the definition's but the one its worker build requires
+    /// (a run alternate); the agent's guard (9.5) applies.
+    pub alternate: bool,
 }
 
 impl Plan {
@@ -198,8 +202,21 @@ impl Engine {
         if !d.builds.contains(&lease.build.build_id) {
             return refused(format!("worker build {} is not in definition {} version {}", lease.build.build_id, d.scope(), d.version));
         }
+        // rev 11 (PROTOCOL 7, 9): the definition's runtime, or the one the lease's worker build itself requires (its
+        // signed manifest): a definition authorizes each build it lists with that build's pack (a run alternate).
+        let mut alternate = false;
         if lease.runtime.as_ref().map(|r| &r.build_id) != d.runtime.as_ref() {
-            return refused(format!("runtime {:?} is not the definition's {:?}", lease.runtime.as_ref().map(|r| &r.build_id), d.runtime));
+            let Some(rt) = lease.runtime.as_ref().map(|r| r.build_id.clone()) else {
+                return refused(format!("the lease has no runtime, the definition names {:?}", d.runtime));
+            };
+            let m = self.signed_manifest(&lease.build, Kind::Worker)?;
+            if m.requires_runtime.as_deref() != Some(rt.as_str()) {
+                return refused(format!(
+                    "runtime {rt} is neither the definition's {:?} nor the one worker build {} requires ({:?})",
+                    d.runtime, lease.build.build_id, m.requires_runtime
+                ));
+            }
+            alternate = true;
         }
         let template = d.template(&lease.kind).ok_or_else(|| PlanError::Refused(format!("definition {} has no {} job", d.scope(), lease.kind)))?;
         check_lease_checkpoints(lease, template).map_err(PlanError::Refused)?;
@@ -209,8 +226,28 @@ impl Engine {
         let paired = template.get("paired").and_then(Value::as_bool).unwrap_or(false);
         let mut job = template.clone();
         job.extend(def::lease_fields(&lease.kind, &lease.job, paired).map_err(PlanError::Refused)?);
-        log::info!("lease {id}: definition {} version {} verified", d.scope(), d.version);
-        Ok(Plan { job, def: Some(d) })
+        log::info!("lease {id}: definition {} version {} verified{}", d.scope(), d.version, if alternate { " (an alternate runtime pack)" } else { "" });
+        Ok(Plan { job, def: Some(d), alternate })
+    }
+
+    /// A build's signed manifest alone (rev 11, PROTOCOL 9.5): from the cache when the build is there and verifies,
+    /// else just `manifest.json` + its signature, verified with the release keys (no other file is fetched).
+    pub(crate) fn signed_manifest(&self, r: &ArtifactRef, kind: Kind) -> Result<Manifest, PlanError> {
+        if !zerofarm_common::is_build_id(&r.build_id) || r.manifest != format!("builds/{}/manifest.json", r.build_id) {
+            return refused(format!("bad build reference {:?}", r.build_id));
+        }
+        let expect = Expect { build_id: Some(&r.build_id), kind: Some(kind), version: None };
+        if let Ok(v) = verify_dir(&self.cfg.layout.cache_builds().join(&r.build_id), &self.cfg.keys, &expect) {
+            return Ok(v.manifest);
+        }
+        let bytes = self.fetch_small(&r.manifest, None, MAX_MANIFEST_BYTES, &format!("m-{}.json", r.build_id))?;
+        let sig = self.fetch_small(&format!("{}.minisig", r.manifest), None, MAX_SIG_BYTES, &format!("m-{}.minisig", r.build_id))?;
+        let sig = String::from_utf8(sig).map_err(|_| PlanError::Refused("a manifest signature is not text".into()))?;
+        let (m, id) = verify_manifest_bytes(&self.cfg.keys, &bytes, &sig).map_err(|e| PlanError::Refused(format!("build {}: {e}", r.build_id)))?;
+        if id != r.build_id || m.kind != kind {
+            return refused(format!("build {}: the manifest is {} {id}", r.build_id, m.kind));
+        }
+        Ok(m)
     }
 
     /// Downloads a small file (definition, signature) into `cache\tmp` and returns its bytes.
@@ -261,7 +298,7 @@ fn plan_legacy(lease: &Lease) -> Result<Plan, PlanError> {
     let paired = template.get("paired").and_then(Value::as_bool).unwrap_or(false);
     let mut job = template;
     job.extend(def::lease_fields(kind, &lease.job, paired).map_err(PlanError::Refused)?);
-    Ok(Plan { job, def: None })
+    Ok(Plan { job, def: None, alternate: false })
 }
 
 #[cfg(test)]
