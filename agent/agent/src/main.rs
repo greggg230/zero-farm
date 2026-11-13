@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! farm-agent run       [--root DIR] [--headless] [--coordinator URL]   (what the launcher starts)
-//! farm-agent dry-run   [--root DIR] [--seconds N]    log idle-policy decisions only; no work
+//! farm-agent dry-run   [--root DIR] [--seconds N] [--every N]   log idle-policy decisions (and per-GPU readings) only; no work
 //! farm-agent install   [--root DIR] [--reg-name NAME] [--shortcut-dir DIR] [--no-shortcut] [--no-start] [--quiet]
 //! farm-agent uninstall [--root DIR] [--reg-name NAME] [--shortcut-dir DIR] [--quiet]
 //! farm-agent enroll    --invite CODE [--name NAME] [--root DIR] [--coordinator URL]
@@ -250,23 +250,40 @@ fn cmd_dry_run(args: &Args) -> i32 {
     farm_agent::logging::init(&layout, true);
     let machine = Machine::load(&layout);
     let secs: u64 = args.get("seconds").and_then(|s| s.parse().ok()).unwrap_or(u64::MAX);
+    // Log at least this often even when the decision doesn't change (with the per-GPU readings).
+    let every: u64 = args.get("every").and_then(|s| s.parse().ok()).unwrap_or(60).max(1);
     let mut signals = Win32Signals::new(true);
     let mut st = farm_agent::policy::PolicyState::default();
     let start = std::time::Instant::now();
     let mut last: Option<String> = None;
     let mut last_log = std::time::Instant::now();
-    log::info!("dry run: logging decisions only (no leases, no work); nvml {}", signals.has_nvml());
+    log::info!(
+        "dry run: logging decisions only (no leases, no work); GPU Engine counters {}",
+        if signals.has_busy_counters() { "available" } else { "missing" }
+    );
     while start.elapsed().as_secs() < secs {
+        let t0 = std::time::Instant::now();
         let s = signals.sample(None);
+        let took_ms = t0.elapsed().as_millis();
         let d = farm_agent::policy::decide(&mut st, &s, &machine.settings);
         let line = format!(
-            "work={} block={:?} gpu={} gpu_block={:?} mem_pressure={} | idle_s={} fullscreen={} on_ac={:?} saver={} mem={}/{} MB gpu={:?}",
+            "work={} block={:?} gpu={} gpu_block={:?} mem_pressure={} | idle_s={} fullscreen={} on_ac={:?} saver={} mem={}/{} MB gpu={:?} (sampled in {took_ms} ms)",
             d.work, d.block, d.gpu, d.gpu_block, d.mem_pressure, s.idle_s, s.notification.is_fullscreen(), s.on_ac, s.battery_saver,
             s.mem_avail_mb, s.mem_total_mb, s.gpu
         );
         let key = format!("{} {:?} {} {:?}", d.work, d.block, d.gpu, d.gpu_block);
-        if last.as_deref() != Some(&key) || last_log.elapsed().as_secs() >= 60 {
+        if last.as_deref() != Some(&key) || last_log.elapsed().as_secs() >= every {
             log::info!("decision: {line}");
+            for r in signals.gpu_readings() {
+                let temp = r.temp_c.map_or_else(|| "none".to_string(), |t| format!("{t} C"));
+                log::info!(
+                    "  gpu luid {} {} ({}): other use {} %, temperature {temp}",
+                    farm_agent::profile::luid_hex(r.luid),
+                    r.vendor,
+                    r.name,
+                    r.other_util_pct
+                );
+            }
             last = Some(key);
             last_log = std::time::Instant::now();
         }

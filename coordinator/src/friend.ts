@@ -9,6 +9,18 @@ import { bookFor } from "./leasebook";
 import { minAgentOk } from "./manifest";
 import { parseRanges, total } from "./ranges";
 import { ipKey, take } from "./ratelimit";
+import {
+  LUID_RE,
+  MAX_RUNTIME_PROVIDERS,
+  MAX_RUNTIMES,
+  type Provider,
+  type Routing,
+  gpuEligible,
+  kindRank,
+  place,
+  storedRouting,
+  verifiedProviders,
+} from "./routing";
 import { cleanStats, telemetry } from "./telemetry";
 import {
   BUILD_RE,
@@ -65,8 +77,9 @@ export interface Profile {
   eff_cores?: number;
   ram_mb?: number;
   disk_free_mb?: number;
-  gpus?: { vendor?: string; name?: string; vram_mb?: number; driver?: string }[];
-  providers?: string[];
+  gpus?: { vendor?: string; name?: string; vram_mb?: number; driver?: string; luid?: string }[];
+  providers?: string[]; // rev 7: every provider that passed this PC's probe, preference order, cpu last
+  runtime_providers?: Record<string, string[]>; // rev 7: runtime build_id -> providers that passed with it
   idle_h_day?: number;
   on_h_day?: number;
   [k: string]: unknown;
@@ -86,9 +99,21 @@ export function cleanProfile(p: Record<string, any>): Profile {
       str(o.name, `profile.gpus[${i}].name`, { optional: true, max: 200 });
       str(o.driver, `profile.gpus[${i}].driver`, { optional: true, max: 64 });
       int(o.vram_mb, `profile.gpus[${i}].vram_mb`, { optional: true, min: 0 });
+      str(o.luid, `profile.gpus[${i}].luid`, { optional: true, re: LUID_RE }); // rev 7: lowercase hex
     });
   }
+  // Provider names this coordinator doesn't know are kept (a newer agent may know more); routing
+  // ignores them.
   strList(p.providers, "profile.providers", { optional: true, max: 32, itemMax: 64 });
+  if (p.runtime_providers !== undefined && p.runtime_providers !== null) {
+    const rp = obj(p.runtime_providers, "profile.runtime_providers");
+    const ids = Object.keys(rp);
+    if (ids.length > MAX_RUNTIMES) throw bad(`profile.runtime_providers has more than ${MAX_RUNTIMES} runtimes`);
+    for (const id of ids) {
+      if (!BUILD_RE.test(id)) throw bad(`profile.runtime_providers: ${JSON.stringify(id.slice(0, 64))} is not a runtime build_id`);
+      strList(rp[id], `profile.runtime_providers.${id}`, { max: MAX_RUNTIME_PROVIDERS, itemMax: 64 });
+    }
+  }
   // Availability: hours per day the idle policy let it work / the agent was running (7-day means).
   for (const k of ["idle_h_day", "on_h_day"]) num(p[k], `profile.${k}`, { optional: true, min: 0, max: 24 });
   if (JSON.stringify(p).length > 8192) throw bad("profile is larger than 8 KB");
@@ -187,9 +212,10 @@ interface Candidate {
   run?: string;
   campaign?: string;
   priority: number;
-  tier: number; // 1: a run's games; 2: backfill (fuzz, or a GPU-preferring run on a CPU-only PC)
+  tier: number; // 1: a run's games; 2: backfill (fuzz, or a GPU-preferring job on a PC that isn't GPU-eligible)
   fit: number;
   configured: "auto" | number;
+  providers: Provider[] | null; // rev 7: the job's allowlist, sent with the lease
 }
 
 // Lease sizing: about TARGET_S seconds of this machine's measured rate (ids per running second),
@@ -267,6 +293,12 @@ export async function lease(c: Ctx): Promise<Response> {
   }
   const capsJson = JSON.stringify(caps);
   if (capsJson !== m.caps) await db.prepare(`UPDATE machines SET caps = ? WHERE machine_id = ?`).bind(capsJson, m.machine_id).run();
+  // Rev 7 routing reads the profile the coordinator keeps: the one just sent, else the stored one.
+  const machineProfile = profile && digest !== m.profile_digest ? profile : parseJson<Profile | null>(m.profile, null);
+  // Where a job goes on this machine (PROTOCOL 8): GPU-eligible when it may use the GPU and
+  // verified a provider the job allows, with the job's runtime pack if the profile says.
+  const placeFor = (kind: "selfplay" | "eval" | "fuzz", r: Routing, runtime: string | null) =>
+    place(kind, r, gpuEligible(caps.gpu, verifiedProviders(machineProfile, runtime), r.providers), caps.gpu);
 
   const [runsR, campsR, releaseR, pausedR, activeR, poolR, ratesR, classR, diagR, mineR] = await db.batch<any>([
     db.prepare(`SELECT * FROM runs WHERE state = 'active'`),
@@ -319,29 +351,27 @@ export async function lease(c: Ctx): Promise<Response> {
     const cachedBonus = cachedBuilds.has(r.build_id) ? 1.2 : 1;
     if (kinds.has("selfplay") && r.selfplay && r.current_gen !== null) {
       const sp = JSON.parse(r.selfplay) as book.SelfplayCfg;
-      if (sp && needsOk(sp.needs) && !(sp.gpu === "required" && !caps.gpu) && diskOk([r.build_id, r.runtime])) {
-        const backfill = sp.gpu === "preferred" && !caps.gpu;
+      const routing = sp ? storedRouting(sp.gpu, sp.providers) : null;
+      const at = routing ? placeFor("selfplay", routing, r.runtime) : null;
+      if (sp && routing && at && needsOk(sp.needs) && diskOk([r.build_id, r.runtime])) {
         const ckptBonus = cachedCkpts.has(`${r.run}/${r.current_gen}`) ? 1.1 : 1;
         cands.push({
           scope,
           kind: "selfplay",
           run: r.run,
           priority: r.priority,
-          tier: backfill ? 2 : 1,
-          fit: (backfill ? 0.25 : 1) * cachedBonus * ckptBonus,
+          tier: at.tier,
+          fit: at.fit * cachedBonus * ckptBonus,
           configured: sp.games_per_lease,
+          providers: routing.providers,
         });
       }
     }
     if (kinds.has("eval") && r.eval) {
       const ev = JSON.parse(r.eval) as book.EvalCfg | null;
-      if (
-        ev &&
-        Array.isArray(ev.checkpoints) &&
-        (poolN.get(`${scope}|eval:${ev.batch}`) ?? 0) > 0 &&
-        needsOk(ev.needs) &&
-        !(ev.gpu === "required" && !caps.gpu)
-      ) {
+      const routing = ev ? storedRouting(ev.gpu, ev.providers) : null;
+      const at = routing ? placeFor("eval", routing, r.runtime) : null;
+      if (ev && routing && at && Array.isArray(ev.checkpoints) && (poolN.get(`${scope}|eval:${ev.batch}`) ?? 0) > 0 && needsOk(ev.needs)) {
         // Rev 5: the lease brings every network the seats name; uncached ones count against the disk.
         const keys = ev.checkpoints.map((g) => `${r.run}/${g}`);
         let ckptBytes = 0;
@@ -353,16 +383,16 @@ export async function lease(c: Ctx): Promise<Response> {
           ckptBytes = results.reduce((s, x) => s + (cachedCkpts.has(`${r.run}/${x.gen}`) ? 0 : (x.size ?? 0)), 0);
         }
         if (diskOk([r.build_id, r.runtime], ckptBytes)) {
-          const backfill = ev.gpu === "preferred" && !caps.gpu;
           const ckptBonus = keys.length && keys.every((k) => cachedCkpts.has(k)) ? 1.1 : 1;
           cands.push({
             scope,
             kind: "eval",
             run: r.run,
             priority: r.priority,
-            tier: backfill ? 2 : 1,
-            fit: (backfill ? 0.25 : 1) * cachedBonus * ckptBonus,
+            tier: at.tier,
+            fit: at.fit * cachedBonus * ckptBonus,
             configured: ev.games_per_lease,
+            providers: routing.providers,
           });
         }
       }
@@ -371,16 +401,19 @@ export async function lease(c: Ctx): Promise<Response> {
   if (kinds.has("fuzz")) {
     for (const x of camps) {
       const needs = parseJson<book.Needs | null>(x.needs, null);
-      if (!needsOk(needs) || !diskOk([x.build_id])) continue;
+      // A campaign has no runtime pack: its machines' verified providers are their union.
+      const routing = storedRouting(x.gpu, parseJson<unknown>(x.providers, null));
+      const at = placeFor("fuzz", routing, null);
+      if (!at || !needsOk(needs) || !diskOk([x.build_id])) continue;
       cands.push({
         scope: book.campaignScope(x.campaign),
         kind: "fuzz",
         campaign: x.campaign,
         priority: x.priority,
-        tier: 2,
-        // Fuzzing goes preferentially to CPU-only PCs.
-        fit: (caps.gpu ? 0.5 : 1) * (cachedBuilds.has(x.build_id) ? 1.2 : 1),
+        tier: at.tier,
+        fit: at.fit * (cachedBuilds.has(x.build_id) ? 1.2 : 1),
         configured: x.chunk === "auto" ? "auto" : Number(x.chunk),
+        providers: routing.providers,
       });
     }
   }
@@ -427,7 +460,7 @@ export async function lease(c: Ctx): Promise<Response> {
       const l = unwrap(
         await bookFor(c.env, book.DIAG_SCOPE).grant({ now: c.now, machine_id: m.machine_id, kind: "diag", want: 0, diag_id: d.id, def_aware: defAware }),
       );
-      if (l) return withDiag({ lease: l });
+      if (l) return withDiag({ lease: { ...l, providers: null } });
     }
   }
 
@@ -436,14 +469,16 @@ export async function lease(c: Ctx): Promise<Response> {
   const rate = new Map<string, number>((ratesR.results as any[]).map((x) => [`${x.scope}|${x.kind}`, x.rate]));
   const classRate = new Map<string, number>((classR.results as any[]).map((x) => [`${x.scope}|${x.kind}`, x.rate]));
   const score = (cd: Candidate) => (cd.priority * cd.fit) / (1 + (active.get(`${cd.scope}|${cd.kind}`) ?? 0));
-  usable.sort((a, b) => a.tier - b.tier || score(b) - score(a) || a.scope.localeCompare(b.scope));
+  // Within a tier, evaluation before self-play (rev 7), then by score.
+  usable.sort((a, b) => a.tier - b.tier || kindRank(a.kind) - kindRank(b.kind) || score(b) - score(a) || a.scope.localeCompare(b.scope));
   for (const cd of usable) {
     const key = `${cd.scope}|${cd.kind}`;
     const want = leaseSize(cd.kind as Exclude<book.Kind, "diag">, cd.configured, rate.get(key) ?? classRate.get(key) ?? null);
     const l = unwrap(
       await bookFor(c.env, cd.scope).grant({ now: c.now, machine_id: m.machine_id, kind: cd.kind, want, run: cd.run, campaign: cd.campaign, def_aware: defAware }),
     );
-    if (l) return withDiag({ lease: l });
+    // Rev 7: the job's provider allowlist rides along (a routing hint, not part of the signed job).
+    if (l) return withDiag({ lease: { ...l, providers: cd.providers } });
   }
   return withDiag({ wait_s: WAIT_S, reason: "no_work" });
 }

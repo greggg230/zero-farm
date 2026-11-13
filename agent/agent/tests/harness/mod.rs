@@ -58,6 +58,7 @@ pub fn fake_profile() -> Profile {
         disk_free_mb: 100_000,
         gpus: vec![],
         providers: vec!["cpu".into()],
+        runtime_providers: None,
         idle_h_day: None,
         on_h_day: None,
     }

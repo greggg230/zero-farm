@@ -169,8 +169,8 @@ Friends never see an update prompt, a UAC dialog or a restart request.
 | User input idle | `GetLastInputInfo` | start after 5 min idle; yield within 2 s of input |
 | Fullscreen app / game / presentation | `SHQueryUserNotificationState` (`QUNS_RUNNING_D3D_FULL_SCREEN`, `QUNS_BUSY`, `QUNS_PRESENTATION_MODE`) | never work |
 | Power | `GetSystemPowerStatus` | never on battery or battery saver |
-| Another GPU user | NVML: running compute/graphics processes, utilization | no GPU work while another process uses >10% for 30 s |
-| GPU temperature | NVML | back off above 83 °C |
+| Another GPU user | PDH "GPU Engine" per-process utilization, every vendor (rev 7; NVML before) | no GPU work while another process uses >10% for 30 s |
+| GPU temperature | D3DKMT adapter performance data, every vendor (rev 7; none reported = no rule) | back off above 83 °C |
 | Memory | `GlobalMemoryStatusEx` | keep ≥ 4 GB or 25% free, whichever is larger |
 
 Modes: **Idle only** (default), **Always, low priority**, **Paused**, plus optional hours ("only
@@ -623,6 +623,24 @@ Expect many friends' PCs to contribute mainly through the **CPU EP**: these nets
 CPU inference is competitive at small batches (the M4 Max beat its own GPU via MPS for MTG Zero;
 the 5090 needed CUDA graphs plus sparse uploads to pull ahead). Phase 0 measures this.
 
+**Phase 4 result (2026-11-12; zero-farm-notes phase4-gpu.md).** Every session goes through one factory
+(PROTOCOL 8, `create_session`); a provider is accepted only through the self-test (2e-5, twice
+bit-identical). Findings, eoe1 iter 80 (`packed`) unless noted:
+
+| provider | runtime | self-test | nodes on the CPU | rows/s at 64 / 256 / 1,024-row batches (CPU EP, same PC) |
+|---|---|---|---|---|
+| CPU | ORT 1.28.3 / 1.31.1 | 7.0e-6 | - | canary 4-core: 2,606 / 2,200 / 2,212; desktop 4 threads (loaded): 2,665 / 2,747 / 2,636 |
+| DirectML | Windows ML pack (ORT 1.28.3) | 4.8e-6 (4070 Ti, Windows 10), 8.6e-6 (5090); probe graph also on an Intel UHD 770 | 14-17: the 3-4 ScatterElements (opset 18: DirectML has none), the rest shape arithmetic | canary 4070 Ti: 873 / 2,463 / 4,448; 5090 (shared with a training run): 1,188 / 3,076 / 5,647 |
+| CUDA | ORT 1.24.4 + CUDA 12.6 + cuDNN 9.28 (ops, graph only: 1.4 GB) | 5.6e-6 (4070 Ti, Windows 10), 8.2e-6 (5090) | 11, shape arithmetic only | canary 4070 Ti: 12,371 / 24,471 / 23,887; 5090: 6,221 / 18,827 / 33,879 |
+| TensorRT-RTX 1.2 | ORT 1.23.2's own build | none: refused | - | `packed`: NonZero has no TensorRT-RTX kernel and 1.23.2 has no `nv_op_types_to_exclude`; `mask`: the engine builds (1.35 GB) and fails in Myelin's shape inference at run time (5090 and 4070 Ti alike) |
+
+Two export changes made the graphs run on the GPU providers with the same answers (zero-core
+`zero.onnx_export`, bit-identical on the CPU to the old export on 7,713 real rows; gate 1 passed again):
+densify without a ScatterElements reduction (TensorRT's parser refused the whole graph for it) and
+`portable()` (DirectML answered a MatMul with a 1-D operand with zeros, and failed on Reshape
+allowzero=1). A GPU wins only on big batches: below ~200 rows the CPU is as fast; agents should give GPU
+jobs a high `conc`.
+
 ### 8.5 Phases 3 and 4 in parallel (2026-11-12)
 
 The user's go-ahead covers both phases at once: self-play (3) and GPU for all vendors (4 + 4b,
@@ -653,6 +671,23 @@ OpenVINO). Its availability in an unpackaged per-user app is to be confirmed fir
 (the canary PC): a DirectML runtime pack. Each provider is accepted only through the self-test,
 which also exposes nodes left to the CPU. The graph features flagged in 8.2 are the risks: int64
 identity decoding, GatherElements/ScatterElements, boolean-mask attention.
+**Confirmed and built (2026-11-12):** Windows ML 2.x is usable from an unpackaged per-user Win32
+process through its flat C API (`WinMLEpCatalogCreate` / `EnumProviders` / `EnsureReady`, exported by
+`Microsoft.Windows.AI.MachineLearning.dll`): no Windows App SDK runtime, no MSIX identity, no WinRT
+registration; it needs Windows 10 1903+ for the files, Windows 11 24H2+ for the catalog's providers,
+medium integrity (an AppContainer would need the `packageQuery` capability SID), and an EULA that
+binds friends to its terms (Microsoft's distributable-code clause). So one runtime pack serves every
+vendor: the **Windows ML pack** (its ONNX Runtime 1.28.3 with CPU and DirectML built in, DirectML.dll,
+the catalog DLL; 43 MB) - DirectML everywhere (also the Windows 10 pack), and on Windows 11 24H2+ the
+catalog's NvTensorRtRtx (NVIDIA), AMDGPUExecutionProvider (AMD RDNA3+; MIGraphX is deprecated in
+Windows ML 2.x) and OpenVINO (Intel), downloaded by Windows ML on the first probe and accepted only
+through it. The risk features: int64 identity decoding runs on DirectML once its MatMul has a 2-D
+operand; GatherElements and boolean-mask attention run on every provider tried; ScatterElements stays on
+the CPU under DirectML (opset 18) and runs on CUDA. Not measurable here: the catalog's providers (this
+desktop is Windows 11 23H2, the canary Windows 10) - the friends' Windows 11 PCs probe them. The CUDA
+pack is measured (5-14x DirectML on the same NVIDIA cards) but not shipped: 1.4 GB, NVIDIA only, and a
+definition names one runtime. If the catalog's TensorRT-RTX fails on the friends' NVIDIA PCs, a CUDA pack
+is the NVIDIA answer, with a definition that may name a runtime per worker build (a protocol change).
 
 **Self-play run.** Phase 3 needs a run to feed. Options: (a) a short throwaway run forked from an
 EoE checkpoint, with a desktop-only twin as an A/B; (b) joining EoE run 2 (`eoe2e`, live,
@@ -728,6 +763,10 @@ the Python-only pieces a worker needs moved to Rust (league seats, forked/archiv
 **Phase 3b: co-training runs** (team_draft: deferred results, two nets): episodes as lease items
 via the `queue_only` driver's tags. Until then `check-config` refuses those runs loudly.
 
+**Phase 4 status (2026-11-12): built, not released** (zero-core `gpu`, mtg-zero `gpu`, zero-farm `gpu`;
+PROTOCOL rev 7 section 8; zero-farm-notes phase4-gpu.md). Left: a canary agent release; the AMD friend's probe
+report; a definition naming the Windows ML pack; per-adapter GPU gating; the CUDA pack if NVIDIA's catalog
+provider fails.
 **Phase 4: GPU.** Windows ML provider selection; TensorRT-RTX (or CUDA) EP on NVIDIA behind the
 yield protocol (drop the session to free VRAM), NVML gating, per-GPU engine cache; the per-machine
 self-test. **Phase 4b: AMD and Intel GPUs** through the same path (MIGraphX, OpenVINO, DirectML on

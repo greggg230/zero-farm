@@ -243,18 +243,19 @@ describe("choosing work", () => {
     expect(counts).toEqual({ hi: 12, lo: 4 });
   });
 
-  it("self-play first, then eval, then fuzz as the backfill", async () => {
+  it("eval first, then self-play, then fuzz as the backfill", async () => {
     await makeCampaign("fz");
     const seats = [{ net: 1 }, { bot: "heuristic" }];
     await makeRun("r", { quota: 10, slack: 0, games_per_lease: 10, eval: { batch: "it1", games: 4, checkpoints: [1], games_per_lease: 2, job: { seats, paired: true } } });
     const m = await enroll("a");
-    expect((await lease(m)).kind).toBe("selfplay");
+    // Rev 7 (PROTOCOL 8): within a tier, evaluation goes before self-play.
     const e1 = await lease(m);
     expect(e1).toMatchObject({ kind: "eval", checkpoint: null, job: { kind: "eval", games: 2, gid_base: 0 } });
     expect((await checkDefinitionLease(m, e1)).jobs.eval).toEqual({ settings: {}, seats, paired: true });
     expect(e1.checkpoints.map((c: any) => c.gen)).toEqual([1]);
     expect((await lease(m)).kind).toBe("eval");
-    expect((await lease(m)).kind).toBe("fuzz"); // quota full, eval all issued
+    expect((await lease(m)).kind).toBe("selfplay"); // eval all issued
+    expect((await lease(m)).kind).toBe("fuzz"); // quota full
   });
 
   it("routes by GPU: required skips CPU-only PCs, preferred makes them backfill", async () => {

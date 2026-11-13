@@ -30,6 +30,8 @@ pub enum WorkerMsg {
 
 pub struct SpawnOpts<'a> {
     pub exe: &'a Path,
+    /// The command line (`["serve"]` for a lease; the provider probe's own).
+    pub args: &'a [&'a str],
     pub cwd: &'a Path,
     /// Job memory limit (whole process tree).
     pub mem_limit_mb: u64,
@@ -143,7 +145,7 @@ fn set_eco_qos(h: HANDLE) -> bool {
 }
 
 impl WorkerProc {
-    /// Starts `<exe> serve` in `cwd`. Every stdout line is delivered to `on_msg` from a reader
+    /// Starts `<exe> <args>` (`serve`) in `cwd`. Every stdout line is delivered to `on_msg` from a reader
     /// thread (then `Eof` when the pipe closes).
     pub fn spawn(opts: SpawnOpts, on_msg: impl Fn(WorkerMsg) + Send + 'static) -> std::io::Result<WorkerProc> {
         use windows_sys::Win32::System::Threading::{
@@ -167,7 +169,7 @@ impl WorkerProc {
             cmd.env("PATH", joined).env("ZEROFARM_RUNTIME_DIR", rt);
         }
         let mut child = cmd
-            .arg("serve")
+            .args(opts.args)
             .current_dir(opts.cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

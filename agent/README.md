@@ -357,9 +357,13 @@ Agent exit codes: 0 quit, 75 switch to `state\pending`, 76 hand over to the new 
 - Worker sandbox (DESIGN 4: no network, only its work directory): see the design note below. Today
   the worker runs in a job object (kill on close, memory cap, no crash dialogs, no UI: clipboard,
   atoms, desktops, settings, logoff) at idle priority with EcoQoS, as the friend's user.
-- ONNX Runtime provider detection (`providers` is `["cpu"]`; the runtime pack fills it in later),
-  the per-machine self-test and GPU providers (phase 4). NVML signals and DXGI/NVML GPU profiles are
-  in place.
+- GPU work (phase 4, PROTOCOL 8) is built but not released: provider probes between leases
+  (`probe.rs`: a cached worker build's `probe-providers` per runtime pack, results in
+  `state\probes.json`, the readable report in the worker log), the profile's `providers` /
+  `runtime_providers` and adapter LUIDs, `caps.gpu` only with a verified GPU provider, the job line's
+  `providers` / `gpu`; the vendor-neutral GPU signals (PDH busy counters, D3DKMT temperature). Not yet:
+  gating on the job's own adapter only (today the busiest adapter gates every GPU job). An AppContainer
+  worker would need the `packageQuery` capability for Windows ML's provider catalog.
 - Authenticode signing (planned before more friends).
 - Autotuning sweeps and `diag` jobs beyond passing them to the worker.
 

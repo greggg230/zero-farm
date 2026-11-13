@@ -12,6 +12,10 @@ pub struct Gpu {
     pub name: String,
     pub vram_mb: u64,
     pub driver: String,
+    /// rev 7 (PROTOCOL 8): the adapter LUID, 16 lowercase hex digits of `(HighPart << 32) |
+    /// LowPart`; `gpus[]` has one entry per LUID. Absent from older agents.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub luid: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
@@ -25,7 +29,12 @@ pub struct Profile {
     pub ram_mb: u64,
     pub disk_free_mb: u64,
     pub gpus: Vec<Gpu>,
+    /// rev 7 (PROTOCOL 8): the execution providers that passed this PC's probe with any runtime pack,
+    /// preference order, `cpu` last (`["cpu"]` before any probe).
     pub providers: Vec<String>,
+    /// rev 7: per runtime pack build_id, the providers that passed with it (absent before any probe).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_providers: Option<std::collections::BTreeMap<String, Vec<String>>>,
     /// Availability: hours per day the idle policy let this PC work / the agent was running,
     /// 7-day means of complete days (absent before the first complete day).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -156,6 +165,10 @@ pub struct Lease {
     /// leases (coordinators before rev 6).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub definition: Option<DefinitionRef>,
+    /// rev 7 (PROTOCOL 8): the job's execution-provider allowlist (null: any). The agent only narrows
+    /// its verified providers with it; it is a routing hint, not part of the signed job.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub providers: Option<Vec<String>>,
     /// The per-lease fields (`gid_base`, `games`, `seed` / `first`, `count`); before rev 6 the
     /// whole job. The agent never forwards anything else from it (PROTOCOL 7).
     pub job: Value,
@@ -304,6 +317,17 @@ mod tests {
             canonical_json(&serde_json::json!({"b": 1, "a": {"d": [2, {"z": 1, "y": 2}], "c": null}})),
             r#"{"a":{"c":null,"d":[2,{"y":2,"z":1}]},"b":1}"#
         );
+    }
+
+    #[test]
+    fn gpu_luid_is_optional() {
+        let old: Gpu = serde_json::from_str(r#"{"vendor": "amd", "name": "RX 7900", "vram_mb": 20464, "driver": "1.2"}"#).unwrap();
+        assert_eq!(old.luid, None);
+        let v = serde_json::to_value(&old).unwrap();
+        assert!(v.get("luid").is_none(), "no luid key when unknown (old digests unchanged)");
+        let g = Gpu { luid: Some("000000000000d1f3".into()), ..old };
+        let back: Gpu = serde_json::from_str(&serde_json::to_string(&g).unwrap()).unwrap();
+        assert_eq!(back.luid.as_deref(), Some("000000000000d1f3"));
     }
 
     #[test]

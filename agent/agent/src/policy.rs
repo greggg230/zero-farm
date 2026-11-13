@@ -11,8 +11,14 @@
 //! | fullscreen / D3D / presentation / busy | never work (also in "always" mode, unless disabled) |
 //! | memory | keep ≥ max(4 GB, 25 %) free; below that: no work, and pressure ends a paused lease |
 //! | input idle | "idle only" mode: work after `idle_minutes` without input; any input → yield |
+//! | GPU present | no GPU work on a PC without a hardware GPU adapter |
 //! | other GPU process | no GPU work while others use > 10 % for 30 s (cleared after 30 s quiet) |
-//! | GPU temperature | no GPU work above 83 °C, resumes at ≤ 78 °C |
+//! | GPU temperature | no GPU work above 83 °C, resumes at ≤ 78 °C; no reading = no temperature rule |
+//!
+//! The GPU signals are vendor-neutral (signals.rs, PROTOCOL 8, DESIGN 8.5): "other use" is the
+//! Windows PDH `GPU Engine` utilisation of every process except Zero Farm's own, temperature the
+//! D3DKMT adapter performance data. A GPU whose driver gives no temperature (`temp_c: None`) has
+//! no temperature rule: only the driver's own thermal limits apply.
 
 use crate::settings::{Mode, Settings};
 
@@ -41,9 +47,10 @@ impl Notification {
 
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct GpuSignal {
-    /// Utilisation by processes other than our worker, percent (max over GPUs).
+    /// Utilisation by processes other than ours, percent, 0..=100 (max over GPUs; per GPU the
+    /// busiest engine). 0 when Windows has no GPU Engine counters.
     pub other_util_pct: u32,
-    /// Hottest GPU, °C.
+    /// Hottest GPU that reports a temperature, °C; `None` = no GPU reports one (no rule).
     pub temp_c: Option<u32>,
 }
 
@@ -60,7 +67,7 @@ pub struct Signals {
     pub battery_saver: bool,
     pub mem_avail_mb: u64,
     pub mem_total_mb: u64,
-    /// `None` = no NVIDIA GPU / NVML not available.
+    /// `None` = no hardware GPU adapter on this PC (any vendor).
     pub gpu: Option<GpuSignal>,
 }
 
@@ -193,12 +200,12 @@ fn update_gpu_state(st: &mut PolicyState, s: &Signals) -> Option<GpuBlock> {
             st.other_busy = false;
         }
     }
-    if let Some(t) = g.temp_c {
-        if t > GPU_HOT_C {
-            st.hot = true;
-        } else if t <= GPU_COOL_C {
-            st.hot = false;
-        }
+    match g.temp_c {
+        Some(t) if t > GPU_HOT_C => st.hot = true,
+        Some(t) if t <= GPU_COOL_C => st.hot = false,
+        Some(_) => {}
+        // No reading (any more): no temperature rule, so an earlier "too hot" can't stick.
+        None => st.hot = false,
     }
     if st.other_busy {
         Some(GpuBlock::OtherProcess)
@@ -345,6 +352,44 @@ mod tests {
         s.gpu = Some(GpuSignal { other_util_pct: 0, temp_c: Some(60) });
         s.now = 120;
         assert!(decide(&mut st, &s, &cfg).gpu);
+    }
+
+    #[test]
+    fn gpu_without_temperature_works() {
+        // An AMD/Intel-like signal: busy counters but no temperature reading.
+        let cfg = Settings::default();
+        let mut st = PolicyState::default();
+        let mut s = Signals::all_clear(0);
+        s.gpu = Some(GpuSignal { other_util_pct: 0, temp_c: None });
+        let r = decide(&mut st, &s, &cfg);
+        assert!(r.gpu, "{r:?}");
+        assert_eq!(r.gpu_block, None);
+        // Hot, then the reading disappears: temperature None never blocks.
+        s.gpu = Some(GpuSignal { other_util_pct: 0, temp_c: Some(90) });
+        assert_eq!(decide(&mut st, &s, &cfg).gpu_block, Some(GpuBlock::TooHot));
+        s.gpu = Some(GpuSignal { other_util_pct: 0, temp_c: None });
+        assert!(decide(&mut st, &s, &cfg).gpu);
+        // The busy rule still applies without a temperature.
+        for t in [1, 31] {
+            s.now = t;
+            s.gpu = Some(GpuSignal { other_util_pct: 40, temp_c: None });
+            decide(&mut st, &s, &cfg);
+        }
+        assert_eq!(decide(&mut st, &s, &cfg).gpu_block, Some(GpuBlock::OtherProcess));
+    }
+
+    #[test]
+    fn no_gpu_adapter_means_no_gpu_work_and_resets_state() {
+        let cfg = Settings::default();
+        let mut st = PolicyState::default();
+        let mut s = Signals::all_clear(0);
+        s.gpu = Some(GpuSignal { other_util_pct: 0, temp_c: Some(90) });
+        assert_eq!(decide(&mut st, &s, &cfg).gpu_block, Some(GpuBlock::TooHot));
+        s.gpu = None;
+        let r = decide(&mut st, &s, &cfg);
+        assert_eq!(r.gpu_block, Some(GpuBlock::NoGpu));
+        assert!(r.work && !r.gpu);
+        assert_eq!(st, PolicyState::default());
     }
 
     #[test]

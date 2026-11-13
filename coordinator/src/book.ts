@@ -27,6 +27,7 @@ import {
   leaseProblem,
 } from "./definitions";
 import { intersect, normalize, parseRanges, subtract, total, type Range } from "./ranges";
+import type { GpuMode, Provider } from "./routing";
 import {
   HttpError,
   type Json,
@@ -57,7 +58,8 @@ export interface SelfplayCfg {
   slack: number;
   max_stale: number;
   games_per_lease: "auto" | number;
-  gpu: "any" | "preferred" | "required";
+  gpu: GpuMode;
+  providers?: Provider[] | null; // rev 7: allowlist (null or absent: any provider)
   needs: Needs;
   job: Record<string, Json>;
 }
@@ -66,7 +68,8 @@ export interface EvalCfg {
   games: number;
   checkpoints: number[]; // rev 5: every network the seats name (rev 2's single `gen` is refused)
   games_per_lease: "auto" | number;
-  gpu: "any" | "preferred" | "required";
+  gpu: GpuMode;
+  providers?: Provider[] | null; // rev 7: allowlist (null or absent: any provider)
   needs: Needs;
   job: Record<string, Json>; // {settings, seats, paired}
 }
@@ -120,6 +123,8 @@ export interface CampaignRow {
   priority: number;
   state: string;
   needs: string | null;
+  gpu: string; // rev 7: any | preferred | required
+  providers: string | null; // rev 7: JSON allowlist or NULL (any provider)
   created_at: number;
   updated_at: number;
 }
@@ -490,6 +495,9 @@ export interface Lease {
   // the definition's template.
   definition?: { key: string; sha256: string };
   job: Record<string, Json>;
+  // Rev 7 (PROTOCOL 8): the job's provider allowlist, a routing hint that is not part of the signed
+  // job (null: any). friend.ts adds it to the answer; the stored lease JSON doesn't carry it.
+  providers?: Provider[] | null;
 }
 
 const buildRef = (id: string) => ({ build_id: id, manifest: `builds/${id}/manifest.json` });
@@ -1329,6 +1337,8 @@ export interface CampaignCfg {
   priority: number;
   state: "active" | "paused";
   needs: Needs | null;
+  gpu: GpuMode; // rev 7
+  providers: Provider[] | null; // rev 7
 }
 
 export async function putCampaign(env: Env, cfg: CampaignCfg, now: number): Promise<{ ok: true; created: boolean; cursor: number }> {
@@ -1338,11 +1348,12 @@ export async function putCampaign(env: Env, cfg: CampaignCfg, now: number): Prom
   const cursor = old ? Math.max(old.cursor, cfg.seed_base) : cfg.seed_base;
   await db
     .prepare(
-      `INSERT INTO campaigns (campaign, build_id, mode, env, seed_base, cursor, chunk, priority, state, needs, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO campaigns (campaign, build_id, mode, env, seed_base, cursor, chunk, priority, state, needs, gpu, providers, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (campaign) DO UPDATE SET build_id = excluded.build_id, mode = excluded.mode, env = excluded.env,
          seed_base = excluded.seed_base, cursor = MAX(campaigns.cursor, excluded.cursor), chunk = excluded.chunk,
-         priority = excluded.priority, state = excluded.state, needs = excluded.needs, updated_at = excluded.updated_at`,
+         priority = excluded.priority, state = excluded.state, needs = excluded.needs, gpu = excluded.gpu,
+         providers = excluded.providers, updated_at = excluded.updated_at`,
     )
     .bind(
       cfg.campaign,
@@ -1355,6 +1366,8 @@ export async function putCampaign(env: Env, cfg: CampaignCfg, now: number): Prom
       cfg.priority,
       cfg.state,
       cfg.needs ? JSON.stringify(cfg.needs) : null,
+      cfg.gpu,
+      cfg.providers ? JSON.stringify(cfg.providers) : null,
       now,
       now,
     )

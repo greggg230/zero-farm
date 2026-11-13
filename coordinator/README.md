@@ -115,7 +115,7 @@ npm test          # vitest + @cloudflare/vitest-pool-workers: local workerd, no 
 npm run check     # wrangler types --check, tsc (src + test), tsc (scripts)
 ```
 
-141 tests in 17 files (about 2 minutes; the fleet simulation is most of it):
+158 tests in 18 files (about 2 minutes; the fleet simulation is most of it):
 
 | File | Covers |
 |---|---|
@@ -123,7 +123,7 @@ npm run check     # wrangler types --check, tsc (src + test), tsc (scripts)
 | `ratelimit.test.ts` | 429 + `retry-after` after the burst; the 2026-11-11 hot loop (8 lease requests a second) gets exactly one answer per 5 s and is never locked out; a simulated day of a well-behaved agent (leases, beats, need_profile retries, wait_s, back-to-back leases at the limit's rate) is never limited; per machine; beats and crash reports; enroll per client IP (wrong codes count, the invite survives); the cron prunes |
 | `onboard.test.ts` | `/` without an installer (and its GitHub source link), with only canary (says "test build"), stable over canary, `?channel=`, an installer older than its channel's min_agent skipped; `/download` = 302 to the release's `github_url` (GET and HEAD, no bytes); `github_url` validation (GitHub release assets only), `setup` and `setup/` uploads refused; 426 `download` link per channel |
 | `diag.test.ts` | user-initiated uploads (`x-farm-diag: user`): no request needed, once an hour per machine, 20 MB (an oversize one doesn't use up the hour), requested uploads unchanged, a user upload answers open requests |
-| `lease.test.ts` | lifecycle: issue → beat → upload → done; expiry after 3 silent beats → reissue of exactly the unfinished ids; paused past slack → `give_back`; agent give-back; pause → `cancel`; new checkpoint through beats; `done` with missing results; job choice by priority, self-play → eval → fuzz backfill, GPU routing, needs/disk; lease sizing from measured and class rates; paused and starved (`starved_ms`) time not counted |
+| `lease.test.ts` | lifecycle: issue → beat → upload → done; expiry after 3 silent beats → reissue of exactly the unfinished ids; paused past slack → `give_back`; agent give-back; pause → `cancel`; new checkpoint through beats; `done` with missing results; job choice by priority, eval → self-play → fuzz backfill, GPU routing, needs/disk; lease sizing from measured and class rates; paused and starved (`starved_ms`) time not counted |
 | `quota.test.ts` | cap = quota × (1 + slack), trimmed last lease, in-flight = leased + unacked, rejected games freeing room, given-back ids reissued, checkpoint resets the count, expired leases stop counting |
 | `fuzz.test.ts` | cursor never rewinds (lower seed_base ignored, higher jumps), pool before cursor, failures parsed and deduped, campaign results/ack |
 | `eval.test.ts` | rev 5 eval batches: a head-to-head run without self-play (gens registered in any order), leases with every network (`checkpoints`, `checkpoint: null`) in whole pairs, odd `games_per_lease` rounded down; the batch checks (registered gens, seats = checkpoints, `ext:` bots, one of net/bot, seat count, even paired games, `gen` refused, a new run must register its gens first, bots-only batches); batches immutable and names never reused; pair crediting across chunks of a lease (`held`, `also`, retries) read back the documented way; a held game's pair given back whole and played again, a late chunk completing its own pair first, an expired lease's pair reissued; the even start and the skipped id in the self-play pool; `max_stale` and `x-gen` ignored; agent 0.2.3 gating; uncached checkpoints against the disk cap; progress in `GET run`, stats and the dashboard; per-gen `selftest` stats kept |
@@ -135,6 +135,7 @@ npm run check     # wrangler types --check, tsc (src + test), tsc (scripts)
 | `external.test.ts` | the owner's own machines: merged contributors (farm and own), totals by origin, per run; each POST replaces the reporter's sources; offline after 30 min (1-hour numbers drop out, 24-hour ones after a day), deleted after 7 days; validation and size limit; admin only; never on the public page |
 | `update.test.ts` | `{"update"}` for agents older than the channel's or a build's `min_agent`, no update loop for builds no release satisfies, `aw` mismatch, enroll → 426 |
 | `units.test.ts` | ranges, semver, sizing, BLAKE2b vectors, minisign (prehashed and legacy, tampering, wrong key, wrong trusted comment), telemetry adapter |
+| `routing.test.ts` | rev 7 capability routing: allowlist and `gpu` validation (runs' `selfplay`/`eval`, campaigns, stored and returned by GET); profile `gpus[].luid` and `runtime_providers` checks, unknown provider names kept; GPU eligibility from verified providers (not `caps.gpu` alone), per runtime pack else the union, from a profile sent with the request; `required` / `preferred` / `any` (an allowlist never filters under `any`); a `tensorrt_rtx` allowlist excludes an AMD PC; eval before self-play within a tier; campaign routing; `providers` on every lease (diag: null); providers and LUIDs in stats |
 | `fleet.test.ts` | 10 fake machines × 6 generations against the real Worker, with the real lease cap (2); rev 6: 4 run an agent older than `DEFINITION_AGENT`, the campaign is signed from the start and the run once gen 2 is out (then a new version per gen and batch), every definition lease is checked as an agent would (signature, run, build, runtime, checkpoints, per-lease fields only), legacy agents get legacy self-play leases before the cutover and nothing after; random vanishing (some crash and lose games in progress, one dies for good holding a lease), pauses past the slack, late results, double and conflicting uploads, checkpoint switches, fuzz backfill, and two paired eval batches (gen 2 v 1, then the current gen v 1) whose games finish in random order, so pairs are split across chunks and left half-played by dropouts; a fake trainer fills each generation by cursor and reads the eval batches by `ids` + `also`. Asserts every game id and seed is claimed exactly once or back in the pool, every generation filled by exactly `quota` accepted games, accepted + in flight never over the cap, ≥ 3 machines per generation, the dead machine's games played by others, every eval pair credited exactly once with both games from one lease, eval chunks never refused as stale |
 
 Test notes:
@@ -302,9 +303,14 @@ reissued before any fresh id is.
 **Choosing and sizing.** Pull only. For a lease request: diag requests for that machine first;
 then each active run's self-play (needs a checkpoint and quota headroom) and eval (unissued batch
 ids), scored priority × fit ÷ (1 + active leases of that job), which shares machines by priority;
-then fuzz as the backfill. Fit: `gpu: required` excludes CPU-only PCs, `gpu: preferred` moves the
-run to the backfill tier at ×0.25 on them, fuzz is ×0.5 on GPU PCs, cached builds ×1.2, a cached
-checkpoint ×1.1; `needs` and disk must fit the caps. Size = ~450 s × the machine's rate for that
+then fuzz as the backfill. Within a tier, eval goes before self-play (rev 7), then by score. Fit
+(rev 7, `src/routing.ts`): a machine is GPU-eligible for a job when `caps.gpu` is true and it
+verified a GPU provider the job's `providers` allowlist allows (any, without one); verified =
+`profile.runtime_providers[<the run's runtime>]` if present, else `profile.providers`. `gpu:
+required` excludes machines that aren't eligible, `gpu: preferred` moves the job to the backfill
+tier at ×0.25 on them, `any` never filters; fuzz (campaigns take `gpu`/`providers` too) is ×0.5
+on GPU PCs under `any`, cached builds ×1.2, a cached checkpoint ×1.1; `needs` and disk must fit
+the caps. The lease carries the job's allowlist as `providers` (null: any). Size = ~450 s × the machine's rate for that
 (kind, scope), an EWMA of ids per running second (paused time excluded), else its hardware class's
 average, else defaults (16 games, 10 eval games, 20000 seeds), clamped. `games_per_lease` / `chunk`
 override.
