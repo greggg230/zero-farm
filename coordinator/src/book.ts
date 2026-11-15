@@ -63,6 +63,7 @@ export interface SelfplayCfg {
   providers?: Provider[] | null; // rev 7: allowlist (null or absent: any provider)
   needs: Needs;
   job: Record<string, Json>;
+  share?: number; // rev 13 (PROTOCOL 5.3): a background self-play (an analysis campaign's), as EvalCfg's
 }
 export interface EvalCfg {
   batch: string;
@@ -74,6 +75,10 @@ export interface EvalCfg {
   providers?: Provider[] | null; // rev 7: allowlist (null or absent: any provider)
   needs: Needs;
   job: Record<string, Json>; // {settings, seats, paired}
+  // rev 13 (PROTOCOL 5.3): a background batch (an analysis campaign): its leases go before other runs' games only
+  // while its share of the runs' active leases is below this; otherwise after them. Absent: the eval rule of rev 7
+  // (evaluation before self-play).
+  share?: number;
 }
 
 export const isPaired = (ev: EvalCfg) => ev.job.paired === true;

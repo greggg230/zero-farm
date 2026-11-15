@@ -265,6 +265,7 @@ function selfplayOf(v: unknown): book.SelfplayCfg | null {
     ...routingIn(o, "selfplay."),
     needs: needsOf(o.needs, "selfplay.needs"),
     job: jobOf(o.job, "selfplay.job"),
+    ...shareOf(o.share, "selfplay.share"),
   };
 }
 
@@ -300,7 +301,17 @@ export function evalOf(v: unknown): book.EvalCfg | null {
     ...routingIn(o, "eval."),
     needs: needsOf(o.needs, "eval.needs"),
     job,
+    ...shareOf(o.share, "eval.share"),
   };
+}
+
+// Rev 13 (PROTOCOL 5.3): a background job's (an analysis campaign's eval batch or self-play) share of the runs' active
+// leases, a number in (0, 1]; absent or null: not a background job (the key is then left out of the stored config: the
+// body of before).
+export function shareOf(v: unknown, name: string): { share?: number } {
+  if (v === undefined || v === null) return {};
+  if (typeof v !== "number" || !Number.isFinite(v) || v <= 0 || v > 1) throw bad(`${name} must be a number in (0, 1] or null`);
+  return { share: v };
 }
 
 // Rev 9: the oldest agent a run's or campaign's leases may go to (null or absent: no such limit).

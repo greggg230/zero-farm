@@ -103,6 +103,17 @@ export function place(kind: "selfplay" | "eval" | "fuzz", r: Routing, eligible: 
 // Within a tier, evaluation goes before self-play (PROTOCOL 8); self-play and fuzz compare by score.
 export const kindRank = (kind: string): number => (kind === "eval" ? 0 : 1);
 
+// Rev 13 (PROTOCOL 5.3): a candidate's rank within its tier. A run job with a `share` (a background job: an analysis
+// campaign's eval batch or self-play) ranks first (0) only while this lease keeps its share of the runs' active leases
+// (its own active leases of that kind + 1 at most `share` x (all runs' active self-play and eval leases + 1));
+// otherwise after every other run job (2). The lease loop takes the first candidate that grants, so a background job
+// still gets every machine whose other run jobs have nothing to give (a self-play quota filled, no run at all): it
+// never idles a PC.
+export function jobRank(kind: string, share: number | undefined, activeScope: number, activeRuns: number): number {
+  if (kind === "fuzz" || share === undefined) return kindRank(kind);
+  return activeScope + 1 <= share * (activeRuns + 1) + 1e-9 ? 0 : 2;
+}
+
 // A stored run job (`selfplay`/`eval` JSON) or campaign's routing settings; configs put before
 // rev 7 have neither field (any GPU setting, any provider).
 export function storedRouting(gpu: unknown, providers: unknown): Routing {

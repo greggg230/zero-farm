@@ -22,7 +22,7 @@ import {
   gpuNeedOf,
   hasAdapter,
   isGpuProvider,
-  kindRank,
+  jobRank,
   place,
   requiresRuntimeOf,
   runtimeProvidersOf,
@@ -235,6 +235,7 @@ interface Candidate {
   runtime: string | null;
   alt: boolean;
   gpu_lease: boolean; // an alternate, or a machine GPU-eligible for the job: `auto` leases get GPU_LEASE_MIN
+  share?: number; // rev 13: a background job's share of the runs' active leases (PROTOCOL 5.3)
 }
 
 // Lease sizing: about TARGET_S seconds of this machine's measured rate (ids per running second),
@@ -451,6 +452,7 @@ export async function lease(c: Ctx): Promise<Response> {
           runtime: v.runtime,
           alt: v.alt,
           gpu_lease: altAware && v.gpuLease,
+          ...(typeof sp.share === "number" ? { share: sp.share } : {}),
         });
       }
     }
@@ -486,6 +488,7 @@ export async function lease(c: Ctx): Promise<Response> {
             runtime: v.runtime,
             alt: v.alt,
             gpu_lease: altAware && v.gpuLease,
+            ...(typeof ev.share === "number" ? { share: ev.share } : {}),
           });
         }
       }
@@ -568,8 +571,11 @@ export async function lease(c: Ctx): Promise<Response> {
   const rate = new Map<string, number>((ratesR.results as any[]).map((x) => [`${x.scope}|${x.kind}`, x.rate]));
   const classRate = new Map<string, number>((classR.results as any[]).map((x) => [`${x.scope}|${x.kind}`, x.rate]));
   const score = (cd: Candidate) => (cd.priority * cd.fit) / (1 + (active.get(`${cd.scope}|${cd.kind}`) ?? 0));
-  // Within a tier, evaluation before self-play (rev 7), then by score.
-  usable.sort((a, b) => a.tier - b.tier || kindRank(a.kind) - kindRank(b.kind) || score(b) - score(a) || a.scope.localeCompare(b.scope));
+  // Rev 13: the runs' active leases (self-play and eval), for a background batch's share.
+  const activeRuns = (activeR.results as any[]).filter((a) => a.kind === "selfplay" || a.kind === "eval").reduce((t, a) => t + a.n, 0);
+  const rank = (cd: Candidate) => jobRank(cd.kind, cd.share, active.get(`${cd.scope}|${cd.kind}`) ?? 0, activeRuns);
+  // Within a tier, evaluation before self-play (rev 7; a background batch only within its share, rev 13), then by score.
+  usable.sort((a, b) => a.tier - b.tier || rank(a) - rank(b) || score(b) - score(a) || a.scope.localeCompare(b.scope));
   for (const cd of usable) {
     const key = `${cd.scope}|${cd.kind}`;
     let want = leaseSize(cd.kind as Exclude<book.Kind, "diag">, cd.configured, rate.get(key) ?? classRate.get(key) ?? null);
