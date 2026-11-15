@@ -388,7 +388,7 @@ tools also send an Access service token (`CF-Access-Client-Id`, `CF-Access-Clien
 | `POST /v1/admin/build` | `{"build_id"}` after its manifest, signature and files are uploaded; the coordinator checks presence + sizes + hashes, and the signature and its trusted comment (`build_id=`, `kind=`) when the Worker var `RELEASE_PUBKEYS` is set → `{"ok": true, "build_id", "kind", "version", "size", "sig_verified"}`; failures → 400 with `"problems": [...]` |
 | `POST /v1/admin/agent/release` | `{"version", "build_id", "channel": "canary" \| "stable", "min_agent", "github_url": "<url>" \| null}`: `build_id` must be a registered agent build of that version, `min_agent` ≤ `version`. `github_url` (rev 4): the installer asset of the release's GitHub Release, where `GET /download` redirects; create the GitHub Release first. Rev 6: exactly `https://github.com/<GITHUB_REPO>/releases/download/agent-v<version>/ZeroFarmSetup.exe` (the var defaults to `greggg230/zero-farm`), else 400. `setup` (rev 3) → 400 → `{"ok": true, "channel", "version", "build_id", "min_agent", "github_url"}` |
 | `PUT /v1/admin/definition` | rev 6, section 7: `{"kind": "run" \| "campaign", "id", "version", "key", "sha256"}` after `definition.json` and `.minisig` are uploaded to `key` = `defs/<kind>/<id>/<version>/definition.json` → `{"ok": true, "kind", "id", "version", "key", "sha256", "unchanged", "current": true}`; failures → 400 with `"problems"`, a version not above the current one (or the same with other bytes) → 409 |
-| `PUT /v1/admin/run/{run}` | `{"game", "build_id", "runtime", "priority": 1.0, "min_agent": "0.2.8" \| null, "alternates": [{"build_id", "runtime", "when": {"vendor", "min_driver"?}}] \| null (rev 11, section 9.4), "selfplay": {"quota": 600, "slack": 0.1, "max_stale": 1, "games_per_lease": "auto", "gpu_games_per_lease": 24 | "auto" (rev 11, optional, section 9.4), "gpu": "any" \| "preferred" \| "required", "providers": ["dml", "cpu"] \| null, "needs": {"threads", "ram_mb"}, "job": {...}} \| null, "eval": {"batch": "it81", "games": 110, "checkpoints": [81, 70], "games_per_lease": "auto", "gpu", "providers", "needs", "job": {"settings", "seats", "paired"}} \| null, "state": "active" \| "paused"}` → `{"ok": true, "created"}`. `build_id` must be a registered worker build, `runtime` a runtime build. A new eval `batch` reserves `games` fresh game ids (the old batch's unissued ones are dropped); its rules and checks are in section 5.2 (rev 5: `checkpoints` replaces `gen`, which is now refused). Pausing a run, or dropping its `selfplay`/`eval`, cancels those leases at their next beat. Rev 9: `min_agent` (semver, optional; absent or null: none) - the run's leases (self-play and eval) go only to agents at or above it (section 3's update rule); a PUT is the whole configuration, so a PUT without it removes the limit; leases already issued run on (migration 0007) |
+| `PUT /v1/admin/run/{run}` | `{"game", "build_id", "runtime", "priority": 1.0, "min_agent": "0.2.8" \| null, "alternates": [{"build_id", "runtime", "when": {"vendor", "min_driver"?}}] \| null (rev 11, section 9.4), "selfplay": {"quota": 600, "slack": 0.1, "max_stale": 1, "games_per_lease": "auto", "gpu_games_per_lease": 24 | "auto" (rev 11, optional, section 9.4), "gpu": "any" \| "preferred" \| "required", "providers": ["dml", "cpu"] \| null, "needs": {"threads", "ram_mb"}, "job": {...}, "share": 0.25 \| null (rev 13, section 5.3)} \| null, "eval": {"batch": "it81", "games": 110, "checkpoints": [81, 70], "games_per_lease": "auto", "gpu", "providers", "needs", "job": {"settings", "seats", "paired"}, "share" (rev 13)} \| null, "state": "active" \| "paused"}` → `{"ok": true, "created"}`. `build_id` must be a registered worker build, `runtime` a runtime build. A new eval `batch` reserves `games` fresh game ids (the old batch's unissued ones are dropped); its rules and checks are in section 5.2 (rev 5: `checkpoints` replaces `gen`, which is now refused). Pausing a run, or dropping its `selfplay`/`eval`, cancels those leases at their next beat. Rev 9: `min_agent` (semver, optional; absent or null: none) - the run's leases (self-play and eval) go only to agents at or above it (section 3's update rule); a PUT is the whole configuration, so a PUT without it removes the limit; leases already issued run on (migration 0007) |
 | `GET /v1/admin/run/{run}` | config (rev 9: with `min_agent`) + state: `current_gen`, `next_gid`, `pool`, `selfplay_state` (`cap`, `accepted`, `leased`, `pending`, `in_flight`, `headroom`), `checkpoints` (registered gens, rev 5), `eval_state` (the current batch's progress, section 5.2) and `eval_batches` (every batch of the run, newest first, same fields); rev 6 `definition` (as in stats; `GET /v1/admin/campaign/{id}` too) |
 | `PUT /v1/admin/run/{run}/checkpoint/{gen}` | `{"model", "sha256", "reference", "reference_sha256"}` (files under `ckpt/<run>/`, uploaded first); makes `gen` current for self-play and resets that generation's quota counter → `{"ok": true, "unchanged", "current"}`. Rev 5: a `gen` older than the current one is registered without becoming current (`"current": false`: an eval opponent or a head-to-head label); the same `gen` with other files → 409. Rev 6: a gen the current definition already signs must be exactly those files (else 400); self-play with a definition plays the new current gen once a definition signs it |
 | `GET /v1/admin/run/{run}/results?after={cursor}&limit=500` | → `{"results": [{"id", "key", "lease_id", "seq", "machine_id", "kind", "gen", "games", "ids", "dup_ids", "sha256", "size", "t"}], "cursor"}`. `ids`/`games`: the game ids credited to this chunk; `dup_ids`: ids in it that an earlier chunk was credited with (skip those games). Eval chunks (rev 5) also carry `batch`, `held` and `also`, and their `games` counts `also` too (section 5.2). `limit` ≤ 1000 |
@@ -552,6 +552,49 @@ stale, so eval leases ignore `max_stale` (and `x-gen`).
 - **Semantics** must equal zero-core's `zero.h2h` / `Run.evaluate` at the same settings (eval sims,
   seat order, the deal shared by a pair); the worker's gate checks native rows against the Python
   path running the same ONNX graphs, byte for byte.
+
+### 5.3 Play jobs with traces: analysis campaigns, background shares (rev 13)
+
+One job model for "play N games with these networks under these settings over game ids [0, N) and return every game"
+(the owner's 2026-11-15 architecture review: self-play, evaluation, yardsticks, census and analyses are all instances
+of it). A **play job** = a worker build, networks by sha256, the play settings, seats, a base seed, ids `[0, N)` ->
+one traced game record and its digest per id, positive coverage (every id done or failed with a reason), a spot
+replay on the desktop. Options: `trace` (the moves come back) and `samples` (the search's policy targets and values
+too). On the wire it reuses the two existing job kinds, so **agents need no change** (any agent that takes eval or
+self-play leases runs it; the agent forwards the template's `settings` as they are):
+
+| play job | wire form | rows / files |
+|---|---|---|
+| without samples (evaluation seats: a head-to-head, a run's yardstick, analysis games) | an eval batch (5.2) of a run of its own, its settings with `eval_trace: 1` (zero-core docs/az.md 50) | eval rows + `digest` + `rec` (the game's record: seed, every real move, result, margins, rounds, setup) |
+| with samples (self-play seats: noise, temperature, playout cap - what a training game is) | the self-play of a run of its own: `quota` = N, `slack` 0, its one checkpoint current; the desktop posts `accept` = the games it took | the records files of rev 8 |
+
+- **The run.** `cmp-<name>`, `selfplay` null (or the samples job), its own signed definition (7), gens 1 (A) and
+  2 (B, absent for self-play). The batch's job carries `seed`, the base seed of every game (`baseSeed`: the job's
+  `seed` wins over the name), so a campaign plays exactly the games a local match of that seed plays: game g's seed is
+  `game_seed(seed, g, paired)`.
+- **Background share** (rev 13, coordinator only; migration none): a run's `selfplay` or `eval` may carry
+  `"share": x` (0 < x <= 1; absent or null: none, and the stored config has no such key). Within a tier, such a job
+  goes first only while its own active leases + 1 are at most `x` times (all runs' active self-play and eval leases
+  + 1); otherwise it goes after every other run job. The lease loop takes the first candidate that grants, so a
+  background job still gets every machine the other runs have nothing for (a self-play quota filled, a paused run,
+  no run): it never idles a PC, and the default 0.25 never starves a live run's farm self-play (1 machine in 4 at
+  most while both want work). Without `share` nothing changes: evaluation still goes before self-play (rev 7).
+  `share` is not part of a batch's identity (it may change like `games_per_lease`). Lease counts measure machine time
+  because leases are sized to ~7.5 minutes of each machine (5.1).
+- **Trust.** Each traced row carries `digest` = SHA-256 of its record's sorted-key compact JSON (16 hex); the desktop
+  checks every row's digest against its record, then replays a random ~5% of the games (seeded by the campaign's
+  name) through the engine from seed + moves (every move legal, the result, margins, rounds and setup the record's);
+  any mismatch refuses the whole campaign. A lease's (or campaign's) games have one digest: SHA-256 over `gid:digest`
+  lines in gid order. This catches bad hardware and transport faults (bad RAM, a broken build) - the realistic threat
+  with invited friends; it proves the moves are legal and the results theirs, not that the network chose them (a
+  duplicate-lease audit would, later).
+- **Coverage and fallback.** The coordinator's reissue rules are unchanged (a lease not heard from is reissued). The
+  desktop collector gives every campaign a deadline: game ids the farm has not delivered by then are played on the
+  owner's machine by the same signed worker executable on the same graphs (the same games), the campaign's run is
+  paused (its leases cancelled at their next beat), and a piece that fails there marks its games failed with the
+  worker's error. Without local fallback the campaign fails loudly, naming the missing ranges.
+- **Desktop.** MTG Zero's `tools/farm_campaign.py submit|status|collect` and library `mtgz.az.farm_campaign`
+  (its docs/ENGINE.md 165).
 
 ## 6. Agent install layout, launcher and self-update
 
@@ -1074,6 +1117,12 @@ the rest, or `[]`), or every agent deletes it at each start and each update chec
 lease.
 
 ## Changes
+- v1 rev 13 (2026-11-15; coordinator only, no migration, no agent change): **play jobs with traces and background
+  shares** (section 5.3). A run's `selfplay` and `eval` take an optional `share` (0 < x <= 1): such a job goes first
+  only within that share of the runs' active leases, else after every other run job, and still gets any machine the
+  others have nothing for; absent, nothing changes. Analysis campaigns are play jobs on runs of their own: an eval
+  batch with the zero-core setting `eval_trace` (rows carry `digest` and `rec`) or a self-play with `quota` = the
+  games; the desktop checks digests, replays ~5% and plays what is missing past a deadline itself.
 - v1 rev 12 (2026-11-13; agent 0.2.11, canary first; coordinator: no migration): **probes the PC never finished,
   no GPU work on AMD, the evict list** (section 9.8). The agent writes a probe-in-progress marker through to disk
   before every built-in probe and bench; one left at the next start is an unfinished probe: reported (`/v1/crash`

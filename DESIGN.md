@@ -407,6 +407,12 @@ Job kinds, in the order they ship:
    `engine/tests/az.rs:2253` uniform-evaluator pattern).
 3. **selfplay**: play with the run's latest checkpoint; upload game records; the trainer replays
    them to rebuild training rows.
+4. **play jobs with traces** (2026-11-15, PROTOCOL 5.3, rev 13): analysis campaigns - "play N games with these
+   networks under these settings over ids [0, N) and return every game" - as eval batches with `eval_trace` (or a
+   self-play with samples) of runs of their own, at a background `share` of the farm's run leases (default 0.25), with
+   per-game digests, a ~5% replay on the desktop and a deadline after which the desktop plays what is missing with the
+   same worker. The owner's architecture review (2026-11-15) makes this the general job model: self-play and
+   evaluation become play jobs with options (`samples`, `trace`) instead of separate shapes.
 
 ### 6.1 Self-play records instead of shards
 
