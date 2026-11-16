@@ -297,7 +297,7 @@ export async function makeRun(run: string, o: RunOpts = {}): Promise<string> {
 
 export async function makeCampaign(
   id: string,
-  o: { build?: string; seed_base?: number; chunk?: number | "auto"; priority?: number; state?: string; define?: boolean; min_agent?: string | null } = {},
+  o: { build?: string; seed_base?: number; chunk?: number | "auto"; priority?: number; state?: string; define?: boolean; min_agent?: string | null; share?: unknown } = {},
 ) {
   const build = o.build ?? (await makeBuild({ tag: `fuzz-${id}` }));
   const ans = ok(
@@ -310,6 +310,7 @@ export async function makeCampaign(
       priority: o.priority ?? 0.2,
       state: o.state ?? "active",
       ...(o.min_agent !== undefined ? { min_agent: o.min_agent } : {}),
+      ...(o.share !== undefined ? { share: o.share } : {}),
     }),
   );
   if (o.define !== false) await define("campaign", id);

@@ -604,6 +604,8 @@ export async function putCampaign(c: Ctx, id: string): Promise<Response> {
     needs: b.needs === undefined || b.needs === null ? null : needsOf(b.needs, "needs"),
     ...routingIn(b, ""),
     min_agent: minAgentOf(b.min_agent),
+    // Rev 14 (PROTOCOL 5.4): a fuzz campaign's share of the farm beside the runs' games (null: the backfill).
+    share: shareOf(b.share, "share").share ?? null,
   };
   await buildOfKind(c.env.DB, cfg.build_id, "worker", "build_id");
   return json(unwrap(await bookFor(c.env, book.campaignScope(id)).putCampaign(cfg, c.now)));
@@ -968,6 +970,7 @@ export async function stats(c: Ctx): Promise<Response> {
       mode: x.mode,
       state: x.state,
       priority: x.priority,
+      share: x.share ?? null,
       min_agent: x.min_agent ?? null,
       build_id: x.build_id,
       seed_base: x.seed_base,

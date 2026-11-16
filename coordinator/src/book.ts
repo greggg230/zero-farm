@@ -135,6 +135,7 @@ export interface CampaignRow {
   gpu: string; // rev 7: any | preferred | required
   providers: string | null; // rev 7: JSON allowlist or NULL (any provider)
   min_agent: string | null; // rev 9: the oldest agent its leases go to (NULL: no such limit)
+  share: number | null; // rev 14: competes with the runs' games within this share (NULL: the backfill)
   created_at: number;
   updated_at: number;
 }
@@ -1372,6 +1373,7 @@ export interface CampaignCfg {
   gpu: GpuMode; // rev 7
   providers: Provider[] | null; // rev 7
   min_agent: string | null; // rev 9
+  share: number | null; // rev 14 (PROTOCOL 5.4): null = the backfill
 }
 
 export async function putCampaign(env: Env, cfg: CampaignCfg, now: number): Promise<{ ok: true; created: boolean; cursor: number }> {
@@ -1381,12 +1383,12 @@ export async function putCampaign(env: Env, cfg: CampaignCfg, now: number): Prom
   const cursor = old ? Math.max(old.cursor, cfg.seed_base) : cfg.seed_base;
   await db
     .prepare(
-      `INSERT INTO campaigns (campaign, build_id, mode, env, seed_base, cursor, chunk, priority, state, needs, gpu, providers, min_agent, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO campaigns (campaign, build_id, mode, env, seed_base, cursor, chunk, priority, state, needs, gpu, providers, min_agent, share, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (campaign) DO UPDATE SET build_id = excluded.build_id, mode = excluded.mode, env = excluded.env,
          seed_base = excluded.seed_base, cursor = MAX(campaigns.cursor, excluded.cursor), chunk = excluded.chunk,
          priority = excluded.priority, state = excluded.state, needs = excluded.needs, gpu = excluded.gpu,
-         providers = excluded.providers, min_agent = excluded.min_agent, updated_at = excluded.updated_at`,
+         providers = excluded.providers, min_agent = excluded.min_agent, share = excluded.share, updated_at = excluded.updated_at`,
     )
     .bind(
       cfg.campaign,
@@ -1402,6 +1404,7 @@ export async function putCampaign(env: Env, cfg: CampaignCfg, now: number): Prom
       cfg.gpu,
       cfg.providers ? JSON.stringify(cfg.providers) : null,
       cfg.min_agent,
+      cfg.share,
       now,
       now,
     )

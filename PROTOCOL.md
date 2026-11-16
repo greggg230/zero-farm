@@ -198,7 +198,7 @@ lease hears about a diagnostics request on its next `/v1/lease`.
 
 How the coordinator picks (DESIGN 5.1): diagnostics asked for this machine first; then runs'
 evaluation (unissued games) and self-play (short of quota), by run priority × fit ÷ (1 + that job's
-active leases), evaluation before self-play at the same tier (rev 7); then fuzz, the backfill (also where a
+active leases), evaluation before self-play at the same tier (rev 7); then fuzz, the backfill (rev 14: a campaign with a `share` competes with the runs' games within it, section 5.4; also where a
 job with `"gpu": "preferred"` goes on a PC that isn't GPU-eligible for it, section 8). Caps must cover the job's `needs` and the disk its uncached builds (and, rev 5, an
 eval job's uncached checkpoints) take. A lease is
 sized to about 450 s of this machine's measured rate for that job (ids per running second, from its
@@ -394,8 +394,8 @@ tools also send an Access service token (`CF-Access-Client-Id`, `CF-Access-Clien
 | `GET /v1/admin/run/{run}/results?after={cursor}&limit=500` | → `{"results": [{"id", "key", "lease_id", "seq", "machine_id", "kind", "gen", "games", "ids", "dup_ids", "sha256", "size", "t"}], "cursor"}`. `ids`/`games`: the game ids credited to this chunk; `dup_ids`: ids in it that an earlier chunk was credited with (skip those games). Eval chunks (rev 5) also carry `batch`, `held` and `also`, and their `games` counts `also` too (section 5.2). `limit` ≤ 1000 |
 | `POST /v1/admin/run/{run}/accept` | `{"gen", "games": n}`: the trainer's total of games accepted for `gen` (a total, not an increment; include games held over for the next generation). Self-play stops when accepted + in flight (unclaimed ids in active self-play leases + credited self-play games not yet acked) reaches `quota × (1 + slack)`. Call it before `ack` |
 | `POST /v1/admin/run/{run}/ack` | `{"cursor"}`: results up to it are ingested (R2 objects deleted after 7 days) → `{"ok": true, "acked"}` |
-| `PUT /v1/admin/campaign/{id}` | `{"build_id", "mode", "env": {"FUZZ_POOL": "delver", ...}, "seed_base": 10000000, "chunk": "auto" \| n, "priority": 0.2, "state", "needs": {"threads", "ram_mb"} \| null, "gpu": "any" (default) \| "preferred" \| "required", "providers": [...] \| null, "min_agent": "0.2.8" \| null}` → `{"ok": true, "created", "cursor"}`. The seed cursor never rewinds: a lower `seed_base` is ignored, a higher one moves it up. Rev 7: `gpu` and `providers` (section 8; migration 0006). Rev 9: `min_agent` as for runs (migration 0007) |
-| `GET /v1/admin/campaign/{id}` · `GET …/results?after=` · `POST …/ack` | config + `cursor`, `seeds_done`, `pool`, `failures`, `sites`; results and ack as for runs (`ids` are seeds) |
+| `PUT /v1/admin/campaign/{id}` | `{"build_id", "mode", "env": {"FUZZ_POOL": "delver", ...}, "seed_base": 10000000, "chunk": "auto" \| n, "priority": 0.2, "state", "needs": {"threads", "ram_mb"} \| null, "gpu": "any" (default) \| "preferred" \| "required", "providers": [...] \| null, "min_agent": "0.2.8" \| null, "share": 0.5 \| null}` → `{"ok": true, "created", "cursor"}`. The seed cursor never rewinds: a lower `seed_base` is ignored, a higher one moves it up. Rev 7: `gpu` and `providers` (section 8; migration 0006). Rev 9: `min_agent` as for runs (migration 0007). Rev 14: `share` (0 < x <= 1, or null/absent: the backfill; section 5.4; migration 0010); a PUT is the whole configuration, so one without `share` removes it |
+| `GET /v1/admin/campaign/{id}` · `GET …/results?after=` · `POST …/ack` | config (rev 14: with `share`) + `cursor`, `seeds_done`, `seeds_leased`, `active_leases`, `pool`, `failures`, `sites`; results and ack as for runs (`ids` are seeds) |
 | `GET /v1/admin/campaign/{id}/failures?after=&limit=` | → `{"failures": [{"id", "seed", "mode", "site", "panic", "repro", "output_tail", "build_id", "engine_commit", "machine_id", "lease_id", "first_of_site", "t"}], "cursor"}` (section 5.1; one row per (seed, site)) |
 | `GET /v1/admin/machines` · `POST /v1/admin/machine/{id}/revoke` | revoking cancels the machine's active leases at once (their ids go back to the pool) → `{"ok": true, "cancelled"}` |
 | `POST /v1/admin/machine/{id}` | `{"name"?, "channel"?, "paused"?, "unblock"?}`; a paused machine gets `wait_s` / `paused_by_admin`; `"unblock": true` (rev 5) lifts the machine's build blocks (`/v1/crash` kind `blocked`) and answers `{"ok": true, "unblocked": n}` |
@@ -595,6 +595,29 @@ self-play leases runs it; the agent forwards the template's `settings` as they a
   worker's error. Without local fallback the campaign fails loudly, naming the missing ranges.
 - **Desktop.** MTG Zero's `tools/farm_campaign.py submit|status|collect` and library `mtgz.az.farm_campaign`
   (its docs/ENGINE.md 165).
+
+### 5.4 A fuzz campaign's share: fuzz ahead of a live run's self-play while it is behind (rev 14)
+
+By default a fuzz campaign is the **backfill** (section 3: after every run's evaluation and self-play), so while a live
+run's farm self-play has games to give - always, at the farm's size, since the pool never holds a share of a
+generation's quota - fuzz gets no machine. The owner's 2026-11-15 decision: continuous fuzz of 50,000 seeds a day for
+main's build and each live run's pinned build, on the farm first, and the farm's side-work cap (~25% of the farm
+while a run is live; idle machines always) **may be exceeded while a build's fuzz is behind its daily pace**. So a
+campaign takes an optional `"share": x` (0 < x <= 1; absent or null: the backfill, unchanged):
+
+- with a share the campaign's candidate is in tier 1 beside the runs' games, and goes first while its own active
+  leases + 1 are at most `x` times (all runs' active self-play and eval leases + its own active leases + 1) - the
+  same rule as rev 13's background jobs, with the campaign's own leases added to the total because they are not run
+  leases; beyond its share it goes after every other run job (still before the tier-2 backfill), so it never idles a
+  PC and never takes more than its share from a live run that has games to give;
+- `share` 0.25 is the side-work share; the steward uses more (e.g. 0.5: every other machine) only while that build's
+  fuzz is behind its pace, and removes the share once it is back on pace (the campaign is the backfill again);
+- several campaigns with a share each count only their own leases: the desktop keeps their number small (the MTG Zero
+  steward boosts at most one campaign per build at a time).
+
+The share is not signed (like `priority`), and changes no job: the same seeds, mode and env. Coordinator only
+(migration 0010 adds the column); agents need no change. The desktop side: MTG Zero's `tools/fuzz_steward.py`
+(its docs/ENGINE.md).
 
 ## 6. Agent install layout, launcher and self-update
 
@@ -1117,6 +1140,12 @@ the rest, or `[]`), or every agent deletes it at each start and each update chec
 lease.
 
 ## Changes
+- v1 rev 14 (2026-11-16; coordinator only, migration 0010, no agent change): **a fuzz campaign's share** (section
+  5.4). `PUT /v1/admin/campaign/{id}` takes an optional `share` (0 < x <= 1): the campaign then competes with the runs'
+  games and goes first while its own active leases + 1 are at most `x` x (the runs' active self-play and eval leases +
+  its own + 1), else after every other run job; absent or null, it stays the backfill. GET and the stats show it. For
+  the desktop's fuzz steward: continuous fuzz of main's and each live run's build at a daily quota, allowed past the
+  side-work share while behind its pace.
 - v1 rev 13 (2026-11-15; coordinator only, no migration, no agent change): **play jobs with traces and background
   shares** (section 5.3). A run's `selfplay` and `eval` take an optional `share` (0 < x <= 1): such a job goes first
   only within that share of the runs' active leases, else after every other run job, and still gets any machine the

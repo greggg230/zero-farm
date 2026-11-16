@@ -501,12 +501,14 @@ export async function lease(c: Ctx): Promise<Response> {
       const routing = storedRouting(x.gpu, parseJson<unknown>(x.providers, null));
       const at = placeFor("fuzz", routing, null);
       if (!at || !needsOk(needs) || !diskOk([x.build_id])) continue;
+      // Rev 14 (PROTOCOL 5.4): a campaign with a share competes with the runs' games (tier 1) within that share.
+      const share = typeof x.share === "number" ? x.share : undefined;
       cands.push({
         scope: book.campaignScope(x.campaign),
         kind: "fuzz",
         campaign: x.campaign,
         priority: x.priority,
-        tier: at.tier,
+        tier: share === undefined ? at.tier : 1,
         fit: at.fit * (cachedBuilds.has(x.build_id) ? 1.2 : 1),
         configured: x.chunk === "auto" ? "auto" : Number(x.chunk),
         providers: routing.providers,
@@ -514,6 +516,7 @@ export async function lease(c: Ctx): Promise<Response> {
         runtime: null,
         alt: false,
         gpu_lease: false,
+        ...(share === undefined ? {} : { share }),
       });
     }
   }

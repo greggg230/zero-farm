@@ -109,9 +109,12 @@ export const kindRank = (kind: string): number => (kind === "eval" ? 0 : 1);
 // otherwise after every other run job (2). The lease loop takes the first candidate that grants, so a background job
 // still gets every machine whose other run jobs have nothing to give (a self-play quota filled, no run at all): it
 // never idles a PC.
+// Rev 14 (PROTOCOL 5.4): a fuzz campaign with a `share` takes part the same way (its candidate is then in tier 1); its
+// own leases are not among the runs' self-play and eval leases, so they are added to the total it is a share of.
 export function jobRank(kind: string, share: number | undefined, activeScope: number, activeRuns: number): number {
-  if (kind === "fuzz" || share === undefined) return kindRank(kind);
-  return activeScope + 1 <= share * (activeRuns + 1) + 1e-9 ? 0 : 2;
+  if (share === undefined) return kindRank(kind);
+  const total = kind === "fuzz" ? activeRuns + activeScope : activeRuns;
+  return activeScope + 1 <= share * (total + 1) + 1e-9 ? 0 : 2;
 }
 
 // A stored run job (`selfplay`/`eval` JSON) or campaign's routing settings; configs put before
