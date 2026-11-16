@@ -270,6 +270,23 @@ npm run dev        # local server on port 5400
 | [`DESIGN.md`](DESIGN.md) | why it works this way: goals, architecture, security, diagnostics, the training side |
 | [`PROTOCOL.md`](PROTOCOL.md) | exactly what goes over the wire, the signed manifest format, the install layout |
 | [`CHANGELOG.md`](CHANGELOG.md) | what changed in each app version |
+| [`tools/`](tools/) | `privacy-check.mjs`, the check that keeps private details out of the repository (below) |
+
+## Contributing: no farm computer details in the repository
+
+This repository is public. **Nothing that identifies a farm PC or its owner is committed**: not in code, tests,
+fixtures, docs, logs pasted into docs, or commit messages. That means no machine names or handles of anyone's PCs, no
+machine ids (`m_...`), no CPU or GPU models tied to a particular PC, no per-machine game counts, no host names, IP or
+Tailscale addresses, and no home-directory paths with a user name (`C:\Users\<name>`). Write "a farm PC", "PC A" or
+`%USERPROFILE%` instead. Machine-specific notes belong in the owner's private notes, never here.
+
+`node tools/privacy-check.mjs` scans every tracked file for these and runs first in `npm test` (coordinator/), with its
+own tests (`tools/privacy-check.test.mjs`). It has a committed generic set (Tailscale addresses and names, machine ids,
+home paths that name a user, default PC host names, `user@<IP>`) and reads the real names to refuse from an untracked
+file, `~/.config/zero/privacy_patterns.txt` (format: [`tools/privacy_patterns.example.txt`](tools/privacy_patterns.example.txt));
+the real names are never committed as patterns. Synthetic data that must look real (the redactor and its tests) carries
+`privacy-check: allow` on the line, or `privacy-check: allow-file` in a file's first lines. Fix a finding in the file,
+never by loosening the check. mtg-zero and zero-core have the same check (`tools/privacy_check.py`).
 
 ## License
 

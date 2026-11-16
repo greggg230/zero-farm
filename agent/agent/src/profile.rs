@@ -214,8 +214,8 @@ pub fn gpus(nvml: Option<&nvml_wrapper::Nvml>) -> Vec<Gpu> {
         .collect()
 }
 
-/// GPU vendors this agent never uses: the user's decision of 2026-11-13, after the RX 9070 XT probes (the AMD
-/// execution providers failed on the built-in graph, and a driver fault during a probe could take a friend's PC down).
+/// GPU vendors this agent never uses: the user's decision of 2026-11-13, after the AMD GPU probes (the AMD
+/// execution providers failed on the built-in graph, and a driver fault during a probe could take a PC down).
 /// PCs with only these GPUs run CPU work. The one vendor-specific rule: everything downstream (probes, benches, the
 /// measured choice, `caps`, the coordinator's routing) only ever sees the adapters that are left.
 pub const GPU_VENDORS_OFF: &[&str] = &["amd"];

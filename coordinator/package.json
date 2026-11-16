@@ -6,7 +6,7 @@
   "type": "module",
   "scripts": {
     "check": "wrangler types --check && tsc --noEmit && tsc --noEmit -p scripts",
-    "test": "vitest run",
+    "test": "node ../tools/privacy-check.mjs && node --test ../tools/privacy-check.test.mjs && vitest run",
     "dev": "wrangler dev --ip 0.0.0.0 --port 5400",
     "db:local": "wrangler d1 migrations apply zero-farm --local",
     "db:remote": "wrangler d1 migrations apply zero-farm --remote",

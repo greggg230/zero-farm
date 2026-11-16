@@ -1,3 +1,4 @@
+// privacy-check: allow-file (the user names and profile paths below are synthetic examples of what the redactor removes)
 //! Keeps the Windows user name and the user-profile path out of logs and uploads (security
 //! review M5). Everything written to `logs\*.log` goes through [`redact`] (the rotating log does
 //! it), and so does everything uploaded that can carry a path: the diagnostics body, crash

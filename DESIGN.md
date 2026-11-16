@@ -745,7 +745,7 @@ managed by another session) at an iteration boundary; (c) resuming the paused De
 pool added. **Decided (user, 2026-11-12): (a)**, a short throwaway run forked from an EoE checkpoint with a
 desktop-only twin, to show that games from friends' PCs train the same as local ones.
 
-The double RTX 4080 on one friend's PC is a single card listed twice (confirmed by the user): the
+A GPU that one farm PC reported twice is a single card listed twice (confirmed by the user): the
 profile de-duplicates adapters by LUID.
 
 ## 9. Phases

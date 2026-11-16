@@ -1100,7 +1100,7 @@ agent kept. On a PC with an adapter of a vendor that is off (below) they also pa
 adapter (NVIDIA first, then Intel), so the worker doesn't enumerate the others.
 
 **GPU vendors off.** The owner's decision of 2026-11-13: the farm runs no GPU work on AMD GPUs (the AMD providers
-failed on the RX 9070 XT and a driver fault mid-probe could take a friend's PC down). Agents from 0.2.11 leave AMD
+failed on a farm PC's AMD GPU and a driver fault mid-probe could take a PC down). Agents from 0.2.11 leave AMD
 adapters (`vendor: "amd"`, PCI vendor 0x1002 / 0x1022) out of the profile's `gpus` altogether: no probe, bench or
 GPU job touches them, `caps.gpu` and `caps.gpu_allowed` stay false when they are a PC's only GPUs, and no
 alternate can match them (9.4). The coordinator refuses and skips AMD alternates (9.4). The choice itself (9.6)
