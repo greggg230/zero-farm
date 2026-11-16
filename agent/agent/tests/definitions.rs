@@ -93,7 +93,7 @@ fn the_job_line_comes_from_the_signed_template_only() {
     assert_eq!(j["kind"], "selfplay");
     assert_eq!(j["out_dir"], "out");
     assert!(j["runtime_dir"].is_null());
-    assert_eq!(j["threads"], 6, "the agent's own thread count");
+    assert_eq!(j["threads"], 8, "the agent's own thread count (physical cores)");
     // rev 7 (PROTOCOL 8): the agent's own providers (no probe here: the CPU), never the coordinator's
     assert_eq!((j["providers"].clone(), j["gpu"].clone()), (json!(["cpu"]), Value::Null), "{j}");
     let model = std::path::PathBuf::from(j["model"].as_str().unwrap());

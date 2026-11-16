@@ -174,7 +174,7 @@ Friends never see an update prompt, a UAC dialog or a restart request.
 | Memory | `GlobalMemoryStatusEx` | keep ≥ 4 GB or 25% free, whichever is larger |
 
 Modes: **Idle only** (default), **Always, low priority**, **Paused**, plus optional hours ("only
-00:00–08:00"). Caps: CPU threads (default physical cores − 2), GPU on/off, max RAM.
+00:00–08:00"). Caps: CPU threads (default physical cores), GPU on/off, max RAM.
 
 CPU work runs at `IDLE_PRIORITY_CLASS` with Windows EcoQoS (`PROCESS_POWER_THROTTLING_EXECUTION_SPEED`)
 so the scheduler prefers efficiency cores and the fans stay quiet.

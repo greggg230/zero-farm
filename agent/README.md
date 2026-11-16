@@ -239,7 +239,7 @@ Signatures are minisign-compatible: `minisign -Vm <dir>\manifest.json -p release
   optional hours, not paused; GPU work also needs no other process > 10 % GPU for 30 s and GPU ≤
   83 °C (resumes at 78 °C). Only yes/no answers are kept; no process, window or file names are read.
   `farm-agent dry-run` logs the decisions on a real PC without doing any work.
-- **Leases**: profile digest (resent on 409), caps (threads = physical cores − 2 by default, RAM,
+- **Leases**: profile digest (resent on 409), caps (threads = physical cores by default, RAM,
   GPU, disk budget), cached builds/checkpoints; only fuzz/diag while > 200 MB of results are unsent.
 - **Downloads**: manifest + signature first, then each file with resume and size/sha256 checks into
   a staging folder; nothing unverified enters the cache; builds are re-verified before every worker

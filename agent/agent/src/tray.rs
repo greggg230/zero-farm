@@ -17,7 +17,7 @@
 //! panic is reported (`/v1/crash`, kind `agent`) instead of killing the app.
 
 use crate::engine::{Control, EngineExit};
-use crate::settings::{pause_for, pause_until_tomorrow, Mode, Pause, SharedMachine};
+use crate::settings::{pause_for, pause_until_tomorrow, Mode, Pause, Settings, SharedMachine};
 use crate::status::{Phase, SharedStatus};
 use crate::util::wide;
 use std::cell::{Cell, RefCell};
@@ -279,7 +279,7 @@ impl Tray {
             AppendMenuW(m, MF_POPUP, mode as usize, mode_label.as_ptr());
             add(MF_STRING | if s.gpu { MF_CHECKED } else { 0 }, ID_GPU, "Use the graphics card (GPU)");
             let threads = CreatePopupMenu();
-            let auto = s.threads(self.physical, self.logical);
+            let auto = Settings { cpu_threads: None, ..s.clone() }.threads(self.physical, self.logical);
             let auto_label = wide(&format!("Automatic ({auto})"));
             AppendMenuW(threads, MF_STRING | if s.cpu_threads.is_none() { MF_CHECKED } else { 0 }, ID_THREADS_AUTO, auto_label.as_ptr());
             for n in thread_choices(self.logical) {

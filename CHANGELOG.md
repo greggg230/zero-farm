@@ -4,6 +4,14 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>`.
 
+## 0.2.12 (2026-11-15, canary)
+
+- **"Automatic" CPU threads now uses one thread per physical core** (it was physical cores minus 2), still at
+  least 1 and never more than the processor's logical threads. Jobs run at the lowest priority, so they still
+  give way to anything you do. Only PCs on "Automatic" change; a number picked in the tray's "CPU threads" menu
+  stays as it is. The tray's "Automatic (N)" label now always shows the automatic number, even while another
+  number is picked.
+
 ## 0.2.11 (2026-11-13, canary)
 
 - **A GPU check that takes the PC down is never repeated over and over.** Before testing a graphics card, Zero

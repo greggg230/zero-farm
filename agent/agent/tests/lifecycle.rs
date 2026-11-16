@@ -442,7 +442,7 @@ fn profile_is_resent_when_the_coordinator_asks() {
     let reqs = h.mock.with(|s| s.lease_requests.clone());
     assert!(reqs[0]["profile"].is_null());
     assert_eq!(reqs[1]["profile"]["cpu"], "Test CPU");
-    assert_eq!(reqs[1]["caps"]["threads"], 6, "physical cores - 2");
+    assert_eq!(reqs[1]["caps"]["threads"], 8, "physical cores");
     assert_eq!(reqs[1]["kinds"], json!(["fuzz", "eval", "selfplay", "diag"]));
     // Afterwards the profile is not sent again.
     assert!(wait(|| h.mock.with(|s| s.lease_requests.len() >= 3)));

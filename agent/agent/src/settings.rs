@@ -49,7 +49,7 @@ pub struct Settings {
     pub mode: Mode,
     pub pause: Pause,
     pub gpu: bool,
-    /// CPU threads for work; `None` = physical cores − 2 (at least 1).
+    /// CPU threads for work; `None` = physical cores (at least 1, at most the logical threads).
     pub cpu_threads: Option<u32>,
     pub idle_minutes: u32,
     pub hours: Option<Hours>,
@@ -87,7 +87,7 @@ impl Settings {
     }
 
     pub fn threads(&self, physical_cores: u32, logical: u32) -> u32 {
-        let auto = physical_cores.saturating_sub(2).max(1);
+        let auto = physical_cores.max(1);
         self.cpu_threads.unwrap_or(auto).clamp(1, logical.max(1))
     }
 
@@ -226,8 +226,10 @@ mod tests {
     #[test]
     fn defaults_and_threads() {
         let s = Settings::default();
-        assert_eq!(s.threads(8, 16), 6);
-        assert_eq!(s.threads(2, 4), 1);
+        assert_eq!(s.threads(8, 16), 8, "auto = physical cores");
+        assert_eq!(s.threads(2, 4), 2);
+        assert_eq!(s.threads(0, 4), 1, "at least 1");
+        assert_eq!(s.threads(8, 4), 4, "at most the logical threads");
         let s = Settings { cpu_threads: Some(64), ..Settings::default() };
         assert_eq!(s.threads(8, 16), 16);
         assert_eq!(s.ram_cap_mb(32768), 16384);

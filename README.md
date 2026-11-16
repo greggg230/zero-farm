@@ -36,7 +36,7 @@ of CPU for more than about 10 minutes is handed back to the farm.
 | | Limit |
 |---|---|
 | Priority | Windows' lowest (`IDLE_PRIORITY_CLASS`) plus EcoQoS: anything you run comes first, fans stay quiet |
-| CPU | physical cores − 2 threads by default (at least 1); adjustable in the tray |
+| CPU | as many threads as the processor has physical cores by default; adjustable in the tray |
 | RAM | the job's memory is capped by Windows (a job object): half your RAM by default, never more than what is free above the 4 GB / 25 % floor |
 | Disk | everything lives in `%LOCALAPPDATA%\ZeroFarm`, hard cap 3 GB including logs (20 MB) and caches; nothing else on the disk is written |
 | Network | HTTPS only, to `farm.greggg230.com`; no open ports, no remote access |
