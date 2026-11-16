@@ -7,7 +7,7 @@ A change to anything here is a protocol change: bump the version it belongs to a
 bottom.
 
 Versions: HTTP API `v1` (path prefix), agent↔worker protocol `aw/1`, network files `zero-onnx/1`,
-manifests `manifest/1`.
+manifests `manifest/1`. Current revision: v1 rev 15 (section 10, rolling self-play leases).
 
 ## 1. Conventions
 
@@ -1139,7 +1139,140 @@ machine, every channel): before a run uses a listed build again, take it off the
 the rest, or `[]`), or every agent deletes it at each start and each update check and downloads it again for every
 lease.
 
+## 10. Rolling self-play leases (rev 15; coordinator migration 0011, agent 0.2.13, worker feature `rolling`)
+
+**Why.** A classic self-play lease starts all its games at once and replaces none: its batch drains to one row per
+call for the last minutes, and it lasts as long as its slowest game whatever its size, so a large GPU lease keeps about
+a third of its full-batch rate and whole leases outlive the staleness window (`max_stale`) and are refused. A *rolling*
+lease keeps N games in flight: the worker starts a new game whenever one ends, asks for more game ids as it goes,
+switches to each new generation in place (section 5, `checkpoint`) and uploads finished games in small chunks. The
+batch stays full, a new generation costs no restart, and staleness is judged per row, not per lease. Classic leases
+are unchanged; everything below is additive.
+
+### 10.1 The run's setting
+
+`PUT /v1/admin/run/{run}` `selfplay.rolling`: `{"inflight": n | "auto", "gpu_inflight": n | "auto", "block": 65536,
+"max_s": 7200, "flush_s": 120}` or null / absent (classic leases only). `inflight` / `gpu_inflight` (1 to 4,096 or
+`"auto"`): the games in flight of a CPU / GPU job (`"auto"`: the agent's choice, 10.6); `block` (1 to `MAX_LEASE_IDS`,
+default 65,536): the ids a lease reserves; `max_s` (600 to 86,400, default 7,200): how long a lease runs before the
+coordinator decides whether it goes on (10.4); `flush_s` (10 to 3,600, default 120): the longest a finished game waits
+in the worker before it is uploaded. Missing keys take the defaults; unknown keys → 400. The desktop sets `rolling` only
+for a run whose worker builds (the default and every alternate) announce the feature `rolling` (10.5); the coordinator
+cannot see inside a build, so this is the desktop's declaration. GET and the stats show it.
+
+### 10.2 Who gets one
+
+A self-play lease of a run with `rolling` set is rolling when the agent is at least `ROLLING_AGENT` (Worker var,
+default `0.2.13`) and its `POST /v1/lease` request lists `"rolling"` in the new optional field `"features": [...]`
+(names the coordinator doesn't know are ignored). Any other agent gets a classic lease of that run, exactly as before.
+Eval, fuzz and diag leases are never rolling.
+
+### 10.3 The lease
+
+A rolling lease is a self-play lease (section 3) plus
+
+```json
+"rolling": {"block": [lo, hi], "inflight": {"cpu": n | "auto", "gpu": n | "auto"}, "until": 1794307200,
+            "max_s": 7200, "flush_s": 120}
+```
+
+- `block`: ids `[lo, hi)` reserved for this lease, a fresh range from the run's `next_gid` (never from the pool), of
+  `block` ids (fewer when a game id would pass 2^32).
+- **Released ids.** `job.gid_base` = `lo`; `job.games` = the ids released so far: the lease's game ids are `[lo, lo +
+  games)`. At grant `games` = min(headroom, `block`, 2 x the larger `inflight`, `"auto"` counting 256). Only released
+  ids count as leased for the quota (section 4 `selfplay_state.leased` = the unclaimed released ids of active leases);
+  the rest of the block belongs to the lease but to no game yet.
+- `until`: the lease runs to at least this time (`issued_at + max_s`, moved on by a renewal, 10.4).
+- `inflight`: the run's setting for a CPU and a GPU job; the agent picks one by its own CPU-or-GPU choice (9.6).
+
+### 10.4 `POST /v1/lease/{lease_id}/extend`
+
+`{"games": k}` (k ≥ 1): release k more ids. Answers (200):
+- `{"games": total}`: the lease's ids are now `[lo, lo + total)` (total ≥ the previous; it may be less than asked:
+  the run's self-play headroom, or the block's end);
+- `{"games": total, "wait_s": 60, "reason": "quota"}`: nothing released now (no headroom: the generation's quota is
+  full); ask again after `wait_s`;
+- `{"games": total, "finish": true, "reason": "max_s" | "block" | "state"}`: no id will ever be released: finish the
+  games in flight and close the lease (`done`). `max_s`: `until` has passed and the coordinator does not renew it;
+  `block`: the block is used up; `state`: the run's self-play is no longer rolling, or the run or the machine is paused
+  (a paused run's leases are also cancelled at their next beat, section 4).
+- **Renewal.** Past `until`, the coordinator renews the lease (`until` += `max_s`, and the answer releases ids as
+  usual) unless something else is waiting for this machine, in the order section 3 picks work: a diagnostics request
+  for it; an eval batch of an active run with unissued ids; a fuzz campaign with a `share` that is below it (5.4);
+  another active run's self-play with headroom and a higher `priority`. Then it answers `finish` with `"reason":
+  "max_s"`, and the agent's next `/v1/lease` gets the waiting work. So a rolling lease is re-decided at every id
+  release past `until`, at least every `max_s`.
+- 400 for a classic lease or a bad `games`; 404 a lease that isn't this machine's; 410 a lease that isn't active
+  (expired, closed, cancelled). Rate limit: the beat bucket (section 1). The agent asks when its worker says it is
+  low on ids (10.5 `low`), at most once per 10 s, for about 2 x its games in flight.
+
+### 10.5 The worker (aw/1, feature `rolling`)
+
+- `hello` gains `"features": ["rolling"]` (absent: none); `<worker> info` prints the same list.
+- The job line's optional `"rolling": true` (and `"flush_s"`): the job does **not** end when its `games` are done.
+  It keeps up to `conc` games in flight while ids are left, then waits (still answering `ping` and sending `status`)
+  for `{"op": "extend", "games": total}` (raises the job's games to `total`: ids `[gid_base, gid_base + total)`;
+  never lower) or `finish` / `quit`. It sends `{"ev": "low", "started": s, "games": g}` when fewer than `conc` of its
+  ids are unstarted (g - s < conc), once per `games` value.
+- A records file is written when it holds `shard_rows` rows, or `flush_s` seconds after the first game in it
+  finished, so finished games reach the coordinator within about `flush_s`.
+- `checkpoint` (section 5) in a rolling job: the worker builds the new network's session and runs its self-test
+  (`selftest` with `gen`) on a thread of its own while the games go on with the old network, then switches (games in
+  flight continue, their searches restart on the new network, each row records `net`). A failed self-test is fatal,
+  as at the start.
+- `end` (`finish` or `quit`): `unfinished` = the released ids not finished.
+- A worker without the feature ignores `rolling` and `extend` (an `error`, not fatal) and ends `done` after `games`:
+  the agent then closes the lease as a classic one. The agent sends `extend` only to a worker whose `hello` lists
+  `rolling`.
+
+### 10.6 The agent (0.2.13)
+
+- Sends `"features": ["rolling"]` in `/v1/lease`.
+- **Games in flight.** `conc` of the job line = the lease's `inflight` for the job's provider (a GPU winner: `gpu`,
+  else `cpu`). `"auto"`: CPU: 4 x the job's threads in 4 groups; GPU: from the bench of the job's own network (9.6),
+  the in-flight count among 64, 128, 256 and 512 (2 groups: batches of half of it) after which doubling gains less than
+  15% rows/s, capped so that the memory per game in flight fits `caps.ram_mb`. `games` of the job line = the released
+  ids; the template's `conc` / `groups` are replaced as for a GPU job today (section 5 tuning fields).
+- **Ids.** On `low`, `POST .../extend` for about 2 x `conc`; on `{"games"}`, `{"op": "extend", "games": total}` to
+  the worker; on `wait_s`, ask again then; on `finish`, `{"op": "finish"}` to the worker.
+- **Generations.** Beats of a rolling lease carry `"gen"` (the newest generation the worker plays). When the run's
+  current generation is newer, the beat answer has `checkpoint` **and** `"definition": {"key", "sha256"}` (the current
+  definition version). The agent verifies that definition as at grant (section 7, steps 1-4: signature, kind and id,
+  expiry, a version never older than any seen, the lease's worker build in `builds` and its runtime authorized as at
+  grant, the checkpoint's files as signed), and checks that its `jobs.selfplay` template is the lease's own (canonical
+  JSON). Then it fetches the checkpoint (beating meanwhile) and sends `checkpoint` with the model's `sha256`. A
+  template that changed, or a definition that fails a check, ends the lease gracefully: `finish` (its games in flight
+  complete on the network they have; the agent's next lease brings the new template). Repeats are ignored. Classic
+  leases are unchanged (they switch only to gens their own definition signs, section 3).
+- **Ending.** As any lease: `cancel` → `quit`; `give_back`, a pause or starvation past `slack_s` → give back; the user
+  quits → `quit`. Rolling leases also end with `finish` when the coordinator answers `finish` to an extension, when the
+  template changes (above), and when the agent has a newer version ready to switch to (section 6) - a rolling lease
+  would otherwise never let it update.
+- Stats add `inflight` (the chosen `conc`) and `released` (the lease's released ids).
+
+### 10.7 Results, staleness and closing
+
+- A rolling lease's self-play chunks are **never refused as stale** (no 410 for `max_stale`): the trainer judges
+  each row by the network that searched it (zero-core's pool: rows older than its window are dropped, the rest of the
+  game kept). `x-gen` is still checked (not older than the lease's first generation, not newer than the current one),
+  and `x-ids` must lie in the released ids `[lo, lo + games)`.
+- Closing (`done`, expiry, give back, cancel): the released ids not credited go back to the pool, as for a classic
+  lease; the unreleased rest of the block `[lo + games, hi)` goes back to the run's `next_gid` when nothing was taken
+  after it (`next_gid` = `hi`), else to the pool.
+- The machine's rate counts credited ids per running second, as before; `games_per_lease` and `gpu_games_per_lease`
+  don't apply to rolling leases.
+- The D1 lease row gains `rel_hi` (released ids `[lo, rel_hi)`; NULL for classic leases), `until` and `cur_gen` (the
+  newest generation the agent reported). Migration 0011.
+
 ## Changes
+- v1 rev 15 (2026-11-16; coordinator migration 0011, agent 0.2.13 canary first, worker feature `rolling`): **rolling
+  self-play leases** (section 10). A run's `selfplay.rolling` makes its self-play leases to agents from 0.2.13 (request
+  `features: ["rolling"]`) long-lived: a reserved block of ids released as the worker asks (`POST /v1/lease/{id}/extend`),
+  N games in flight with a new one started whenever one ends, finished games flushed every `flush_s`, each new
+  generation switched to in place (beat answers carry the new `definition` beside `checkpoint`; the agent verifies it
+  and requires an unchanged template, else `finish`), renewed every `max_s` unless other work waits for the machine,
+  and never refused as stale (the trainer judges rows by `net`). aw/1 additions: `hello.features`, job `rolling` /
+  `flush_s`, op `extend`, event `low`. Classic leases, older agents and workers without the feature are unchanged.
 - v1 rev 14 (2026-11-16; coordinator only, migration 0010, no agent change): **a fuzz campaign's share** (section
   5.4). `PUT /v1/admin/campaign/{id}` takes an optional `share` (0 < x <= 1): the campaign then competes with the runs'
   games and goes first while its own active leases + 1 are at most `x` x (the runs' active self-play and eval leases +
