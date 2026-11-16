@@ -165,9 +165,24 @@ function render(s) {
     ["accepted", (r) => (r.selfplay ? num(r.selfplay.accepted) : "-"), "n"],
     ["in flight", (r) => (r.selfplay ? num(r.selfplay.leased) + " leased + " + num(r.selfplay.pending) + " unacked" : "-")],
     ["eval", (r) => (r.eval ? esc(r.eval.batch) + ": " + num(r.eval.done) + " / " + num(r.eval.games) + " done" : "-")],
+    // Rev 15 (PROTOCOL 10): rolling self-play leases (the run's setting and how many run now; each in its own table).
+    ["rolling", (r) => (r.rolling ? (r.rolling_leases || []).length + ' leases<br><span class="muted">block ' + num(r.rolling.block) +
+      ", " + Math.round(r.rolling.max_s / 60) + " min</span>" : (r.rolling_leases || []).length ? (r.rolling_leases || []).length + " leases (setting removed)" : "-")],
     ["definition", (r) => defCell(r.definition)],
     ["active leases", (r) => r.active_leases, "n"], ["pool", (r) => num(r.pool), "n"], ["next gid", (r) => num(r.next_gid), "n"],
   ], s.runs);
+
+  // Rolling self-play leases (PROTOCOL 10): the ids released of each block, until when it runs at least, its generations.
+  const rolling = s.runs.flatMap((r) => (r.rolling_leases || []).map((x) => Object.assign({ run: r.run }, x)));
+  if (rolling.length) {
+    h += "<h2>Rolling leases</h2>" + table([
+      ["run", (x) => esc(x.run)], ["machine", (x) => esc(x.name || x.machine_id)],
+      ["released / block", (x) => num(x.released) + " / " + num(x.block[1] - x.block[0]), "n"], ["done", (x) => num(x.claimed), "n"],
+      ["ids", (x) => "<code>" + num(x.block[0]) + " .. " + num(x.block[1]) + "</code>"],
+      ["gen", (x) => (x.cur_gen !== x.gen ? x.gen + " &rarr; " + x.cur_gen : String(x.gen ?? "-")), "n"],
+      ["started", (x) => ago(x.issued_at, now)], ["until", (x) => (x.until ? when(x.until) : "-")],
+    ], rolling);
+  }
 
   // Eval batches (PROTOCOL 5.2): progress only; the coordinator never reads game rows, so the
   // score is the desktop's to compute.

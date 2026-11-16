@@ -17,6 +17,7 @@ import { HttpError, type Outcome } from "./util";
 export interface LeaseBookApi {
   grant(req: book.GrantReq): Promise<Outcome<book.Lease | null>>;
   beat(req: book.BeatReq): Promise<Outcome<book.BeatAnswer>>;
+  extend(req: book.ExtendReq): Promise<Outcome<book.ExtendAnswer>>; // rev 15
   putResult(req: book.ResultReq): Promise<Outcome<book.ResultCommit>>;
   done(req: book.DoneReq): Promise<Outcome<book.DoneAnswer>>;
   sweep(scope: string, now: number): Promise<Outcome<number>>;
@@ -52,6 +53,10 @@ export class LeaseBook extends DurableObject<Env> implements LeaseBookApi {
   }
   beat(req: book.BeatReq) {
     return this.serial(() => book.beat(this.env, req));
+  }
+  // Rev 15 (PROTOCOL 10.4): releases more of a rolling lease's ids.
+  extend(req: book.ExtendReq) {
+    return this.serial(() => book.extend(this.env, req));
   }
   putResult(req: book.ResultReq) {
     return this.serial(() => book.putResult(this.env, req));
