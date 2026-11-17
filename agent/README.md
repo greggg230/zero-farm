@@ -298,9 +298,10 @@ Signatures are minisign-compatible: `minisign -Vm <dir>\manifest.json -p release
 - **Rolling self-play leases** (`rolling.rs`, rev 15, PROTOCOL 10, agent 0.2.13): the agent asks with
   `features: ["rolling"]`; a lease with `rolling` (a reserved block of ids, the run's games in flight for a CPU and a
   GPU job) runs its worker with `rolling: true`, `flush_s`, the released ids as `games` and `conc` / `groups` from the
-  run's setting for the provider the measured choice picked ("auto": 4 x the job's threads in 4 groups on the CPU; on a
-  GPU, from the bench of the job's network, the games in flight among 64-512 after which doubling gains under 15 %
-  rows/s; both capped by `caps.ram_mb` at 600 MB + 32 MB per game, the constants at the top of `rolling.rs`). The
+  run's setting for the provider the measured choice picked ("auto": 32 in 4 groups on the CPU; on a GPU, from the bench
+  of the job's network, the games in flight among 64-512 after which doubling gains under 15 % rows/s, one group from
+  256, else 2; both capped by `caps.ram_mb` at 1 GB + 40 MB per game, rounded down to a multiple of 32; the constants
+  at the top of `rolling.rs`, from the canary measurement). The
   worker's `low` asks `POST /v1/lease/{id}/extend` for 2 x `conc` (at most every 10 s; `wait_s`, `finish`, a lost
   lease and errors handled); beats carry `gen`, and a newer generation's definition is verified off the lease's
   thread as at grant (`jobplan.rs` `Fetch::recheck`, the same template required) before its checkpoint is fetched and

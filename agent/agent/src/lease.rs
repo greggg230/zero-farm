@@ -346,16 +346,16 @@ impl Engine {
     }
 
     /// The measured choice for the job (PROTOCOL 9.6), or for a rolling lease (rev 15, PROTOCOL 10.6) with its games in
-    /// flight: the run's setting for the CPU and the GPU, "auto" worked out by `rolling.rs` (the CPU from the job's
-    /// threads, a GPU from its bench row, both within `ram_mb`).
+    /// flight: the run's setting for the CPU and the GPU, "auto" worked out by `rolling.rs` (a fixed number on the
+    /// CPU, a GPU's from its bench row, both within `ram_mb`).
     #[allow(clippy::too_many_arguments)]
-    fn pick(bench: Option<&crate::probe::Bench>, gpus: &[zerofarm_common::protocol::Gpu], lease: &Lease, plan: &Plan, gpu_ok: bool, threads: u32, ram_mb: u64, roll: Option<&Setup>) -> crate::probe::Choice {
+    fn pick(bench: Option<&crate::probe::Bench>, gpus: &[zerofarm_common::protocol::Gpu], lease: &Lease, plan: &Plan, gpu_ok: bool, ram_mb: u64, roll: Option<&Setup>) -> crate::probe::Choice {
         let (games, conc, groups) = Self::job_shape(plan);
         let allow = lease.providers.as_deref();
         match roll {
             None => crate::probe::choose(bench, gpus, allow, gpu_ok, games, conc, groups),
             Some(r) => {
-                let cpu = crate::rolling::cpu_shape(r.cpu, threads, groups, ram_mb);
+                let cpu = crate::rolling::cpu_shape(r.cpu, groups, ram_mb);
                 let gpu = |row: &crate::probe::BenchRow| crate::rolling::gpu_shape(r.gpu, &row.rows, groups, ram_mb);
                 crate::probe::choose_rolling(bench, gpus, allow, gpu_ok, cpu, &gpu, groups)
             }
@@ -373,7 +373,7 @@ impl Engine {
             _ => None,
         };
         let (Some(rt), Some(net), Some(run)) = (&prep.runtime, net, lease.run.as_deref()) else {
-            return Self::pick(None, &self.profile.gpus, lease, plan, gpu_ok, threads, ram_mb, roll);
+            return Self::pick(None, &self.profile.gpus, lease, plan, gpu_ok, ram_mb, roll);
         };
         let id = lease.lease_id.clone();
         let control = self.control.clone();
@@ -469,7 +469,7 @@ impl Engine {
                 self.evict_after.push(format!("builds/{}", rt.build_id));
             }
         }
-        let c = Self::pick(bench.as_ref(), &gpus, lease, plan, gpu_ok, threads, ram_mb, roll);
+        let c = Self::pick(bench.as_ref(), &gpus, lease, plan, gpu_ok, ram_mb, roll);
         if let Some(mut b) = bench.filter(|b| b.error.is_none()) {
             // what the coordinator sizes this run's GPU leases by (PROTOCOL 9.4: caps.gpu_games)
             b.gpu_games = c.gpu_games;

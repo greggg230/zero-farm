@@ -1229,10 +1229,12 @@ A rolling lease is a self-play lease (section 3) plus
 
 - Sends `"features": ["rolling"]` in `/v1/lease`.
 - **Games in flight.** `conc` of the job line = the lease's `inflight` for the job's provider (a GPU winner: `gpu`,
-  else `cpu`). `"auto"`: CPU: 4 x the job's threads in 4 groups; GPU: from the bench of the job's own network (9.6),
-  the in-flight count among 64, 128, 256 and 512 (2 groups: batches of half of it) after which doubling gains less than
-  15% rows/s; both capped so that the memory per game in flight fits `caps.ram_mb` (the agent's estimate: a base per
-  worker plus a constant per game in flight, both agent constants). A number is taken as it is (a CPU job in the
+  else `cpu`). `"auto"`: CPU: 32 in flight in 4 groups; GPU: from the bench of the job's own network (9.6), the
+  in-flight count among 64, 128, 256 and 512 after which doubling gains less than 15% rows/s (each rated at its batch:
+  1 group from 256 in flight, else 2, batches of half of it), in those groups; both capped so that the games in flight
+  fit `caps.ram_mb` at 40 MB per game in flight plus 1 GB for the worker ((`ram_mb` - 1000) / 40, rounded down to a
+  multiple of 32 when at least 32; agent constants, `rolling.rs`, from the canary measurement of 2026-11-16: a
+  4070 Ti PC with 9,494 MB gets 192). A number is taken as it is (a CPU job in the
   template's `groups`, a GPU job in at most 2); anything that is neither a number from 1 to 4,096 nor `"auto"` counts as
   `"auto"`. `games` of the job line = the released ids; the template's `conc` / `groups` are replaced as for a GPU job
   today (section 5 tuning fields). A lease whose `rolling` doesn't fit its job (`block[0]` = `gid_base`, the released

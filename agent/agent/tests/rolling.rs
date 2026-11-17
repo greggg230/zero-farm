@@ -167,7 +167,10 @@ fn a_new_generation_with_a_verified_definition_is_switched_to_in_place() {
     let done = h.wait_done("l_RG");
     assert_eq!(done["given_back"], false, "{done}");
     all_accounted(&h, "l_RG", &done, 40, 2);
-    assert!(x_gens(&h, "l_RG").contains(&2), "chunks of the new generation: {:?}", x_gens(&h, "l_RG"));
+    let gens = x_gens(&h, "l_RG");
+    assert!(gens.contains(&1) && gens.contains(&2), "chunks of both generations: {gens:?}");
+    assert!(gens.windows(2).all(|w| w[0] <= w[1]), "never back to the old network: {gens:?}");
+    assert!(h.job_line_n(1).is_none(), "switched in place: one worker, one job line");
     assert_eq!(h.mock.count("GET", &format!("/v1/artifact/ckpt/{RUN}/2/model.onnx")), 1, "fetched once, whatever the repeats");
     let seen: Value = serde_json::from_slice(&std::fs::read(h.layout.state().join("definitions.json")).unwrap()).unwrap();
     assert_eq!(seen, json!({"run/roll-run": 2}), "the new version is remembered");
@@ -194,7 +197,7 @@ fn a_changed_template_finishes_the_lease() {
     assert!(h.agent_log().contains("rolling job ended (finish)"), "{}", h.agent_log());
     assert_eq!(h.mock.count("GET", &format!("/v1/artifact/ckpt/{RUN}/2/")), 0, "the new network is never fetched");
     assert_eq!(definition_crashes(&h), 0, "a new template is no fault");
-    // "auto" on the CPU: 4 per thread (8 here) in 4 groups, never more than fits the memory cap
+    // "auto" on the CPU: 32 in flight in 4 groups, never more than fits the memory cap (rolling.rs)
     let j = h.job_line();
     let (conc, groups) = (j["conc"].as_u64().unwrap(), j["groups"].as_u64().unwrap());
     assert!((1..=32).contains(&conc) && groups == conc.min(4), "{j}");

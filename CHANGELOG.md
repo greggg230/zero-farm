@@ -12,8 +12,8 @@ version is a GitHub Release tagged `agent-v<version>`.
   minutes. When the farm's network improves, the job switches to the new network in place, after checking that the
   farm's signed instructions for it are genuine and unchanged otherwise. Such a job ends by itself when the farm has
   other work for the PC, when its instructions change, or when a Zero Farm update is ready, so updates still happen.
-- How many games run at once is chosen from the PC's measurements: four per processor thread on the processor; on a
-  graphics card, as many as still make it noticeably faster, never more than fit the memory Zero Farm may use.
+- How many games run at once: 32 on the processor; on a graphics card, as many as still make it noticeably faster
+  (measured on the card), never more than fit the memory Zero Farm may use.
 
 ## 0.2.12 (2026-11-15, canary)
 
