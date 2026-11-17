@@ -1231,10 +1231,16 @@ A rolling lease is a self-play lease (section 3) plus
 - **Games in flight.** `conc` of the job line = the lease's `inflight` for the job's provider (a GPU winner: `gpu`,
   else `cpu`). `"auto"`: CPU: 4 x the job's threads in 4 groups; GPU: from the bench of the job's own network (9.6),
   the in-flight count among 64, 128, 256 and 512 (2 groups: batches of half of it) after which doubling gains less than
-  15% rows/s, capped so that the memory per game in flight fits `caps.ram_mb`. `games` of the job line = the released
-  ids; the template's `conc` / `groups` are replaced as for a GPU job today (section 5 tuning fields).
+  15% rows/s; both capped so that the memory per game in flight fits `caps.ram_mb` (the agent's estimate: a base per
+  worker plus a constant per game in flight, both agent constants). A number is taken as it is (a CPU job in the
+  template's `groups`, a GPU job in at most 2); anything that is neither a number from 1 to 4,096 nor `"auto"` counts as
+  `"auto"`. `games` of the job line = the released ids; the template's `conc` / `groups` are replaced as for a GPU job
+  today (section 5 tuning fields). A lease whose `rolling` doesn't fit its job (`block[0]` = `gid_base`, the released
+  ids inside the block), or that has no definition, runs as a classic lease; `flush_s` is kept within 10 to 3,600.
 - **Ids.** On `low`, `POST .../extend` for about 2 x `conc`; on `{"games"}`, `{"op": "extend", "games": total}` to
-  the worker; on `wait_s`, ask again then; on `finish`, `{"op": "finish"}` to the worker.
+  the worker; on `wait_s`, ask again then; on `finish`, `{"op": "finish"}` to the worker. A 404 or 410 stops the lease
+  like a lost one (`quit`, given back); 429, 5xx and network errors are retried with backoff (honouring
+  `retry-after`); any other 4xx, or a total past the block, ends it with `finish`.
 - **Generations.** Beats of a rolling lease carry `"gen"` (the newest generation the worker plays). When the run's
   current generation is newer, the beat answer has `checkpoint` **and** `"definition": {"key", "sha256"}` (the current
   definition version). The agent verifies that definition as at grant (section 7, steps 1-4: signature, kind and id,
@@ -1242,12 +1248,16 @@ A rolling lease is a self-play lease (section 3) plus
   grant, the checkpoint's files as signed), and checks that its `jobs.selfplay` template is the lease's own (canonical
   JSON). Then it fetches the checkpoint (beating meanwhile) and sends `checkpoint` with the model's `sha256`. A
   template that changed, or a definition that fails a check, ends the lease gracefully: `finish` (its games in flight
-  complete on the network they have; the agent's next lease brings the new template). Repeats are ignored. Classic
+  complete on the network they have; the agent's next lease brings the new template); a failed check is reported once
+  per lease (`/v1/crash` kind `definition`), a changed template is not. A definition that can't be fetched right now
+  is asked again at a later beat; a checkpoint whose files can't be fetched or verified ends the lease with `finish` too
+  (it would otherwise play an old network for good). Repeats are ignored. Classic
   leases are unchanged (they switch only to gens their own definition signs, section 3).
 - **Ending.** As any lease: `cancel` → `quit`; `give_back`, a pause or starvation past `slack_s` → give back; the user
   quits → `quit`. Rolling leases also end with `finish` when the coordinator answers `finish` to an extension, when the
   template changes (above), and when the agent has a newer version ready to switch to (section 6) - a rolling lease
-  would otherwise never let it update.
+  would otherwise never let it update: while one runs, the agent checks `GET /v1/agent/latest` every 6 hours as between
+  leases (the download keeps the lease's files in the cache; the `evict` list is applied when the lease ends).
 - Stats add `inflight` (the chosen `conc`) and `released` (the lease's released ids).
 
 ### 10.7 Results, staleness and closing
