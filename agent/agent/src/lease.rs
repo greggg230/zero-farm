@@ -9,8 +9,9 @@
 
 use crate::cache::{Cache, CacheError, CkptFiles};
 use crate::engine::Engine;
-use crate::jobplan::{Plan, PlanError};
+use crate::jobplan::{Plan, PlanError, Recheck};
 use crate::results::{compute_unfinished, ResultMeta, Source};
+use crate::rolling::Setup;
 use crate::status::Phase;
 use crate::worker::{CpuMark, SpawnOpts, WorkerMsg, WorkerProc};
 use serde_json::{json, Map, Value};
@@ -19,9 +20,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use zerofarm_common::http::CallError;
+use zerofarm_common::definition::Definition;
+use zerofarm_common::http::{Backoff, CallError};
 use zerofarm_common::manifest::{check_rel_path, Kind, VerifiedBuild};
-use zerofarm_common::protocol::{BeatReq, BeatResp, CheckpointRef, CrashReq, DoneReq, Lease, Progress, Stats};
+use zerofarm_common::protocol::{BeatReq, BeatResp, CheckpointRef, CrashReq, DefinitionRef, DoneReq, ExtendReq, ExtendResp, Lease, Progress, Stats};
 use zerofarm_common::manifest::GpuNeed;
 use std::collections::BTreeMap;
 
@@ -50,6 +52,36 @@ enum Ev {
     Worker(WorkerMsg),
     Beat(Result<BeatResp, CallError>),
     Ckpt(Result<(CheckpointRef, CkptFiles), (CheckpointRef, String)>),
+    /// rev 15 (PROTOCOL 10.4): the answer to a rolling lease's extension.
+    Extend(Result<ExtendResp, CallError>),
+    /// rev 15 (PROTOCOL 10.6): a rolling lease's new definition, verified (or why not), with the checkpoint it came with.
+    Def(Box<Result<(DefinitionRef, Definition, CheckpointRef), Recheck>>),
+    /// rev 15 (PROTOCOL 10.6): a rolling lease's update check: the agent version now ready, the evict list.
+    Update(Result<(Option<String>, Vec<String>), String>),
+}
+
+/// rev 15 (PROTOCOL 10): a rolling lease while it runs.
+struct Roll {
+    setup: Setup,
+    /// The released ids: `[lo, lo + released)`.
+    released: u64,
+    /// The worker's `hello` lists `rolling`: it gets the rolling job and `extend`s. Else the lease runs as a classic
+    /// one (done after its released ids).
+    active: bool,
+    /// `finish` was sent: no more ids, generations or update checks.
+    finishing: bool,
+    /// The worker said `low`: ask for more ids when allowed.
+    want_more: bool,
+    extend_inflight: bool,
+    /// No extension before this (at most one per `extend_every`; a `wait_s`; a backoff after an error).
+    next_extend: Instant,
+    backoff: Backoff,
+    /// The definition the lease runs under (at grant, then each accepted new one).
+    def: DefinitionRef,
+    def_inflight: bool,
+    /// A `definition` crash report went out for this lease (at most one).
+    def_reported: bool,
+    update_inflight: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -234,11 +266,13 @@ impl Engine {
         let pump = {
             let (client, stop, id, beat_s) = (self.client.clone(), pump_stop.clone(), lease.lease_id.clone(), lease.beat_s.max(5));
             let total = games_total(lease);
+            // rev 15: a rolling lease's beats carry its generation
+            let gen = lease.rolling.as_ref().and(lease.checkpoint.as_ref()).map(|c| c.gen);
             std::thread::spawn(move || {
                 let mut next = Instant::now() + Duration::from_secs(beat_s);
                 while !stop.load(Ordering::SeqCst) {
                     if Instant::now() >= next {
-                        let body = BeatReq { state: "running".into(), progress: Progress { games_done: 0, games_total: total }, stats: Stats::new() };
+                        let body = BeatReq { state: "running".into(), progress: Progress { games_done: 0, games_total: total }, stats: Stats::new(), gen };
                         let _ = client.post_json::<_, Value>(&format!("/v1/lease/{id}/beat"), &body);
                         next = Instant::now() + Duration::from_secs(beat_s);
                     }
@@ -311,18 +345,35 @@ impl Engine {
         (games, conc, groups)
     }
 
+    /// The measured choice for the job (PROTOCOL 9.6), or for a rolling lease (rev 15, PROTOCOL 10.6) with its games in
+    /// flight: the run's setting for the CPU and the GPU, "auto" worked out by `rolling.rs` (the CPU from the job's
+    /// threads, a GPU from its bench row, both within `ram_mb`).
+    #[allow(clippy::too_many_arguments)]
+    fn pick(bench: Option<&crate::probe::Bench>, gpus: &[zerofarm_common::protocol::Gpu], lease: &Lease, plan: &Plan, gpu_ok: bool, threads: u32, ram_mb: u64, roll: Option<&Setup>) -> crate::probe::Choice {
+        let (games, conc, groups) = Self::job_shape(plan);
+        let allow = lease.providers.as_deref();
+        match roll {
+            None => crate::probe::choose(bench, gpus, allow, gpu_ok, games, conc, groups),
+            Some(r) => {
+                let cpu = crate::rolling::cpu_shape(r.cpu, threads, groups, ram_mb);
+                let gpu = |row: &crate::probe::BenchRow| crate::rolling::gpu_shape(r.gpu, &row.rows, groups, ram_mb);
+                crate::probe::choose_rolling(bench, gpus, allow, gpu_ok, cpu, &gpu, groups)
+            }
+        }
+    }
+
     /// Before the first job line (rev 11, PROTOCOL 9.6): a pack with no probe here yet gets the built-in probe first
     /// (exactly the between-lease one, recorded as the pack's probe); then, if a GPU provider passed and there is no
     /// fresh bench of this run's network on the pack, the bench (a record of its own); then CPU or GPU by measured speed.
-    fn choose_providers(&mut self, lease: &Lease, plan: &Plan, prep: &Prepared, gpu_ok: bool, threads: u32, need: Option<&GpuNeed>) -> crate::probe::Choice {
-        let (games, conc, groups) = Self::job_shape(plan);
+    #[allow(clippy::too_many_arguments)]
+    fn choose_providers(&mut self, lease: &Lease, plan: &Plan, prep: &Prepared, gpu_ok: bool, threads: u32, ram_mb: u64, need: Option<&GpuNeed>, roll: Option<&Setup>) -> crate::probe::Choice {
         let net = match lease.kind.as_str() {
             "selfplay" => prep.ckpt.as_ref().map(|(_, f)| f),
             "eval" => prep.models.first().map(|(_, f)| f),
             _ => None,
         };
         let (Some(rt), Some(net), Some(run)) = (&prep.runtime, net, lease.run.as_deref()) else {
-            return crate::probe::choose(None, &self.profile.gpus, lease.providers.as_deref(), gpu_ok, games, conc, groups);
+            return Self::pick(None, &self.profile.gpus, lease, plan, gpu_ok, threads, ram_mb, roll);
         };
         let id = lease.lease_id.clone();
         let control = self.control.clone();
@@ -418,7 +469,7 @@ impl Engine {
                 self.evict_after.push(format!("builds/{}", rt.build_id));
             }
         }
-        let c = crate::probe::choose(bench.as_ref(), &gpus, lease.providers.as_deref(), gpu_ok, games, conc, groups);
+        let c = Self::pick(bench.as_ref(), &gpus, lease, plan, gpu_ok, threads, ram_mb, roll);
         if let Some(mut b) = bench.filter(|b| b.error.is_none()) {
             // what the coordinator sizes this run's GPU leases by (PROTOCOL 9.4: caps.gpu_games)
             b.gpu_games = c.gpu_games;
@@ -534,9 +585,29 @@ impl Engine {
         }
         let d = self.decide(None);
         let caps = self.caps(&d);
+        // rev 15 (PROTOCOL 10): a rolling lease (its block checked against its job; with a definition only, which is
+        // what its new generations are verified against); else, or anything amiss, a classic lease
+        let roll = match (crate::rolling::setup(lease), &lease.definition) {
+            (Ok(Some(s)), Some(dref)) => {
+                log::info!("lease {id}: rolling, ids [{}, {}) reserved, {} released, flush {} s", s.lo, s.hi, s.released, s.flush_s);
+                Some((s, dref.clone()))
+            }
+            (Ok(Some(_)), None) => {
+                log::warn!("lease {id}: a rolling lease without a definition: running it as a classic lease");
+                None
+            }
+            (Ok(None), _) => None,
+            (Err(e), _) => {
+                log::warn!("lease {id}: its rolling part is not usable ({e}): running it as a classic lease");
+                None
+            }
+        };
         // rev 11 (PROTOCOL 9.6): CPU or GPU by measured speed at the job's batch size (the providers this PC verified
         // with the lease's pack, narrowed by the lease's allowlist; the CPU alone when the GPU may not be used now)
-        let choice = self.choose_providers(lease, &plan, &prep, d.gpu && !self.profile.gpus.is_empty(), caps.threads, need.as_ref());
+        let choice = self.choose_providers(lease, &plan, &prep, d.gpu && !self.profile.gpus.is_empty(), caps.threads, caps.ram_mb, need.as_ref(), roll.as_ref().map(|(s, _)| s));
+        if roll.is_some() {
+            log::info!("lease {id}: {} games in flight in {} groups", choice.conc.unwrap_or(0), choice.groups.unwrap_or(0));
+        }
         let plan_providers = (choice.providers.clone(), choice.gpu.clone());
         if plan_providers.0 != ["cpu"] {
             log::info!("lease {id}: providers {:?} on {}", plan_providers.0, plan_providers.1["name"].as_str().unwrap_or("?"));
@@ -614,6 +685,20 @@ impl Engine {
             selftest_failed: false,
             crash_reported: false,
             hello_seen: false,
+            roll: roll.map(|(setup, def)| Roll {
+                released: setup.released,
+                setup,
+                active: false,
+                finishing: false,
+                want_more: false,
+                extend_inflight: false,
+                next_extend: Instant::now(),
+                backoff: Backoff::default(),
+                def,
+                def_inflight: false,
+                def_reported: false,
+                update_inflight: false,
+            }),
         };
         run.go(self)
     }
@@ -722,6 +807,8 @@ struct Run {
     crash_reported: bool,
     /// The worker said `hello` (it started): start failures are over.
     hello_seen: bool,
+    /// rev 15 (PROTOCOL 10): a rolling lease.
+    roll: Option<Roll>,
 }
 
 impl Run {
@@ -744,6 +831,11 @@ impl Run {
         s.insert("batch_rows".into(), json!(self.batch_rows));
         if !self.rows_per_s.is_empty() {
             s.insert("rows_per_s".into(), json!(self.rows_per_s));
+        }
+        // rev 15 (PROTOCOL 10.6)
+        if let Some(r) = &self.roll {
+            s.insert("inflight".into(), json!(self.conc));
+            s.insert("released".into(), json!(r.released));
         }
         if !self.selftests.is_empty() {
             let max = self.selftests.values().filter_map(|t| t.get("max_abs").and_then(Value::as_f64)).fold(None, |m: Option<f64>, x| {
@@ -950,12 +1042,145 @@ impl Run {
                 state: if paused { "paused" } else { "running" }.into(),
                 progress: Progress { games_done: self.games_done, games_total: games_total(&self.lease) },
                 stats: self.merged_stats(),
+                // rev 15 (PROTOCOL 10.6): the newest generation the worker plays
+                gen: self.roll.as_ref().and(self.prep.ckpt.as_ref()).map(|(c, _)| c.gen),
             };
             let (client, tx, id) = (eng.client.clone(), self.tx.clone(), self.lease.lease_id.clone());
             std::thread::spawn(move || {
                 let r = client.post_json::<_, BeatResp>(&format!("/v1/lease/{id}/beat"), &body);
                 let _ = tx.send(Ev::Beat(r));
             });
+        }
+        self.roll_tick(eng);
+    }
+
+    /// rev 15 (PROTOCOL 10.4, 10.6), each tick of a rolling lease: more ids when the worker is low (at most once per
+    /// `extend_every`, not before a `wait_s` or a backoff), the update check every `update_check` (a rolling lease
+    /// would otherwise never let the agent update), and `finish` once a newer agent is ready.
+    fn roll_tick(&mut self, eng: &mut Engine) {
+        let stopping = matches!(self.state, WState::Stopping(_)) || self.after.is_some();
+        if stopping || !self.roll.as_ref().is_some_and(|r| r.active && !r.finishing) {
+            return;
+        }
+        if let Some(v) = eng.pending_update.clone() {
+            self.roll_finish(&format!("agent {v} is ready to switch to"));
+            return;
+        }
+        let Some(r) = self.roll.as_mut() else { return };
+        let now = Instant::now();
+        if r.want_more && !r.extend_inflight && now >= r.next_extend {
+            r.extend_inflight = true;
+            r.next_extend = now + eng.cfg.timings.extend_every;
+            // about 2 x the games in flight (PROTOCOL 10.4)
+            let body = ExtendReq { games: 2 * self.conc.unwrap_or(1).max(1) };
+            log::info!("lease {}: the worker is low on game ids ({} released); asking for {} more", self.lease.lease_id, r.released, body.games);
+            let (client, tx, id) = (eng.client.clone(), self.tx.clone(), self.lease.lease_id.clone());
+            std::thread::spawn(move || {
+                let r = client.post_json::<_, ExtendResp>(&format!("/v1/lease/{id}/extend"), &body);
+                let _ = tx.send(Ev::Extend(r));
+            });
+        }
+        let due = eng.last_update_check.is_none_or(|t| t.elapsed() >= eng.cfg.timings.update_check);
+        if due && !r.update_inflight {
+            r.update_inflight = true;
+            eng.last_update_check = Some(now);
+            let mut keep = Engine::keep_list(&self.lease);
+            if let (Some(run), Some((c, _))) = (&self.lease.run, &self.prep.ckpt) {
+                keep.push(Cache::ckpt_key(run, c.gen));
+            }
+            let check = crate::update::InLease {
+                client: eng.client.clone(),
+                keys: eng.cfg.keys.clone(),
+                layout: eng.cfg.layout.clone(),
+                cache: Cache::new(eng.cfg.layout.clone(), eng.cfg.keys.clone()),
+                cap: eng.settings().disk_cap_mb << 20,
+                keep,
+                control: eng.control.clone(),
+                channel: eng.cfg.channel.clone(),
+                running: eng.cfg.version.clone(),
+            };
+            let tx = self.tx.clone();
+            std::thread::spawn(move || {
+                let _ = tx.send(Ev::Update(check.run()));
+            });
+        }
+    }
+
+    /// rev 15 (PROTOCOL 10.6): ends a rolling lease gracefully: the worker starts no new game, finishes the ones in
+    /// flight, flushes and ends with `finish`; `done` then closes the lease (not given back). Once.
+    fn roll_finish(&mut self, why: &str) {
+        let Some(r) = self.roll.as_mut() else { return };
+        if r.finishing {
+            return;
+        }
+        r.finishing = true;
+        r.want_more = false;
+        log::info!("lease {}: finishing the games in flight ({why})", self.lease.lease_id);
+        if !matches!(self.state, WState::Stopping(_)) {
+            self.send(json!({"op": "finish"}));
+        }
+    }
+
+    /// rev 15 (PROTOCOL 10.4): the answer to an extension.
+    fn on_extend(&mut self, eng: &mut Engine, res: Result<ExtendResp, CallError>) {
+        let id = self.lease.lease_id.clone();
+        let Some(r) = self.roll.as_mut() else { return };
+        r.extend_inflight = false;
+        let a = match res {
+            Ok(a) => a,
+            Err(e) if matches!(e.status(), Some(404 | 410)) => {
+                log::info!("lease {id}: the coordinator no longer has it ({e})");
+                self.stop(After::Expire);
+                return;
+            }
+            Err(e) if e.is_revoked() => {
+                self.after = Some(After::Revoked);
+                self.kill("machine revoked");
+                return;
+            }
+            Err(e) if e.is_retryable() => {
+                let d = r.backoff.delay_for(&e);
+                log::warn!("lease {id}: asking for more game ids failed ({e}); again in {d:?}");
+                r.next_extend = Instant::now() + d;
+                return;
+            }
+            Err(e) => {
+                self.roll_finish(&format!("the coordinator refused more game ids: {e}"));
+                return;
+            }
+        };
+        r.backoff.reset();
+        if r.finishing {
+            return;
+        }
+        let block = r.setup.hi - r.setup.lo;
+        if a.games > block {
+            log::error!("lease {id}: the coordinator released {} ids, more than the lease's block of {block}", a.games);
+            self.roll_finish("an extension past the lease's block");
+            return;
+        }
+        if a.games > r.released {
+            log::info!("lease {id}: {} more game ids released ({} in all)", a.games - r.released, a.games);
+            r.released = a.games;
+            r.want_more = false;
+            let total = a.games;
+            self.lease.job["games"] = json!(total);
+            self.plan.job.insert("games".into(), json!(total));
+            // what an agent that dies now closes the lease with (its released ids)
+            if let Err(e) = eng.results.begin(&self.lease) {
+                log::warn!("lease {id}: could not save the lease: {e}");
+            }
+            self.send(json!({"op": "extend", "games": total}));
+        } else if a.games < r.released {
+            log::warn!("lease {id}: the coordinator's extension says {} ids, fewer than the {} released; ignored", a.games, r.released);
+        }
+        let r = self.roll.as_mut().expect("rolling");
+        if a.finish {
+            let why = a.reason.as_deref().unwrap_or("finish").to_string();
+            self.roll_finish(&format!("the coordinator releases no more ids: {why}"));
+        } else if let Some(w) = a.wait_s {
+            log::info!("lease {id}: no game ids now ({}); asking again in {w} s", a.reason.as_deref().unwrap_or("wait"));
+            r.next_extend = r.next_extend.max(Instant::now() + Duration::from_secs(w.min(3600)));
         }
     }
 
@@ -996,18 +1221,92 @@ impl Run {
             Ev::Beat(r) => self.on_beat(eng, r),
             Ev::Ckpt(r) => {
                 self.ckpt_inflight = false;
+                let rolling = self.roll.as_ref().is_some_and(|r| r.active);
+                if self.roll.as_ref().is_some_and(|r| r.finishing) {
+                    return;
+                }
                 match r {
                     Ok((c, f)) => {
                         log::info!("lease {}: switching to checkpoint {}", self.id(), c.gen);
-                        self.send(json!({"op": "checkpoint", "gen": c.gen, "model": f.model, "reference": f.reference}));
+                        let mut op = json!({"op": "checkpoint", "gen": c.gen, "model": f.model, "reference": f.reference});
+                        if rolling {
+                            // rev 15 (PROTOCOL 10.6): with the model's sha256 (the worker self-tests it before switching)
+                            op["sha256"] = json!(c.sha256);
+                        }
+                        self.send(op);
                         self.prep.ckpt = Some((c, f));
                     }
                     Err((c, e)) => {
                         log::warn!("lease {}: checkpoint {} not usable: {e}", self.id(), c.gen);
                         self.ckpt_failed.push((c.gen, c.sha256));
+                        // a rolling lease would otherwise play an old network for good: the next lease starts afresh
+                        if rolling && !eng.quitting() {
+                            self.roll_finish(&format!("checkpoint {} could not be fetched", c.gen));
+                        }
                     }
                 }
             }
+            Ev::Extend(r) => self.on_extend(eng, r),
+            Ev::Def(r) => self.on_definition(eng, *r),
+            Ev::Update(r) => {
+                if let Some(x) = self.roll.as_mut() {
+                    x.update_inflight = false;
+                }
+                match r {
+                    Ok((ready, evict)) => {
+                        // the coordinator's evict list, applied once the lease ends (always between leases)
+                        for b in evict.iter().take(64).filter(|b| zerofarm_common::is_build_id(b)) {
+                            let key = format!("builds/{b}");
+                            if eng.cfg.layout.cache_builds().join(b).exists() && !eng.evict_after.contains(&key) {
+                                eng.evict_after.push(key);
+                            }
+                        }
+                        if let Some(v) = ready {
+                            log::info!("lease {}: agent {v} is ready; finishing this rolling lease to switch to it", self.id());
+                            eng.pending_update = Some(v);
+                        }
+                    }
+                    Err(e) => log::warn!("update check: {e}"),
+                }
+            }
+        }
+    }
+
+    /// rev 15 (PROTOCOL 10.6): a rolling lease's new definition, checked off this thread.
+    fn on_definition(&mut self, eng: &mut Engine, r: Result<(DefinitionRef, Definition, CheckpointRef), Recheck>) {
+        let id = self.lease.lease_id.clone();
+        let Some(roll) = self.roll.as_mut() else { return };
+        roll.def_inflight = false;
+        if roll.finishing {
+            return;
+        }
+        match r {
+            Ok((dref, d, c)) => {
+                log::info!("lease {id}: definition {} version {} verified (the same template); fetching checkpoint {}", d.scope(), d.version, c.gen);
+                roll.def = dref;
+                self.plan.def = Some(d);
+                self.fetch_checkpoint(eng, c);
+            }
+            Err(Recheck::TemplateChanged(why)) => {
+                log::info!("lease {id}: {why}");
+                self.roll_finish("the run's self-play template changed; the next lease brings it");
+            }
+            Err(Recheck::Refused(why)) => {
+                log::error!("lease {id}: the run's new definition failed a check: {why}");
+                if !roll.def_reported {
+                    roll.def_reported = true;
+                    eng.report_crash(CrashReq {
+                        build_id: Some(self.lease.build.build_id.clone()),
+                        kind: "definition".into(),
+                        message: format!("rolling lease's new definition refused: {why}"),
+                        lease_id: Some(id.clone()),
+                        ..Default::default()
+                    });
+                }
+                self.roll_finish("the run's new definition failed a check");
+            }
+            Err(Recheck::Unavailable(why)) => log::warn!("lease {id}: the run's new definition can't be fetched right now ({why}); trying at a later beat"),
+            Err(Recheck::Stopped) => {}
         }
     }
 
@@ -1053,6 +1352,18 @@ impl Run {
         }
         j.insert("out_dir".into(), json!("out"));
         j.insert("runtime_dir".into(), self.prep.runtime.as_ref().map(|r| json!(r.dir)).unwrap_or(Value::Null));
+        // rev 15 (PROTOCOL 10.5): a worker with the feature keeps `conc` games in flight past `games` (the released
+        // ids), asks for more with `low`, and flushes finished games every `flush_s`
+        match self.roll.as_ref().filter(|r| r.active) {
+            Some(r) => {
+                j.insert("rolling".into(), json!(true));
+                j.insert("flush_s".into(), json!(r.setup.flush_s));
+            }
+            None => {
+                j.remove("rolling");
+                j.remove("flush_s");
+            }
+        }
         Value::Object(j)
     }
 
@@ -1079,6 +1390,14 @@ impl Run {
                     self.report(eng, "crash", &format!("worker says build {bid}, lease says {}", self.prep.build.build_id), None);
                     self.kill("wrong build id");
                     return;
+                }
+                // rev 15 (PROTOCOL 10.5): only a worker that lists `rolling` gets a rolling job and `extend`s
+                if let Some(r) = self.roll.as_mut() {
+                    let features = v.get("features").and_then(Value::as_array);
+                    r.active = features.is_some_and(|f| f.iter().any(|x| x.as_str() == Some(crate::rolling::WORKER_FEATURE)));
+                    if !r.active {
+                        log::info!("lease {}: worker build {bid} can't play rolling jobs; running the lease as a classic one ({} games)", self.lease.lease_id, r.released);
+                    }
                 }
                 let line = self.job_line();
                 self.send(line);
@@ -1136,6 +1455,12 @@ impl Run {
                 }
             }
             "shard" | "records" | "evals" => self.on_result_file(eng, &ev, &v),
+            // rev 15 (PROTOCOL 10.5): fewer than `conc` of the released ids are unstarted
+            "low" => {
+                if let Some(r) = self.roll.as_mut().filter(|r| r.active && !r.finishing) {
+                    r.want_more = true;
+                }
+            }
             "failure" => {
                 let mut f = Map::new();
                 for k in ["seed", "panic", "site", "repro", "output_tail"] {
@@ -1261,7 +1586,19 @@ impl Run {
                         let current = self.prep.ckpt.as_ref().map(|(c, _)| c.gen);
                         let failed = self.ckpt_failed.iter().any(|(g, h)| *g == c.gen && *h == c.sha256);
                         if current.is_none_or(|g| c.gen > g) && !self.ckpt_inflight && !failed {
-                            self.fetch_checkpoint(eng, c);
+                            match self.roll.as_ref().map(|r| (r.active, r.finishing || r.def_inflight, &r.def)) {
+                                // rev 15 (PROTOCOL 10.6): a rolling lease's new generation comes with the run's current
+                                // definition: verified (off this thread) before the checkpoint is fetched
+                                Some((true, false, cur)) if resp.definition.as_ref().is_some_and(|d| d != cur) => {
+                                    self.recheck_definition(eng, resp.definition.clone().expect("checked"), c)
+                                }
+                                // finishing, or a definition being checked: repeats are ignored
+                                Some((true, true, _)) => {}
+                                // a rolling lease before its worker said hello: nothing is switched yet
+                                Some((false, _, _)) if !self.hello_seen => {}
+                                // classic, an old worker, or a gen the lease's own definition signs
+                                _ => self.fetch_checkpoint(eng, c),
+                            }
                         }
                     }
                     if let Some(what) = resp.upload_diag {
@@ -1291,6 +1628,19 @@ impl Run {
         }
     }
 
+    /// rev 15 (PROTOCOL 10.6): verifies a rolling lease's new definition on another thread (`Ev::Def`).
+    fn recheck_definition(&mut self, eng: &Engine, dref: DefinitionRef, c: CheckpointRef) {
+        let Some(current) = self.plan.def.clone() else { return };
+        let Some(r) = self.roll.as_mut() else { return };
+        r.def_inflight = true;
+        log::info!("lease {}: generation {} comes with definition {}; checking it", self.lease.lease_id, c.gen, dref.key);
+        let (fetch, lease, tx) = (eng.fetch(), self.lease.clone(), self.tx.clone());
+        std::thread::spawn(move || {
+            let r = fetch.recheck(&lease, &current, &dref, &c).map(|d| (dref, d, c));
+            let _ = tx.send(Ev::Def(Box::new(r)));
+        });
+    }
+
     fn fetch_checkpoint(&mut self, eng: &Engine, c: CheckpointRef) {
         let Some(run) = self.lease.run.clone() else { return };
         // With a definition, only a network it names, with its hashes and sizes (PROTOCOL 7).
@@ -1309,6 +1659,10 @@ impl Run {
         // Everything the running worker uses stays (security review L2), plus the new network.
         let mut keep = Engine::keep_list(&self.lease);
         keep.push(Cache::ckpt_key(&run, c.gen));
+        // the network the worker plays now (a rolling lease's may be newer than the lease's first)
+        if let Some((cur, _)) = &self.prep.ckpt {
+            keep.push(Cache::ckpt_key(&run, cur.gen));
+        }
         let control = eng.control.clone();
         std::thread::spawn(move || {
             let stop = move || control.quitting();

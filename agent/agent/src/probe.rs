@@ -499,15 +499,45 @@ pub struct Choice {
 /// fastest provider whose self-test passed, a GPU one only at `GPU_MARGIN` times the CPU or better; the CPU when
 /// the GPU may not be used, there is no bench, or the bench has no CPU baseline.
 pub fn choose(bench: Option<&Bench>, gpus: &[Gpu], allow: Option<&[String]>, gpu_ok: bool, games: u64, conc: u64, groups: u64) -> Choice {
-    let cpu_b = batch_rows(conc, games, groups);
     let gpu_conc = games.min(conc.max(GPU_CONC)).max(1);
     let gpu_groups = groups.clamp(1, 2);
-    let gpu_b = batch_rows(gpu_conc, games, gpu_groups);
+    let mut c = choose_shaped(bench, gpus, allow, gpu_ok, games, (conc, groups), &|_: &BenchRow| (gpu_conc, gpu_groups), gpu_groups);
+    // a CPU job keeps the template's `conc` and `groups`; a GPU job's `groups` is sent only when it changed
+    if c.providers == ["cpu"] {
+        (c.conc, c.groups) = (None, None);
+    } else if c.groups == Some(groups) {
+        c.groups = None;
+    }
+    c
+}
+
+/// The choice for a rolling lease (rev 15, PROTOCOL 10.6): the same measurement, with the games in flight of the
+/// run's setting for each side (`cpu`: the CPU job's (conc, groups); `gpu`: a GPU candidate's, from its own bench
+/// row) and no end of games. The job line always gets `conc` and `groups`.
+pub fn choose_rolling(bench: Option<&Bench>, gpus: &[Gpu], allow: Option<&[String]>, gpu_ok: bool, cpu: (u64, u64), gpu: &dyn Fn(&BenchRow) -> (u64, u64), template_groups: u64) -> Choice {
+    choose_shaped(bench, gpus, allow, gpu_ok, u64::MAX, cpu, gpu, template_groups.clamp(1, 2))
+}
+
+/// `choose` with the games in flight given: the CPU job's (conc, groups), and a GPU candidate's from its bench row;
+/// `games_groups` is the GPU groups `gpu_games` (PROTOCOL 9.4) is worked out with. `conc` and `groups` of the result
+/// are always set (the chosen side's).
+#[allow(clippy::too_many_arguments)]
+fn choose_shaped(
+    bench: Option<&Bench>,
+    gpus: &[Gpu],
+    allow: Option<&[String]>,
+    gpu_ok: bool,
+    games: u64,
+    cpu_shape: (u64, u64),
+    gpu_shape: &dyn Fn(&BenchRow) -> (u64, u64),
+    games_groups: u64,
+) -> Choice {
+    let cpu_b = batch_rows(cpu_shape.0, games, cpu_shape.1);
     let mut c = Choice {
         providers: vec!["cpu".into()],
         gpu: Value::Null,
-        conc: None,
-        groups: None,
+        conc: Some(cpu_shape.0),
+        groups: Some(cpu_shape.1),
         gpu_games: None,
         batch_rows: cpu_b,
         rows_per_s: BTreeMap::new(),
@@ -524,18 +554,22 @@ pub fn choose(bench: Option<&Bench>, gpus: &[Gpu], allow: Option<&[String]>, gpu
     c.rows_per_s.insert("cpu".into(), cpu.round());
     // (0.2.11: never a provider a probe may not load - AMD's - even from a bench an older agent kept)
     let allowed = |p: &str| p != "cpu" && PROBE_PROVIDERS.contains(&p) && allow.is_none_or(|a| a.iter().any(|x| x == p));
-    let mut best: Option<(&BenchRow, &Gpu, f64)> = None;
+    // (row, adapter, rows/s, its (conc, groups), its batch rows)
+    type Best<'a> = (&'a BenchRow, &'a Gpu, f64, (u64, u64), u64);
+    let mut best: Option<Best> = None;
     for r in b.results.iter().filter(|r| r.ok && allowed(&r.provider)) {
         let Some(g) = gpus.iter().find(|g| Some(g.name.as_str()) == r.adapter.as_deref()) else { continue };
+        let shape = gpu_shape(r);
+        let gpu_b = batch_rows(shape.0, games, shape.1);
         let Some(rate) = rate_at(&r.rows, gpu_b) else { continue };
         let e = c.rows_per_s.entry(r.provider.clone()).or_insert(0.0);
         *e = e.max(rate.round());
-        if best.is_none_or(|(_, _, x)| rate > x) {
-            best = Some((r, g, rate));
+        if best.is_none_or(|(_, _, x, _, _)| rate > x) {
+            best = Some((r, g, rate, shape, gpu_b));
         }
     }
     // The fewest games per lease at which a GPU pays (PROTOCOL 9.4): the smallest batch where one reaches 2x the CPU,
-    // else GPU_MARGIN times, with `gpu_groups` batches in turn.
+    // else GPU_MARGIN times, with `games_groups` batches in turn.
     let cpu_rows = &b.results.iter().find(|r| r.ok && r.provider == "cpu").expect("checked above").rows;
     let gpu_rows: Vec<&BenchRow> =
         b.results.iter().filter(|r| r.ok && allowed(&r.provider) && gpus.iter().any(|g| Some(g.name.as_str()) == r.adapter.as_deref())).collect();
@@ -550,21 +584,20 @@ pub fn choose(bench: Option<&Bench>, gpus: &[Gpu], allow: Option<&[String]>, gpu
         }
         None
     };
-    c.gpu_games = pays_at(2.0).or_else(|| pays_at(GPU_MARGIN)).map(|n| n * gpu_groups);
+    c.gpu_games = pays_at(2.0).or_else(|| pays_at(GPU_MARGIN)).map(|n| n * games_groups);
     if !gpu_ok {
         c.why = "the GPU may not be used now".into();
         return c;
     }
     match best {
-        Some((r, g, rate)) if rate >= GPU_MARGIN * cpu => {
+        Some((r, g, rate, shape, gpu_b)) if rate >= GPU_MARGIN * cpu => {
             c.providers = vec![r.provider.clone(), "cpu".into()];
             c.gpu = json!({"luid": g.luid.clone().unwrap_or_default(), "vendor": g.vendor, "name": g.name});
-            c.conc = Some(gpu_conc);
-            c.groups = (gpu_groups != groups).then_some(gpu_groups);
+            (c.conc, c.groups) = (Some(shape.0), Some(shape.1));
             c.batch_rows = gpu_b;
             c.why = format!("{} on {}: {:.0} rows/s at {gpu_b} rows, the CPU {:.0} at {cpu_b}", r.provider, g.name, rate, cpu);
         }
-        Some((r, g, rate)) => {
+        Some((r, g, rate, _, gpu_b)) => {
             c.why = format!("the CPU: {:.0} rows/s at {cpu_b} rows; the best GPU, {} on {}, {:.0} at {gpu_b} (needs {GPU_MARGIN}x)", cpu, r.provider, g.name, rate);
         }
         None => c.why = "no GPU provider passed on this pack".into(),

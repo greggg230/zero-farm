@@ -21,7 +21,16 @@
 //! Fuzz jobs can carry the same object as a JSON string in `env.FAKE`.
 //!
 //! An optional `startup.json` next to the executable (part of the signed test build) can delay
-//! `hello`: `{"hello_delay_ms": 60000}`.
+//! `hello`: `{"hello_delay_ms": 60000}`, and set the features `hello` lists: `{"features": []}` (an old
+//! worker; the default is `["rolling"]`).
+//!
+//! Rolling self-play jobs (PROTOCOL 10.5, `"rolling": true` with the feature): games are played one at a time
+//! (the job's `conc` only decides `low`: sent once per `games` value when fewer than `conc` released ids are
+//! unstarted); past the released ids the worker waits for `extend` (more ids), `finish` or `quit`, still sending
+//! `status`. Finished games are flushed every `shard_every` games or `flush_s` (`settings.fake.flush_ms` overrides
+//! it) after the first unflushed one. A `checkpoint` is self-tested (`selftest` with `gen`: the file exists and
+//! matches the `sha256` the agent sent) before the switch. Without the feature `rolling` is ignored and `extend` is
+//! answered with a non-fatal `error`.
 
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
@@ -161,6 +170,8 @@ struct Cfg {
     fail_seeds: Vec<u64>,
     chunk: u64,
     selftest_fail_gen: Option<u64>,
+    /// Rolling jobs: overrides the job's `flush_s`.
+    flush_ms: Option<u64>,
 }
 
 impl Cfg {
@@ -192,6 +203,7 @@ impl Cfg {
                 .unwrap_or_default(),
             chunk: u("chunk", 1000).max(1),
             selftest_fail_gen: o("selftest_fail_gen"),
+            flush_ms: o("flush_ms"),
         }
     }
 }
@@ -214,6 +226,10 @@ struct W {
     yields: u64,
     last_status: Instant,
     stop: Stop,
+    /// A rolling job runs (the job asked and the worker has the feature).
+    rolling: bool,
+    /// A rolling job's released ids (`games`, raised by `extend`).
+    games: u64,
 }
 
 impl W {
@@ -235,16 +251,40 @@ impl W {
         };
         match op.get("op").and_then(Value::as_str).unwrap_or("") {
             "ping" => self.status(),
-            "checkpoint" => {
-                self.gen = op.get("gen").and_then(Value::as_u64);
-                eprintln!("fakeworker: switching to checkpoint {:?} at the next game", self.gen);
+            "checkpoint" => self.checkpoint(&op),
+            "extend" if self.rolling => {
+                let g = op.get("games").and_then(Value::as_u64).unwrap_or(0);
+                eprintln!("fakeworker: extend to {g} games (from {})", self.games);
+                self.games = self.games.max(g);
             }
+            "extend" => self.out.send(json!({"ev": "error", "message": "unknown op extend", "fatal": false})),
             "finish" => self.stop = Stop::Finish,
             "quit" => self.stop = Stop::Quit,
             "yield" => self.do_yield(),
             "resume" => {} // not yielded: nothing to do
             other => eprintln!("fakeworker: unknown op {other:?}"),
         }
+    }
+
+    /// A new network: in a rolling job self-tested first (`selftest` with `gen`), then played.
+    fn checkpoint(&mut self, op: &Value) {
+        let gen = op.get("gen").and_then(Value::as_u64);
+        if self.rolling {
+            let sha = op.get("sha256").and_then(Value::as_str);
+            let file_ok = op
+                .get("model")
+                .and_then(Value::as_str)
+                .and_then(|p| std::fs::read(p).ok())
+                .is_some_and(|b| sha.is_none_or(|h| sha256_hex(&b) == h));
+            self.out.send(json!({"ev": "selftest", "gen": gen, "provider": "cpu", "max_abs": if file_ok { 0.0 } else { 0.5 }, "ok": file_ok}));
+            if !file_ok {
+                self.out.send(json!({"ev": "error", "message": format!("network {gen:?} failed the self-test"), "fatal": true}));
+                std::process::exit(2);
+            }
+            eprintln!("fakeworker: checkpoint {gen:?} self-tested (sha256 given: {})", sha.is_some());
+        }
+        self.gen = gen;
+        eprintln!("fakeworker: switching to checkpoint {:?} at the next game", self.gen);
     }
 
     fn do_yield(&mut self) {
@@ -273,7 +313,8 @@ impl W {
                     }
                     "finish" => self.stop = Stop::Finish,
                     "ping" => self.status(),
-                    "checkpoint" => self.gen = op.get("gen").and_then(Value::as_u64),
+                    "checkpoint" => self.checkpoint(&op),
+                    "extend" if self.rolling => self.games = self.games.max(op.get("games").and_then(Value::as_u64).unwrap_or(0)),
                     _ => {}
                 },
                 Ok(None) | Err(_) => std::process::exit(0),
@@ -368,6 +409,58 @@ impl W {
         };
         let rest: Vec<u64> = (base + next..base + games).collect();
         let unfinished = if rest.is_empty() { Value::Null } else { json!({"gids": ranges(&rest)}) };
+        self.out.send(json!({"ev": "end", "reason": reason, "stats": self.stats(), "unfinished": unfinished}));
+    }
+
+    /// A rolling self-play job (PROTOCOL 10.5).
+    fn run_rolling(&mut self, job: &Value) {
+        let base = job.get("gid_base").and_then(Value::as_u64).unwrap_or(0);
+        let conc = job.get("conc").and_then(Value::as_u64).unwrap_or(1).max(1);
+        let flush = Duration::from_millis(self.cfg.flush_ms.unwrap_or(job.get("flush_s").and_then(Value::as_u64).unwrap_or(120) * 1000));
+        self.games = job.get("games").and_then(Value::as_u64).unwrap_or(4);
+        eprintln!("fakeworker: rolling job, {} ids released, {conc} in flight, flush {flush:?}", self.games);
+        let mut unflushed = Vec::new();
+        let mut first_fin: Option<Instant> = None;
+        let mut next = 0u64;
+        let mut low_for = None;
+        while matches!(self.stop, Stop::No) {
+            if next < self.games {
+                let started = next + 1;
+                if self.games - started < conc && low_for != Some(self.games) {
+                    low_for = Some(self.games);
+                    self.out.send(json!({"ev": "low", "started": started, "games": self.games}));
+                }
+                self.work(self.cfg.game_ms);
+                if matches!(self.stop, Stop::Quit) {
+                    break;
+                }
+                unflushed.push(base + next);
+                first_fin.get_or_insert_with(Instant::now);
+                next += 1;
+                self.done += 1;
+                self.out.send(json!({"ev": "fin", "n": 1}));
+                self.after_game_hooks();
+            } else {
+                // every released id is played: wait for more (still answering ops, sending status)
+                if low_for != Some(self.games) {
+                    low_for = Some(self.games);
+                    self.out.send(json!({"ev": "low", "started": next, "games": self.games}));
+                }
+                self.work(20);
+            }
+            if unflushed.len() >= self.cfg.shard_every || first_fin.is_some_and(|t| t.elapsed() >= flush) {
+                self.flush(&mut unflushed);
+                first_fin = None;
+            }
+        }
+        self.flush(&mut unflushed);
+        let reason = match self.stop {
+            Stop::Quit => "quit",
+            _ => "finish",
+        };
+        let rest: Vec<u64> = (base + next..base + self.games).collect();
+        let unfinished = if rest.is_empty() { Value::Null } else { json!({"gids": ranges(&rest)}) };
+        eprintln!("fakeworker: rolling job ended ({reason}): {next} of {} released ids played", self.games);
         self.out.send(json!({"ev": "end", "reason": reason, "stats": self.stats(), "unfinished": unfinished}));
     }
 
@@ -521,9 +614,15 @@ fn main() {
             std::thread::sleep(Duration::from_millis(ms));
         }
     }
+    let features: Value = std::fs::read_to_string(exe_dir.join("startup.json"))
+        .ok()
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
+        .and_then(|v| v.get("features").cloned())
+        .unwrap_or(json!(["rolling"]));
+    let rolling_feature = features.as_array().is_some_and(|f| f.iter().any(|x| x == "rolling"));
     let out = Out;
     out.send(json!({"ev": "hello", "aw": 1, "build_id": build_id(), "game": "fake",
-                    "kinds": ["fuzz", "eval", "selfplay"], "zero_onnx": [1], "pid": std::process::id()}));
+                    "kinds": ["fuzz", "eval", "selfplay"], "zero_onnx": [1], "pid": std::process::id(), "features": features}));
     let rx = spawn_stdin();
     let job = loop {
         match rx.recv() {
@@ -550,6 +649,8 @@ fn main() {
         yields: 0,
         last_status: Instant::now(),
         stop: Stop::No,
+        rolling: rolling_feature && job.get("kind").and_then(Value::as_str) == Some("selfplay") && job.get("rolling").and_then(Value::as_bool) == Some(true),
+        games: 0,
     };
     if job.get("model").and_then(Value::as_str).is_some() {
         w.out.send(json!({"ev": "selftest", "provider": "cpu", "max_abs": 0.0, "ok": true}));
@@ -558,6 +659,7 @@ fn main() {
     match job.get("kind").and_then(Value::as_str) {
         Some("fuzz") => w.run_fuzz(&job),
         Some("eval") => w.run_eval(&job),
+        _ if w.rolling => w.run_rolling(&job),
         _ => w.run_games(&job),
     }
 }

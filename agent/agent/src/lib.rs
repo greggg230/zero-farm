@@ -16,6 +16,7 @@ pub mod policy;
 pub mod probe;
 pub mod profile;
 pub mod results;
+pub mod rolling;
 pub mod settings;
 pub mod signals;
 pub mod startfail;
@@ -78,6 +79,8 @@ pub struct Timings {
     pub start_backoff_max: Duration,
     /// How often crash reports saved under `state\crashes\` (e.g. a caught tray panic) are sent.
     pub crash_resend: Duration,
+    /// rev 15 (PROTOCOL 10.4): a rolling lease asks for more game ids at most this often (10 s).
+    pub extend_every: Duration,
 }
 
 impl Default for Timings {
@@ -102,6 +105,7 @@ impl Default for Timings {
             start_backoff: Duration::from_secs(60),
             start_backoff_max: Duration::from_secs(3600),
             crash_resend: Duration::from_secs(60),
+            extend_every: Duration::from_secs(10),
         }
     }
 }

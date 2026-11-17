@@ -89,6 +89,7 @@ pub fn fast_timings() -> Timings {
         start_backoff: Duration::from_secs(60),
         start_backoff_max: Duration::from_secs(3600),
         crash_resend: Duration::from_millis(500),
+        extend_every: Duration::from_millis(200),
     }
 }
 

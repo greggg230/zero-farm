@@ -11,6 +11,12 @@
 //! [`MockCoord::fail_next_raw`] answers without it, like a WAF or proxy in front of the
 //! coordinator. Signed definitions (PROTOCOL 7) are served under `defs/` and registered with
 //! `PUT /v1/admin/definition` (checked against the trusted data keys).
+//!
+//! Rolling self-play leases (rev 15, PROTOCOL 10): a queued lease with `rolling` goes out rolling only to a request
+//! that lists the feature (else classic: `rolling` removed); `POST /v1/lease/{id}/extend` releases ids from the
+//! block (scriptable: [`MockCoord::script_extend`]), raising the lease's `job.games` so `x-ids` and `unfinished`
+//! may name them; beats of a rolling lease whose `gen` is older than the run's current one
+//! ([`MockCoord::set_run_current`]) answer with `checkpoint` and `definition`.
 
 pub mod testkit;
 
@@ -109,6 +115,12 @@ pub struct State {
     pub agent_releases: Vec<Value>,
     /// `PUT /v1/admin/definition` bodies that were accepted.
     pub definitions_registered: Vec<Value>,
+    /// rev 15: `POST /v1/lease/{id}/extend` bodies, in order.
+    pub extends: Vec<(String, Value)>,
+    /// rev 15: scripted extension answers per lease, used in order (see [`MockCoord::script_extend`]).
+    pub extend_script: HashMap<String, VecDeque<Value>>,
+    /// rev 15: per run, its current generation's checkpoint and definition reference.
+    pub run_current: HashMap<String, (Value, Value)>,
 }
 
 pub struct MockCoord {
@@ -271,6 +283,20 @@ impl MockCoord {
 
     pub fn script_beat(&self, lease_id: &str, answer: Value) {
         self.with(|s| s.beat_script.entry(lease_id.to_string()).or_default().push_back(answer));
+    }
+
+    /// rev 15: the next extension of `lease_id` gets this answer instead of the default (release what is asked,
+    /// within the block; `finish` with reason `block` once it is used up): `{"release": n}` releases n ids (fewer at
+    /// the block's end), `{"wait_s": s}` and `{"finish": true, "reason": r}` answer so with the current total,
+    /// `{"status": 410}` is that error.
+    pub fn script_extend(&self, lease_id: &str, answer: Value) {
+        self.with(|s| s.extend_script.entry(lease_id.to_string()).or_default().push_back(answer));
+    }
+
+    /// rev 15: the run's current generation: a rolling lease's beats with an older `gen` answer with this checkpoint
+    /// and definition reference (PROTOCOL 10.6).
+    pub fn set_run_current(&self, run: &str, checkpoint: Value, definition: Value) {
+        self.with(|s| s.run_current.insert(run.to_string(), (checkpoint, definition)));
     }
 
     /// The next `count` requests matching `method` and path prefix get `status` (a coordinator
@@ -562,6 +588,13 @@ fn handle(mut req: Request, st: &Arc<Mutex<State>>) {
                 done!(reply(req, 200, json!({"update": {"min_agent": min}})))
             } else if let Some(mut l) = s.lease_queue.pop_front() {
                 let t = now();
+                // rev 15 (PROTOCOL 10.2): rolling only for an agent that asks for it
+                let rolling_ok = json_body["features"].as_array().is_some_and(|f| f.iter().any(|x| x == "rolling"));
+                if !rolling_ok {
+                    if let Some(o) = l.as_object_mut() {
+                        o.remove("rolling");
+                    }
+                }
                 if l["issued_at"] == 0 {
                     l["issued_at"] = json!(t);
                 }
@@ -594,6 +627,17 @@ fn handle(mut req: Request, st: &Arc<Mutex<State>>) {
                     if let Some(d) = ans_d.get("upload_diag") {
                         ans["upload_diag"] = d.clone();
                     }
+                    // rev 15 (PROTOCOL 10.6): a rolling lease behind the run's current generation gets it, with its
+                    // definition
+                    let ls = &s.leases[&id].lease;
+                    if ans.get("checkpoint").is_none() && !ls["rolling"].is_null() {
+                        if let Some((c, d)) = ls["run"].as_str().and_then(|r| s.run_current.get(r)) {
+                            if json_body["gen"].as_u64().is_none_or(|g| c["gen"].as_u64().is_some_and(|cur| cur > g)) {
+                                ans["checkpoint"] = c.clone();
+                                ans["definition"] = d.clone();
+                            }
+                        }
+                    }
                     if ans.get("checkpoint").is_none() {
                         ans["checkpoint"] = Value::Null;
                     }
@@ -607,6 +651,49 @@ fn handle(mut req: Request, st: &Arc<Mutex<State>>) {
                         return;
                     }
                     done!(reply(req, 200, ans))
+                }
+            }
+        }
+        ("POST", ["lease", id, "extend"]) => {
+            let id = id.to_string();
+            s.extends.push((id.clone(), json_body.clone()));
+            let k = json_body["games"].as_u64().unwrap_or(0);
+            match s.leases.get(&id).cloned() {
+                None => done!(err(req, 404, "not_found", "lease")),
+                Some(ls) if ls.cancelled || ls.expired || ls.done => done!(err(req, 410, "gone", "lease")),
+                Some(ls) if ls.lease["rolling"].is_null() => done!(err(req, 400, "bad_request", "not a rolling lease")),
+                Some(_) if k == 0 => done!(err(req, 400, "bad_request", "games must be at least 1")),
+                Some(ls) => {
+                    let (lo, hi) = (ls.lease["rolling"]["block"][0].as_u64().unwrap_or(0), ls.lease["rolling"]["block"][1].as_u64().unwrap_or(0));
+                    let cur = ls.lease["job"]["games"].as_u64().unwrap_or(0);
+                    let left = (hi - lo).saturating_sub(cur);
+                    let script = s.extend_script.get_mut(&id).and_then(|q| q.pop_front());
+                    let release = |n: u64| -> (u64, Value) {
+                        let n = n.min(left);
+                        if n == 0 {
+                            (cur, json!({"games": cur, "finish": true, "reason": "block"}))
+                        } else {
+                            (cur + n, json!({"games": cur + n}))
+                        }
+                    };
+                    let (total, ans) = match &script {
+                        None => release(k),
+                        Some(a) if a.get("release").is_some() => release(a["release"].as_u64().unwrap_or(0)),
+                        Some(a) if a.get("wait_s").is_some() => (cur, json!({"games": cur, "wait_s": a["wait_s"], "reason": "quota"})),
+                        Some(a) if a.get("finish").is_some() => {
+                            (cur, json!({"games": cur, "finish": true, "reason": a.get("reason").cloned().unwrap_or(json!("max_s"))}))
+                        }
+                        Some(a) => (cur, a.clone()),
+                    };
+                    if let Some(code) = script.as_ref().and_then(|a| a["status"].as_u64()) {
+                        if code == 410 {
+                            s.leases.get_mut(&id).unwrap().expired = true;
+                        }
+                        done!(err(req, code as u16, "scripted", "scripted extension failure"))
+                    } else {
+                        s.leases.get_mut(&id).unwrap().lease["job"]["games"] = json!(total);
+                        done!(reply(req, 200, ans))
+                    }
                 }
             }
         }

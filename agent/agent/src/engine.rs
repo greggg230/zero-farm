@@ -445,6 +445,8 @@ impl Engine {
             caps,
             cached: Cached { builds, ckpts },
             kinds,
+            // rev 15 (PROTOCOL 10.2): rolling self-play leases
+            features: crate::rolling::FEATURES.iter().map(|f| f.to_string()).collect(),
         };
         let resp: LeaseResp = match self.client.post_json("/v1/lease", &req) {
             Err(CallError::Http { status: 409, body: Some(b), .. }) if b.get("need_profile").and_then(Value::as_bool) == Some(true) => {

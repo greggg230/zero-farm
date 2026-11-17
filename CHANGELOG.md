@@ -4,6 +4,17 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>`.
 
+## 0.2.13 (unreleased)
+
+- **Long self-play jobs that keep the PC's processor or graphics card fully busy.** For runs that use them, a job
+  now keeps a steady number of games going: whenever one ends, the next starts, and Zero Farm asks the farm for more
+  games as it goes, so the work never trails off at the end of a job. Finished games are sent every couple of
+  minutes. When the farm's network improves, the job switches to the new network in place, after checking that the
+  farm's signed instructions for it are genuine and unchanged otherwise. Such a job ends by itself when the farm has
+  other work for the PC, when its instructions change, or when a Zero Farm update is ready, so updates still happen.
+- How many games run at once is chosen from the PC's measurements: four per processor thread on the processor; on a
+  graphics card, as many as still make it noticeably faster, never more than fit the memory Zero Farm may use.
+
 ## 0.2.12 (2026-11-15, canary)
 
 - **"Automatic" CPU threads now uses one thread per physical core** (it was physical cores minus 2), still at

@@ -15,15 +15,17 @@
 //! A lease that fails is refused (`done` with `refused: "definition"`), reported once a day as
 //! crash kind `definition`, and the agent waits before asking again.
 
-use crate::engine::Engine;
+use crate::engine::{Control, Engine};
 use serde_json::{Map, Value};
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use zerofarm_common::definition::{self as def, CheckpointDef, Definition};
-use zerofarm_common::http::{CallError, Want};
+use zerofarm_common::http::{CallError, Client, Want};
+use zerofarm_common::keys::TrustedKeys;
 use zerofarm_common::layout::Layout;
 use zerofarm_common::manifest::{verify_dir, verify_manifest_bytes, Expect, Kind, Manifest, MAX_MANIFEST_BYTES, MAX_SIG_BYTES};
-use zerofarm_common::protocol::{ArtifactRef, CheckpointRef, Lease};
+use zerofarm_common::protocol::{canonical_json, ArtifactRef, CheckpointRef, DefinitionRef, Lease};
 
 /// What the worker of a lease will be told, before the agent's local fields.
 #[derive(Debug, Clone)]
@@ -167,20 +169,7 @@ impl Engine {
     fn plan_signed(&mut self, lease: &Lease) -> Result<Plan, PlanError> {
         let dref = lease.definition.as_ref().expect("signed lease");
         let id = &lease.lease_id;
-        if zerofarm_common::http::check_key(&dref.key).is_err()
-            || !dref.key.starts_with("defs/")
-            || !dref.key.ends_with(&format!("/{}", def::DEFINITION_FILE))
-            || !zerofarm_common::is_sha256_hex(&dref.sha256)
-        {
-            return refused(format!("bad definition reference {:?}", dref.key));
-        }
-        let bytes = self.fetch_small(&dref.key, Some(&dref.sha256), def::MAX_DEFINITION_BYTES, &format!("def-{id}.json"))?;
-        let sig = self.fetch_small(&format!("{}{}", dref.key, def::SIG_SUFFIX), None, def::MAX_SIG_BYTES, &format!("def-{id}.minisig"))?;
-        let sig = String::from_utf8(sig).map_err(|_| PlanError::Refused("the definition's signature is not text".into()))?;
-        let d = def::verify(&self.cfg.data_keys, &bytes, &sig).map_err(PlanError::Refused)?;
-        if d.key() != dref.key {
-            return refused(format!("the definition at {} says it is {}", dref.key, d.key()));
-        }
+        let d = self.fetch().definition(dref, id)?;
         // Kind and id against the lease's run or campaign.
         let (want_kind, want_id) = match (&lease.run, &lease.campaign) {
             (Some(r), None) => ("run", r),
@@ -230,20 +219,71 @@ impl Engine {
         Ok(Plan { job, def: Some(d), alternate })
     }
 
+    /// A build's signed manifest alone (rev 11, PROTOCOL 9.5): see [`Fetch::signed_manifest`].
+    pub(crate) fn signed_manifest(&self, r: &ArtifactRef, kind: Kind) -> Result<Manifest, PlanError> {
+        self.fetch().signed_manifest(r, kind)
+    }
+
+    /// What fetches and verifies definitions and manifests, also off the engine's thread (a rolling lease's new
+    /// definition, PROTOCOL 10.6).
+    pub(crate) fn fetch(&self) -> Fetch {
+        Fetch {
+            client: self.client.clone(),
+            layout: self.cfg.layout.clone(),
+            keys: self.cfg.keys.clone(),
+            data_keys: self.cfg.data_keys.clone(),
+            control: self.control.clone(),
+        }
+    }
+}
+
+/// Fetches and verifies the small signed files a lease is checked with (definitions, manifests), on any thread.
+#[derive(Clone)]
+pub struct Fetch {
+    pub client: Client,
+    pub layout: Layout,
+    /// Release keys (manifests) and data keys (definitions): each check accepts only its own list.
+    pub keys: TrustedKeys,
+    pub data_keys: TrustedKeys,
+    pub control: Arc<Control>,
+}
+
+impl Fetch {
+    /// A definition (PROTOCOL 7 steps 1-2): its reference well formed, its bytes with the referenced sha256, its
+    /// signature by a trusted **data** key, and the key it says it is. `tag` names the temporary files (unique per
+    /// lease and use).
+    pub fn definition(&self, dref: &DefinitionRef, tag: &str) -> Result<Definition, PlanError> {
+        if zerofarm_common::http::check_key(&dref.key).is_err()
+            || !dref.key.starts_with("defs/")
+            || !dref.key.ends_with(&format!("/{}", def::DEFINITION_FILE))
+            || !zerofarm_common::is_sha256_hex(&dref.sha256)
+        {
+            return refused(format!("bad definition reference {:?}", dref.key));
+        }
+        let bytes = self.fetch_small(&dref.key, Some(&dref.sha256), def::MAX_DEFINITION_BYTES, &format!("def-{tag}.json"))?;
+        let sig = self.fetch_small(&format!("{}{}", dref.key, def::SIG_SUFFIX), None, def::MAX_SIG_BYTES, &format!("def-{tag}.minisig"))?;
+        let sig = String::from_utf8(sig).map_err(|_| PlanError::Refused("the definition's signature is not text".into()))?;
+        let d = def::verify(&self.data_keys, &bytes, &sig).map_err(PlanError::Refused)?;
+        if d.key() != dref.key {
+            return refused(format!("the definition at {} says it is {}", dref.key, d.key()));
+        }
+        Ok(d)
+    }
+
     /// A build's signed manifest alone (rev 11, PROTOCOL 9.5): from the cache when the build is there and verifies,
     /// else just `manifest.json` + its signature, verified with the release keys (no other file is fetched).
-    pub(crate) fn signed_manifest(&self, r: &ArtifactRef, kind: Kind) -> Result<Manifest, PlanError> {
+    pub fn signed_manifest(&self, r: &ArtifactRef, kind: Kind) -> Result<Manifest, PlanError> {
         if !zerofarm_common::is_build_id(&r.build_id) || r.manifest != format!("builds/{}/manifest.json", r.build_id) {
             return refused(format!("bad build reference {:?}", r.build_id));
         }
         let expect = Expect { build_id: Some(&r.build_id), kind: Some(kind), version: None };
-        if let Ok(v) = verify_dir(&self.cfg.layout.cache_builds().join(&r.build_id), &self.cfg.keys, &expect) {
+        if let Ok(v) = verify_dir(&self.layout.cache_builds().join(&r.build_id), &self.keys, &expect) {
             return Ok(v.manifest);
         }
         let bytes = self.fetch_small(&r.manifest, None, MAX_MANIFEST_BYTES, &format!("m-{}.json", r.build_id))?;
         let sig = self.fetch_small(&format!("{}.minisig", r.manifest), None, MAX_SIG_BYTES, &format!("m-{}.minisig", r.build_id))?;
         let sig = String::from_utf8(sig).map_err(|_| PlanError::Refused("a manifest signature is not text".into()))?;
-        let (m, id) = verify_manifest_bytes(&self.cfg.keys, &bytes, &sig).map_err(|e| PlanError::Refused(format!("build {}: {e}", r.build_id)))?;
+        let (m, id) = verify_manifest_bytes(&self.keys, &bytes, &sig).map_err(|e| PlanError::Refused(format!("build {}: {e}", r.build_id)))?;
         if id != r.build_id || m.kind != kind {
             return refused(format!("build {}: the manifest is {} {id}", r.build_id, m.kind));
         }
@@ -252,7 +292,7 @@ impl Engine {
 
     /// Downloads a small file (definition, signature) into `cache\tmp` and returns its bytes.
     fn fetch_small(&self, key: &str, sha: Option<&str>, max: u64, tmp_name: &str) -> Result<Vec<u8>, PlanError> {
-        let dir = self.cfg.layout.cache_tmp();
+        let dir = self.layout.cache_tmp();
         let _ = std::fs::create_dir_all(&dir);
         let dest = dir.join(tmp_name);
         let _ = std::fs::remove_file(&dest);
@@ -273,6 +313,78 @@ impl Engine {
         };
         let _ = std::fs::remove_file(&dest);
         out
+    }
+
+    /// rev 15 (PROTOCOL 10.6): a rolling lease's new generation comes with the run's current definition. It is
+    /// verified as at grant (PROTOCOL 7 steps 1-4: the signature by a data key, kind and id, expiry, a version never
+    /// older than any seen - and recorded -, the lease's worker build in `builds` and its runtime authorized as at
+    /// grant, the new checkpoint's hashes as signed), and its self-play template must be the lease's own (canonical
+    /// JSON): anything else ends the lease gracefully.
+    pub fn recheck(&self, lease: &Lease, current: &Definition, dref: &DefinitionRef, c: &CheckpointRef) -> Result<Definition, Recheck> {
+        let tag = format!("{}-g{}", lease.lease_id, c.gen);
+        let d = self.definition(dref, &tag).map_err(Recheck::from)?;
+        let no = |m: String| Err(Recheck::Refused(m));
+        let Some(run) = &lease.run else { return no("a rolling lease names a run".into()) };
+        if d.kind != "run" || &d.id != run {
+            return no(format!("definition {} is not for the lease's run {run}", d.scope()));
+        }
+        if let Some(e) = d.expires.filter(|e| zerofarm_common::now_unix() > *e) {
+            return no(format!("definition {} version {} expired at {}", d.scope(), d.version, zerofarm_common::rotlog::utc_timestamp(e)));
+        }
+        SeenVersions::check_and_record(&self.layout, &d.scope(), d.version).map_err(Recheck::Refused)?;
+        if !d.builds.contains(&lease.build.build_id) {
+            return no(format!("worker build {} is not in definition {} version {}", lease.build.build_id, d.scope(), d.version));
+        }
+        // the runtime as at grant: the definition's, or the one the lease's worker build itself requires (an alternate)
+        if lease.runtime.as_ref().map(|r| &r.build_id) != d.runtime.as_ref() {
+            let Some(rt) = lease.runtime.as_ref().map(|r| r.build_id.clone()) else {
+                return no(format!("the lease has no runtime, definition {} version {} names {:?}", d.scope(), d.version, d.runtime));
+            };
+            let m = self.signed_manifest(&lease.build, Kind::Worker).map_err(Recheck::from)?;
+            if m.requires_runtime.as_deref() != Some(rt.as_str()) {
+                return no(format!(
+                    "runtime {rt} is neither definition {} version {}'s {:?} nor the one worker build {} requires",
+                    d.scope(),
+                    d.version,
+                    d.runtime,
+                    lease.build.build_id
+                ));
+            }
+        }
+        match_checkpoint(&d, c).map_err(Recheck::Refused)?;
+        let template = |x: &Definition| x.template(&lease.kind).map(|t| canonical_json(&Value::Object(t.clone())));
+        if template(&d).is_none() || template(&d) != template(current) {
+            return Err(Recheck::TemplateChanged(format!(
+                "definition {} version {} has another {} template than version {}",
+                d.scope(),
+                d.version,
+                lease.kind,
+                current.version
+            )));
+        }
+        Ok(d)
+    }
+}
+
+/// Why a rolling lease's new definition isn't taken (PROTOCOL 10.6).
+#[derive(Debug)]
+pub enum Recheck {
+    /// It failed a check: the lease finishes, reported once (crash kind `definition`).
+    Refused(String),
+    /// Its job template is not the lease's: the lease finishes (the next lease brings the new template).
+    TemplateChanged(String),
+    /// It couldn't be fetched right now: asked again at a later beat.
+    Unavailable(String),
+    Stopped,
+}
+
+impl From<PlanError> for Recheck {
+    fn from(e: PlanError) -> Recheck {
+        match e {
+            PlanError::Refused(m) => Recheck::Refused(m),
+            PlanError::Unavailable(m) => Recheck::Unavailable(m),
+            PlanError::Stopped => Recheck::Stopped,
+        }
     }
 }
 

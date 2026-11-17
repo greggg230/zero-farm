@@ -126,6 +126,10 @@ pub struct LeaseReq {
     pub caps: Caps,
     pub cached: Cached,
     pub kinds: Vec<String>,
+    /// rev 15 (PROTOCOL 10.2): what this agent can do beyond the base protocol (`"rolling"`: rolling self-play
+    /// leases). Names a coordinator doesn't know are ignored; absent before 0.2.13.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub features: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -143,6 +147,52 @@ pub struct CheckpointRef {
     pub reference: Option<String>,
     #[serde(default)]
     pub reference_sha256: Option<String>,
+}
+
+/// rev 15 (PROTOCOL 10.3): what makes a self-play lease rolling. Every field but `block` has a default, so a
+/// coordinator can add to it; the agent checks the values itself (`rolling.rs`).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct Rolling {
+    /// Ids `[lo, hi)` reserved for the lease; `job.gid_base` = `lo`, `job.games` = the ids released so far.
+    pub block: (u64, u64),
+    #[serde(default)]
+    pub inflight: RollingInflight,
+    /// The lease runs to at least this time (Unix seconds).
+    #[serde(default)]
+    pub until: i64,
+    #[serde(default)]
+    pub max_s: u64,
+    /// The longest a finished game waits in the worker before it is uploaded.
+    #[serde(default)]
+    pub flush_s: u64,
+}
+
+/// The run's games in flight for a CPU and a GPU job: a number (1 to 4,096) or `"auto"` (the agent's choice).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct RollingInflight {
+    #[serde(default)]
+    pub cpu: Value,
+    #[serde(default)]
+    pub gpu: Value,
+}
+
+/// rev 15 (PROTOCOL 10.4): `POST /v1/lease/{id}/extend`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ExtendReq {
+    pub games: u64,
+}
+
+/// The answer to an extension: the lease's released ids are `[lo, lo + games)`; `wait_s`: nothing released now,
+/// ask again then; `finish`: no id will ever be released, finish the games in flight and close the lease.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct ExtendResp {
+    pub games: u64,
+    #[serde(default)]
+    pub wait_s: Option<u64>,
+    #[serde(default)]
+    pub finish: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 /// rev 6 (PROTOCOL 7): where a lease's signed definition is (`defs/<kind>/<id>/<version>/
@@ -184,6 +234,9 @@ pub struct Lease {
     /// The per-lease fields (`gid_base`, `games`, `seed` / `first`, `count`); before rev 6 the
     /// whole job. The agent never forwards anything else from it (PROTOCOL 7).
     pub job: Value,
+    /// rev 15 (PROTOCOL 10.3): a rolling self-play lease (only to agents that asked with `features: ["rolling"]`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rolling: Option<Rolling>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -218,6 +271,9 @@ pub struct BeatReq {
     pub state: String,
     pub progress: Progress,
     pub stats: Stats,
+    /// rev 15 (PROTOCOL 10.6): a rolling lease's newest generation the worker plays.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gen: Option<u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default)]
@@ -227,6 +283,10 @@ pub struct BeatResp {
     pub expires_at: Option<i64>,
     #[serde(default)]
     pub checkpoint: Option<CheckpointRef>,
+    /// rev 15 (PROTOCOL 10.6): beside a rolling lease's newer `checkpoint`, the run's current definition (which
+    /// signs it); the agent verifies it as at grant and requires the lease's own self-play template.
+    #[serde(default)]
+    pub definition: Option<DefinitionRef>,
     #[serde(default)]
     pub upload_diag: Option<Vec<String>>,
 }
@@ -314,6 +374,13 @@ pub mod headers {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    fn e_classic() -> Lease {
+        serde_json::from_value(json!({"lease_id": "l_c", "kind": "selfplay", "issued_at": 1, "expires_at": 2, "beat_s": 60,
+            "slack_s": 600, "build": {"build_id": "0123456789abcdef01234567", "manifest": "m"}, "job": {}}))
+        .unwrap()
+    }
 
     #[test]
     fn digest_is_order_independent_and_stable() {
@@ -371,6 +438,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(e.checkpoints.unwrap()[0].gen, 80);
+        // rev 15: a rolling lease; defaults for what a coordinator leaves out
+        let r: Lease = serde_json::from_str(
+            r#"{"lease_id": "l_3", "kind": "selfplay", "issued_at": 1, "expires_at": 2, "beat_s": 60, "slack_s": 600,
+                "run": "r", "build": {"build_id": "0123456789abcdef01234567", "manifest": "m"},
+                "job": {"kind": "selfplay", "gid_base": 100, "games": 8, "seed": 1},
+                "rolling": {"block": [100, 65636], "inflight": {"cpu": 16, "gpu": "auto"}, "until": 9, "future": 1}}"#,
+        )
+        .unwrap();
+        let ro = r.rolling.unwrap();
+        assert_eq!((ro.block, ro.inflight.cpu, ro.inflight.gpu, ro.flush_s), ((100, 65636), json!(16), json!("auto"), 0));
+        assert!(serde_json::from_str::<Lease>(&serde_json::to_string(&e_classic()).unwrap()).unwrap().rolling.is_none());
+        let x: ExtendResp = serde_json::from_str(r#"{"games": 40, "wait_s": 60, "reason": "quota"}"#).unwrap();
+        assert_eq!((x.games, x.wait_s, x.finish), (40, Some(60), false));
+        let b = serde_json::to_value(BeatReq { state: "running".into(), progress: Progress::default(), stats: Stats::new(), gen: None }).unwrap();
+        assert!(b.get("gen").is_none(), "classic beats are unchanged");
         let c = CrashReq { kind: "blocked".into(), os_error: Some(4551), ..Default::default() };
         assert_eq!(serde_json::to_value(&c).unwrap()["os_error"], 4551);
         assert!(serde_json::to_value(CrashReq::default()).unwrap().get("os_error").is_none());

@@ -86,3 +86,18 @@ fn fuzz_reports_failures() {
     assert_eq!(fails, vec![1500, 3999]);
     assert_eq!(evs.last().unwrap()["reason"], "done");
 }
+
+#[test]
+fn rolling_job_says_low_takes_extend_and_finishes() {
+    let job = json!({"kind": "selfplay", "games": 2, "gid_base": 100, "conc": 2, "rolling": true, "flush_s": 10,
+                     "fake": {"game_ms": 50, "shard_every": 1}});
+    let evs = events(job, &[json!({"op": "extend", "games": 4}), json!({"op": "finish"})]);
+    assert_eq!(evs[0]["features"], json!(["rolling"]));
+    let low = evs.iter().find(|e| e["ev"] == "low").expect("low");
+    assert_eq!((low["started"].clone(), low["games"].clone()), (json!(1), json!(2)), "fewer than conc ids unstarted");
+    let end = evs.last().unwrap();
+    assert_eq!(end["reason"], "finish");
+    // the game in flight finished; the rest of the released ids (raised to 4 by `extend`) are unfinished
+    assert_eq!(end["unfinished"], json!({"gids": [[101, 104]]}), "{end}");
+    assert!(evs.iter().all(|e| e["ev"] != "error"), "{evs:?}");
+}

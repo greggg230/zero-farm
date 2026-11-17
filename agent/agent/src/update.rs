@@ -3,8 +3,12 @@
 //! into `versions\<new>\`, and once no lease is running write `state\pending` and exit 75. The
 //! launcher does the switch (and the rollback).
 
-use crate::engine::Engine;
+use crate::cache::Cache;
+use crate::engine::{Control, Engine};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+use zerofarm_common::http::Client;
+use zerofarm_common::keys::TrustedKeys;
 use zerofarm_common::layout::{is_version_label, Layout, AGENT_EXE};
 use zerofarm_common::manifest::{verify_dir, Expect, Kind};
 use zerofarm_common::protocol::AgentLatest;
@@ -75,33 +79,20 @@ impl Engine {
     /// Fetches `latest`; if it is newer than us (and at least `min_agent` when given), downloads
     /// and verifies it and sets `pending_update`.
     pub fn update_to_latest(&mut self, min_agent: Option<&str>) -> Result<(), String> {
-        let path = format!("/v1/agent/latest?channel={}", self.cfg.channel);
-        let latest: AgentLatest = match self.client.get_json(&path) {
-            Ok(l) => l,
-            Err(e) if e.status() == Some(404) => return Ok(()),
-            Err(e) => return Err(e.to_string()),
-        };
+        let Some(latest) = get_latest(&self.client, &self.cfg.channel)? else { return Ok(()) };
         self.apply_evict(&latest.evict);
         if let Some(min) = min_agent {
             if !is_newer(&latest.version, min) && parse_version(&latest.version) != parse_version(min) {
                 return Err(format!("latest agent {} is older than the required {min}", latest.version));
             }
         }
-        if !is_newer(&latest.version, &self.cfg.version) {
+        if !wanted(&latest, &self.cfg.version, &self.cfg.layout)? {
             return Ok(());
-        }
-        if !is_version_label(&latest.version) || !zerofarm_common::is_build_id(&latest.build_id) {
-            return Err(format!("bad latest answer {latest:?}"));
-        }
-        if let Some(t) = self.cfg.layout.bad_since(&latest.version) {
-            if zerofarm_common::now_unix() - t < BAD_VERSION_RETRY_S {
-                log::info!("agent {} was rolled back recently; not retrying it yet", latest.version);
-                return Ok(());
-            }
         }
         log::info!("agent {} available (running {}); downloading", latest.version, self.cfg.version);
         self.set_status(crate::status::Phase::Updating, &latest.version, None);
-        self.prepare_version(&latest)?;
+        let cap = self.settings().disk_cap_mb << 20;
+        prepare_version(&self.client, &self.cfg.keys, &self.cfg.layout, &self.cache, cap, &[], &self.control, &latest)?;
         self.pending_update = Some(latest.version.clone());
         Ok(())
     }
@@ -117,36 +108,88 @@ impl Engine {
             }
         }
     }
+}
 
-    fn prepare_version(&mut self, latest: &AgentLatest) -> Result<(), String> {
-        let layout = &self.cfg.layout;
-        let dest = layout.version_dir(&latest.version);
-        let expect = Expect { build_id: Some(&latest.build_id), kind: Some(Kind::Agent), version: Some(&latest.version) };
-        let check_entry = |m: &zerofarm_common::manifest::Manifest| -> Result<(), String> {
-            if m.entry.as_deref().map(|e| e.eq_ignore_ascii_case(AGENT_EXE)) == Some(true) {
-                Ok(())
-            } else {
-                Err(format!("agent manifest entry is {:?}", m.entry))
-            }
-        };
-        if dest.exists() {
-            if let Ok(v) = verify_dir(&dest, &self.cfg.keys, &expect) {
-                return check_entry(&v.manifest);
-            }
+/// `GET /v1/agent/latest` (None: nothing released on the channel).
+pub(crate) fn get_latest(client: &Client, channel: &str) -> Result<Option<AgentLatest>, String> {
+    match client.get_json(&format!("/v1/agent/latest?channel={channel}")) {
+        Ok(l) => Ok(Some(l)),
+        Err(e) if e.status() == Some(404) => Ok(None),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// `latest` is a version to switch to: newer than `running`, well formed, and not rolled back here within a day.
+pub(crate) fn wanted(latest: &AgentLatest, running: &str, layout: &Layout) -> Result<bool, String> {
+    if !is_newer(&latest.version, running) {
+        return Ok(false);
+    }
+    if !is_version_label(&latest.version) || !zerofarm_common::is_build_id(&latest.build_id) {
+        return Err(format!("bad latest answer {latest:?}"));
+    }
+    if let Some(t) = layout.bad_since(&latest.version) {
+        if zerofarm_common::now_unix() - t < BAD_VERSION_RETRY_S {
+            log::info!("agent {} was rolled back recently; not retrying it yet", latest.version);
+            return Ok(false);
         }
-        let tmp = layout.cache_tmp().join(format!("agent-{}", latest.version));
-        let cap = self.settings().disk_cap_mb << 20;
-        let cache = &self.cache;
-        let mut room = |need: u64| cache.ensure_space(need, cap, &[]);
-        let control = self.control.clone();
-        let stop = move || control.quitting();
-        let v = crate::cache::download_build(&self.client, &self.cfg.keys, &latest.manifest, &expect, &dest, &tmp, &mut room, &stop)
-            .map_err(|e| e.to_string())?;
-        if let Err(e) = check_entry(&v.manifest) {
-            let _ = std::fs::remove_dir_all(&dest);
-            return Err(e);
+    }
+    Ok(true)
+}
+
+/// Downloads and verifies `latest` into `versions\<v>\` (already there and verified: nothing to do). Room is made under
+/// the disk cap without evicting `keep` (what a running lease uses). Any thread.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_version(client: &Client, keys: &TrustedKeys, layout: &Layout, cache: &Cache, cap: u64, keep: &[String], control: &Arc<Control>, latest: &AgentLatest) -> Result<(), String> {
+    let dest = layout.version_dir(&latest.version);
+    let expect = Expect { build_id: Some(&latest.build_id), kind: Some(Kind::Agent), version: Some(&latest.version) };
+    let check_entry = |m: &zerofarm_common::manifest::Manifest| -> Result<(), String> {
+        if m.entry.as_deref().map(|e| e.eq_ignore_ascii_case(AGENT_EXE)) == Some(true) {
+            Ok(())
+        } else {
+            Err(format!("agent manifest entry is {:?}", m.entry))
         }
-        Ok(())
+    };
+    if dest.exists() {
+        if let Ok(v) = verify_dir(&dest, keys, &expect) {
+            return check_entry(&v.manifest);
+        }
+    }
+    let tmp = layout.cache_tmp().join(format!("agent-{}", latest.version));
+    let mut room = |need: u64| cache.ensure_space(need, cap, keep);
+    let control = control.clone();
+    let stop = move || control.quitting();
+    let v = crate::cache::download_build(client, keys, &latest.manifest, &expect, &dest, &tmp, &mut room, &stop).map_err(|e| e.to_string())?;
+    if let Err(e) = check_entry(&v.manifest) {
+        let _ = std::fs::remove_dir_all(&dest);
+        return Err(e);
+    }
+    Ok(())
+}
+
+/// rev 15 (PROTOCOL 10.6): the update check of a rolling lease, which would otherwise never let the agent update
+/// (section 6): `latest`, and when it is a version to switch to, downloaded and verified (keeping what the lease
+/// uses). Returns the version now ready, if any, and the coordinator's evict list (applied once the lease ends).
+pub(crate) struct InLease {
+    pub client: Client,
+    pub keys: TrustedKeys,
+    pub layout: Layout,
+    pub cache: Cache,
+    pub cap: u64,
+    pub keep: Vec<String>,
+    pub control: Arc<Control>,
+    pub channel: String,
+    pub running: String,
+}
+
+impl InLease {
+    pub fn run(&self) -> Result<(Option<String>, Vec<String>), String> {
+        let Some(latest) = get_latest(&self.client, &self.channel)? else { return Ok((None, vec![])) };
+        if !wanted(&latest, &self.running, &self.layout)? {
+            return Ok((None, latest.evict));
+        }
+        log::info!("agent {} available (running {}); downloading it during the lease", latest.version, self.running);
+        prepare_version(&self.client, &self.keys, &self.layout, &self.cache, self.cap, &self.keep, &self.control, &latest)?;
+        Ok((Some(latest.version.clone()), latest.evict))
     }
 }
 
