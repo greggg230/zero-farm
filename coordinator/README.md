@@ -29,7 +29,9 @@ src/leasebook.ts   the Durable Object: serialises every change to one run / camp
 src/manifest.ts    build checks: manifest, file sizes/hashes, minisign (Ed25519, BLAKE2b prehash)
 src/telemetry.ts   Analytics Engine writer (no-op without the binding) + Stats sanitising
 src/admin_page.ts  the /admin dashboard (static HTML + JS)
-src/onboard.ts     the public pages: / (onboarding) and /download (302 to the installer on GitHub)
+src/onboard.ts     the public pages: / (onboarding), /download (302 to the installer on GitHub) and
+                   /install-macos.sh (rev 17: the macOS installer script)
+src/platform.ts    rev 17 platform names (windows-x64, macos-arm64) and the x-farm-platform header
 src/ratelimit.ts   per-machine (and per-IP-HMAC for enroll) rate limits: GCRA in D1, 429 + retry-after
 src/blocks.ts      worker builds Windows refused to start on a machine (crash kind "blocked")
 src/cron.ts        every minute: expire silent leases, delete acked results after 7 days, crash
@@ -115,7 +117,7 @@ npm test          # vitest + @cloudflare/vitest-pool-workers: local workerd, no 
 npm run check     # wrangler types --check, tsc (src + test), tsc (scripts)
 ```
 
-158 tests in 18 files (about 2 minutes; the fleet simulation is most of it):
+243 tests in 26 files (about 4 minutes; the fleet simulation is most of it):
 
 | File | Covers |
 |---|---|
@@ -136,6 +138,7 @@ npm run check     # wrangler types --check, tsc (src + test), tsc (scripts)
 | `update.test.ts` | `{"update"}` for agents older than the channel's or a build's `min_agent`, no update loop for builds no release satisfies, `aw` mismatch, enroll → 426 |
 | `units.test.ts` | ranges, semver, sizing, BLAKE2b vectors, minisign (prehashed and legacy, tampering, wrong key, wrong trusted comment), telemetry adapter |
 | `routing.test.ts` | rev 7 capability routing: allowlist and `gpu` validation (runs' `selfplay`/`eval`, campaigns, stored and returned by GET); profile `gpus[].luid` and `runtime_providers` checks, unknown provider names kept; GPU eligibility from verified providers (not `caps.gpu` alone), per runtime pack else the union, from a profile sent with the request; `required` / `preferred` / `any` (an allowlist never filters under `any`); a `tensorrt_rtx` allowlist excludes an AMD PC; eval before self-play within a tier; campaign routing; `providers` on every lease (diag: null); providers and LUIDs in stats |
+| `platforms.test.ts` | rev 17 platforms: the platform stored at enrollment (no header: windows-x64; unknown → 400), 409 `reason: platform` for a token used from another platform; a Mac gets a run's macOS CPU alternate (self-play and eval, GPU allowed or not) and never the Windows default (no macOS alternate, or one the definition doesn't list: nothing), Windows PCs the CUDA alternate or the default and never a macOS build, a macOS-only run gives Windows PCs nothing and never `{"update"}`; Windows leases unchanged by a macOS alternate; a macOS alternate or campaign build held back by `min_agent` asks for the update only when the Mac's own channel offers it; the lease book refuses another platform's build; PUT checks (alternate and default platforms, CPU alternates, no GPU alternates for macOS, round trip); campaign alternates (lease, results, GET/stats `alternates` and `platforms`, checks, removal); releases, `min_agent`, `/v1/agent/latest`, enroll's 426 and stats `releases` per platform; release `platform` and macOS `github_url`; manifest `platform` (unknown, `min_agent` below 0.3.0); diag requests against the target's platform; `/download?platform=`, `/install-macos.sh`, the onboarding page's macOS command |
 | `fleet.test.ts` | 10 fake machines × 6 generations against the real Worker, with the real lease cap (2); rev 6: 4 run an agent older than `DEFINITION_AGENT`, the campaign is signed from the start and the run once gen 2 is out (then a new version per gen and batch), every definition lease is checked as an agent would (signature, run, build, runtime, checkpoints, per-lease fields only), legacy agents get legacy self-play leases before the cutover and nothing after; random vanishing (some crash and lose games in progress, one dies for good holding a lease), pauses past the slack, late results, double and conflicting uploads, checkpoint switches, fuzz backfill, and two paired eval batches (gen 2 v 1, then the current gen v 1) whose games finish in random order, so pairs are split across chunks and left half-played by dropouts; a fake trainer fills each generation by cursor and reads the eval batches by `ids` + `also`. Asserts every game id and seed is claimed exactly once or back in the pool, every generation filled by exactly `quota` accepted games, accepted + in flight never over the cap, ≥ 3 machines per generation, the dead machine's games played by others, every eval pair credited exactly once with both games from one lease, eval chunks never refused as stale |
 
 Test notes:
@@ -218,6 +221,18 @@ Order:
    definitions" (no problems listed), then release agent 0.2.5. From the first definition on, older
    agents get nothing from that run or campaign (and `{"update"}` once 0.2.5 is on their channel).
 3. Cloudflare Access on `/admin` (below), then its secrets.
+
+### Deploy notes: rev 17 (platforms: macOS on Apple silicon)
+
+Migration `0013_platforms.sql` adds `machines.platform`, `builds.platform`, `agent_releases.platform` (existing rows
+`windows-x64`) and `campaigns.alternates`; the code reads them, so the migration goes first (`npm run deploy` does
+that). New var `PLATFORM_AGENT` (`0.3.0`, in `wrangler.jsonc`). Windows agents send no `x-farm-platform` and are
+`windows-x64`: nothing changes for them. For Macs: register macOS builds (manifests with `"platform": "macos-arm64"`
+and `min_agent` 0.3.0+), release the agent with `agent-release <v> <build_id> <channel> <min_agent> --platform
+macos-arm64 --github-url <the agent-macos-v<v> tarball>`, give runs a CPU alternate
+`{"build_id", "runtime", "when": {"platform": "macos-arm64"}}` and campaigns `"alternates": [{"build_id", "when":
+{"platform": "macos-arm64"}}]`, and list those builds in the next definition (the stats' `platforms` then name
+macos-arm64). Friends install with `curl -fsSL https://farm.greggg230.com/install-macos.sh | sh -s -- --invite CODE`.
 
 ### Cloudflare Access (security review H1)
 
