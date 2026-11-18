@@ -81,6 +81,7 @@ export interface MachineRow {
   caps: string | null;
   paused: number;
   revoked_at: number | null;
+  gpu_play?: number | null; // rev 18 (migration 0014): 1 while its last offer had self-play it plays on its GPU
 }
 
 function bearer(req: Request): string | null {

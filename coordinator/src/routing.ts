@@ -224,3 +224,61 @@ export function altProviders(need: GpuNeed | null, allow: readonly string[] | nu
 // GPU leases of `auto` jobs are at least this many games (PROTOCOL 9.4): a batch never has more rows than games
 // in flight, and a GPU only pays with hundreds of rows per batch.
 export const GPU_LEASE_MIN = { selfplay: 64, eval: 128 } as const;
+
+// ---------- rev 18 (PROTOCOL 12): hardware routing ----------
+
+// The owner's switch and knobs (settings key `hw_routing`, `GET/POST /v1/admin/routing`). `on` false: the order of
+// before rev 18 (eval before self-play everywhere, CPU self-play in tier 1). `eval_horizon_s`: a PC that plays a
+// run's self-play on its GPU takes an eval batch ahead of that self-play only while the CPU PCs online could not
+// finish the batch's unissued games within this many seconds (0: always, the order of before). `eval_games_per_thread`:
+// an `auto` eval lease on the CPU gets at least this many games per caps.thread (0: no floor).
+export interface HwRouting {
+  on: boolean;
+  eval_horizon_s: number;
+  eval_games_per_thread: number;
+}
+export const HW_ROUTING_DEFAULT: HwRouting = { on: true, eval_horizon_s: 1800, eval_games_per_thread: 2 };
+export const MAX_EVAL_HORIZON_S = 7 * 86400;
+export const MAX_EVAL_GAMES_PER_THREAD = 16;
+
+// The stored setting (its JSON text, or null: never set) with every missing or unreadable field at its default.
+export function hwRoutingOf(text: string | null | undefined): HwRouting {
+  let v: any = null;
+  try {
+    v = text ? JSON.parse(text) : null;
+  } catch {
+    v = null;
+  }
+  const o = v && typeof v === "object" && !Array.isArray(v) ? v : {};
+  const n = (x: unknown, max: number, def: number) => (typeof x === "number" && Number.isFinite(x) && x >= 0 && x <= max ? x : def);
+  return {
+    on: typeof o.on === "boolean" ? o.on : HW_ROUTING_DEFAULT.on,
+    eval_horizon_s: n(o.eval_horizon_s, MAX_EVAL_HORIZON_S, HW_ROUTING_DEFAULT.eval_horizon_s),
+    eval_games_per_thread: n(o.eval_games_per_thread, MAX_EVAL_GAMES_PER_THREAD, HW_ROUTING_DEFAULT.eval_games_per_thread),
+  };
+}
+
+// A deferred eval batch (a PC that plays self-play on its GPU, the batch not behind) ranks after that self-play
+// (rank 1) and before a background job past its share (rank 2), still in tier 1 (before fuzz).
+export const DEFERRED_EVAL_RANK = 1.5;
+// Self-play a PC would play on its CPU while the run has a GPU version that other PCs play: after fuzz (tier 2).
+export const CPU_SELFPLAY_TIER = 3;
+
+// The memory a CPU eval lease's games take (PROTOCOL 10.6's CPU plan: 600 MB + 45 MB per game in flight).
+export const CPU_BASE_MB = 600;
+export const CPU_GAME_MB = 45;
+
+// The fewest games an `auto` eval lease on the CPU gets (rev 18): `per_thread` x caps.threads, no more than the RAM the
+// agent allows holds, within the eval lease limits. 0: no floor.
+export function evalCpuFloor(perThread: number, threads: number, ramMb: number, min: number, max: number): number {
+  if (perThread <= 0) return 0;
+  const byRam = ramMb > 0 ? Math.floor((ramMb - CPU_BASE_MB) / CPU_GAME_MB) : Infinity;
+  const n = Math.min(Math.floor(perThread * threads), byRam, max);
+  return n >= min ? n : 0;
+}
+
+// Behind (rev 18): the CPU PCs online can't finish the batch's unissued games within the horizon at their eval rates
+// (games per second, summed). No CPU capacity: behind while anything is unissued.
+export function evalBehind(unissued: number, cpuRate: number, horizonS: number): boolean {
+  return unissued > cpuRate * horizonS;
+}
