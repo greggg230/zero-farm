@@ -359,7 +359,9 @@ export async function lease(c: Ctx): Promise<Response> {
       .run();
     m.class = classOf(profile);
   }
-  const capsJson = JSON.stringify(caps);
+  // Rev 18 (PROTOCOL 12.2): the stored caps also keep `gpu_allowed` and `gpu_games`, so a rolling lease's renewal
+  // (otherWorkWaits) sees the same GPU self-play this request does (an agent may send gpu false, gpu_allowed true).
+  const capsJson = JSON.stringify({ ...caps, gpu_allowed: gpuAllowed, ...(gpuGames.size ? { gpu_games: Object.fromEntries(gpuGames) } : {}) });
   if (capsJson !== m.caps) await db.prepare(`UPDATE machines SET caps = ? WHERE machine_id = ?`).bind(capsJson, m.machine_id).run();
   // Rev 7 routing reads the profile the coordinator keeps: the one just sent, else the stored one.
   const machineProfile = profile && digest !== m.profile_digest ? profile : parseJson<Profile | null>(m.profile, null);
@@ -909,20 +911,26 @@ export async function extend(c: Ctx, leaseId: string): Promise<Response> {
 // self-play with a higher priority. A self-play counts only with headroom. Null: nothing waits.
 export async function otherWorkWaits(c: Ctx, m: MachineRow, l: book.LeaseRow): Promise<string | null> {
   const db = c.env.DB;
-  const stored = parseJson<Partial<Caps> | null>(m.caps, null) ?? {};
+  const stored = parseJson<(Partial<Caps> & { gpu_allowed?: unknown; gpu_games?: unknown }) | null>(m.caps, null) ?? {};
   const caps: Caps = {
     threads: typeof stored.threads === "number" ? stored.threads : 1,
     ram_mb: typeof stored.ram_mb === "number" ? stored.ram_mb : 0,
     gpu: stored.gpu === true,
     disk_mb: typeof stored.disk_mb === "number" ? stored.disk_mb : 0,
   };
+  // Rev 18: what the last /v1/lease said of GPU work (caps stored before rev 18: `gpu` alone, no bench).
+  const gpuAllowed = typeof stored.gpu_allowed === "boolean" ? stored.gpu_allowed : caps.gpu;
+  const g = stored.gpu_games;
+  const gpuGames = new Map<string, number>(
+    g && typeof g === "object" && !Array.isArray(g) ? Object.entries(g).filter((e): e is [string, number] => typeof e[1] === "number") : [],
+  );
   const agent = m.agent_version && isSemver(m.agent_version) ? m.agent_version : "0.0.0";
   const awHeader = c.req.headers.get("x-farm-aw") ?? "1";
   const aw = /^\d{1,4}$/.test(awHeader) ? Number(awHeader) : 1;
   const o = await offer(
     c,
     m,
-    { caps, gpuAllowed: caps.gpu, gpuGames: new Map(), cachedBuilds: new Set(), cachedCkpts: new Set(), kinds: new Set(KINDS), agent, aw },
+    { caps, gpuAllowed, gpuGames, cachedBuilds: new Set(), cachedCkpts: new Set(), kinds: new Set(KINDS), agent, aw },
     parseJson<Profile | null>(m.profile, null),
   );
   if (!o.defAware && o.diag.length) return "diag";

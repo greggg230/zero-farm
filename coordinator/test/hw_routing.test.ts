@@ -259,6 +259,25 @@ describe("rolling self-play and hardware routing (rev 18)", () => {
     expect((await gpuRolling("roomy", 100000)).finish).toBeUndefined();
   });
 
+  it("the renewal reads gpu_allowed and gpu_games as the lease request sent them (an agent with gpu false, gpu_allowed true)", async () => {
+    await gpuRun("sp", { rolling: ROLLING, eval: EVAL(400) });
+    const cpu = await enroll("cpu", { profile: CPU_ONLY });
+    await online(cpu);
+    await setRate(cpu, "run:sp", 1);
+    const nv = await enroll("nv");
+    const l = await rollingLease(nv, GPU_OK);
+    expect(l.kind).toBe("selfplay");
+    expect(await gpuPlay(nv)).toBe(1);
+    await due(l.lease_id);
+    expect(ok(await extend(nv, l.lease_id, 8)).finish).toBeUndefined(); // still its GPU self-play: the batch waits
+    expect(await gpuPlay(nv)).toBe(1);
+    // its next request says its bench found no GPU that pays for this run: a CPU PC now, so the batch ends the lease
+    ok(await ask(nv, { kinds: [], caps: { ...GPU_OK, gpu_games: { sp: 0 } } }));
+    expect(await gpuPlay(nv)).toBe(0);
+    await due(l.lease_id);
+    expect(ok(await extend(nv, l.lease_id, 8))).toMatchObject({ finish: true, reason: "max_s" });
+  });
+
   it("a deferred batch ends it at renewal once the generation is full", async () => {
     expect(await gpuRolling("full", 1)).toMatchObject({ finish: true, reason: "max_s" });
   });
