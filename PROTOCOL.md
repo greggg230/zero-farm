@@ -7,7 +7,7 @@ A change to anything here is a protocol change: bump the version it belongs to a
 bottom.
 
 Versions: HTTP API `v1` (path prefix), agent↔worker protocol `aw/1`, network files `zero-onnx/1`,
-manifests `manifest/1`. Current revision: v1 rev 16 (section 3, `POST /v1/presence`).
+manifests `manifest/1`. Current revision: v1 rev 17 (section 11, platforms: macOS on Apple silicon).
 
 ## 1. Conventions
 
@@ -1336,7 +1336,126 @@ Coordinator details (from building it, rev 15):
   `issued_at`); the stats add per run `rolling` (the setting or null) and `rolling_leases`; the admin page shows a
   "rolling" column in Runs and a "Rolling leases" table.
 
+## 11. Platforms: macOS on Apple silicon (rev 17; coordinator migration 0013, agents from 0.3.0)
+
+**Why.** Until rev 17 every agent, worker build and runtime pack was Windows x64, and nothing on the wire said so.
+A Mac (Apple silicon) can do the same CPU work, but it needs its own agent, worker builds and runtime packs, and a
+Windows PC must never be handed a Mac build (or the reverse). Rev 17 names the platform everywhere a build is chosen.
+Everything below is additive: an agent or manifest that says nothing is `windows-x64`, exactly as before.
+
+Platform names: `windows-x64` and `macos-arm64` (Apple silicon, macOS 13 or newer). Intel Macs and Linux: not yet.
+`PLATFORM_AGENT` (coordinator var, default `0.3.0`) is the first agent that knows platforms.
+
+### 11.1 The agent's platform
+
+- Every request of an agent from 0.3.0 carries the header `x-farm-platform: <platform>`; absent = `windows-x64`
+  (every older agent). The profile may carry the same value as `platform` (informational; the header counts).
+- `POST /v1/enroll` with an unknown platform → 400. The coordinator stores the platform with the machine
+  (`machines.platform`, migration 0013; existing machines `windows-x64`). It is fixed at enrollment: a later request
+  whose header names another platform → 409 `conflict` with `"reason": "platform"` (a machine token copied to
+  another computer: install there instead).
+- The admin stats and `GET /v1/admin/machines` show each machine's `platform`.
+
+### 11.2 Agent releases per platform
+
+- `agent_releases.platform` (migration 0013; existing rows `windows-x64`). `POST /v1/admin/agent/release` takes
+  `"platform"` (default `windows-x64`), which must equal the agent build's manifest platform (11.3).
+- Every lookup of "the channel's latest release" uses the newest release of (channel, platform), with the
+  machine's platform (or the request's, before enrollment): enroll's 426, the update rule of `POST /v1/lease`
+  (section 3), `GET /v1/agent/latest`, `GET /download`, the onboarding page and the stats' `releases` (one per
+  channel and platform). So `latest` and `min_agent` are per platform: a Windows-only release never asks a Mac to
+  update, and the reverse.
+- GitHub (section 2.1): a macOS release is the GitHub Release `agent-macos-v<version>` (never marked Latest;
+  `agent-v<version>` stays Windows), assets `ZeroFarm-macos-arm64.tar.gz`, `SHA256SUMS`, `SHA256SUMS.minisig` (same
+  rules as 2.1). Its `github_url` must be exactly
+  `https://github.com/<GITHUB_REPO>/releases/download/agent-macos-v<version>/ZeroFarm-macos-arm64.tar.gz`.
+- `GET /download?platform=macos-arm64` (optional `channel` as today) → 302 to the newest macOS release's tarball.
+  `GET /install-macos.sh` (optional `?channel=canary`) → a POSIX shell script (`text/plain`) that downloads that
+  tarball, checks it against the release's `SHA256SUMS`, unpacks it into a temporary directory and runs
+  `./ZeroFarm setup "$@"` (so `curl -fsSL https://farm.greggg230.com/install-macos.sh | sh -s -- --invite CODE`
+  works, and without `--invite` the setup asks on the terminal). The tarball holds the launcher `ZeroFarm`, the
+  agent package (its signed manifest and files) and nothing else; `ZeroFarm setup` verifies the package's manifest
+  against its embedded release keys before installing it.
+
+### 11.3 Builds per platform
+
+- Manifests (`agent`, `worker`, `runtime`) take an optional `"platform"`; absent = `windows-x64`. A manifest that
+  names a platform has `min_agent` 0.3.0 or newer (`farm-release sign` refuses less; agents before 0.3.0 refuse the
+  unknown field anyway, and the coordinator never leases them such a build).
+- On macOS executables have no extension (`entry: "mtgz-worker"`; an agent package's `farm-agent` and `ZeroFarm`)
+  and a runtime pack carries `libonnxruntime.dylib` (the name the worker loads from aw/1 `runtime_dir`). The
+  executable bit is not in the manifest: the agent sets mode 0755 on a build's `entry` (and an agent package's
+  `ZeroFarm`) after verifying it. Binaries are ad-hoc code-signed (the arm64 linker does it) and not notarized;
+  files the agent downloads itself carry no quarantine attribute, so Gatekeeper doesn't check them.
+- `POST /v1/admin/build` stores the manifest's platform (`builds.platform`, migration 0013); an unknown platform →
+  400.
+- An agent from 0.3.0 checks, before downloading anything else, that the lease's worker build (and runtime pack)
+  manifest names its own platform. A mismatch → `done` with `refused: "platform"`, a crash report of kind
+  `definition` at most once a day per build, and the start-failure wait (section 9.5's pattern).
+
+### 11.4 Which build a machine gets
+
+- **Runs.** An alternate (9.4) takes `when.platform` (default `windows-x64`), and `when.vendor` becomes optional:
+  an alternate without `vendor` is a **CPU alternate**, offered to every machine of its platform with no GPU
+  condition (its runtime must have no `gpu`). `PUT /v1/admin/run/{run}` checks that the alternate's build and
+  runtime manifests name `when.platform` (else 400); still at most 4 alternates.
+- For a self-play or eval job and an agent of at least `ALT_RUNTIME_AGENT`, the lease carries: the first alternate
+  **of the machine's platform** that it qualifies for (a GPU alternate: 9.4's conditions 1-7; a CPU alternate:
+  conditions 5-7 and the build's `aw`), else the run's default when the default build's platform is the machine's,
+  else nothing from that run for this machine (it gets other work). An agent older than `ALT_RUNTIME_AGENT` is
+  `windows-x64` and is never offered a build of another platform.
+- **Campaigns.** `PUT /v1/admin/campaign/{id}` takes `"alternates": [{"build_id", "when": {"platform"}}] | null`
+  (at most 4 worker builds, one per platform at most, each of the campaign's game and profile; migration 0013
+  `campaigns.alternates`). A machine gets the campaign's alternate of its platform (registered, not blocked for it,
+  `min_agent` and `aw` met, listed in the campaign's current definition's `builds`), else the campaign's build when
+  its platform is the machine's, else nothing from that campaign. `GET /v1/admin/campaign/{id}` and the stats show
+  them.
+- **Diag leases** (`POST /v1/admin/diag`): a request whose build (from `params`) is of another platform than the
+  machine's → 400.
+- **The admin view.** Per run and campaign the stats add `platforms`: the platforms that can get its jobs.
+- **Results across platforms.** What the engine alone decides is identical on every platform (fuzz seeds, record
+  replay). A network's outputs differ in rounding between ONNX Runtime's x64 and arm64 kernels, so a game that
+  consults a network can play out differently on a Mac. Self-play records are unaffected (the trainer replays the
+  moves, never the network: section 6.1 of DESIGN). A run or campaign whose games are compared across machines
+  (eval traces and digests, section 5.3) gets no macOS alternate unless its checks allow it; the desktop tools add
+  macOS alternates only where asked. A worker build refuses (`check-config`) settings whose replay would depend on
+  the platform's libm (the engine's own rule; mtg-zero: the sealed deck builder until it uses a portable libm).
+
+### 11.5 The macOS agent
+
+- **Layout.** `~/Library/Application Support/ZeroFarm/`, the same tree as section 6 without `.exe`
+  (`ZeroFarm`, `versions/<v>/farm-agent`). Autostart: the LaunchAgent `~/Library/LaunchAgents/com.zerofarm.agent.plist`
+  runs `<root>/ZeroFarm` at login (`RunAtLoad`; no `KeepAlive`: the launcher restarts the agent itself, as on
+  Windows). Exit codes, `pending`/`healthy-<v>`/`bad-<v>`, the rollback and the launcher's own update (exit 76,
+  `--takeover`, `launcher-swap`) behave as in section 6; single-instance and "quit" use POSIX means (an exclusive
+  `flock` per role in `state/`, signals) instead of named mutexes and events.
+- **Token.** `state/machine.json` (mode 0600, `state/` 0700) holds the token in the clear instead of DPAPI. The
+  Keychain is not used: the agent's code identity changes with every self-update, so the Keychain would prompt.
+- **Worker.** Its own process group; CPU work at nice 19 (never the background QoS / `PRIO_DARWIN_BG`, which
+  confines a process to the efficiency cores); yield/resume = `SIGSTOP`/`SIGCONT` to the group; the memory cap and
+  the rolling memory plan (10.6) read the worker's physical footprint (there are no job objects); the group is
+  killed when the agent exits, and a worker whose stdin closes exits by itself.
+- **When it works.** Input idle time from IOKit (`HIDIdleTime`); `on_battery` and `battery_saver` (Low Power Mode)
+  from the power source; `low_memory` from memory pressure; no fullscreen detection in 0.3.0. While it holds a
+  lease on AC power the agent keeps the Mac from idle-sleeping (an IOKit power assertion like `caffeinate -i`; the
+  display still sleeps), setting `keep_awake` (default on): a Mac otherwise sleeps whenever the user leaves.
+- **Profile.** `os` (e.g. `macOS 26.1`), `cpu` (`machdep.cpu.brand_string`), `cores`/`threads`,
+  `perf_cores`/`eff_cores` (`hw.perflevel0/1.physicalcpu`), `ram_mb`, `disk_free_mb`, `gpus: []`, `providers:
+  ["cpu"]`. No GPU work on Macs in rev 17 (Core ML later, behind the same probe and bench as section 9.6).
+- **No tray in 0.3.0.** The agent runs headless; `ZeroFarm status | pause [minutes] | resume | set <key> <value> |
+  quit | uninstall` work from a terminal.
+- **Install.** `curl -fsSL https://farm.greggg230.com/install-macos.sh | sh -s -- --invite CODE` (11.2). A browser
+  download (a `.pkg` or `.app`) would need Developer ID signing and notarization: later, the owner's decision.
+
 ## Changes
+- v1 rev 17 (2026-11-18; coordinator migration 0013, agents from 0.3.0): platforms (section 11). Header
+  `x-farm-platform` (`windows-x64` when absent; fixed per machine at enrollment, 409 `reason: platform`);
+  `machines.platform`, `builds.platform`, `agent_releases.platform`, `campaigns.alternates`; manifests take
+  `platform` (min_agent 0.3.0+); agent releases, `min_agent`, `/v1/agent/latest`, `/download` and the onboarding
+  page are per (channel, platform); macOS GitHub Releases `agent-macos-v<version>`; `GET /install-macos.sh`;
+  run alternates take `when.platform` and may omit `when.vendor` (CPU alternates); campaign alternates per
+  platform; agents refuse a build of another platform (`refused: "platform"`); the macOS agent (layout,
+  LaunchAgent, token file, process groups, IOKit idle/power, `keep_awake`, headless CLI).
 - v1 rev 16 (2026-11-17; coordinator migration 0012, agent 0.2.14): `POST /v1/presence` (section
   3, Other): an agent that is on but may not work says why (owner using the PC, fullscreen app, battery, outside
   its hours, paused, low memory) every 5 min and when the reason changes; stats carry `presence`. Older agents
