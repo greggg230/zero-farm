@@ -1,6 +1,7 @@
 // Desktop API (PROTOCOL 4): bearer = the admin token. Used by the trainer's pool remote, the
 // release tool, scripts/admin.ts and the /admin dashboard.
 
+import { presenceOf } from "./presence";
 import { accessEnabled } from "./access";
 import * as book from "./book";
 import { blockLifted } from "./blocks";
@@ -845,7 +846,7 @@ export async function stats(c: Ctx): Promise<Response> {
   const cfg = config(c.env);
   const [machinesR, leasesR, crashesR, thrR, runsR, campsR, recentCrashR, fuzzR, classR, pausedR, failCountR, releasesR, diagR, blocksR, batchesR, perMachineR, perScopeR, externalR] = await db.batch<any>([
     db.prepare(
-      `SELECT machine_id, name, class, channel, agent_version, created_at, last_seen, revoked_at, paused, caps,
+      `SELECT machine_id, name, class, channel, agent_version, created_at, last_seen, revoked_at, paused, caps, presence, presence_t,
          json_extract(profile, '$.idle_h_day') AS idle_h_day, json_extract(profile, '$.on_h_day') AS on_h_day,
          json_extract(profile, '$.providers') AS providers, json_extract(profile, '$.gpus') AS gpus
        FROM machines ORDER BY created_at`,
@@ -941,6 +942,8 @@ export async function stats(c: Ctx): Promise<Response> {
       last_seen: m.last_seen,
       revoked: m.revoked_at !== null,
       paused: !!m.paused,
+      // Rev 16: why an online agent isn't working (POST /v1/presence), while fresh.
+      presence: presenceOf(m, c.now),
       caps: parseJson(m.caps, null),
       // Rev 7: the execution providers that passed this PC's probe, and its adapters' LUIDs.
       providers: parseJson<unknown>(m.providers, null),
@@ -1067,6 +1070,7 @@ export async function stats(c: Ctx): Promise<Response> {
         eval: w.eval ?? none,
         fuzz: w.fuzz ?? none,
         busy_h_24h: Math.round(((m.busy_s_24h ?? 0) / 3600) * 10) / 10,
+        presence: m.active_leases > 0 ? null : m.presence,
       };
     }),
     ...(externalR.results as ExternalRow[]).map((r) => ownContributor(r, c.now)),

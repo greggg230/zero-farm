@@ -14,6 +14,7 @@
 import * as admin from "./admin";
 import { ADMIN_PAGE } from "./admin_page";
 import { nowOf, type Ctx } from "./ctx";
+import { presence } from "./presence";
 import * as friend from "./friend";
 import { runCron } from "./cron";
 import * as onboard from "./onboard";
@@ -37,6 +38,7 @@ const routes: [string, RegExp, Handler][] = [
   ["HEAD", /^\/v1\/artifact\/(.+)$/, friend.artifact],
   ["GET", /^\/v1\/agent\/latest$/, friend.agentLatest],
   ["POST", /^\/v1\/crash$/, friend.crash],
+  ["POST", /^\/v1\/presence$/, presence], // rev 16
   ["POST", new RegExp(`^/v1/diag/${SEG}$`), friend.diagUpload],
 
   ["POST", /^\/v1\/admin\/invites$/, admin.invites],

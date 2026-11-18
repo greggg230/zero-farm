@@ -23,6 +23,7 @@ export const LIMITS = {
   crash: { interval: 10, burst: 30 }, // an agent sends up to 20 saved reports at start
   enroll: { interval: 60, burst: 10 }, // per client IP: a few typos are fine, guessing is not
   diag_user: { interval: 3600, burst: 1 }, // the friend's "Send diagnostics": once an hour
+  presence: { interval: 60, burst: 5 }, // rev 16: every ~5 min, and when the reason changes
 } as const satisfies Record<string, Limit>;
 
 export type Bucket = keyof typeof LIMITS;
