@@ -49,6 +49,8 @@ pub struct WorkerProc {
     job: Handle,
     stdin: Option<ChildStdin>,
     pub pid: u32,
+    /// The job's memory limit (MB; 0: none).
+    pub mem_limit_mb: u64,
     tail: Arc<Mutex<VecDeque<String>>>,
     suspended: bool,
 }
@@ -216,7 +218,7 @@ impl WorkerProc {
             return Err(std::io::Error::other("could not start the worker's main thread"));
         }
         let stdin = child.stdin.take();
-        Ok(WorkerProc { child, job, stdin, pid, tail, suspended: false })
+        Ok(WorkerProc { child, job, stdin, pid, mem_limit_mb: opts.mem_limit_mb, tail, suspended: false })
     }
 
     /// Sends one JSON line.
@@ -288,6 +290,33 @@ impl WorkerProc {
             return 0;
         }
         (ft(&k) + ft(&u)) / 10_000
+    }
+
+    /// The worker's committed private memory now (MB): what the job's memory limit counts (the worker is the job's
+    /// only process). None when Windows doesn't say (the worker has exited).
+    pub fn commit_mb(&self) -> Option<u64> {
+        use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
+        let mut c: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+        c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+        let ok = unsafe { GetProcessMemoryInfo(self.child.as_raw_handle() as HANDLE, &mut c as *mut _ as *mut PROCESS_MEMORY_COUNTERS, c.cb) };
+        (ok != 0).then_some((c.PrivateUsage as u64) >> 20)
+    }
+
+    /// The most memory the job (the worker and anything it started) ever committed (MB), from Windows' own
+    /// accounting: a worker that ran into the job's memory limit shows a peak at the limit even after it died.
+    pub fn job_peak_mb(&self) -> Option<u64> {
+        use windows_sys::Win32::System::JobObjects::{JobObjectExtendedLimitInformation, QueryInformationJobObject, JOBOBJECT_EXTENDED_LIMIT_INFORMATION};
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.job.0,
+                JobObjectExtendedLimitInformation,
+                &mut info as *mut _ as *mut core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        (ok != 0).then_some((info.PeakJobMemoryUsed as u64) >> 20)
     }
 
     pub fn stderr_tail(&self) -> String {

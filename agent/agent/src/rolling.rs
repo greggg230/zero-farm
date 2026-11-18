@@ -2,13 +2,23 @@
 //! setting checked, and the games in flight (`conc`, `groups`) for "auto" - and the numbers those choices use.
 //! The lease's life (extensions, generation switches, finishing) is in lease.rs.
 //!
-//! **The numbers for "auto" live here, in one place** (PROTOCOL 10.6), from the canary measurement of 2026-11-16 (a
-//! run's network on a PC with an RTX 4070 Ti, rolling leases): about 40 MB per game in flight plus about 1 GB for the
-//! worker; on the GPU 64 / 128 / 256 games in flight gave 831 / 1,320 / 2,130 games an hour (2,191 at 256 in one
-//! group), still climbing at 256, so memory mostly decides; on the CPU 64 in flight gave only 23 % more rows/s than 32
-//! while a game took about 19 minutes (stale rows), so 32.
+//! **The numbers for "auto" live here, in one place** (PROTOCOL 10.6). Speed, from the canary measurement of 2026-11-16
+//! (a run's network on a PC with an RTX 4070 Ti, rolling leases): on the GPU 64 / 128 / 256 games in flight gave 831 /
+//! 1,320 / 2,130 games an hour (2,191 at 256 in one group), still climbing at 256, so memory mostly decides; on the CPU
+//! 64 in flight gave only 23 % more rows/s than 32 while a game took about 19 minutes (stale rows), so 32.
+//!
+//! Memory, from the soaks of 2026-11-17 (pb3's gen-143 network, a rolling job of 224 games in flight with no memory
+//! limit; the same 4070 Ti PC): the worker commits about 1.75 GB before its games (the CUDA runtime; the CPU runtime
+//! well under 1 GB), a game in flight grows as it is played, and the total levels off once the first wave of games has
+//! been replaced - 9.4 GB at 12 minutes (191 games finished), 11.2 GB at 21 (497), 11.4 GB at 29 (776), ... - about 43
+//! MB per game in flight at steady state. 0.2.13 planned 40 MB per game in flight plus 1 GB with no headroom, so
+//! every lease ran into its 10,735 MB limit after 21-25 minutes; the plan now has a base, 45 MB per game and 15 %
+//! headroom, and the agent watches the worker's memory as it runs (lease.rs, PROTOCOL 10.6 **Memory**).
 
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
+use zerofarm_common::layout::Layout;
 use zerofarm_common::protocol::Lease;
 
 /// The `features` this agent asks `/v1/lease` with (PROTOCOL 10.2).
@@ -26,11 +36,31 @@ pub const GPU_STEPS: [u64; 4] = [64, 128, 256, 512];
 pub const GPU_DOUBLING_GAIN: f64 = 1.15;
 /// "auto" on a GPU: from this many games in flight one group (one batch of all of them), below it 2 (each batch half).
 pub const GPU_ONE_GROUP_FROM: u64 = 256;
-/// Memory of one game in flight (its search tree, positions, rows waiting), MB. "auto" never plans more games in
-/// flight than fit `caps.ram_mb` with this and `RAM_BASE_MB`.
-pub const RAM_PER_GAME_MB: u64 = 40;
-/// The worker's memory before any game (the network's session, the runtime, the process), MB.
-pub const RAM_BASE_MB: u64 = 1000;
+/// What a rolling job's worker commits (the memory its job's limit counts, MB): `base_mb` before any game (the
+/// network's session, the runtime, the process), and `per_game_mb` for each game in flight (its search trees, its
+/// positions and records so far, its share of the evaluation cache and of the runtime's buffers).
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct MemCost {
+    pub base_mb: u64,
+    pub per_game_mb: u64,
+}
+
+/// A CPU job's cost until this PC measured the run's own (`Learned`).
+pub const CPU_COST: MemCost = MemCost { base_mb: 600, per_game_mb: 45 };
+/// A GPU job's cost until this PC measured the run's own: the GPU runtime commits more before any game.
+pub const GPU_COST: MemCost = MemCost { base_mb: 1800, per_game_mb: 45 };
+/// The games in flight are planned to commit at most this share of the memory cap (the job's limit): the rest is
+/// headroom for games that run long and for the runtime's buffers.
+pub const PLAN_SHARE: f64 = 0.85;
+/// A rolling worker that commits this share of its job's memory limit is restarted with fewer games in flight (it
+/// finishes its games first, PROTOCOL 10.6) before it can run into the limit.
+pub const HIGH_SHARE: f64 = 0.92;
+/// A worker that died with the job's peak memory at this share of the limit or more ran into the limit.
+pub const HIT_SHARE: f64 = 0.97;
+/// A restart takes at most this share of the games in flight before it (fewer when the measured cost says so).
+pub const RESTART_SHARE: f64 = 0.75;
+/// Restarts of one lease's worker for memory at most; the next memory failure ends the lease as a failure.
+pub const MAX_RESTARTS: u32 = 4;
 /// A memory cap of at least this many games in flight is rounded down to a multiple of it.
 pub const RAM_CAP_STEP: u64 = 32;
 
@@ -98,14 +128,104 @@ pub fn setup(lease: &Lease) -> Result<Option<Setup>, String> {
     }))
 }
 
-/// The most games in flight `ram_mb` holds: (`ram_mb` - `RAM_BASE_MB`) / `RAM_PER_GAME_MB`, rounded down to a multiple of
-/// `RAM_CAP_STEP` (when at least that), at least 1.
-pub fn ram_cap(ram_mb: u64) -> u64 {
-    let n = ram_mb.saturating_sub(RAM_BASE_MB) / RAM_PER_GAME_MB;
+/// The most games in flight `ram_mb` holds at `cost`: (`ram_mb` x `PLAN_SHARE` - base) / per game, rounded down to a
+/// multiple of `RAM_CAP_STEP` (when at least that), at least 1.
+pub fn ram_cap(ram_mb: u64, cost: MemCost) -> u64 {
+    let room = (ram_mb as f64 * PLAN_SHARE) as u64;
+    round_games(room.saturating_sub(cost.base_mb) / cost.per_game_mb.max(1))
+}
+
+/// `n` games in flight rounded down to a multiple of `RAM_CAP_STEP` when at least that, at least 1.
+pub fn round_games(n: u64) -> u64 {
     if n >= RAM_CAP_STEP {
         n / RAM_CAP_STEP * RAM_CAP_STEP
     } else {
         n.max(1)
+    }
+}
+
+/// The games in flight a restart for memory runs with (PROTOCOL 10.6): what fits the job's limit at the measured
+/// cost, and never more than `RESTART_SHARE` of the games in flight before it (rounded as `round_games`, always
+/// fewer than before); None when one game in flight already didn't fit.
+pub fn restart_games(conc: u64, limit_mb: u64, cost: MemCost) -> Option<u64> {
+    if conc <= 1 {
+        return None;
+    }
+    let shrunk = ((conc as f64 * RESTART_SHARE) as u64).max(1);
+    Some(round_games(ram_cap(limit_mb, cost).min(shrunk)).min(conc - 1))
+}
+
+/// The per-game cost a worker that committed `commit_mb` with `conc` games in flight shows over `cost`'s base (MB,
+/// rounded up; 0 when it committed no more than the base).
+pub fn measured_per_game(commit_mb: u64, conc: u64, cost: MemCost) -> u64 {
+    commit_mb.saturating_sub(cost.base_mb).div_ceil(conc.max(1))
+}
+
+/// The memory a game in flight was measured to take on this PC, per run and provider class (`state\rolling_memory.json`,
+/// keys `<run>/cpu` and `<run>/gpu`, MB per game over the base): "auto" and a run's number are planned with it from
+/// then on (PROTOCOL 10.6). It only goes up.
+pub struct Learned;
+
+impl Learned {
+    fn path(layout: &Layout) -> PathBuf {
+        layout.state().join("rolling_memory.json")
+    }
+
+    fn key(run: &str, gpu: bool) -> String {
+        format!("{run}/{}", if gpu { "gpu" } else { "cpu" })
+    }
+
+    pub fn load(layout: &Layout) -> BTreeMap<String, u64> {
+        std::fs::read(Self::path(layout)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    }
+
+    /// The measured per-game cost of `run` on the CPU or a GPU (None: never measured here).
+    pub fn get(layout: &Layout, run: &str, gpu: bool) -> Option<u64> {
+        Self::load(layout).get(&Self::key(run, gpu)).copied()
+    }
+
+    /// What a job of `run` is planned with: the default's cost with the larger of its and the measured per-game
+    /// cost, and whether there was a measurement.
+    pub fn plan(layout: &Layout, run: &str, gpu: bool, ram_mb: u64) -> MemPlan {
+        let d = if gpu { GPU_COST } else { CPU_COST };
+        let m = Self::get(layout, run, gpu);
+        MemPlan { ram_mb, cost: MemCost { per_game_mb: d.per_game_mb.max(m.unwrap_or(0)), ..d }, measured: m.is_some() }
+    }
+
+    /// Records `per_game_mb` for `run` when it is more than what was recorded -> true when it was.
+    pub fn raise(layout: &Layout, run: &str, gpu: bool, per_game_mb: u64) -> bool {
+        let mut m = Self::load(layout);
+        let k = Self::key(run, gpu);
+        if m.get(&k).is_some_and(|&v| v >= per_game_mb) {
+            return false;
+        }
+        m.insert(k, per_game_mb);
+        let _ = std::fs::create_dir_all(layout.state());
+        if let Err(e) = zerofarm_common::fsutil::atomic_write(&Self::path(layout), &serde_json::to_vec(&m).expect("json")) {
+            log::warn!("could not record a rolling job's memory per game: {e}");
+        }
+        true
+    }
+}
+
+/// The memory a rolling job is planned within: the cap (`caps.ram_mb`, the job's limit), the cost per game, and
+/// whether that cost was measured on this PC for the run (`Learned`): only then is a run's number capped too.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct MemPlan {
+    pub ram_mb: u64,
+    pub cost: MemCost,
+    pub measured: bool,
+}
+
+impl MemPlan {
+    /// The games in flight a job may run: "auto"'s choice capped by memory; a run's number as it is, unless this PC
+    /// measured that it doesn't fit.
+    pub fn cap(&self, n: u64, auto: bool) -> u64 {
+        if auto || self.measured {
+            n.min(ram_cap(self.ram_mb, self.cost)).max(1)
+        } else {
+            n
+        }
     }
 }
 
@@ -119,12 +239,15 @@ pub fn gpu_groups(conc: u64) -> u64 {
 }
 
 /// A CPU job's (conc, groups): the run's number (in the template's groups, at most one per game), or "auto":
-/// `CPU_INFLIGHT` games in `CPU_GROUPS` groups, capped by memory.
-pub fn cpu_shape(setting: Inflight, template_groups: u64, ram_mb: u64) -> (u64, u64) {
+/// `CPU_INFLIGHT` games in `CPU_GROUPS` groups; capped by memory (`MemPlan::cap`).
+pub fn cpu_shape(setting: Inflight, template_groups: u64, mem: MemPlan) -> (u64, u64) {
     match setting {
-        Inflight::N(n) => (n, template_groups.clamp(1, n)),
+        Inflight::N(n) => {
+            let n = mem.cap(n, false);
+            (n, template_groups.clamp(1, n))
+        }
         Inflight::Auto => {
-            let conc = CPU_INFLIGHT.min(ram_cap(ram_mb)).max(1);
+            let conc = mem.cap(CPU_INFLIGHT, true);
             (conc, CPU_GROUPS.min(conc))
         }
     }
@@ -132,11 +255,14 @@ pub fn cpu_shape(setting: Inflight, template_groups: u64, ram_mb: u64) -> (u64, 
 
 /// A GPU job's (conc, groups) from the bench of the job's network on the provider (rows/s by batch rows): the run's
 /// number (in at most 2 groups), or "auto": among `GPU_STEPS` the games in flight after which doubling gains less than
-/// `GPU_DOUBLING_GAIN` rows/s (each rated at its batch, `conc / gpu_groups(conc)` rows), capped by memory, in
-/// `gpu_groups` groups.
-pub fn gpu_shape(setting: Inflight, rows: &BTreeMap<String, f64>, template_groups: u64, ram_mb: u64) -> (u64, u64) {
+/// `GPU_DOUBLING_GAIN` rows/s (each rated at its batch, `conc / gpu_groups(conc)` rows), in `gpu_groups` groups; capped
+/// by memory (`MemPlan::cap`).
+pub fn gpu_shape(setting: Inflight, rows: &BTreeMap<String, f64>, template_groups: u64, mem: MemPlan) -> (u64, u64) {
     match setting {
-        Inflight::N(n) => (n, template_groups.clamp(1, 2).min(n)),
+        Inflight::N(n) => {
+            let n = mem.cap(n, false);
+            (n, template_groups.clamp(1, 2).min(n))
+        }
         Inflight::Auto => {
             let rate = |n: u64| crate::probe::rate_at(rows, n.div_ceil(gpu_groups(n)));
             let mut n = GPU_STEPS[0];
@@ -146,7 +272,7 @@ pub fn gpu_shape(setting: Inflight, rows: &BTreeMap<String, f64>, template_group
                     _ => break,
                 }
             }
-            let conc = n.min(ram_cap(ram_mb)).max(1);
+            let conc = mem.cap(n, true);
             (conc, gpu_groups(conc))
         }
     }
@@ -170,23 +296,87 @@ mod tests {
         assert_eq!(Inflight::parse(&json!(null)), Inflight::Auto);
     }
 
+    /// A plan with `ram_mb` at `per_game` MB per game over a base of `base` MB (`measured`: this PC measured it).
+    fn plan(ram_mb: u64, base: u64, per_game: u64, measured: bool) -> MemPlan {
+        MemPlan { ram_mb, cost: MemCost { base_mb: base, per_game_mb: per_game }, measured }
+    }
+
+    fn auto_cpu(ram_mb: u64) -> MemPlan {
+        MemPlan { ram_mb, cost: CPU_COST, measured: false }
+    }
+
+    fn auto_gpu(ram_mb: u64) -> MemPlan {
+        MemPlan { ram_mb, cost: GPU_COST, measured: false }
+    }
+
     #[test]
     fn memory_caps_the_games_in_flight() {
-        // the canary PC: caps.ram_mb 9,494 -> (9,494 - 1,000) / 40 = 212 -> 192
-        assert_eq!(ram_cap(9494), 192);
-        assert_eq!(ram_cap(1000 + 40 * 64), 64);
-        assert_eq!(ram_cap(1000 + 40 * 63), 32, "a multiple of 32");
-        assert_eq!(ram_cap(1000 + 40 * 20), 20, "below 32 as it is");
-        assert_eq!(ram_cap(500), 1, "never 0");
+        // (ram x 0.85 - base) / per game, a multiple of 32 from 32
+        assert_eq!(ram_cap(10_000, MemCost { base_mb: 1500, per_game_mb: 50 }), 128, "(8,500 - 1,500) / 50 = 140 -> 128");
+        assert_eq!(ram_cap(1000, MemCost { base_mb: 0, per_game_mb: 10 }), 64, "85 -> 64");
+        assert_eq!(ram_cap(1000, MemCost { base_mb: 0, per_game_mb: 30 }), 28, "below 32 as it is");
+        assert_eq!(ram_cap(500, MemCost { base_mb: 1000, per_game_mb: 10 }), 1, "never 0");
+        assert_eq!(ram_cap(500, MemCost { base_mb: 0, per_game_mb: 0 }), 416, "a per-game cost of 0 counts 1 MB");
+        // the canary PC of 2026-11-17 (a 10,735 MB limit), GPU defaults: (9,124 - 1,800) / 45 = 162 -> 160; at the
+        // soak's steady state (1.75 GB + 43 MB a game) that commits 8.6 GB, 80 % of the limit, under HIGH_SHARE
+        let canary = ram_cap(10_735, GPU_COST);
+        assert_eq!(canary, 160);
+        assert!(((1750 + canary * 43) as f64) < 10_735.0 * HIGH_SHARE);
+    }
+
+    #[test]
+    fn a_restart_runs_fewer_games_than_before() {
+        let c = MemCost { base_mb: 1000, per_game_mb: 40 };
+        // (10,000 x 0.75 - 1,000) / 40 = 162 -> 160, but at most 3/4 of 224 = 168 -> 160
+        assert_eq!(restart_games(224, 10_000, c), Some(160));
+        // fits more than 3/4: 3/4 (rounded)
+        assert_eq!(restart_games(64, 100_000, c), Some(32), "48 -> a multiple of 32");
+        assert_eq!(restart_games(10, 100_000, c), Some(7));
+        assert_eq!(restart_games(2, 100_000, c), Some(1));
+        assert_eq!(restart_games(1, 100_000, c), None, "one game didn't fit: nothing to shrink");
+        assert_eq!(restart_games(40, 100, c), Some(1), "at least 1");
+        // never as many as before, whatever fits
+        for conc in [2u64, 3, 33, 64, 65, 100, 512] {
+            assert!(restart_games(conc, 1_000_000, c).unwrap() < conc, "{conc}");
+        }
+    }
+
+    #[test]
+    fn the_cost_per_game_is_measured_over_the_base() {
+        let c = MemCost { base_mb: 2000, per_game_mb: 60 };
+        // the canary's crash: 10,735 MB at 224 in flight
+        assert_eq!(measured_per_game(10_735, 224, c), 39);
+        assert_eq!(measured_per_game(1999, 10, c), 0);
+        assert_eq!(measured_per_game(2001, 0, c), 1, "no games counts 1");
+    }
+
+    #[test]
+    fn the_measured_cost_is_remembered_per_run_and_provider_and_only_goes_up() {
+        let dir = std::env::temp_dir().join(format!("zf-rolling-mem-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let layout = Layout::new(&dir);
+        assert_eq!(Learned::plan(&layout, "r", true, 10_000), MemPlan { ram_mb: 10_000, cost: GPU_COST, measured: false });
+        assert!(Learned::raise(&layout, "r", true, 75));
+        assert!(!Learned::raise(&layout, "r", true, 70), "only up");
+        assert!(Learned::raise(&layout, "r", false, 20));
+        assert_eq!(Learned::get(&layout, "r", true), Some(75));
+        assert_eq!(Learned::get(&layout, "other", true), None);
+        let p = Learned::plan(&layout, "r", true, 10_000);
+        assert_eq!((p.cost.per_game_mb, p.cost.base_mb, p.measured), (75, GPU_COST.base_mb, true));
+        // measured below the default: the default is planned with (a run's number is capped by it, measured)
+        let p = Learned::plan(&layout, "r", false, 10_000);
+        assert_eq!((p.cost.per_game_mb, p.measured), (CPU_COST.per_game_mb, true));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn cpu_auto_is_32_in_four_groups_within_memory() {
-        assert_eq!(cpu_shape(Inflight::Auto, 1, 16_000), (32, 4));
-        assert_eq!(cpu_shape(Inflight::Auto, 1, 1000 + 40 * 20), (20, 4), "the memory cap");
-        assert_eq!(cpu_shape(Inflight::Auto, 1, 100), (1, 1), "never 0");
-        assert_eq!(cpu_shape(Inflight::N(24), 3, 100), (24, 3), "the run's number as it is");
-        assert_eq!(cpu_shape(Inflight::N(2), 4, 16_000), (2, 2));
+        assert_eq!(cpu_shape(Inflight::Auto, 1, auto_cpu(16_000)), (32, 4));
+        assert_eq!(cpu_shape(Inflight::Auto, 1, plan(2000, 0, 75, false)), (22, 4), "the memory cap: 1,700 / 75");
+        assert_eq!(cpu_shape(Inflight::Auto, 1, auto_cpu(100)), (1, 1), "never 0");
+        assert_eq!(cpu_shape(Inflight::N(24), 3, auto_cpu(100)), (24, 3), "the run's number as it is");
+        assert_eq!(cpu_shape(Inflight::N(24), 3, plan(2000, 0, 75, true)), (22, 3), "unless this PC measured it doesn't fit");
+        assert_eq!(cpu_shape(Inflight::N(2), 4, auto_cpu(16_000)), (2, 2));
     }
 
     #[test]
@@ -194,16 +384,17 @@ mod tests {
         // batch rows 32, 64 (2 groups) for 64, 128 in flight; 256, 512 (1 group) for 256, 512
         let climbing = rows(&[(1, 100.0), (32, 3000.0), (64, 4800.0), (256, 9000.0), (512, 11000.0), (1024, 11500.0)]);
         // 64 -> 128: 3000 -> 4800 (+60 %); 128 -> 256: 4800 -> 9000; 256 -> 512: 9000 -> 11000 (+22 %): 512, one group
-        assert_eq!(gpu_shape(Inflight::Auto, &climbing, 1, 64_000), (512, 1));
-        // the canary PC's memory: 192, in 2 groups
-        assert_eq!(gpu_shape(Inflight::Auto, &climbing, 1, 9494), (192, 2));
-        assert_eq!(gpu_shape(Inflight::Auto, &climbing, 1, 1000 + 40 * 300), (288, 1), "a multiple of 32, one group from 256");
+        assert_eq!(gpu_shape(Inflight::Auto, &climbing, 1, auto_gpu(100_000)), (512, 1));
+        // (10,000 x 0.85 - 1,500) / 50 = 140 -> 128, in 2 groups
+        assert_eq!(gpu_shape(Inflight::Auto, &climbing, 1, plan(10_000, 1500, 50, false)), (128, 2));
+        assert_eq!(gpu_shape(Inflight::Auto, &climbing, 1, plan(40_000, 0, 100, false)), (320, 1), "340 -> a multiple of 32, one group from 256");
         let flat = rows(&[(1, 100.0), (32, 3000.0), (64, 3300.0), (1024, 3400.0)]);
-        assert_eq!(gpu_shape(Inflight::Auto, &flat, 1, 64_000), (64, 2), "64 -> 128 gains 10 %");
+        assert_eq!(gpu_shape(Inflight::Auto, &flat, 1, auto_gpu(100_000)), (64, 2), "64 -> 128 gains 10 %");
         let r2 = rows(&[(32, 3000.0), (64, 6000.0), (256, 6600.0)]);
-        assert_eq!(gpu_shape(Inflight::Auto, &r2, 1, 64_000), (128, 2), "128 -> 256 gains 10 %");
-        assert_eq!(gpu_shape(Inflight::N(300), &climbing, 4, 100), (300, 2), "the run's number, at most 2 groups");
-        assert_eq!(gpu_shape(Inflight::Auto, &BTreeMap::new(), 1, 64_000), (64, 2), "no numbers: the smallest step");
+        assert_eq!(gpu_shape(Inflight::Auto, &r2, 1, auto_gpu(100_000)), (128, 2), "128 -> 256 gains 10 %");
+        assert_eq!(gpu_shape(Inflight::N(300), &climbing, 4, auto_gpu(100)), (300, 2), "the run's number, at most 2 groups");
+        assert_eq!(gpu_shape(Inflight::N(300), &climbing, 4, plan(40_000, 0, 200, true)), (160, 2), "measured: 170 -> 160");
+        assert_eq!(gpu_shape(Inflight::Auto, &BTreeMap::new(), 1, auto_gpu(100_000)), (64, 2), "no numbers: the smallest step");
     }
 
     #[test]

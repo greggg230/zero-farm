@@ -305,3 +305,106 @@ fn classic_leases_are_unchanged() {
     assert!(done["stats"].get("released").is_none() && done["stats"].get("inflight").is_none(), "{done}");
     h.stop();
 }
+
+// ---- rev 15 (PROTOCOL 10.6): memory. A rolling worker that runs into its job's memory limit is started again with
+// fewer games in flight and the lease goes on; one that comes near it finishes its games first; the run's cost per game
+// measured on the PC plans its next leases.
+
+/// `settings(game_ms)` with more of the fakeworker's script (its memory).
+fn settings_with(game_ms: u64, fake: Value) -> Value {
+    let mut s = settings(game_ms);
+    for (k, v) in fake.as_object().unwrap() {
+        s["fake"][k] = v.clone();
+    }
+    s
+}
+
+/// Network 1 and definition version 1 signing it with `settings`.
+fn generation_1_with(h: &H, settings: Value) -> (Value, Value) {
+    let (c1, d1) = network(h, 1);
+    let dref = h.define(&definition(h, 1, json!({"1": d1}), settings));
+    (c1, dref)
+}
+
+/// The rolling memory the PC remembers (`state\rolling_memory.json`).
+fn learned(h: &H) -> Value {
+    std::fs::read(h.layout.state().join("rolling_memory.json")).map(|b| serde_json::from_slice(&b).unwrap()).unwrap_or(json!(null))
+}
+
+/// No id credited twice, and every released id credited or reported unfinished.
+fn accounted_once(h: &H, id: &str, done: &Value, released: u64) {
+    let dup: u64 = h.mock.with(|s| s.credits.iter().filter(|(l, ..)| l == id).map(|(.., a)| *a).sum());
+    assert_eq!(dup, 0, "an id credited twice: {done}");
+    assert_eq!(credited(h, id) + unfinished_n(done), released, "{done}");
+}
+
+/// With a 1,600 MB limit (the CPU cost's 600 MB base and 45 MB per game plan 16 games in flight), a run's 16 games in
+/// flight at 100 MB each run into the limit at once.
+fn out_of_memory_lease(oom_abort: bool) {
+    let mut h = H::new();
+    h.machine.lock().unwrap().settings.max_ram_mb = Some(1600);
+    let g1 = generation_1_with(&h, settings_with(50, json!({"mem_per_game_mb": 100, "oom_abort": oom_abort})));
+    h.push(rolling_lease(&h, "l_RM", &g1, 0, 32, 80, json!(16)));
+    h.start();
+    let done = h.wait_done("l_RM");
+    assert_eq!(done["given_back"], false, "the lease went on and ended as any: {done}");
+    let (j0, j1) = (h.job_line(), h.job_line_n(1).expect("a second worker"));
+    assert_eq!((j0["conc"].clone(), j0["gid_base"].clone(), j0["games"].clone(), j0["out_dir"].clone()), (json!(16), json!(0), json!(32), json!("out")), "{j0}");
+    // measured (1,600 - 600) / 16 = 63 MB per game: (1,600 x 0.85 - 600) / 63 = 12 (= 3/4 of 16); the first worker's
+    // ids were all lost: the second's start after them
+    assert_eq!((j1["conc"].clone(), j1["gid_base"].clone(), j1["games"].clone(), j1["out_dir"].clone()), (json!(12), json!(32), json!(0), json!("out-r1")), "{j1}");
+    assert!(h.job_line_n(2).is_none(), "one restart: {}", h.agent_log());
+    accounted_once(&h, "l_RM", &done, 80);
+    let u = done["unfinished"]["gids"].as_array().unwrap();
+    assert_eq!(u[0], json!([0, 32]), "the dead worker's ids go back: {done}");
+    assert_eq!(done["stats"]["inflight"], 12, "{done}");
+    assert_eq!(learned(&h), json!({"roll-run/cpu": 63}));
+    let crashes = h.crashes();
+    assert_eq!(crashes.len(), 1, "reported once: {crashes:?}");
+    assert!(crashes[0]["message"].as_str().unwrap().contains("memory limit"), "{crashes:?}");
+    // the run's next lease: its number is capped by the cost measured here
+    h.push(rolling_lease(&h, "l_RM2", &g1, 100, 12, 112, json!(16)));
+    let done2 = h.wait_done("l_RM2");
+    assert_eq!(done2["given_back"], false, "{done2}");
+    assert_eq!(h.job_line_n(2).expect("the next lease's job")["conc"], 12);
+    assert_eq!(h.crashes().len(), 1);
+    h.stop();
+}
+
+#[test]
+fn a_worker_out_of_memory_is_started_again_with_fewer_games_and_the_lease_goes_on() {
+    out_of_memory_lease(false);
+}
+
+#[test]
+fn a_worker_that_aborts_at_the_memory_limit_is_started_again_too() {
+    out_of_memory_lease(true);
+}
+
+#[test]
+fn a_worker_near_its_memory_limit_finishes_its_games_and_goes_on_with_fewer() {
+    let mut h = H::new();
+    h.machine.lock().unwrap().settings.max_ram_mb = Some(1600);
+    // 8 x 50 MB, then 100 MB more per finished game for its first 11: past 92 % of the limit (1,472 MB) at the 11th
+    let g1 = generation_1_with(&h, settings_with(60, json!({"mem_per_game_mb": 50, "mem_grow_mb": 100, "mem_grow_until": 11})));
+    h.push(rolling_lease(&h, "l_RH", &g1, 0, 16, 40, json!(8)));
+    h.start();
+    let done = h.wait_done("l_RH");
+    assert_eq!(done["given_back"], false, "{done}");
+    let (j0, j1) = (h.job_line(), h.job_line_n(1).expect("a second worker"));
+    assert_eq!(j0["conc"], 8, "{j0}");
+    let c1 = j1["conc"].as_u64().unwrap();
+    assert!((1..=6).contains(&c1), "fewer games in flight, at most 3/4: {j1}");
+    // nothing lost: the second worker starts at the first id its predecessor never started
+    let first_played = credited(&h, "l_RH");
+    let base1 = j1["gid_base"].as_u64().unwrap();
+    assert!((11..=16).contains(&base1), "{j1}");
+    assert!(h.agent_log().contains("rolling job ended (finish)"), "the first worker finished its games: {}", h.agent_log());
+    accounted_once(&h, "l_RH", &done, 40);
+    assert!(unfinished_n(&done) < 8, "only ids never started go back: {done}");
+    assert!(first_played >= base1);
+    let per = learned(&h)["roll-run/cpu"].as_u64().expect("measured");
+    assert!(per >= 100, "(~1,500 - 600) / 8: {per}");
+    assert!(h.crashes().is_empty(), "coming near the limit is no crash: {:?}", h.crashes());
+    h.stop();
+}

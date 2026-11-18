@@ -24,6 +24,11 @@ pub trait SignalSource: Send {
     /// `worker_pid`: our own worker, excluded from "other GPU users".
     fn sample(&mut self, worker_pid: Option<u32>) -> Signals;
 
+    /// (available, total) physical memory in MB: what a worker's memory cap is worked out from (`Engine::caps`).
+    fn memory_mb(&self) -> (u64, u64) {
+        memory_mb()
+    }
+
     /// Since `mark`, was the worker starved of CPU: it got almost none while the PC had almost no
     /// idle time (other programs), so it is waiting for a turn, not hung.
     fn worker_starved(&self, mark: &CpuMark, worker: &WorkerProc) -> bool {
@@ -510,6 +515,10 @@ impl SignalSource for SharedSignals {
             s.now = zerofarm_common::now_unix();
         }
         s
+    }
+    fn memory_mb(&self) -> (u64, u64) {
+        let s = self.inner.lock().unwrap();
+        (s.mem_avail_mb, s.mem_total_mb)
     }
     fn worker_starved(&self, mark: &CpuMark, worker: &WorkerProc) -> bool {
         self.starved.load(Ordering::SeqCst) || mark.starved_since(worker)

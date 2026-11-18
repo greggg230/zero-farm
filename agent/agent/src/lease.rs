@@ -11,7 +11,7 @@ use crate::cache::{Cache, CacheError, CkptFiles};
 use crate::engine::Engine;
 use crate::jobplan::{Plan, PlanError, Recheck};
 use crate::results::{compute_unfinished, ResultMeta, Source};
-use crate::rolling::Setup;
+use crate::rolling::{Learned, MemPlan, Setup};
 use crate::status::Phase;
 use crate::worker::{CpuMark, SpawnOpts, WorkerMsg, WorkerProc};
 use serde_json::{json, Map, Value};
@@ -49,7 +49,9 @@ pub enum LeaseEnd {
 }
 
 enum Ev {
-    Worker(WorkerMsg),
+    /// A line of the worker of this generation (a rolling lease's restart starts generation 1, 2, ...: lines of an
+    /// earlier worker are dropped).
+    Worker(u32, WorkerMsg),
     Beat(Result<BeatResp, CallError>),
     Ckpt(Result<(CheckpointRef, CkptFiles), (CheckpointRef, String)>),
     /// rev 15 (PROTOCOL 10.4): the answer to a rolling lease's extension.
@@ -82,6 +84,69 @@ struct Roll {
     /// A `definition` crash report went out for this lease (at most one).
     def_reported: bool,
     update_inflight: bool,
+    /// The memory the job is planned within (its provider's cost, PROTOCOL 10.6).
+    mem: MemPlan,
+    /// The job runs on a GPU (the measured cost is the run's GPU one).
+    gpu: bool,
+    /// The most the current worker committed (MB).
+    peak_mb: u64,
+    /// The current worker's ids start at `lo + offset` (0 until a restart; a restart's worker gets the ids after
+    /// the ones its predecessor started).
+    offset: u64,
+    /// Restarts for memory so far.
+    restarts: u32,
+    /// A restart for memory is due once the current worker is gone.
+    restart: Option<Restart>,
+}
+
+/// rev 15 (PROTOCOL 10.6): a rolling lease's worker restarted with fewer games in flight, for memory.
+#[derive(Debug, Clone)]
+struct Restart {
+    /// The games in flight of the next worker.
+    conc: u64,
+    /// The worker died (it ran into the job's memory limit): its games in flight are lost and the next worker's ids
+    /// start after every id released so far. Else it finishes its games first (`finish`) and the next worker takes
+    /// the released ids it never started.
+    burn: bool,
+}
+
+/// What a worker is started with (kept: a rolling lease's restart starts another).
+struct SpawnSpec {
+    exe: PathBuf,
+    cwd: PathBuf,
+    mem_limit_mb: u64,
+    cpu_job: bool,
+    log: Arc<zerofarm_common::rotlog::RotatingFile>,
+    tag: String,
+    runtime_dir: Option<PathBuf>,
+}
+
+impl SpawnSpec {
+    /// Starts the worker; its lines reach `tx` as generation `gen`'s.
+    fn spawn(&self, gen: u32, tx: Sender<Ev>) -> std::io::Result<WorkerProc> {
+        WorkerProc::spawn(
+            SpawnOpts {
+                exe: &self.exe,
+                args: &["serve"],
+                cwd: &self.cwd,
+                mem_limit_mb: self.mem_limit_mb,
+                cpu_job: self.cpu_job,
+                log: self.log.clone(),
+                tag: self.tag.clone(),
+                runtime_dir: self.runtime_dir.as_deref(),
+            },
+            move |m| {
+                let _ = tx.send(Ev::Worker(gen, m));
+            },
+        )
+    }
+}
+
+/// A worker's fatal error that says it could not allocate memory (ONNX Runtime's "bad allocation", Rust's "memory
+/// allocation of N bytes failed", ...).
+fn alloc_failure(msg: &str) -> bool {
+    let m = msg.to_ascii_lowercase();
+    ["bad allocation", "bad_alloc", "out of memory", "memory allocation of", "failed to allocate"].iter().any(|k| m.contains(k))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -347,16 +412,16 @@ impl Engine {
 
     /// The measured choice for the job (PROTOCOL 9.6), or for a rolling lease (rev 15, PROTOCOL 10.6) with its games in
     /// flight: the run's setting for the CPU and the GPU, "auto" worked out by `rolling.rs` (a fixed number on the
-    /// CPU, a GPU's from its bench row, both within `ram_mb`).
+    /// CPU, a GPU's from its bench row, both within the memory plans `mem` (CPU, GPU), PROTOCOL 10.6).
     #[allow(clippy::too_many_arguments)]
-    fn pick(bench: Option<&crate::probe::Bench>, gpus: &[zerofarm_common::protocol::Gpu], lease: &Lease, plan: &Plan, gpu_ok: bool, ram_mb: u64, roll: Option<&Setup>) -> crate::probe::Choice {
+    fn pick(bench: Option<&crate::probe::Bench>, gpus: &[zerofarm_common::protocol::Gpu], lease: &Lease, plan: &Plan, gpu_ok: bool, mem: (MemPlan, MemPlan), roll: Option<&Setup>) -> crate::probe::Choice {
         let (games, conc, groups) = Self::job_shape(plan);
         let allow = lease.providers.as_deref();
         match roll {
             None => crate::probe::choose(bench, gpus, allow, gpu_ok, games, conc, groups),
             Some(r) => {
-                let cpu = crate::rolling::cpu_shape(r.cpu, groups, ram_mb);
-                let gpu = |row: &crate::probe::BenchRow| crate::rolling::gpu_shape(r.gpu, &row.rows, groups, ram_mb);
+                let cpu = crate::rolling::cpu_shape(r.cpu, groups, mem.0);
+                let gpu = |row: &crate::probe::BenchRow| crate::rolling::gpu_shape(r.gpu, &row.rows, groups, mem.1);
                 crate::probe::choose_rolling(bench, gpus, allow, gpu_ok, cpu, &gpu, groups)
             }
         }
@@ -366,14 +431,14 @@ impl Engine {
     /// (exactly the between-lease one, recorded as the pack's probe); then, if a GPU provider passed and there is no
     /// fresh bench of this run's network on the pack, the bench (a record of its own); then CPU or GPU by measured speed.
     #[allow(clippy::too_many_arguments)]
-    fn choose_providers(&mut self, lease: &Lease, plan: &Plan, prep: &Prepared, gpu_ok: bool, threads: u32, ram_mb: u64, need: Option<&GpuNeed>, roll: Option<&Setup>) -> crate::probe::Choice {
+    fn choose_providers(&mut self, lease: &Lease, plan: &Plan, prep: &Prepared, gpu_ok: bool, threads: u32, mem: (MemPlan, MemPlan), need: Option<&GpuNeed>, roll: Option<&Setup>) -> crate::probe::Choice {
         let net = match lease.kind.as_str() {
             "selfplay" => prep.ckpt.as_ref().map(|(_, f)| f),
             "eval" => prep.models.first().map(|(_, f)| f),
             _ => None,
         };
         let (Some(rt), Some(net), Some(run)) = (&prep.runtime, net, lease.run.as_deref()) else {
-            return Self::pick(None, &self.profile.gpus, lease, plan, gpu_ok, ram_mb, roll);
+            return Self::pick(None, &self.profile.gpus, lease, plan, gpu_ok, mem, roll);
         };
         let id = lease.lease_id.clone();
         let control = self.control.clone();
@@ -469,7 +534,7 @@ impl Engine {
                 self.evict_after.push(format!("builds/{}", rt.build_id));
             }
         }
-        let c = Self::pick(bench.as_ref(), &gpus, lease, plan, gpu_ok, ram_mb, roll);
+        let c = Self::pick(bench.as_ref(), &gpus, lease, plan, gpu_ok, mem, roll);
         if let Some(mut b) = bench.filter(|b| b.error.is_none()) {
             // what the coordinator sizes this run's GPU leases by (PROTOCOL 9.4: caps.gpu_games)
             b.gpu_games = c.gpu_games;
@@ -604,34 +669,43 @@ impl Engine {
         };
         // rev 11 (PROTOCOL 9.6): CPU or GPU by measured speed at the job's batch size (the providers this PC verified
         // with the lease's pack, narrowed by the lease's allowlist; the CPU alone when the GPU may not be used now)
-        let choice = self.choose_providers(lease, &plan, &prep, d.gpu && !self.profile.gpus.is_empty(), caps.threads, caps.ram_mb, need.as_ref(), roll.as_ref().map(|(s, _)| s));
-        if roll.is_some() {
-            log::info!("lease {id}: {} games in flight in {} groups", choice.conc.unwrap_or(0), choice.groups.unwrap_or(0));
-        }
+        // rev 15 (PROTOCOL 10.6): the games in flight fit the job's memory limit at the run's cost per game (this PC's
+        // measurement when it has one)
+        let limit_mb = caps.ram_mb.max(256);
+        let run_name = lease.run.clone().unwrap_or_default();
+        let mem = (Learned::plan(&self.cfg.layout, &run_name, false, limit_mb), Learned::plan(&self.cfg.layout, &run_name, true, limit_mb));
+        let choice = self.choose_providers(lease, &plan, &prep, d.gpu && !self.profile.gpus.is_empty(), caps.threads, mem, need.as_ref(), roll.as_ref().map(|(s, _)| s));
         let plan_providers = (choice.providers.clone(), choice.gpu.clone());
+        let gpu_choice = plan_providers.0 != ["cpu"];
+        if roll.is_some() {
+            let m = if gpu_choice { mem.1 } else { mem.0 };
+            log::info!(
+                "lease {id}: {} games in flight in {} groups (memory: {} MB limit, {} MB + {} MB per game{})",
+                choice.conc.unwrap_or(0),
+                choice.groups.unwrap_or(0),
+                limit_mb,
+                m.cost.base_mb,
+                m.cost.per_game_mb,
+                if m.measured { ", measured here" } else { "" }
+            );
+        }
         if plan_providers.0 != ["cpu"] {
             log::info!("lease {id}: providers {:?} on {}", plan_providers.0, plan_providers.1["name"].as_str().unwrap_or("?"));
         }
         let (tx, rx) = mpsc::channel::<Ev>();
-        let txw = tx.clone();
         let entry = build.entry_path().expect("worker manifests have an entry");
+        let spawn_spec = SpawnSpec {
+            exe: entry,
+            cwd: work.clone(),
+            mem_limit_mb: limit_mb,
+            cpu_job: plan_providers.0 == ["cpu"],
+            log: self.worker_log.clone(),
+            tag: id.clone(),
+            runtime_dir: prep.runtime.as_ref().map(|r| r.dir.clone()),
+        };
         let spawn = match self.cfg.test_spawn_error.filter(|_| cfg!(debug_assertions)) {
             Some(code) => Err(std::io::Error::from_raw_os_error(code)),
-            None => WorkerProc::spawn(
-                SpawnOpts {
-                    exe: &entry,
-                    args: &["serve"],
-                    cwd: &work,
-                    mem_limit_mb: caps.ram_mb.max(256),
-                    cpu_job: plan_providers.0 == ["cpu"],
-                    log: self.worker_log.clone(),
-                    tag: id.clone(),
-                    runtime_dir: prep.runtime.as_ref().map(|r| r.dir.as_path()),
-                },
-                move |m| {
-                    let _ = txw.send(Ev::Worker(m));
-                },
-            ),
+            None => spawn_spec.spawn(0, tx.clone()),
         };
         let worker = match spawn {
             Ok(w) => w,
@@ -685,6 +759,9 @@ impl Engine {
             selftest_failed: false,
             crash_reported: false,
             hello_seen: false,
+            spawn: spawn_spec,
+            wgen: 0,
+            out_dir: "out".into(),
             roll: roll.map(|(setup, def)| Roll {
                 released: setup.released,
                 setup,
@@ -698,6 +775,12 @@ impl Engine {
                 def_inflight: false,
                 def_reported: false,
                 update_inflight: false,
+                mem: if gpu_choice { mem.1 } else { mem.0 },
+                gpu: gpu_choice,
+                peak_mb: 0,
+                offset: 0,
+                restarts: 0,
+                restart: None,
             }),
         };
         run.go(self)
@@ -807,6 +890,12 @@ struct Run {
     crash_reported: bool,
     /// The worker said `hello` (it started): start failures are over.
     hello_seen: bool,
+    /// What the worker was started with (a rolling lease's restart starts another).
+    spawn: SpawnSpec,
+    /// The current worker's generation (`Ev::Worker`).
+    wgen: u32,
+    /// The current worker's results directory under the work directory (`out`; a restart's worker gets its own).
+    out_dir: String,
     /// rev 15 (PROTOCOL 10): a rolling lease.
     roll: Option<Roll>,
 }
@@ -947,6 +1036,14 @@ impl Run {
                 while let Ok(ev) = self.rx.try_recv() {
                     self.on_event(eng, ev);
                 }
+                // rev 15 (PROTOCOL 10.6): a rolling worker that died at the job's memory limit without a word (an
+                // abort on a failed allocation) is restarted smaller, as one that said so
+                if self.end_ev.is_none() && !self.killed {
+                    self.memory_failure(eng, &format!("worker exited with code {code}"));
+                }
+                if self.restart_worker(eng) {
+                    continue;
+                }
                 break code;
             }
             self.tick(eng);
@@ -1052,6 +1149,136 @@ impl Run {
             });
         }
         self.roll_tick(eng);
+        self.mem_check(eng);
+    }
+
+    /// rev 15 (PROTOCOL 10.6), each tick of a rolling lease: the worker's committed memory. At `HIGH_SHARE` of the
+    /// job's limit the worker finishes its games and is started again with fewer in flight (`restart_worker`), and the
+    /// run's cost per game measured here is remembered (`Learned`); one that can't have fewer finishes the lease.
+    fn mem_check(&mut self, eng: &Engine) {
+        let limit = self.worker.mem_limit_mb;
+        let live = matches!(self.state, WState::Running | WState::Resuming(_)) && self.after.is_none();
+        let Some(r) = self.roll.as_mut().filter(|r| r.active) else { return };
+        let Some(now) = self.worker.commit_mb() else { return };
+        r.peak_mb = r.peak_mb.max(now);
+        if !live || r.finishing || r.restart.is_some() || limit == 0 || (now as f64) < limit as f64 * crate::rolling::HIGH_SHARE {
+            return;
+        }
+        let id = self.lease.lease_id.clone();
+        let conc = self.conc.unwrap_or(1);
+        let per = crate::rolling::measured_per_game(now, conc, r.mem.cost);
+        if Learned::raise(&eng.cfg.layout, self.lease.run.as_deref().unwrap_or(""), r.gpu, per) {
+            log::info!("lease {id}: remembering {per} MB per game in flight for this run");
+        }
+        let cost = crate::rolling::MemCost { per_game_mb: r.mem.cost.per_game_mb.max(per), ..r.mem.cost };
+        match crate::rolling::restart_games(conc, limit, cost).filter(|_| r.restarts < crate::rolling::MAX_RESTARTS) {
+            Some(n) => {
+                log::warn!("lease {id}: the worker commits {now} MB of its {limit} MB limit with {conc} games in flight; finishing them, then going on with {n}");
+                r.restart = Some(Restart { conc: n, burn: false });
+                self.send(json!({"op": "finish"}));
+            }
+            None => self.roll_finish(&format!("the worker commits {now} MB of its {limit} MB limit and can't run fewer games")),
+        }
+    }
+
+    /// rev 15 (PROTOCOL 10.6): the worker failed (`why`: its fatal error or its exit) - if a rolling worker ran into
+    /// the job's memory limit (Windows' peak at `HIT_SHARE` of it, or an allocation failure), a restart with fewer games
+    /// in flight is due (its games in flight are lost), the cost per game remembered, and the failure reported once per
+    /// lease. -> true when a restart is due.
+    fn memory_failure(&mut self, eng: &Engine, why: &str) -> bool {
+        let limit = self.worker.mem_limit_mb;
+        let peak = self.worker.job_peak_mb().unwrap_or(0);
+        let hit = (limit > 0 && peak as f64 >= limit as f64 * crate::rolling::HIT_SHARE) || alloc_failure(why) || alloc_failure(&self.worker.stderr_tail());
+        let stopping = matches!(self.state, WState::Stopping(_)) || self.after.is_some() || eng.quitting();
+        let conc = self.conc.unwrap_or(1);
+        let Some(r) = self.roll.as_mut().filter(|r| r.active && !r.finishing && !stopping && hit) else { return false };
+        let id = self.lease.lease_id.clone();
+        let per = crate::rolling::measured_per_game(peak.max(r.peak_mb).max(limit), conc, r.mem.cost);
+        if Learned::raise(&eng.cfg.layout, self.lease.run.as_deref().unwrap_or(""), r.gpu, per) {
+            log::info!("lease {id}: remembering {per} MB per game in flight for this run");
+        }
+        let cost = crate::rolling::MemCost { per_game_mb: r.mem.cost.per_game_mb.max(per), ..r.mem.cost };
+        let Some(n) = crate::rolling::restart_games(conc, limit, cost).filter(|_| r.restarts < crate::rolling::MAX_RESTARTS) else {
+            log::error!("lease {id}: the worker ran into its {limit} MB memory limit with {conc} games in flight ({why}); no restart left");
+            return false;
+        };
+        log::warn!("lease {id}: the worker ran into its {limit} MB memory limit with {conc} games in flight ({why}); starting it again with {n}");
+        r.restart = Some(Restart { conc: n, burn: true });
+        let first = r.restarts == 0;
+        if first {
+            self.report(eng, "crash", &format!("rolling worker ran into its {limit} MB memory limit (peak {peak} MB) with {conc} games in flight: {why}; restarted with {n}"), None);
+        }
+        if self.worker.try_wait().is_none() {
+            self.worker.kill();
+        }
+        self.killed = true;
+        true
+    }
+
+    /// rev 15 (PROTOCOL 10.6): the restart due (`Roll::restart`) once the worker is gone: a new worker with fewer games
+    /// in flight, the lease's latest network, its own results directory and the ids after the ones its predecessor
+    /// started; extensions go on as before. -> false when there is none (or it can't start): the lease ends.
+    fn restart_worker(&mut self, eng: &mut Engine) -> bool {
+        let lo_released = self.roll.as_ref().map(|r| (r.setup.lo, r.released));
+        let stopping = self.after.is_some() || eng.quitting();
+        let Some(r) = self.roll.as_mut() else { return false };
+        let Some(rs) = r.restart.take() else { return false };
+        // (a worker that was finishing its games for a restart and died without its `end`, of anything but memory - that
+        // would have made the restart a `burn` one -, fails as any worker)
+        if r.finishing || stopping || (!rs.burn && self.end_ev.is_none()) {
+            return false;
+        }
+        let (lo, released) = lo_released.expect("rolling");
+        // the ids the new worker plays: after every released id when its predecessor died; else the released ids it
+        // never started (its `end`'s unfinished tail)
+        let tail = self
+            .end_ev
+            .as_ref()
+            .and_then(|e| e.get("unfinished"))
+            .and_then(|u| u.get("gids"))
+            .map(crate::util::parse_ranges)
+            .filter(|g| g.len() == 1 && g[0].1 == lo + released && g[0].0 >= lo + r.offset)
+            .map(|g| g[0].0 - lo);
+        r.offset = if rs.burn { released } else { tail.unwrap_or(released) };
+        r.restarts += 1;
+        r.want_more = false;
+        r.peak_mb = 0;
+        let gpu = r.gpu;
+        let restarts = r.restarts;
+        let offset = r.offset;
+        self.conc = Some(rs.conc);
+        self.groups = Some(if gpu { crate::rolling::gpu_groups(rs.conc) } else { self.groups.unwrap_or(1).clamp(1, rs.conc) });
+        self.out_dir = format!("out-r{restarts}");
+        self.wgen += 1;
+        self.end_ev = None;
+        self.killed = false;
+        self.eof = false;
+        self.job_sent = false;
+        self.pinged = false;
+        self.state = WState::Starting;
+        self.started = Instant::now();
+        self.last_msg = Instant::now();
+        self.stall_since = None;
+        let id = self.lease.lease_id.clone();
+        if let Err(e) = std::fs::create_dir_all(self.work.join(&self.out_dir)) {
+            log::error!("lease {id}: cannot start the worker again: {e}");
+            self.after = Some(After::Kill(format!("restart: {e}")));
+            return false;
+        }
+        match self.spawn.spawn(self.wgen, self.tx.clone()) {
+            Ok(w) => {
+                log::info!("lease {id}: worker pid {} started again ({} games in flight, ids from {}, restart {restarts})", w.pid, rs.conc, lo + offset);
+                self.worker = w;
+                self.mark = CpuMark::take(&self.worker);
+                self.sample = (self.mark, Instant::now());
+                true
+            }
+            Err(e) => {
+                log::error!("lease {id}: cannot start the worker again: {e}");
+                self.after = Some(After::Kill(format!("restart: {e}")));
+                false
+            }
+        }
     }
 
     /// rev 15 (PROTOCOL 10.4, 10.6), each tick of a rolling lease: more ids when the worker is low (at most once per
@@ -1115,6 +1342,8 @@ impl Run {
         }
         r.finishing = true;
         r.want_more = false;
+        // (a restart for memory gives way: the lease ends with this worker)
+        r.restart = None;
         log::info!("lease {}: finishing the games in flight ({why})", self.lease.lease_id);
         if !matches!(self.state, WState::Stopping(_)) {
             self.send(json!({"op": "finish"}));
@@ -1170,7 +1399,11 @@ impl Run {
             if let Err(e) = eng.results.begin(&self.lease) {
                 log::warn!("lease {id}: could not save the lease: {e}");
             }
-            self.send(json!({"op": "extend", "games": total}));
+            // (the worker's games count from its own first id; a worker without its job yet gets them in the job line)
+            let offset = self.roll.as_ref().map_or(0, |r| r.offset);
+            if self.job_sent {
+                self.send(json!({"op": "extend", "games": total - offset}));
+            }
         } else if a.games < r.released {
             log::warn!("lease {id}: the coordinator's extension says {} ids, fewer than the {} released; ignored", a.games, r.released);
         }
@@ -1215,9 +1448,11 @@ impl Run {
 
     fn on_event(&mut self, eng: &mut Engine, ev: Ev) {
         match ev {
-            Ev::Worker(WorkerMsg::Line(v)) => self.on_worker(eng, v),
-            Ev::Worker(WorkerMsg::BadLine(s)) => log::warn!("lease {}: worker wrote a non-JSON line: {s}", self.id()),
-            Ev::Worker(WorkerMsg::Eof) => self.eof = true,
+            // (an earlier worker's lines, after a restart: dropped)
+            Ev::Worker(g, _) if g != self.wgen => {}
+            Ev::Worker(_, WorkerMsg::Line(v)) => self.on_worker(eng, v),
+            Ev::Worker(_, WorkerMsg::BadLine(s)) => log::warn!("lease {}: worker wrote a non-JSON line: {s}", self.id()),
+            Ev::Worker(_, WorkerMsg::Eof) => self.eof = true,
             Ev::Beat(r) => self.on_beat(eng, r),
             Ev::Ckpt(r) => {
                 self.ckpt_inflight = false;
@@ -1233,7 +1468,10 @@ impl Run {
                             // rev 15 (PROTOCOL 10.6): with the model's sha256 (the worker self-tests it before switching)
                             op["sha256"] = json!(c.sha256);
                         }
-                        self.send(op);
+                        // (a restarted worker without its job yet gets the network in its job line)
+                        if self.job_sent || !rolling {
+                            self.send(op);
+                        }
                         self.prep.ckpt = Some((c, f));
                     }
                     Err((c, e)) => {
@@ -1350,7 +1588,7 @@ impl Run {
                 }
             }
         }
-        j.insert("out_dir".into(), json!("out"));
+        j.insert("out_dir".into(), json!(self.out_dir));
         j.insert("runtime_dir".into(), self.prep.runtime.as_ref().map(|r| json!(r.dir)).unwrap_or(Value::Null));
         // rev 15 (PROTOCOL 10.5): a worker with the feature keeps `conc` games in flight past `games` (the released
         // ids), asks for more with `low`, and flushes finished games every `flush_s`
@@ -1358,6 +1596,9 @@ impl Run {
             Some(r) => {
                 j.insert("rolling".into(), json!(true));
                 j.insert("flush_s".into(), json!(r.setup.flush_s));
+                // (a restarted worker: the ids after the ones its predecessors started, PROTOCOL 10.6)
+                j.insert("gid_base".into(), json!(r.setup.lo + r.offset));
+                j.insert("games".into(), json!(r.released - r.offset));
             }
             None => {
                 j.remove("rolling");
@@ -1507,6 +1748,10 @@ impl Run {
             "error" => {
                 let msg = v.get("message").and_then(Value::as_str).unwrap_or("").to_string();
                 if v.get("fatal").and_then(Value::as_bool).unwrap_or(false) {
+                    // rev 15 (PROTOCOL 10.6): a rolling worker out of memory is started again with fewer games
+                    if self.memory_failure(eng, &msg) {
+                        return;
+                    }
                     self.report(eng, "crash", &format!("worker fatal error: {msg}"), None);
                     self.kill("fatal error");
                 } else {
@@ -1529,7 +1774,7 @@ impl Run {
                 return;
             }
         };
-        let src = self.work.join("out").join(rel);
+        let src = self.work.join(&self.out_dir).join(rel);
         if !src.is_file() {
             log::error!("lease {}: announced result {path} does not exist", self.id());
             return;
@@ -1710,8 +1955,18 @@ impl Run {
             self.store_bytes(eng, "fuzz", done_n, &body, true, ids);
         }
         let metas = eng.results.metas(&id);
-        if end.is_none() || !self.job_sent {
+        // (after a restart the last worker's `unfinished` covers only its own ids: the lease's are worked out)
+        let restarted = self.roll.as_ref().is_some_and(|r| r.restarts > 0);
+        if end.is_none() || !self.job_sent || restarted {
             unfinished = Some(compute_unfinished(&self.lease, &metas).unwrap_or(Value::Null));
+        }
+        // rev 15 (PROTOCOL 10.6): a rolling job's memory per game measured over the lease, remembered when more than
+        // it was planned with
+        if let (Some(r), Some(conc)) = (self.roll.as_ref().filter(|r| r.active && r.peak_mb > 0), self.conc) {
+            let per = crate::rolling::measured_per_game(r.peak_mb, conc, r.mem.cost);
+            if per > r.mem.cost.per_game_mb && Learned::raise(&eng.cfg.layout, self.lease.run.as_deref().unwrap_or(""), r.gpu, per) {
+                log::info!("lease {id}: the worker committed up to {} MB with {conc} games in flight: remembering {per} MB per game for this run", r.peak_mb);
+            }
         }
         let given_back = !(end.is_some() && matches!(reason.as_str(), "done" | "finish") && self.after.is_none());
         let done = DoneReq {

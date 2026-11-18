@@ -344,7 +344,8 @@ impl Engine {
 
     pub fn caps(&mut self, d: &Decision) -> Caps {
         let s = self.settings();
-        let (avail, total) = crate::signals::memory_mb();
+        // (the memory the signal source sees: the PC's, or the tests' own)
+        let (avail, total) = self.signals.memory_mb();
         let ram_free = avail.saturating_sub(mem_floor_mb(total));
         Caps {
             threads: s.threads(self.profile.cores, self.profile.threads),

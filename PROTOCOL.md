@@ -1226,18 +1226,21 @@ A rolling lease is a self-play lease (section 3) plus
   the agent then closes the lease as a classic one. The agent sends `extend` only to a worker whose `hello` lists
   `rolling`.
 
-### 10.6 The agent (0.2.13)
+### 10.6 The agent (0.2.13; memory: 0.2.14)
 
 - Sends `"features": ["rolling"]` in `/v1/lease`.
 - **Games in flight.** `conc` of the job line = the lease's `inflight` for the job's provider (a GPU winner: `gpu`,
   else `cpu`). `"auto"`: CPU: 32 in flight in 4 groups; GPU: from the bench of the job's own network (9.6), the
   in-flight count among 64, 128, 256 and 512 after which doubling gains less than 15% rows/s (each rated at its batch:
   1 group from 256 in flight, else 2, batches of half of it), in those groups; both capped so that the games in flight
-  fit `caps.ram_mb` at 40 MB per game in flight plus 1 GB for the worker ((`ram_mb` - 1000) / 40, rounded down to a
-  multiple of 32 when at least 32; agent constants, `rolling.rs`, from the canary measurement of 2026-11-16: a
-  4070 Ti PC with 9,494 MB gets 192). A number is taken as it is (a CPU job in the
-  template's `groups`, a GPU job in at most 2); anything that is neither a number from 1 to 4,096 nor `"auto"` counts as
-  `"auto"`. `games` of the job line = the released ids; the template's `conc` / `groups` are replaced as for a GPU job
+  fit the worker's memory limit (`caps.ram_mb`, the job object's limit): planned to commit at most 85% of it at a base
+  plus a cost per game in flight - 1,800 MB + 45 MB on a GPU, 600 MB + 45 MB on the CPU, or this PC's measured cost
+  for the run when it is higher (**Memory**, below) - ((0.85 x `ram_mb` - base) / per game, rounded down to a multiple
+  of 32 when at least 32; agent constants, `rolling.rs`, from the soak of 2026-11-17: pb3's network at 224 in flight
+  with no limit levelled off at about 11.4 GB, 1.75 GB + 43 MB per game; a 4070 Ti PC with a 10,735 MB limit gets 160
+  on the GPU, where 0.2.13's 1 GB + 40 MB per game gave 224 and every lease ran into the limit after 21-25 minutes). A number is taken as it is (a CPU job in the template's `groups`, a GPU job in at most 2) unless this
+  PC measured the run's cost (then it is capped the same way); anything that is neither a number from 1 to 4,096 nor
+  `"auto"` counts as `"auto"`. `games` of the job line = the released ids; the template's `conc` / `groups` are replaced as for a GPU job
   today (section 5 tuning fields). A lease whose `rolling` doesn't fit its job (`block[0]` = `gid_base`, the released
   ids inside the block), or that has no definition, runs as a classic lease; `flush_s` is kept within 10 to 3,600.
 - **Ids.** On `low`, `POST .../extend` for about 2 x `conc`; on `{"games"}`, `{"op": "extend", "games": total}` to
@@ -1261,7 +1264,27 @@ A rolling lease is a self-play lease (section 3) plus
   template changes (above), and when the agent has a newer version ready to switch to (section 6) - a rolling lease
   would otherwise never let it update: while one runs, the agent checks `GET /v1/agent/latest` every 6 hours as between
   leases (the download keeps the lease's files in the cache; the `evict` list is applied when the lease ends).
-- Stats add `inflight` (the chosen `conc`) and `released` (the lease's released ids).
+- **Memory** (0.2.14). The agent reads the worker's committed memory (what the job's limit counts) at every tick.
+  - At 92% of the limit it sends `finish`; once the worker has ended (`end` `finish`) it starts a new worker in the
+    same lease with fewer games in flight: what fits at the measured cost per game ((committed - base) / games in
+    flight, if higher than the plan's), at most 3/4 of the games in flight before (rounded as above, always fewer).
+    The new worker's job line has the lease's latest network, an `out_dir` of its own, `gid_base` = the first released
+    id its predecessor never started (the single tail range of its `end`'s `unfinished`; anything else: the end of the
+    released ids) and `games` = the released ids from there; `extend` totals count from its `gid_base`. Nothing is lost.
+  - A worker that runs into the limit - its fatal `error` or its stderr says an allocation failed (ONNX Runtime's "bad
+    allocation", Rust's "memory allocation of N bytes failed", ...), or it exits without `end` with the job's peak at
+    97% of the limit or more - is started again the same way, its games in flight lost: the new worker's ids start at
+    the end of the released ids (games 0: it asks with `low`). The lost ids go back to the pool when the lease closes:
+    after a restart `done`'s `unfinished` is the released ids not credited (worked out from the results, as for a worker
+    that died). Reported once per lease (`/v1/crash` kind `crash`); the lease is not given back.
+  - At most 4 restarts per lease. After that, or when one game in flight already didn't fit, a worker at 92% finishes
+    the lease (`finish`) and one that runs into the limit fails the lease as before.
+  - The measured cost per game is remembered per run and CPU / GPU job in `state\rolling_memory.json` (only ever
+    raised): at each restart, and when a rolling lease ends whose worker committed more per game than it was planned
+    with. "auto" and a run's number are planned with it from then on.
+  - No wire change: the coordinator sees one lease, its released ids and its extensions as before.
+- Stats add `inflight` (the chosen `conc`; after a restart the current worker's) and `released` (the lease's released
+  ids).
 
 ### 10.7 Results, staleness and closing
 
@@ -1303,6 +1326,11 @@ Coordinator details (from building it, rev 15):
   "rolling" column in Runs and a "Rolling leases" table.
 
 ## Changes
+- v1 rev 15, agent 0.2.14 (2026-11-17; canary first; no coordinator or wire change): **rolling leases and memory**
+  (section 10.6, **Memory**). "auto" plans the games in flight to commit at most 85% of the worker's memory limit at a
+  measured cost per game; a worker at 92% of its limit finishes its games and the lease goes on with a new worker with
+  fewer in flight; one that runs into the limit is started again with fewer (its games in flight lost, nothing else);
+  the run's cost per game measured on the PC is remembered and plans its next leases.
 - v1 rev 15 (2026-11-16; coordinator migration 0011, agent 0.2.13 canary first, worker feature `rolling`): **rolling
   self-play leases** (section 10). A run's `selfplay.rolling` makes its self-play leases to agents from 0.2.13 (request
   `features: ["rolling"]`) long-lived: a reserved block of ids released as the worker asks (`POST /v1/lease/{id}/extend`),

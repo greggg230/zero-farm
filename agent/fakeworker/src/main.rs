@@ -11,8 +11,17 @@
 //!  "fatal_after": null,        // games finished, then {"ev":"error","fatal":true} + exit 2
 //!  "fail_seeds": [10450007],   // fuzz: seeds that "fail"
 //!  "chunk": 1000,              // fuzz: seeds per step
-//!  "selftest_fail_gen": null}  // eval: this network fails its self-test (then a fatal error)
+//!  "selftest_fail_gen": null,  // eval: this network fails its self-test (then a fatal error)
+//!  "mem_per_game_mb": 0,       // rolling: memory committed per game in flight (the job's conc), at the start
+//!  "mem_grow_mb": 0,           // rolling: memory committed per finished game on top (a creep)
+//!  "mem_grow_until": null,     // rolling: ... until this many games are finished (then it stays)
+//!  "oom_abort": false}         // a failed commit: abort on stderr (Rust's message) instead of a fatal error
 //! ```
+//!
+//! Memory (rolling jobs) is committed in 1 MB pieces (`VirtualAlloc`), so it counts against the job's memory limit
+//! as a real worker's does and the job's peak ends within 1 MB of the limit when a commit fails. A failed commit ends
+//! the worker like a real one out of memory: ONNX Runtime's fatal error (`... bad allocation`, exit 2), or with
+//! `oom_abort` Rust's abort (`memory allocation of N bytes failed` on stderr, exit 0xC0000409).
 //!
 //! Eval jobs (PROTOCOL 5.2) self-test every network of `models` (the file must exist and match
 //! its sha256), then write one JSON row per game to `evals-<seq>.jsonl` files announced with
@@ -172,6 +181,10 @@ struct Cfg {
     selftest_fail_gen: Option<u64>,
     /// Rolling jobs: overrides the job's `flush_s`.
     flush_ms: Option<u64>,
+    mem_per_game_mb: u64,
+    mem_grow_mb: u64,
+    mem_grow_until: Option<u64>,
+    oom_abort: bool,
 }
 
 impl Cfg {
@@ -204,6 +217,10 @@ impl Cfg {
             chunk: u("chunk", 1000).max(1),
             selftest_fail_gen: o("selftest_fail_gen"),
             flush_ms: o("flush_ms"),
+            mem_per_game_mb: u("mem_per_game_mb", 0),
+            mem_grow_mb: u("mem_grow_mb", 0),
+            mem_grow_until: o("mem_grow_until"),
+            oom_abort: f.get("oom_abort").and_then(Value::as_bool).unwrap_or(false),
         }
     }
 }
@@ -212,6 +229,32 @@ enum Stop {
     No,
     Finish,
     Quit,
+}
+
+/// Committed memory (`VirtualAlloc` MEM_COMMIT, 1 MB pieces, never freed): what a job's memory limit counts.
+#[derive(Default)]
+struct Mem {
+    pieces: Vec<usize>,
+}
+
+impl Mem {
+    /// Commits `mb` more MB, or ends the worker the way a real one out of memory ends (`Cfg::oom_abort`).
+    fn commit(&mut self, mb: u64, out: &Out, abort: bool) {
+        use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
+        for _ in 0..mb {
+            let p = unsafe { VirtualAlloc(std::ptr::null(), 1 << 20, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
+            if p.is_null() {
+                eprintln!("fakeworker: a commit failed with {} MB committed", self.pieces.len());
+                if abort {
+                    eprintln!("memory allocation of 1048576 bytes failed");
+                    std::process::exit(0xC0000409u32 as i32);
+                }
+                out.send(json!({"ev": "error", "message": "ONNX Runtime: Non-zero status code returned while running Concat node. Status Message: bad allocation", "fatal": true}));
+                std::process::exit(2);
+            }
+            self.pieces.push(p as usize);
+        }
+    }
 }
 
 struct W {
@@ -230,6 +273,7 @@ struct W {
     rolling: bool,
     /// A rolling job's released ids (`games`, raised by `extend`).
     games: u64,
+    mem: Mem,
 }
 
 impl W {
@@ -419,6 +463,8 @@ impl W {
         let flush = Duration::from_millis(self.cfg.flush_ms.unwrap_or(job.get("flush_s").and_then(Value::as_u64).unwrap_or(120) * 1000));
         self.games = job.get("games").and_then(Value::as_u64).unwrap_or(4);
         eprintln!("fakeworker: rolling job, {} ids released, {conc} in flight, flush {flush:?}", self.games);
+        // the games in flight's memory
+        self.mem.commit(conc * self.cfg.mem_per_game_mb, &self.out, self.cfg.oom_abort);
         let mut unflushed = Vec::new();
         let mut first_fin: Option<Instant> = None;
         let mut next = 0u64;
@@ -440,6 +486,9 @@ impl W {
                 self.done += 1;
                 self.out.send(json!({"ev": "fin", "n": 1}));
                 self.after_game_hooks();
+                if self.cfg.mem_grow_until.is_none_or(|u| self.done <= u) {
+                    self.mem.commit(self.cfg.mem_grow_mb, &self.out, self.cfg.oom_abort);
+                }
             } else {
                 // every released id is played: wait for more (still answering ops, sending status)
                 if low_for != Some(self.games) {
@@ -651,6 +700,7 @@ fn main() {
         stop: Stop::No,
         rolling: rolling_feature && job.get("kind").and_then(Value::as_str) == Some("selfplay") && job.get("rolling").and_then(Value::as_bool) == Some(true),
         games: 0,
+        mem: Mem::default(),
     };
     if job.get("model").and_then(Value::as_str).is_some() {
         w.out.send(json!({"ev": "selftest", "provider": "cpu", "max_abs": 0.0, "ok": true}));
