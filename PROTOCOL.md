@@ -7,7 +7,8 @@ A change to anything here is a protocol change: bump the version it belongs to a
 bottom.
 
 Versions: HTTP API `v1` (path prefix), agent↔worker protocol `aw/1`, network files `zero-onnx/1`,
-manifests `manifest/1`. Current revision: v1 rev 17 (section 11, platforms: macOS on Apple silicon).
+manifests `manifest/1`. Current revision: v1 rev 18 (section 12, hardware routing; rev 17: section 11, platforms:
+macOS on Apple silicon).
 
 ## 1. Conventions
 
@@ -198,12 +199,15 @@ lease hears about a diagnostics request on its next `/v1/lease`.
 
 How the coordinator picks (DESIGN 5.1): diagnostics asked for this machine first; then runs'
 evaluation (unissued games) and self-play (short of quota), by run priority × fit ÷ (1 + that job's
-active leases), evaluation before self-play at the same tier (rev 7); then fuzz, the backfill (rev 14: a campaign with a `share` competes with the runs' games within it, section 5.4; also where a
+active leases), evaluation before self-play at the same tier (rev 7; rev 18: on a PC that plays self-play on its GPU,
+only a batch the CPU PCs couldn't finish within the horizon, section 12.2); then fuzz, the backfill (rev 14: a campaign with a `share` competes with the runs' games within it, section 5.4; also where a
 job with `"gpu": "preferred"` goes on a PC that isn't GPU-eligible for it, section 8). Caps must cover the job's `needs` and the disk its uncached builds (and, rev 5, an
 eval job's uncached checkpoints) take. A lease is
 sized to about 450 s of this machine's measured rate for that job (ids per running second, from its
 past leases; its hardware class's average before it has one; 16 games / 10 eval games / 20000
-seeds before either), unless the run sets `games_per_lease` / the campaign sets `chunk`. Every
+seeds before either), unless the run sets `games_per_lease` / the campaign sets `chunk` (rev 18: an `auto` eval
+lease on the CPU gets at least 2 games per thread, section 12.3). Rev 18: after fuzz, tier 3, a PC's self-play that it
+would play on its CPU while the run has a GPU version (section 12.1). Every
 lease covers one contiguous id range.
 
 ```json
@@ -411,6 +415,7 @@ tools also send an Access service token (`CF-Access-Client-Id`, `CF-Access-Clien
 | `GET /v1/admin/machines` · `POST /v1/admin/machine/{id}/revoke` | revoking cancels the machine's active leases at once (their ids go back to the pool) → `{"ok": true, "cancelled"}` |
 | `POST /v1/admin/machine/{id}` | `{"name"?, "channel"?, "paused"?, "unblock"?}`; a paused machine gets `wait_s` / `paused_by_admin`; `"unblock": true` (rev 5) lifts the machine's build blocks (`/v1/crash` kind `blocked`) and answers `{"ok": true, "unblocked": n}` |
 | `POST /v1/admin/pause` | `{"paused": true \| false}`: farm-wide, no new leases while paused |
+| `POST /v1/admin/routing` | rev 18: `{"on": bool, "eval_horizon_s": 0..604800, "eval_games_per_thread": 0..16}`, any of them; the others keep their values → `{"ok": true, "on", "eval_horizon_s", "eval_games_per_thread"}`. `GET /v1/admin/routing` → the same fields and `"stored"` (false: never set, the defaults). Section 12 |
 | `POST /v1/admin/evict` | rev 12: `{"builds": ["<build_id>", ...]}` (at most 64; `[]` clears it) replaces the evict list → `{"ok": true, "builds"}` (deduplicated). `GET /v1/admin/evict` → `{"builds"}`. It rides on every `GET /v1/agent/latest` (section 3) |
 | `POST /v1/admin/diag` | `{"machine_id" \| "class", "kind": "sweep" \| "profile" \| "stability" \| "logs", "params"}` → `{"requests": [{"id", "machine_id"}]}`. `class` = a hardware class as the stats show it (`"<cpu> / <gpu or 'no gpu'>"`). `logs` goes out as `upload_diag`; the others become `diag` leases (`params.build_id` or `params.run` picks the build) |
 | `GET /v1/admin/diag?machine_id=` | requests, uploads and diag-lease results with their R2 keys |
@@ -944,7 +949,8 @@ runtime>]` when the profile has it, else `providers`. A machine is **GPU-eligibl
 `caps.gpu` and it verified a GPU provider the allowlist allows. `required`: only GPU-eligible machines;
 `preferred`: GPU-eligible machines at the job's tier, others as backfill (fit 0.25); `any`: no filter.
 `gpu: preferred | required` with an allowlist that holds no GPU provider is refused (400). Evaluation is
-routed first, then self-play (within a tier); fuzz stays the backfill. Every lease carries the job's
+routed first, then self-play (within a tier); fuzz stays the backfill. Rev 18 (section 12) adds hardware routing on
+top: CPU self-play of a run with a GPU version after fuzz, and eval after GPU self-play unless the batch is behind. Every lease carries the job's
 allowlist as `providers` (null on diag leases).
 
 ## 9. Runtime packs per GPU vendor, compressed build files, the measured provider choice (rev 11)
@@ -1352,31 +1358,41 @@ Platform names: `windows-x64` and `macos-arm64` (Apple silicon, macOS 13 or newe
   (every older agent). The profile may carry the same value as `platform` (informational; the header counts).
 - `POST /v1/enroll` with an unknown platform → 400. The coordinator stores the platform with the machine
   (`machines.platform`, migration 0013; existing machines `windows-x64`). It is fixed at enrollment: a later request
-  whose header names another platform → 409 `conflict` with `"reason": "platform"` (a machine token copied to
-  another computer: install there instead).
-- The admin stats and `GET /v1/admin/machines` show each machine's `platform`.
+  whose header names another platform (no header: `windows-x64`) → 409 `conflict` with `"reason": "platform"` (a
+  machine token copied to another computer: install there instead); an unknown platform → 400.
+- The admin stats and `GET /v1/admin/machines` show each machine's `platform`; the stats' `limits` add
+  `platform_agent`.
 
 ### 11.2 Agent releases per platform
 
 - `agent_releases.platform` (migration 0013; existing rows `windows-x64`). `POST /v1/admin/agent/release` takes
-  `"platform"` (default `windows-x64`), which must equal the agent build's manifest platform (11.3).
+  `"platform"` (default `windows-x64`), which must equal the agent build's manifest platform (11.3); the answer adds
+  `platform`.
 - Every lookup of "the channel's latest release" uses the newest release of (channel, platform), with the
   machine's platform (or the request's, before enrollment): enroll's 426, the update rule of `POST /v1/lease`
   (section 3), `GET /v1/agent/latest`, `GET /download`, the onboarding page and the stats' `releases` (one per
-  channel and platform). So `latest` and `min_agent` are per platform: a Windows-only release never asks a Mac to
-  update, and the reverse.
+  channel and platform, with `platform`). So `latest` and `min_agent` are per platform: a Windows-only release never
+  asks a Mac to update, and the reverse. Enroll's 426 `download` names the platform when it isn't `windows-x64`
+  (`/download?platform=macos-arm64`, `&channel=canary` as before).
 - GitHub (section 2.1): a macOS release is the GitHub Release `agent-macos-v<version>` (never marked Latest;
   `agent-v<version>` stays Windows), assets `ZeroFarm-macos-arm64.tar.gz`, `SHA256SUMS` (its one line: the tarball),
   `SHA256SUMS.minisig` (same rules as 2.1). Its `github_url` must be exactly
   `https://github.com/<GITHUB_REPO>/releases/download/agent-macos-v<version>/ZeroFarm-macos-arm64.tar.gz`.
-- `GET /download?platform=macos-arm64` (optional `channel` as today) → 302 to the newest macOS release's tarball.
+- `GET /download?platform=macos-arm64` (optional `channel` as today) → 302 to the newest macOS release's tarball;
+  every `/download` answer adds `x-farm-platform`; an unknown `platform` → 400.
   `GET /install-macos.sh` (optional `?channel=canary`) → a POSIX shell script (`text/plain`) that downloads that
   tarball, checks it against the release's `SHA256SUMS`, unpacks it into a temporary directory and runs
   `./ZeroFarm setup "$@"` (so `curl -fsSL https://farm.greggg230.com/install-macos.sh | sh -s -- --invite CODE`
   works, and without `--invite` the setup asks on the terminal). The tarball holds the launcher `ZeroFarm`, the
   agent package (its signed manifest and files) and nothing else, flat (`ZeroFarm`, `farm-agent`, `manifest.json`,
   `manifest.json.minisig`; executables 0755); `ZeroFarm setup` verifies the package's manifest against its embedded
-  release keys before installing it.
+  release keys before installing it. The script (`set -eu`, every failure a message and exit 1)
+  stops unless `uname -s` is `Darwin` and `uname -m` is `arm64`; reads the tarball's URL from the coordinator's own
+  `/download?platform=macos-arm64[&channel=]` (the request's origin) and goes on only for
+  `https://github.com/<GITHUB_REPO>/releases/download/agent-macos-v<version>/ZeroFarm-macos-arm64.tar.gz`; fetches
+  `SHA256SUMS` from that release (`shasum -a 256 -c` of the tarball's line); and, piped into `sh`, gives setup the
+  terminal (`/dev/tty`) as its stdin. It is served before any macOS release too (it then says there is none).
+- The onboarding page shows the macOS install command once a macOS release names a `github_url`.
 
 ### 11.3 Builds per platform
 
@@ -1389,8 +1405,9 @@ Platform names: `windows-x64` and `macos-arm64` (Apple silicon, macOS 13 or newe
   executable bit is not in the manifest: the agent sets mode 0755 on a build's `entry` (and an agent package's
   `ZeroFarm`) after verifying it. Binaries are ad-hoc code-signed (the arm64 linker does it) and not notarized;
   files the agent downloads itself carry no quarantine attribute, so Gatekeeper doesn't check them.
-- `POST /v1/admin/build` stores the manifest's platform (`builds.platform`, migration 0013); an unknown platform →
-  400.
+- `POST /v1/admin/build` stores the manifest's platform (`builds.platform`, migration 0013) and answers it; an
+  unknown platform, or a manifest that names a platform with `min_agent` absent or below `PLATFORM_AGENT` → 400
+  (`problems`).
 - An agent from 0.3.0 checks, after the lease's definition (section 7) and before downloading anything but the
   manifests (fetched and verified alone, as in 9.5), that the lease's worker build (and runtime pack) manifest names
   its own platform (a manifest without one is `windows-x64`'s: a Mac refuses it). A mismatch → `done` with
@@ -1400,23 +1417,36 @@ Platform names: `windows-x64` and `macos-arm64` (Apple silicon, macOS 13 or newe
 ### 11.4 Which build a machine gets
 
 - **Runs.** An alternate (9.4) takes `when.platform` (default `windows-x64`), and `when.vendor` becomes optional:
-  an alternate without `vendor` is a **CPU alternate**, offered to every machine of its platform with no GPU
-  condition (its runtime must have no `gpu`). `PUT /v1/admin/run/{run}` checks that the alternate's build and
-  runtime manifests name `when.platform` (else 400); still at most 4 alternates.
+  an alternate without `vendor` whose `when` names `platform` (`windows-x64` too) is a **CPU alternate**, offered
+  to every machine of its platform with no GPU condition (its runtime must have no `gpu`; no `min_driver`). One
+  that names neither, with a pack that names no GPU vendor, is refused as before rev 17 (a GPU pack such as Windows
+  ML needs its vendor spelled out). GPU alternates (a vendor) are `windows-x64` only in rev 17 (else 400).
+  `PUT /v1/admin/run/{run}` checks that the alternate's build and runtime manifests name `when.platform`, and that
+  the default build and runtime name one platform (else 400); still at most 4 alternates. A CPU alternate is stored
+  (and shown) with its `platform`, a GPU alternate without one, as before rev 17.
 - For a self-play or eval job and an agent of at least `ALT_RUNTIME_AGENT`, the lease carries: the first alternate
   **of the machine's platform** that it qualifies for (a GPU alternate: 9.4's conditions 1-7; a CPU alternate:
   conditions 5-7 and the build's `aw`), else the run's default when the default build's platform is the machine's,
   else nothing from that run for this machine (it gets other work). An agent older than `ALT_RUNTIME_AGENT` is
-  `windows-x64` and is never offered a build of another platform.
+  `windows-x64` and is never offered a build of another platform. When the default is of another platform, the
+  first alternate of the machine's platform that only its builds' `min_agent` keeps from this agent counts as the
+  run's build for section 3's update rule (`{"update"}` when the channel offers that agent, else nothing from the
+  run), as a default build's would.
 - **Campaigns.** `PUT /v1/admin/campaign/{id}` takes `"alternates": [{"build_id", "when": {"platform"}}] | null`
-  (at most 4 worker builds, one per platform at most, each of the campaign's game and profile; migration 0013
-  `campaigns.alternates`). A machine gets the campaign's alternate of its platform (registered, not blocked for it,
-  `min_agent` and `aw` met, listed in the campaign's current definition's `builds`), else the campaign's build when
-  its platform is the machine's, else nothing from that campaign. `GET /v1/admin/campaign/{id}` and the stats show
-  them.
-- **Diag leases** (`POST /v1/admin/diag`): a request whose build (from `params`) is of another platform than the
-  machine's → 400.
-- **The admin view.** Per run and campaign the stats add `platforms`: the platforms that can get its jobs.
+  (at most 4 worker builds, one per platform at most, each of the campaign's game and profile, not the campaign's
+  own build; `when.platform` required; migration 0013 `campaigns.alternates`; a PUT without them removes them). A
+  machine gets the campaign's alternate of its platform (registered, not blocked for it, `min_agent` and `aw` met,
+  listed in the campaign's current definition's `builds`), else the campaign's build when its platform is the
+  machine's, else nothing from that campaign (an alternate that only its `min_agent` keeps from the agent counts
+  for the update rule, as for runs). `GET /v1/admin/campaign/{id}` and the stats show them, each with `problems`
+  (why the current definition doesn't authorize it).
+- **Diag leases** (`POST /v1/admin/diag`): a request whose build (`params.build_id`, else `params.run`'s default
+  build) is of another platform than a target machine's → 400. A diag lease never carries a build of another
+  platform (diag leases go only to agents before `DEFINITION_AGENT`, all `windows-x64`).
+- The coordinator checks the builds of every lease against the machine's platform again when it grants it (under
+  the scope's lock): a build of another platform is never leased, whatever chose it.
+- **The admin view.** Per run and campaign the stats (and `GET` run and campaign) add `platforms`: the platforms
+  that can get its jobs (the default build's, and each alternate's that the current definition authorizes).
 - **Results across platforms.** What the engine alone decides is identical on every platform (fuzz seeds, record
   replay). A network's outputs differ in rounding between ONNX Runtime's x64 and arm64 kernels, so a game that
   consults a network can play out differently on a Mac. Self-play records are unaffected (the trainer replays the
@@ -1482,15 +1512,72 @@ Platform names: `windows-x64` and `macos-arm64` (Apple silicon, macOS 13 or newe
   that runs this root's launcher) and the root removed. A browser download (a `.pkg` or `.app`) would need Developer
   ID signing and notarization: later, the owner's decision.
 
+## 12. Hardware routing (rev 18; coordinator migration 0014, no agent change)
+
+Each kind of PC gets the work it is comparatively best at. Measured on the farm (2026-11-18, games per second):
+self-play of a run with a CUDA version is ~9-14x faster on an NVIDIA PC than on an 8-core CPU-only PC, while an eval
+batch (a lease lasts about as long as its slowest game) runs at ~90% of a recent NVIDIA GPU PC's pace on that CPU PC, and fuzz
+uses no network at all. So: CPU PCs take eval and fuzz first and self-play last; GPU PCs take self-play first and eval
+only when the CPU PCs can't keep up. Nobody idles: every rule changes the order, never what a PC may get.
+
+The owner's switch (`POST /v1/admin/routing`, section 4; settings key `hw_routing`): `on` (default true; false: the
+order of rev 17 exactly), `eval_horizon_s` (default 1800), `eval_games_per_thread` (default 2; independent of `on`).
+
+### 12.1 CPU self-play is the last resort while the run has a GPU version
+
+A run **has a GPU version** when it lists an alternate (section 9.4) for a GPU vendor the farm uses, or its default
+runtime pack requires a GPU (`gpu` in its manifest, section 9.2). A default pack that only *may* use a GPU (DirectML)
+counts by its alternates alone. A CPU alternate (rev 17, section 11.4: no `when.vendor`, e.g. a macOS build) is not a GPU version.
+
+A PC **plays a run's self-play on its GPU** when its candidate is a GPU lease (an alternate it qualifies for, or a GPU
+provider that passed with the default pack here; agents from 0.2.10) and its `caps.gpu_games[run]` isn't 0 (its bench
+found no GPU that pays for this run's network).
+
+On a PC that doesn't, the self-play of a run with a GPU version moves to **tier 3**: after fuzz (tier 2). With no fuzz
+or eval for the PC, it still plays the self-play. A run without a GPU version is unchanged (CPU PCs play it in tier 1).
+A rolling lease (section 10.4) of such self-play ends at renewal when fuzz waits, like any lower tier.
+
+### 12.2 Eval on a PC that plays self-play on its GPU
+
+Such a PC records it (`machines.gpu_play` = 1, written on each offer when it changes; every other PC 0). For it, an
+eval batch in tier 1 that may run on the CPU (`gpu` not `required`) is **deferred** unless it is **behind**:
+
+  unissued games > (sum of the CPU PCs' eval rates) x `eval_horizon_s`
+
+where the CPU PCs are the machines with `gpu_play` 0, seen in the last 300 s, not paused or revoked, without a fresh
+presence (section 3, rev 16), not the asking PC; each counts its measured eval rate for that batch (ids per running
+second, PROTOCOL 3), else its average over every eval it played, else nothing (no CPU capacity: behind while anything
+is unissued). A deferred batch ranks after the PC's self-play (rank 1.5: still tier 1, before fuzz; never earlier than
+a background share puts it, section 5.3), so the PC gets it when its self-play has no headroom. On a rolling lease's
+renewal a deferred batch counts only while the lease's own generation has no headroom (the lease would only wait).
+`eval_horizon_s` 0: never deferred (eval before self-play everywhere, as before).
+
+The horizon is the latency the owner accepts: GPU PCs help a batch until what is left would take the CPU PCs at most
+that long, so a batch takes at most about `eval_horizon_s` longer than with every PC on it.
+
+### 12.3 CPU eval lease floor
+
+An eval lease takes about as long as its slowest game, so a CPU lease of a few games measures a low rate and its
+`auto` size (450 s of that rate) stays small. An `auto` eval lease that is not a GPU lease gets at least
+`eval_games_per_thread` x `caps.threads` games, no more than the agent's RAM holds (`(caps.ram_mb - 600) / 45`,
+section 10.6's CPU plan) and within the eval limits (2..1024); a set `games_per_lease` is exact, as before. 0: no floor.
+
 ## Changes
+- v1 rev 18 (2026-11-18; coordinator migration 0014, no agent change): **hardware routing** (section 12). CPU
+  self-play of a run with a GPU version goes after fuzz (tier 3); a PC that plays self-play on its GPU takes an eval
+  batch after that self-play unless the CPU PCs online couldn't finish it within `eval_horizon_s` (1800 s); an `auto`
+  eval lease on the CPU gets at least 2 games per thread. `GET/POST /v1/admin/routing` (`on` false: the order of
+  before).
 - v1 rev 17 (2026-11-18; coordinator migration 0013, agents from 0.3.0): platforms (section 11). Header
   `x-farm-platform` (`windows-x64` when absent; fixed per machine at enrollment, 409 `reason: platform`);
   `machines.platform`, `builds.platform`, `agent_releases.platform`, `campaigns.alternates`; manifests take
   `platform` (min_agent 0.3.0+); agent releases, `min_agent`, `/v1/agent/latest`, `/download` and the onboarding
   page are per (channel, platform); macOS GitHub Releases `agent-macos-v<version>`; `GET /install-macos.sh`;
-  run alternates take `when.platform` and may omit `when.vendor` (CPU alternates); campaign alternates per
-  platform; agents refuse a build of another platform (`refused: "platform"`); the macOS agent (layout,
-  LaunchAgent, token file, process groups, IOKit idle/power, `keep_awake`, headless CLI).
+  run alternates take `when.platform` and may omit `when.vendor` (CPU alternates, which name their platform; GPU
+  alternates `windows-x64` only); campaign alternates per platform; an alternate held back only by `min_agent` drives
+  the update rule when the default is of another platform; agents refuse a build of another platform
+  (`refused: "platform"`); the macOS agent (layout, LaunchAgent, token file, process groups, IOKit idle/power,
+  `keep_awake`, headless CLI).
 - v1 rev 16 (2026-11-17; coordinator migration 0012, agent 0.2.14): `POST /v1/presence` (section
   3, Other): an agent that is on but may not work says why (owner using the PC, fullscreen app, battery, outside
   its hours, paused, low memory) every 5 min and when the reason changes; stats carry `presence`. Older agents

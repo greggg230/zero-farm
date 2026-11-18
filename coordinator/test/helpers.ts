@@ -28,12 +28,21 @@ export interface CallOpts {
   now?: number;
   agent?: string | null;
   env?: Record<string, string>; // vars for this request only (the Worker's; LeaseBook keeps its own)
+  // Rev 17: the x-farm-platform header. Absent: the platform the token's machine enrolled with (enroll() below), if any
+  // other than windows-x64; null: no header.
+  platform?: string | null;
 }
+
+// Rev 17 (PROTOCOL 11.1): machine tokens enrolled with a platform header, so that every helper's request from that
+// machine carries it (an agent from 0.3.0 sends it on every request).
+const platformOfToken = new Map<string, string>();
 
 export async function call(method: string, path: string, o: CallOpts = {}): Promise<Res> {
   const headers: Record<string, string> = { "x-test-now": String(o.now ?? clock.now), "x-farm-aw": "1" };
   if (o.agent !== null) headers["x-farm-agent"] = o.agent ?? AGENT;
   if (o.token) headers.authorization = `Bearer ${o.token}`;
+  const platform = o.platform !== undefined ? o.platform : o.token ? platformOfToken.get(o.token) : undefined;
+  if (platform) headers["x-farm-platform"] = platform;
   let body: BodyInit | undefined;
   if (method === "GET" || method === "HEAD") body = undefined;
   else if (o.raw !== undefined) body = o.raw;
@@ -92,13 +101,17 @@ export interface BuildOpts {
   requires_runtime?: string; // worker: the runtime pack it loads
   gpu?: { vendor: string; min_driver?: string; providers: string[] }; // runtime, rev 11 (PROTOCOL 9.2)
   size?: number; // the file's declared size (the manifest's; default: the real one)
+  platform?: string; // rev 17 (PROTOCOL 11.3): the manifest's platform (absent: none, i.e. windows-x64); min_agent 0.3.0 then
+  game?: string; // worker: default mtg
+  profile?: string; // worker: default release
 }
 
 // Uploads a manifest, its signature file and one file, and registers the build. Returns its id.
 export async function makeBuild(o: BuildOpts = {}): Promise<string> {
   const kind = o.kind ?? "worker";
-  const file = `${kind} binary ${o.tag ?? ""} ${o.version ?? ""}`;
-  const entry = kind === "agent" ? "farm-agent.exe" : kind === "worker" ? "mtgz-worker.exe" : "onnxruntime.dll";
+  const file = `${kind} binary ${o.tag ?? ""} ${o.version ?? ""}${o.platform ? ` ${o.platform}` : ""}`;
+  const mac = o.platform === "macos-arm64"; // macOS: executables have no extension, the pack is a dylib (PROTOCOL 11.3)
+  const entry = kind === "agent" ? (mac ? "farm-agent" : "farm-agent.exe") : kind === "worker" ? (mac ? "mtgz-worker" : "mtgz-worker.exe") : mac ? "libonnxruntime.dylib" : "onnxruntime.dll";
   const manifest: Record<string, unknown> = {
     manifest: 1,
     kind,
@@ -108,12 +121,14 @@ export async function makeBuild(o: BuildOpts = {}): Promise<string> {
   };
   if (kind !== "runtime") manifest.entry = entry;
   if (kind === "worker") {
-    manifest.game = "mtg";
+    manifest.game = o.game ?? "mtg";
     manifest.aw = o.aw ?? 1;
-    manifest.profile = "release";
+    manifest.profile = o.profile ?? "release";
     manifest.zero_onnx = [1];
   }
   if (o.min_agent) manifest.min_agent = o.min_agent;
+  else if (o.platform) manifest.min_agent = "0.3.0";
+  if (o.platform) manifest.platform = o.platform;
   if (o.requires_runtime) manifest.requires_runtime = o.requires_runtime;
   if (o.gpu) manifest.gpu = o.gpu;
   const text = JSON.stringify(manifest, null, 2);
@@ -340,13 +355,15 @@ export interface Machine {
   name: string;
 }
 
-export async function enroll(name = "pc", o: { channel?: string; profile?: object; digest?: string | null } = {}): Promise<Machine> {
+export async function enroll(name = "pc", o: { channel?: string; profile?: object; digest?: string | null; platform?: string } = {}): Promise<Machine> {
   const { codes } = ok(await admin("POST", "/v1/admin/invites", { count: 1, note: name, channel: o.channel }));
   const b = ok(
     await call("POST", "/v1/enroll", {
       body: { invite: codes[0], name, profile: o.profile ?? PROFILE, profile_digest: o.digest === null ? undefined : (o.digest ?? DIGEST) },
+      platform: o.platform,
     }),
   );
+  if (o.platform) platformOfToken.set(b.token, o.platform);
   return { machine_id: b.machine_id, token: b.token, name };
 }
 
@@ -359,6 +376,7 @@ export interface AskOpts {
   profile?: object | null;
   now?: number;
   env?: Record<string, string>;
+  platform?: string | null; // rev 17: the header (absent: the machine's own; null: none)
 }
 
 export function ask(m: Machine, o: AskOpts = {}): Promise<Res> {
@@ -367,6 +385,7 @@ export function ask(m: Machine, o: AskOpts = {}): Promise<Res> {
     agent: o.agent,
     now: o.now,
     env: o.env,
+    platform: o.platform,
     body: {
       profile_digest: o.digest ?? DIGEST,
       profile: o.profile ?? null,

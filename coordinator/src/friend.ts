@@ -7,16 +7,19 @@ import { authMachine, type Ctx, type MachineRow } from "./ctx";
 import { currentDefs, DEF_KEY_RE, leaseProblem, type JobKind } from "./definitions";
 import { bookFor } from "./leasebook";
 import { minAgentOk } from "./manifest";
+import { DEFAULT_PLATFORM, type Platform, requestPlatform, storedPlatform } from "./platform";
 import { parseRanges, total } from "./ranges";
 import { ipKey, take } from "./ratelimit";
 import {
   type Alternate,
+  type CampaignAlternate,
   GPU_LEASE_MIN,
   LUID_RE,
   MAX_RUNTIME_PROVIDERS,
   MAX_RUNTIMES,
   type Provider,
   type Routing,
+  altPlatform,
   altProviders,
   gpuEligible,
   gpuNeedOf,
@@ -30,7 +33,14 @@ import {
   storedRouting,
   verifiedProviders,
   GPU_VENDORS_OFF,
+  CPU_SELFPLAY_TIER,
+  DEFERRED_EVAL_RANK,
+  type HwRouting,
+  evalBehind,
+  evalCpuFloor,
+  hwRoutingOf,
 } from "./routing";
+import { presenceOf } from "./presence";
 import { cleanStats, telemetry } from "./telemetry";
 import {
   BUILD_RE,
@@ -134,17 +144,31 @@ export function cleanProfile(p: Record<string, any>): Profile {
   return p as Profile;
 }
 
+// A machine's hardware class: its CPU and its biggest GPU (most VRAM; the first listed on a tie). On a laptop
+// with switchable graphics Windows lists the integrated GPU first, so the first GPU would name the Intel part.
 export function classOf(p: Profile | null): string | null {
   if (!p) return null;
-  const gpu = p.gpus?.find((g) => g.name)?.name ?? "no gpu";
+  const named = (p.gpus ?? []).filter((g) => g.name);
+  const best = named.reduce<(typeof named)[number] | undefined>((b, g) => (!b || (g.vram_mb ?? 0) > (b.vram_mb ?? 0) ? g : b), undefined);
+  const gpu = best?.name ?? "no gpu";
   return `${p.cpu ?? "unknown cpu"} / ${gpu}`.slice(0, 200);
 }
 
-async function latestRelease(db: D1Database, channel: string) {
+// Rev 17 (PROTOCOL 11.2): the newest release of (channel, platform); `latest` and `min_agent` are per platform.
+async function latestRelease(db: D1Database, channel: string, platform: string) {
   return db
-    .prepare(`SELECT * FROM agent_releases WHERE channel = ? ORDER BY id DESC LIMIT 1`)
-    .bind(channel)
+    .prepare(`SELECT * FROM agent_releases WHERE channel = ? AND platform = ? ORDER BY id DESC LIMIT 1`)
+    .bind(channel, platform)
     .first<{ version: string; build_id: string; min_agent: string; channel: string }>();
+}
+
+// GET /download for a channel and platform (each named only when not the default: stable, windows-x64).
+export function downloadUrl(origin: string, channel: string, platform: string): string {
+  const q = new URLSearchParams();
+  if (platform !== DEFAULT_PLATFORM) q.set("platform", platform);
+  if (channel !== "stable") q.set("channel", channel);
+  const t = q.toString();
+  return `${origin}/download${t ? `?${t}` : ""}`;
 }
 
 // ---------- POST /v1/enroll ----------
@@ -160,6 +184,8 @@ export async function enroll(c: Ctx): Promise<Response> {
   if (!name) throw bad("name is required");
   const profile = cleanProfile(obj(b.profile, "profile"));
   const digest = str(b.profile_digest, "profile_digest", { optional: true, re: HEX64_RE }) ?? null;
+  // Rev 17 (PROTOCOL 11.1): the agent's platform (no header: windows-x64), fixed for the machine from now on.
+  const platform = requestPlatform(c.req);
   const used = () => new HttpError(403, "unauthorized", "unknown or already used invite code");
   if (!INVITE_RE.test(invite)) throw used();
   const inv = await c.env.DB.prepare(`SELECT * FROM invites WHERE code = ?`).bind(invite).first<{ used_at: number | null; channel: string }>();
@@ -167,10 +193,10 @@ export async function enroll(c: Ctx): Promise<Response> {
 
   const agent = c.req.headers.get("x-farm-agent");
   if (agent !== null && isSemver(agent)) {
-    const rel = await latestRelease(c.env.DB, inv.channel);
+    const rel = await latestRelease(c.env.DB, inv.channel, platform);
     if (rel && cmpSemver(agent, rel.min_agent) < 0) {
-      // An unenrolled agent can't update itself: the friend needs a newer installer.
-      const download = `${c.url.origin}/download${inv.channel === "stable" ? "" : `?channel=${inv.channel}`}`;
+      // An unenrolled agent can't update itself: the friend needs a newer installer (of its own platform).
+      const download = downloadUrl(c.url.origin, inv.channel, platform);
       throw new HttpError(426, "update_required", `agent ${agent} is older than ${rel.min_agent}`, { min_agent: rel.min_agent, download });
     }
   }
@@ -181,8 +207,8 @@ export async function enroll(c: Ctx): Promise<Response> {
     c.env.DB.prepare(`UPDATE invites SET used_at = ?, machine_id = ? WHERE code = ? AND used_at IS NULL`).bind(c.now, machineId, invite),
     // Inserted only if the UPDATE above won the invite (a concurrent enroll can't use it twice).
     c.env.DB.prepare(
-      `INSERT INTO machines (machine_id, token_hash, name, channel, invite, created_at, last_seen, agent_version, profile, profile_digest, class)
-       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM invites WHERE code = ? AND machine_id = ?)`,
+      `INSERT INTO machines (machine_id, token_hash, name, channel, invite, created_at, last_seen, agent_version, profile, profile_digest, class, platform)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM invites WHERE code = ? AND machine_id = ?)`,
     ).bind(
       machineId,
       await sha256Hex(token),
@@ -195,6 +221,7 @@ export async function enroll(c: Ctx): Promise<Response> {
       JSON.stringify(profile),
       digest,
       classOf(profile),
+      platform,
       invite,
       machineId,
     ),
@@ -219,6 +246,7 @@ interface BuildInfo {
   aw: number | null;
   size: number;
   manifest: string;
+  platform: string; // rev 17
 }
 
 interface Candidate {
@@ -227,13 +255,17 @@ interface Candidate {
   run?: string;
   campaign?: string;
   priority: number;
-  tier: number; // 1: a run's games; 2: backfill (fuzz, or a GPU-preferring job on a PC that isn't GPU-eligible)
+  tier: number; // 1: a run's games; 2: backfill (fuzz, or a GPU-preferring job on a PC that isn't GPU-eligible); 3 (rev 18): CPU self-play of a run with a GPU version
   fit: number;
+  gpu_play?: boolean; // rev 18: self-play this PC plays on its GPU (a GPU lease whose GPU pays here)
+  unissued?: number; // rev 18: an eval batch's unissued games
+  deferred?: boolean; // rev 18: an eval batch this GPU self-play PC takes after its self-play (not behind)
   configured: "auto" | number;
   gpu_configured?: "auto" | number; // rev 11: the job's gpu_games_per_lease (absent: none)
   max_stale?: number; // self-play: the run's staleness window in gens
   providers: Provider[] | null; // rev 7: the job's allowlist, sent with the lease
-  // Rev 11 (PROTOCOL 9.4): the worker build and runtime the lease carries (a run's default, or an alternate)
+  // Rev 11 (PROTOCOL 9.4): the worker build and runtime the lease carries (a run's default, or an alternate; rev 17: a
+  // campaign's build, or its alternate of the machine's platform)
   build_id: string;
   runtime: string | null;
   alt: boolean;
@@ -327,7 +359,9 @@ export async function lease(c: Ctx): Promise<Response> {
       .run();
     m.class = classOf(profile);
   }
-  const capsJson = JSON.stringify(caps);
+  // Rev 18 (PROTOCOL 12.2): the stored caps also keep `gpu_allowed` and `gpu_games`, so a rolling lease's renewal
+  // (otherWorkWaits) sees the same GPU self-play this request does (an agent may send gpu false, gpu_allowed true).
+  const capsJson = JSON.stringify({ ...caps, gpu_allowed: gpuAllowed, ...(gpuGames.size ? { gpu_games: Object.fromEntries(gpuGames) } : {}) });
   if (capsJson !== m.caps) await db.prepare(`UPDATE machines SET caps = ? WHERE machine_id = ?`).bind(capsJson, m.machine_id).run();
   // Rev 7 routing reads the profile the coordinator keeps: the one just sent, else the stored one.
   const machineProfile = profile && digest !== m.profile_digest ? profile : parseJson<Profile | null>(m.profile, null);
@@ -346,7 +380,15 @@ export async function lease(c: Ctx): Promise<Response> {
   if (kinds.has("diag") && !o.defAware) {
     for (const id of o.diag) {
       const l = unwrap(
-        await bookFor(c.env, book.DIAG_SCOPE).grant({ now: c.now, machine_id: m.machine_id, kind: "diag", want: 0, diag_id: id, def_aware: o.defAware }),
+        await bookFor(c.env, book.DIAG_SCOPE).grant({
+          now: c.now,
+          machine_id: m.machine_id,
+          kind: "diag",
+          want: 0,
+          diag_id: id,
+          def_aware: o.defAware,
+          platform: m.platform,
+        }),
       );
       if (l) return withDiag({ lease: { ...l, providers: null } });
     }
@@ -361,6 +403,10 @@ export async function lease(c: Ctx): Promise<Response> {
     // Rev 11 (PROTOCOL 9.4): a GPU lease gets enough games for big batches.
     if (cd.gpu_lease && cd.run && (cd.kind === "selfplay" || cd.kind === "eval")) {
       want = await gpuLeaseSize(db, cd, want, o.rate.get(key) ?? null, gpuGames.get(cd.run));
+    } else if (cd.kind === "eval" && cd.configured === "auto") {
+      // Rev 18 (PROTOCOL 12.3): an eval lease takes about as long as its slowest game, so a CPU lease of a few games
+      // measures a low rate and stays small; enough games keep every thread busy.
+      want = Math.max(want, evalCpuFloor(o.hw.eval_games_per_thread, caps.threads, caps.ram_mb, SIZING.eval.min, SIZING.eval.max));
     }
     const l = unwrap(
       await bookFor(c.env, cd.scope).grant({
@@ -371,7 +417,8 @@ export async function lease(c: Ctx): Promise<Response> {
         run: cd.run,
         campaign: cd.campaign,
         def_aware: o.defAware,
-        ...(cd.alt ? { alt: { build_id: cd.build_id, runtime: cd.runtime! } } : {}),
+        platform: m.platform, // rev 17: checked again under the scope's lock
+        ...(cd.alt ? { alt: { build_id: cd.build_id, runtime: cd.runtime } } : {}),
         ...(rolling && cd.kind === "selfplay" ? { rolling: true } : {}),
       }),
     );
@@ -404,6 +451,26 @@ interface Offer {
   rank: (cd: Candidate) => number;
   rate: Map<string, number>;
   classRate: Map<string, number>;
+  hw: HwRouting; // rev 18: the owner's hardware-routing setting
+}
+
+// Rev 18 (PROTOCOL 12.2): the eval rate (games per second, summed) of the PCs that would play an eval batch on the CPU
+// and are online and free to work: not playing self-play on a GPU (the `gpu_play` their last offer recorded), seen in
+// the last ONLINE_S, not paused or revoked, no fresh presence (in use by their owner). Each counts its measured rate for
+// this batch, else its average over every eval it played, else nothing (unknown: the batch counts as behind sooner).
+export const ONLINE_S = 300;
+async function cpuEvalRate(db: D1Database, scope: string, self: string, now: number): Promise<number> {
+  const { results } = await db
+    .prepare(
+      `SELECT m.last_seen, m.presence, m.presence_t,
+         (SELECT r.rate FROM rates r WHERE r.machine_id = m.machine_id AND r.kind = 'eval' AND r.scope = ?) AS own,
+         (SELECT AVG(r.rate) FROM rates r WHERE r.machine_id = m.machine_id AND r.kind = 'eval') AS any_rate
+       FROM machines m
+       WHERE m.machine_id != ? AND COALESCE(m.gpu_play, 0) = 0 AND m.revoked_at IS NULL AND m.paused = 0 AND m.last_seen >= ?`,
+    )
+    .bind(scope, self, now - ONLINE_S)
+    .all<{ last_seen: number | null; presence: string | null; presence_t: number | null; own: number | null; any_rate: number | null }>();
+  return results.filter((x) => !presenceOf(x, now)).reduce((s, x) => s + (x.own ?? x.any_rate ?? 0), 0);
 }
 
 async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | null): Promise<Offer> {
@@ -418,11 +485,13 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
   // verified a provider the job allows, with the job's runtime pack if the profile says.
   const placeFor = (kind: "selfplay" | "eval" | "fuzz", r: Routing, runtime: string | null) =>
     place(kind, r, gpuEligible(caps.gpu, verifiedProviders(machineProfile, runtime), r.providers), caps.gpu);
+  // Rev 17 (PROTOCOL 11): the machine's platform. Every build it is offered is of it; its channel's releases are too.
+  const platform: Platform = storedPlatform(m.platform);
 
-  const [runsR, campsR, releaseR, pausedR, activeR, poolR, ratesR, classR, diagR, mineR] = await db.batch<any>([
+  const [runsR, campsR, releaseR, pausedR, activeR, poolR, ratesR, classR, diagR, mineR, hwR] = await db.batch<any>([
     db.prepare(`SELECT * FROM runs WHERE state = 'active'`),
     db.prepare(`SELECT * FROM campaigns WHERE state = 'active'`),
-    db.prepare(`SELECT * FROM agent_releases WHERE channel = ? ORDER BY id DESC LIMIT 1`).bind(m.channel),
+    db.prepare(`SELECT * FROM agent_releases WHERE channel = ? AND platform = ? ORDER BY id DESC LIMIT 1`).bind(m.channel, platform),
     db.prepare(`SELECT value FROM settings WHERE key = 'paused'`),
     db.prepare(`SELECT scope, kind, COUNT(*) AS n FROM leases WHERE state = 'active' GROUP BY scope, kind`),
     db.prepare(`SELECT scope, pool, SUM(hi - lo) AS n FROM pool GROUP BY scope, pool`),
@@ -441,22 +510,28 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
       .bind(m.machine_id),
     // This machine's live leases (an expired one not swept yet doesn't count).
     db.prepare(`SELECT COUNT(*) AS n FROM leases WHERE machine_id = ? AND state = 'active' AND expires_at >= ?`).bind(m.machine_id, c.now),
+    db.prepare(`SELECT value FROM settings WHERE key = 'hw_routing'`),
   ]);
+  const hw = hwRoutingOf(hwR.results[0]?.value ?? null);
   const defs = await currentDefs(db);
   const runs = runsR.results as book.RunRow[];
   const camps = campsR.results as book.CampaignRow[];
   const release = (releaseR.results[0] ?? null) as { version: string; min_agent: string } | null;
 
   const altsOf = (r: book.RunRow) => parseJson<Alternate[] | null>(r.alternates ?? null, null) ?? [];
+  const campAltsOf = (x: book.CampaignRow) => parseJson<CampaignAlternate[] | null>(x.alternates ?? null, null) ?? [];
   const buildIds = [
     ...new Set(
-      [...runs.flatMap((r) => [r.build_id, r.runtime, ...altsOf(r).flatMap((a) => [a.build_id, a.runtime])]), ...camps.map((x) => x.build_id)].filter(Boolean),
+      [
+        ...runs.flatMap((r) => [r.build_id, r.runtime, ...altsOf(r).flatMap((a) => [a.build_id, a.runtime])]),
+        ...camps.flatMap((x) => [x.build_id, ...campAltsOf(x).map((a) => a.build_id)]),
+      ].filter(Boolean),
     ),
   ] as string[];
   const builds = new Map<string, BuildInfo>();
   if (buildIds.length) {
     const { results } = await db
-      .prepare(`SELECT build_id, kind, min_agent, aw, size, manifest FROM builds WHERE build_id IN (${buildIds.map(() => "?").join(",")})`)
+      .prepare(`SELECT build_id, kind, min_agent, aw, size, manifest, platform FROM builds WHERE build_id IN (${buildIds.map(() => "?").join(",")})`)
       .bind(...buildIds)
       .all<BuildInfo>();
     for (const x of results) builds.set(x.build_id, x);
@@ -479,32 +554,57 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
     const need = needOf(id);
     return !need || (altAware && hasAdapter(machineProfile, need.vendor, [need.min_driver]));
   };
-  // The build and runtime a run's job lease carries here (PROTOCOL 9.4): the first alternate this machine
-  // qualifies for, else the default (null: neither may go to this machine).
-  const variantFor = (r: book.RunRow, kind: "selfplay" | "eval", routing: Routing) => {
-    if (altAware && gpuAllowed) {
+  // Rev 17 (PROTOCOL 11.4): a build's platform (one not registered counts as windows-x64; such a candidate is dropped
+  // below anyway); no runtime fits every platform.
+  const platOf = (id: string | null) => (id ? storedPlatform(builds.get(id)?.platform) : platform);
+  // The build and runtime a run's job lease carries here (PROTOCOL 9.4, rev 17 11.4): the first alternate of this
+  // machine's platform it qualifies for, else the default when it is of this machine's platform (null: nothing from
+  // this run for this machine). A GPU alternate (a `vendor`) needs 9.4's conditions 1-7; a CPU alternate (no vendor)
+  // conditions 5-7 and the build's `aw`. One that only its `min_agent` keeps from this agent is held: when the default
+  // isn't of this platform it is the run's build here, so section 3's update rule asks for that agent (as it would for
+  // a default build) instead of the run giving this machine nothing without a word.
+  type Variant = { build_id: string; runtime: string | null; alt: boolean; eligible: boolean; gpuLease: boolean };
+  const variantFor = (r: book.RunRow, kind: "selfplay" | "eval", routing: Routing): Variant | null => {
+    let held: Variant | null = null;
+    if (altAware) {
       for (const a of altsOf(r)) {
+        if (altPlatform(a) !== platform) continue;
+        const vendor = a.when.vendor || null; // null: a CPU alternate
+        if (vendor && !gpuAllowed) continue; // 1
         const bi = builds.get(a.build_id);
         const ri = builds.get(a.runtime);
         if (!bi || !ri || bi.kind !== "worker" || ri.kind !== "runtime") continue; // 6: registered
+        if (platOf(a.build_id) !== platform || platOf(a.runtime) !== platform) continue;
         if (requiresRuntimeOf(bi.manifest) !== a.runtime) continue;
         const need = gpuNeedOf(ri.manifest);
-        if (need && need.vendor !== a.when.vendor) continue;
-        if (GPU_VENDORS_OFF.includes(a.when.vendor)) continue; // (an alternate stored before rev 12)
-        if (!hasAdapter(machineProfile, a.when.vendor, [a.when.min_driver, need?.min_driver])) continue; // 2
-        const allowed = altProviders(need, routing.providers); // 3
-        if (!allowed.length) continue;
-        const rp = runtimeProvidersOf(machineProfile, a.runtime); // 4: never probed here, or a provider passed
-        if (rp !== undefined && !rp.some((p) => (allowed as string[]).includes(p))) continue;
+        let eligible = true;
+        if (!vendor) {
+          if (need) continue; // a CPU alternate's pack has no GPU requirement (checked at PUT too)
+          eligible = gpuEligible(caps.gpu, verifiedProviders(machineProfile, a.runtime), routing.providers);
+        } else {
+          if (need && need.vendor !== vendor) continue;
+          if (GPU_VENDORS_OFF.includes(vendor)) continue; // (an alternate stored before rev 12)
+          if (!hasAdapter(machineProfile, vendor, [a.when.min_driver, need?.min_driver])) continue; // 2
+          const allowed = altProviders(need, routing.providers); // 3
+          if (!allowed.length) continue;
+          const rp = runtimeProvidersOf(machineProfile, a.runtime); // 4: never probed here, or a provider passed
+          if (rp !== undefined && !rp.some((p) => (allowed as string[]).includes(p))) continue;
+        }
         if (!diskOk([a.build_id, a.runtime])) continue; // 5
         if (blocked.has(a.build_id) || blocked.has(a.runtime)) continue; // 6
-        if ([bi.min_agent, ri.min_agent].some((v) => v && !minAgentOk(agent, v))) continue;
         if (bi.aw !== null && bi.aw !== aw) continue;
         const def = defs.get(`run:${r.run}`); // 7: the definition authorizes it
         if (!def || leaseProblem(def, kind, a.build_id, a.runtime, c.now, a.runtime)) continue;
-        return { build_id: a.build_id, runtime: a.runtime as string | null, alt: true, eligible: true, gpuLease: true };
+        const v: Variant = { build_id: a.build_id, runtime: a.runtime, alt: true, eligible, gpuLease: !!vendor };
+        if ([bi.min_agent, ri.min_agent].some((x) => x && !minAgentOk(agent, x))) {
+          held ??= v; // 6: min_agent
+          continue;
+        }
+        return v;
       }
     }
+    // Rev 17: the default only for a machine of its platform (a Mac never gets a Windows build, nor the reverse).
+    if (platOf(r.build_id) !== platform || platOf(r.runtime) !== platform) return held;
     if (!packFits(r.runtime)) return null;
     const eligible = gpuEligible(caps.gpu, verifiedProviders(machineProfile, r.runtime), routing.providers);
     // a GPU lease (its own size, 9.4) only when a GPU provider passed with this very pack here
@@ -512,6 +612,32 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
     const gpuLease = eligible && withPack.some((p) => isGpuProvider(p) && (!routing.providers || (routing.providers as string[]).includes(p)));
     return { build_id: r.build_id, runtime: r.runtime, alt: false, eligible, gpuLease };
   };
+  // Rev 17 (PROTOCOL 11.4): the worker build a campaign's lease carries here: its alternate of this machine's platform
+  // (registered, not blocked here, `aw` and `min_agent` met, in the campaign's current definition's `builds`), else its
+  // build when that is of this machine's platform (null: nothing from this campaign for this machine). An alternate
+  // that only its `min_agent` keeps from this agent is held, as for runs.
+  const campaignBuildFor = (x: book.CampaignRow): { build_id: string; alt: boolean } | null => {
+    let held: { build_id: string; alt: boolean } | null = null;
+    for (const a of campAltsOf(x)) {
+      if (storedPlatform(a.when?.platform) !== platform) continue;
+      const bi = builds.get(a.build_id);
+      if (!bi || bi.kind !== "worker" || platOf(a.build_id) !== platform) continue;
+      if (blocked.has(a.build_id)) continue;
+      if (bi.aw !== null && bi.aw !== aw) continue;
+      const def = defs.get(`campaign:${x.campaign}`);
+      if (!def || leaseProblem(def, "fuzz", a.build_id, null, c.now)) continue;
+      if (!minAgentOk(agent, bi.min_agent)) {
+        held ??= { build_id: a.build_id, alt: true };
+        continue;
+      }
+      return { build_id: a.build_id, alt: true };
+    }
+    if (platOf(x.build_id) === platform) return { build_id: x.build_id, alt: false };
+    return held;
+  };
+  // Rev 18 (PROTOCOL 12.1): a run has a GPU version when it lists an alternate for a GPU vendor the farm uses, or its
+  // default runtime pack requires a GPU (rev 17: a CPU alternate, without `vendor`, is not one; a default pack that only may use one, DirectML, counts by its alternates).
+  const hasGpuVersion = (r: book.RunRow) => altsOf(r).some((x) => !!x.when.vendor && !GPU_VENDORS_OFF.includes(x.when.vendor)) || needOf(r.runtime) !== null;
   for (const r of runs) {
     const scope = book.runScope(r.run);
     if (kinds.has("selfplay") && r.selfplay && r.current_gen !== null) {
@@ -521,12 +647,17 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
       const at = routing && v ? place("selfplay", routing, v.eligible, caps.gpu) : null;
       if (sp && routing && v && at && needsOk(sp.needs) && diskOk([v.build_id, v.runtime])) {
         const ckptBonus = cachedCkpts.has(`${r.run}/${r.current_gen}`) ? 1.1 : 1;
+        // Rev 18 (PROTOCOL 12.1): played on this PC's GPU (a GPU lease, and the agent's bench didn't say no GPU pays
+        // for this run here); else, while the run has a GPU version, this PC's self-play is the last resort.
+        const gpuPlay = altAware && v.gpuLease && a.gpuGames.get(r.run) !== 0;
+        const cpuBackfill = hw.on && !gpuPlay && hasGpuVersion(r);
         cands.push({
           scope,
           kind: "selfplay",
           run: r.run,
           priority: r.priority,
-          tier: at.tier,
+          tier: cpuBackfill ? CPU_SELFPLAY_TIER : at.tier,
+          gpu_play: gpuPlay,
           fit: at.fit * (cachedBuilds.has(v.build_id) ? 1.2 : 1) * ckptBonus,
           configured: sp.games_per_lease,
           gpu_configured: sp.gpu_games_per_lease,
@@ -565,6 +696,8 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
             priority: r.priority,
             tier: at.tier,
             fit: at.fit * (cachedBuilds.has(v.build_id) ? 1.2 : 1) * ckptBonus,
+            // (a batch that requires a GPU has no CPU PCs to wait for: never deferred)
+            ...(routing.gpu === "required" ? {} : { unissued: poolN.get(`${scope}|eval:${ev.batch}`) ?? 0 }),
             configured: ev.games_per_lease,
             gpu_configured: ev.gpu_games_per_lease,
             providers: routing.providers,
@@ -584,7 +717,8 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
       // A campaign has no runtime pack: its machines' verified providers are their union.
       const routing = storedRouting(x.gpu, parseJson<unknown>(x.providers, null));
       const at = placeFor("fuzz", routing, null);
-      if (!at || !needsOk(needs) || !diskOk([x.build_id])) continue;
+      const v = campaignBuildFor(x); // rev 17
+      if (!v || !at || !needsOk(needs) || !diskOk([v.build_id])) continue;
       // Rev 14 (PROTOCOL 5.4): a campaign with a share competes with the runs' games (tier 1) within that share.
       const share = typeof x.share === "number" ? x.share : undefined;
       cands.push({
@@ -593,12 +727,12 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
         campaign: x.campaign,
         priority: x.priority,
         tier: share === undefined ? at.tier : 1,
-        fit: at.fit * (cachedBuilds.has(x.build_id) ? 1.2 : 1),
+        fit: at.fit * (cachedBuilds.has(v.build_id) ? 1.2 : 1),
         configured: x.chunk === "auto" ? "auto" : Number(x.chunk),
         providers: routing.providers,
-        build_id: x.build_id,
+        build_id: v.build_id,
         runtime: null,
-        alt: false,
+        alt: v.alt,
         gpu_lease: false,
         ...(share === undefined ? {} : { share }),
       });
@@ -614,11 +748,13 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
   const usable = cands.filter((cd) => {
     const r = cd.run ? runs.find((x) => x.run === cd.run) : null;
     const camp = r ? null : camps.find((x) => x.campaign === cd.campaign)!;
-    // Rev 11: the candidate's own build and runtime (a run's default, or the alternate variantFor chose).
-    const ids = r ? [cd.build_id, cd.runtime] : [camp!.build_id];
+    // Rev 11: the candidate's own build and runtime (a run's default, or the alternate variantFor chose; rev 17: a
+    // campaign's build or its alternate).
+    const ids = r ? [cd.build_id, cd.runtime] : [cd.build_id];
     if (ids.some((id) => id && blocked.has(id))) return false;
     const infos = ids.filter(Boolean).map((id) => builds.get(id!));
     if (infos.some((i) => !i)) return false; // build not registered
+    if (infos.some((i) => storedPlatform(i!.platform) !== platform)) return false; // rev 17: never another platform's build
     const def = defs.get(r ? `run:${r.run}` : `campaign:${camp!.campaign}`);
     if (!def && defAware) return false;
     if (def && defAware && leaseProblem(def, cd.kind as JobKind, ids[0]!, r ? cd.runtime : null, c.now, cd.alt ? cd.runtime : undefined)) return false;
@@ -640,8 +776,28 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
   const score = (cd: Candidate) => (cd.priority * cd.fit) / (1 + (active.get(`${cd.scope}|${cd.kind}`) ?? 0));
   // Rev 13: the runs' active leases (self-play and eval), for a background batch's share.
   const activeRuns = (activeR.results as any[]).filter((x) => x.kind === "selfplay" || x.kind === "eval").reduce((t, x) => t + x.n, 0);
-  const rank = (cd: Candidate) => jobRank(cd.kind, cd.share, active.get(`${cd.scope}|${cd.kind}`) ?? 0, activeRuns);
-  // Within a tier, evaluation before self-play (rev 7; a background batch only within its share, rev 13), then by score.
+
+  // Rev 18 (PROTOCOL 12): a PC that plays some run's self-play on its GPU records it (the CPU PCs' eval capacity reads
+  // it), and takes an eval batch after that self-play unless the CPU PCs online couldn't finish it within the horizon.
+  const gpuPlay = usable.some((cd) => cd.kind === "selfplay" && cd.gpu_play);
+  if (m.gpu_play !== (gpuPlay ? 1 : 0)) {
+    await db.prepare(`UPDATE machines SET gpu_play = ? WHERE machine_id = ?`).bind(gpuPlay ? 1 : 0, m.machine_id).run();
+    m.gpu_play = gpuPlay ? 1 : 0;
+  }
+  if (hw.on && gpuPlay && hw.eval_horizon_s > 0) {
+    for (const cd of usable) {
+      if (cd.kind !== "eval" || cd.tier !== 1 || cd.unissued === undefined) continue;
+      cd.deferred = !evalBehind(cd.unissued, await cpuEvalRate(db, cd.scope, m.machine_id, c.now), hw.eval_horizon_s);
+    }
+  }
+
+  // A deferred batch (rev 18) ranks after the self-play, and never before where its share (rev 13) puts it.
+  const rank = (cd: Candidate) => {
+    const r = jobRank(cd.kind, cd.share, active.get(`${cd.scope}|${cd.kind}`) ?? 0, activeRuns);
+    return cd.deferred ? Math.max(r, DEFERRED_EVAL_RANK) : r;
+  };
+  // Within a tier, evaluation before self-play (rev 7; a background batch only within its share, rev 13; a GPU self-play
+  // PC's batch only when behind, rev 18), then by score.
   usable.sort((x, y) => x.tier - y.tier || rank(x) - rank(y) || score(y) - score(x) || x.scope.localeCompare(y.scope));
   return {
     usable,
@@ -653,6 +809,7 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
     rank,
     rate,
     classRate,
+    hw,
   };
 }
 
@@ -754,20 +911,26 @@ export async function extend(c: Ctx, leaseId: string): Promise<Response> {
 // self-play with a higher priority. A self-play counts only with headroom. Null: nothing waits.
 export async function otherWorkWaits(c: Ctx, m: MachineRow, l: book.LeaseRow): Promise<string | null> {
   const db = c.env.DB;
-  const stored = parseJson<Partial<Caps> | null>(m.caps, null) ?? {};
+  const stored = parseJson<(Partial<Caps> & { gpu_allowed?: unknown; gpu_games?: unknown }) | null>(m.caps, null) ?? {};
   const caps: Caps = {
     threads: typeof stored.threads === "number" ? stored.threads : 1,
     ram_mb: typeof stored.ram_mb === "number" ? stored.ram_mb : 0,
     gpu: stored.gpu === true,
     disk_mb: typeof stored.disk_mb === "number" ? stored.disk_mb : 0,
   };
+  // Rev 18: what the last /v1/lease said of GPU work (caps stored before rev 18: `gpu` alone, no bench).
+  const gpuAllowed = typeof stored.gpu_allowed === "boolean" ? stored.gpu_allowed : caps.gpu;
+  const g = stored.gpu_games;
+  const gpuGames = new Map<string, number>(
+    g && typeof g === "object" && !Array.isArray(g) ? Object.entries(g).filter((e): e is [string, number] => typeof e[1] === "number") : [],
+  );
   const agent = m.agent_version && isSemver(m.agent_version) ? m.agent_version : "0.0.0";
   const awHeader = c.req.headers.get("x-farm-aw") ?? "1";
   const aw = /^\d{1,4}$/.test(awHeader) ? Number(awHeader) : 1;
   const o = await offer(
     c,
     m,
-    { caps, gpuAllowed: caps.gpu, gpuGames: new Map(), cachedBuilds: new Set(), cachedCkpts: new Set(), kinds: new Set(KINDS), agent, aw },
+    { caps, gpuAllowed, gpuGames, cachedBuilds: new Set(), cachedCkpts: new Set(), kinds: new Set(KINDS), agent, aw },
     parseJson<Profile | null>(m.profile, null),
   );
   if (!o.defAware && o.diag.length) return "diag";
@@ -776,12 +939,24 @@ export async function otherWorkWaits(c: Ctx, m: MachineRow, l: book.LeaseRow): P
   const ownTier = own?.tier ?? 1;
   const ownRank = own ? o.rank(own) : kindRank("selfplay");
   const ownPriority = own?.priority ?? ownRun?.priority ?? 0;
+  // Rev 18 (PROTOCOL 12.2): a deferred eval batch still waits while the lease's own generation has no headroom (the
+  // rolling lease would only wait for the next generation), as every eval batch did before.
+  let ownFull: boolean | null = null;
+  const ownQuotaFull = async () => {
+    if (ownFull === null) {
+      const sp = ownRun ? parseJson<book.SelfplayCfg | null>(ownRun.selfplay, null) : null;
+      ownFull = !ownRun || !sp || (await book.selfplayState(db, ownRun, sp)).headroom < 1;
+    }
+    return ownFull;
+  };
   for (const cd of o.usable) {
     if (cd === own) continue;
     if (cd.tier > ownTier) continue;
     if (cd.tier === ownTier) {
       const rk = o.rank(cd);
-      if (rk > ownRank || (rk === ownRank && !(cd.priority > ownPriority))) continue;
+      if (rk > ownRank || (rk === ownRank && !(cd.priority > ownPriority))) {
+        if (!(cd.deferred && (await ownQuotaFull()))) continue;
+      }
     }
     if (cd.kind === "selfplay") {
       const r = await book.getRun(db, cd.run!);
@@ -949,8 +1124,9 @@ export async function agentLatest(c: Ctx): Promise<Response> {
   // left a machine moved to canary asking for stable forever while its leases demanded canary's
   // min_agent (found 2026-11-12). The query is still accepted, and ignored.
   const channel = m.channel;
-  const rel = await latestRelease(c.env.DB, channel);
-  if (!rel) throw notFound(`no agent release on ${channel}`);
+  // Rev 17 (PROTOCOL 11.2): the newest release of the machine's channel for its platform.
+  const rel = await latestRelease(c.env.DB, channel, m.platform);
+  if (!rel) throw notFound(`no agent release on ${channel} for ${m.platform}`);
   // Rev 12: the evict list rides along (only when there is one: the answer of before otherwise)
   const evict = await evictList(c.env.DB);
   return json({

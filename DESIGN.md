@@ -302,6 +302,13 @@ Both contribute; the coordinator routes by measured rate.
 | CPU only (or an unsuitable GPU) | self-play and evaluation with the CPU EP at small batches (these nets are small: the M4 Max's CPU beat its own GPU on MTG Zero; phase 0a measures x86), and fuzzing, which uses no network at all |
 
 GPU-heavy self-play goes preferentially to GPU PCs and fuzzing preferentially to CPU-only PCs.
+
+**Rev 18 (PROTOCOL 12): by comparative advantage.** Measured 2026-11-18: an 8-core CPU-only PC plays a CUDA run's
+self-play at ~1/9 of a recent NVIDIA GPU PC's pace, but eval at ~90% of it (an eval lease is as long as its slowest game) and fuzz
+as fast as any PC. So CPU PCs take eval and fuzz first and that self-play last, and PCs that play self-play on their GPU
+take an eval batch only when the CPU PCs online couldn't finish it within the owner's horizon (30 min by default; 0 =
+eval first everywhere). CPU eval leases get at least 2 games per thread so the CPU is busy. Nobody idles; the owner's
+switch turns the order of before back on.
 A GPU PC whose GPU is busy (a game running) can still take CPU work, if the user's settings allow
 work while they are active.
 

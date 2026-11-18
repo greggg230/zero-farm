@@ -2,7 +2,8 @@
 
 import { accessEnabled, verifyAccess } from "./access";
 import type { AnyEnv } from "./config";
-import { HttpError, isSemver, safeEqual, sha256Hex } from "./util";
+import { requestPlatform, storedPlatform } from "./platform";
+import { HttpError, conflict, isSemver, safeEqual, sha256Hex } from "./util";
 
 export interface Ctx {
   req: Request;
@@ -81,6 +82,8 @@ export interface MachineRow {
   caps: string | null;
   paused: number;
   revoked_at: number | null;
+  platform: string; // rev 17 (PROTOCOL 11.1): fixed at enrollment; migration 0013 (rows before it: windows-x64)
+  gpu_play?: number | null; // rev 18 (migration 0014): 1 while its last offer had self-play it plays on its GPU
 }
 
 function bearer(req: Request): string | null {
@@ -97,6 +100,15 @@ export async function authMachine(c: Ctx): Promise<MachineRow> {
     .first<MachineRow>();
   if (!row) throw new HttpError(401, "unauthorized", "unknown machine token");
   if (row.revoked_at !== null) throw new HttpError(403, "revoked", "this machine was revoked");
+  // Rev 17 (PROTOCOL 11.1): a machine's platform is fixed at enrollment (no header: windows-x64). Another one is this
+  // machine's token on another computer: install there instead.
+  const platform = requestPlatform(c.req);
+  row.platform = storedPlatform(row.platform);
+  if (platform !== row.platform) {
+    throw conflict(`this machine enrolled as ${row.platform}, but this request comes from ${platform}: install Zero Farm on this computer instead`, {
+      reason: "platform",
+    });
+  }
   const agent = c.req.headers.get("x-farm-agent");
   const version = agent && isSemver(agent) ? agent : row.agent_version;
   if (row.last_seen === null || c.now - row.last_seen >= 30 || version !== row.agent_version) {

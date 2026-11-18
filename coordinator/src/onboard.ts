@@ -2,10 +2,13 @@
 // who got an invite code, and for an installer too old for the farm (enroll answers 426 with a
 // link here: an unenrolled agent can't update itself). Installers live on GitHub Releases
 // (rev 4): /download redirects to the newest one; the coordinator serves no installer bytes.
+// Rev 17 (PROTOCOL 11.2): per platform; a Mac installs with GET /install-macos.sh, a shell script
+// that downloads the macOS tarball through /download?platform=macos-arm64 and runs its setup.
 
 import { config } from "./config";
 import type { Ctx } from "./ctx";
 import { CHANNELS } from "./friend";
+import { DEFAULT_PLATFORM, type Platform, platformOf } from "./platform";
 import { cmpSemver, notFound, oneOf } from "./util";
 
 // The public repository (the GITHUB_REPO var, default greggg230/zero-farm).
@@ -18,17 +21,17 @@ export interface Installer {
   t: number;
 }
 
-// The newest release of `channel` that names an installer on GitHub, unless that installer is
-// older than the channel's min_agent (enroll would refuse it with 426).
-async function installerOf(db: D1Database, channel: string): Promise<Installer | null> {
+// The newest release of (`channel`, `platform`) that names an installer on GitHub, unless that
+// installer is older than that channel's min_agent for the platform (enroll would refuse it with 426).
+async function installerOf(db: D1Database, channel: string, platform: Platform): Promise<Installer | null> {
   const [withInstaller, latest] = await db.batch<any>([
     db
       .prepare(
         `SELECT channel, version, github_url, t FROM agent_releases
-         WHERE channel = ? AND github_url IS NOT NULL ORDER BY id DESC LIMIT 1`,
+         WHERE channel = ? AND platform = ? AND github_url IS NOT NULL ORDER BY id DESC LIMIT 1`,
       )
-      .bind(channel),
-    db.prepare(`SELECT min_agent FROM agent_releases WHERE channel = ? ORDER BY id DESC LIMIT 1`).bind(channel),
+      .bind(channel, platform),
+    db.prepare(`SELECT min_agent FROM agent_releases WHERE channel = ? AND platform = ? ORDER BY id DESC LIMIT 1`).bind(channel, platform),
   ]);
   const r = withInstaller.results[0];
   if (!r) return null;
@@ -38,10 +41,10 @@ async function installerOf(db: D1Database, channel: string): Promise<Installer |
 }
 
 // `?channel=` picks one; without it: stable, else canary (said on the page and in x-farm-channel).
-export async function findInstaller(db: D1Database, channel: string | null): Promise<Installer | null> {
+export async function findInstaller(db: D1Database, channel: string | null, platform: Platform = DEFAULT_PLATFORM): Promise<Installer | null> {
   const order = channel ? [channel] : ["stable", "canary"];
   for (const ch of order) {
-    const i = await installerOf(db, ch);
+    const i = await installerOf(db, ch, platform);
     if (i) return i;
   }
   return null;
@@ -52,10 +55,12 @@ function channelParam(c: Ctx): string | null {
   return v === null ? null : oneOf(v, "channel", CHANNELS);
 }
 
-// GET|HEAD /download[?channel=stable|canary]: 302 to the installer on GitHub Releases.
+// GET|HEAD /download[?channel=stable|canary][&platform=windows-x64|macos-arm64]: 302 to the installer
+// (Windows) or the agent tarball (macOS, rev 17) on GitHub Releases.
 export async function download(c: Ctx): Promise<Response> {
-  const inst = await findInstaller(c.env.DB, channelParam(c));
-  if (!inst) throw notFound("no installer has been released yet");
+  const platform = platformOf(c.url.searchParams.get("platform") ?? undefined, "platform");
+  const inst = await findInstaller(c.env.DB, channelParam(c), platform);
+  if (!inst) throw notFound(platform === DEFAULT_PLATFORM ? "no installer has been released yet" : `nothing has been released for ${platform} yet`);
   return new Response(null, {
     status: 302,
     headers: {
@@ -63,15 +68,72 @@ export async function download(c: Ctx): Promise<Response> {
       "cache-control": "no-store",
       "x-farm-version": inst.version,
       "x-farm-channel": inst.channel,
+      "x-farm-platform": platform,
     },
   });
 }
 
+// GET /install-macos.sh[?channel=canary] (rev 17, PROTOCOL 11.2): the macOS installer, a POSIX shell
+// script for `curl -fsSL <origin>/install-macos.sh | sh -s -- --invite CODE`. It asks this coordinator's
+// /download for the newest macOS tarball (so the channel rules are the same), accepts only this
+// repository's agent-macos-v<version> tarball, checks it against that release's SHA256SUMS, unpacks it
+// into a temporary directory and runs `./ZeroFarm setup "$@"` (which verifies the signed agent package
+// before it installs it). Served whether or not a macOS release exists yet: the script says so then.
+export async function installMacos(c: Ctx): Promise<Response> {
+  const channel = channelParam(c);
+  const q = new URLSearchParams({ platform: "macos-arm64" });
+  if (channel) q.set("channel", channel);
+  const script = INSTALL_MACOS.replaceAll("{{origin}}", c.url.origin)
+    .replaceAll("{{download}}", `${c.url.origin}/download?${q}`)
+    .replaceAll("{{release}}", `https://github.com/${config(c.env).githubRepo}/releases/download/agent-macos-v`);
+  return new Response(script, { headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
+}
+
+const INSTALL_MACOS = `#!/bin/sh
+# Zero Farm for macOS (Apple silicon, macOS 13 or newer):
+#   curl -fsSL {{origin}}/install-macos.sh | sh -s -- --invite CODE
+# Downloads the newest agent from GitHub Releases, checks it against the release's SHA256SUMS,
+# unpacks it into a temporary directory and runs its setup, which verifies the signed agent and
+# installs it into ~/Library/Application Support/ZeroFarm. Without --invite, setup asks.
+set -eu
+
+die() { echo "Zero Farm install: $*" >&2; exit 1; }
+
+main() {
+  [ "$(uname -s)" = Darwin ] || die "this installer is for macOS"
+  [ "$(uname -m)" = arm64 ] || die "Zero Farm needs a Mac with Apple silicon (arm64); this one is $(uname -m)"
+  url=$(curl -fsS -o /dev/null -w '%{redirect_url}' '{{download}}') || die "no macOS release to download yet"
+  case "$url" in
+    '{{release}}'*/ZeroFarm-macos-arm64.tar.gz) ;;
+    *) die "unexpected download location: $url" ;;
+  esac
+  dir=\${url%/*}
+  tmp=$(mktemp -d "\${TMPDIR:-/tmp}/zerofarm.XXXXXX") || die "can't make a temporary directory"
+  trap 'rm -rf "$tmp"' EXIT
+  echo "Downloading Zero Farm \${dir##*/agent-macos-v}"
+  curl -fsSL -o "$tmp/ZeroFarm-macos-arm64.tar.gz" "$url" || die "can't download $url"
+  curl -fsSL -o "$tmp/SHA256SUMS" "$dir/SHA256SUMS" || die "can't download $dir/SHA256SUMS"
+  grep -E '^[0-9a-f]{64} [ *]ZeroFarm-macos-arm64[.]tar[.]gz$' "$tmp/SHA256SUMS" >"$tmp/sum" || die "SHA256SUMS lists no ZeroFarm-macos-arm64.tar.gz"
+  (cd "$tmp" && shasum -a 256 -c sum) || die "the download does not match SHA256SUMS"
+  mkdir "$tmp/pkg"
+  tar -xzf "$tmp/ZeroFarm-macos-arm64.tar.gz" -C "$tmp/pkg" || die "can't unpack the download"
+  [ -f "$tmp/pkg/ZeroFarm" ] || die "the download holds no ZeroFarm"
+  chmod 755 "$tmp/pkg/ZeroFarm"
+  cd "$tmp/pkg"
+  # Piped into sh, this script's stdin is the download: setup asks on the terminal instead.
+  if [ ! -t 0 ] && (: </dev/tty) 2>/dev/null; then ./ZeroFarm setup "$@" </dev/tty; else ./ZeroFarm setup "$@"; fi
+}
+
+main "$@"
+`;
+
 const esc = (s: string) => s.replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[ch]!);
 
-// GET /: what Zero Farm is, what it does to your PC, the download button.
+// GET /: what Zero Farm is, what it does to your PC, the download button (rev 17: and the macOS
+// install command, once there is a macOS release).
 export async function home(c: Ctx): Promise<Response> {
   const inst = await findInstaller(c.env.DB, null);
+  const mac = await findInstaller(c.env.DB, null, "macos-arm64");
   let button: string;
   if (inst) {
     const test = inst.channel === "stable" ? "" : ` <span class="tag">test build</span>`;
@@ -81,8 +143,16 @@ export async function home(c: Ctx): Promise<Response> {
     if (inst.channel !== "stable") {
       button += `<p class="small">There is no regular release yet, so this is the newest test build. It updates itself to regular releases later.</p>`;
     }
+  } else if (mac) {
+    button = `<span class="button off">No Windows download yet</span>`;
   } else {
     button = `<span class="button off">No download yet</span><p class="small">The first release isn't out yet. Check back soon.</p>`;
+  }
+  if (mac) {
+    const test = mac.channel === "stable" ? "" : ` <span class="tag">test build</span>`;
+    button +=
+      `<p class="small">On a Mac with Apple silicon (macOS 13 or newer), Zero Farm ${esc(mac.version)}${test}: in Terminal, run<br>` +
+      `<code>curl -fsSL ${esc(c.url.origin)}/install-macos.sh | sh -s -- --invite CODE</code></p>`;
   }
   const page = HOME.replace("{{button}}", button).replaceAll("{{source}}", sourceUrl(c.env));
   return new Response(page, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
@@ -113,6 +183,7 @@ const HOME = `<!doctype html>
   .button:hover { filter: brightness(1.08); }
   .button.off { background: var(--line); color: var(--muted); }
   .small { font-size: 14px; color: var(--muted); margin: 10px 0 0; }
+  code { font-size: 14px; overflow-wrap: anywhere; }
   .invite { margin: 16px 0 0; font-weight: 600; }
   .tag { background: var(--tag); color: var(--tag-fg); border-radius: 6px; padding: 1px 7px; font-weight: 600; }
   ul, ol { padding-left: 22px; margin: 0; }
