@@ -4,7 +4,7 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>`.
 
-## 0.2.14 (unreleased)
+## 0.2.14 (2026-11-17, canary)
 
 - **Long self-play jobs no longer run out of memory.** Zero Farm now plans how many games a long job plays at once
   so that they fit comfortably within the memory it may use, and keeps an eye on the job's memory while it runs.
