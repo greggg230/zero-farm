@@ -2,7 +2,23 @@
 
 Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher). Installed copies
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
-version is a GitHub Release tagged `agent-v<version>`.
+version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's: `agent-macos-v<version>`).
+
+## Unreleased (0.3.0)
+
+- **Zero Farm for Macs with Apple silicon.** The same app now runs on a Mac (macOS 13 or newer): install it with
+  `curl -fsSL https://farm.greggg230.com/install-macos.sh | sh -s -- --invite CODE` (without `--invite` it asks for the
+  code). It lives in `~/Library/Application Support/ZeroFarm`, starts at login and updates itself like the Windows app.
+  There is no menu-bar icon yet: `ZeroFarm status`, `pause [minutes]`, `resume`, `set <setting> <value>`, `quit` and
+  `uninstall` work from the Terminal (the setup prints the full path). It works while the Mac is idle and on power,
+  uses every processor core at the lowest priority (it gives way to anything you do), and keeps the Mac from going to
+  sleep while it works on power (the display still sleeps; `set keep_awake false` turns that off). Macs run processor
+  jobs only for now.
+- **For a Mac of your own: work while it's in use, and on battery.** `set work_when active` (the Windows tray's
+  "always at low priority") and the new `set on_battery true` (also in Low Power Mode) let it work regardless;
+  the defaults stay as they were.
+- Zero Farm tells the farm which kind of computer it runs on, and refuses (and reports) a job program built for
+  another kind before downloading it.
 
 ## 0.2.14 (2026-11-17, canary)
 

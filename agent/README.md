@@ -1,8 +1,9 @@
 # zero-farm agent
 
-The Windows app invited friends install so their idle PCs do jobs for zero-core runs (MTG Zero
-first), plus its launcher, its installer and the desktop's release tool. The wire contract is
-[`../PROTOCOL.md`](../PROTOCOL.md) (v1 rev 15); the reasons are in
+The app invited friends install so their idle PCs do jobs for zero-core runs (MTG Zero first) - on
+Windows, and from 0.3.0 headless on Macs with Apple silicon ([macOS](#macos-apple-silicon-protocol-11-agent-030)) -
+plus its launcher, its installer and the desktop's release tool. The wire contract is
+[`../PROTOCOL.md`](../PROTOCOL.md) (v1 rev 17); the reasons are in
 [`../DESIGN.md`](../DESIGN.md) sections 2.2, 3, 4 and 5.
 
 | Crate | Output | What it is |
@@ -71,13 +72,20 @@ key, uses the CPU (the fake worker sleeps) or reaches the network beyond its own
 Install tests use a temp root, a temp shortcut folder and the registry name
 `ZeroFarmTest-<pid>-<n>`, removed by a guard even when an assertion fails.
 
-250 tests (+2 ignored), about 3 minutes on an otherwise idle PC:
+On macOS no test touches the real LaunchAgent or `~/Library/Application Support/ZeroFarm`: the install test uses a
+temp root, a temp LaunchAgents folder, the label `com.zerofarm.test-<pid>` and `--no-launchctl`, and quits whatever
+it started even when an assertion fails. Tests that patch a launcher's version re-sign the copy ad hoc (`codesign`:
+Apple silicon runs only signed code).
+
+Windows: 261 tests (+2 ignored), about 3 minutes on an otherwise idle PC. macOS: 221 (+1 ignored); the Windows-only
+suites (`install`, `alternates`, `unfinished`, `release`, the session-end codes) are left out there, and the macOS
+ones (`install_macos`, the footprint / signals / token / CLI unit tests) come in:
 
 | Suite | Tests | Covers |
 |---|---|---|
 | `common` unit + `manifest_verify` | 33 + 9 | manifest rules and verification: tampered file, size change, missing/extra file, edited manifest, bad signature, unknown key, wrong trusted comment, legacy signatures, key rotation; minisign format; paths; DPAPI; backoff; canonical digest; rotating log; payload format; the round Z; VERSIONINFO write/read/patch and `.res` layout; launcher leftovers; `definition/1` (a good one, every refusal: unknown fields, ids, builds, sizes, templates with foreign keys or paths, seats); path-like strings; per-lease fields (ranges, whole pairs, kind); redaction (profile paths in every spelling, short paths, names as words only, JSON); only a coordinator-marked `revoked` revokes, a WAF's 401/403 is retried |
 | `agent` unit | 34 | idle policy (pure function over simulated signals), settings, cache LRU, results store, ranges, update cleanup, invite codes, panic sites, availability (dates, sample-and-hold with gaps, 7-day means); start failures (policy error codes, the 15 min → 24 h and 1 min → 1 h waits and their file, one `blocked` report per build per day, other reports once a day per reason); the tray window procedure re-entered while its state is busy (skipped, no panic) and a panic inside it (caught, reported as `agent`, the tray keeps working); the panic guard; the legacy allowlist (only the kind's keys, paths and kind mismatches refused, eval checkpoints = the seats' networks); definition versions never go back |
-| `agent/tests/lifecycle` | 37 | whole leases with the real fakeworker and the mock: download + verify, run, yield/suspend/resume, give-back after slack, upload retries after injected 503s, restart with pending results, orphaned leases, cancel, crash, hang, fatal error, slow yield, no hello, fuzz failures + summary, checkpoint switch, expiry, coordinator give-back, tampered / unknown-key / bad-signature builds, disk cap, profile resend, revoked token (only the coordinator's own `revoked`), an unknown token kept (tray "can't sign in", one try then a wait), a WAF's 403/401 HTML on lease requests, uploads and beats retried as network errors, quit event, launcher events, rev 2 (stale chunks, `done` missing, `upload_diag`, repeated checkpoints, duplicate ids, `x-farm-agent`); rev 3: starvation past slack gives back, brief starvation counted and kept, pause + starvation add up, availability recorded, the worker job's UI restrictions |
+| `agent/tests/lifecycle` | 38 | whole leases with the real fakeworker and the mock: download + verify, run, yield/suspend/resume, give-back after slack, upload retries after injected 503s, restart with pending results, orphaned leases, cancel, crash, hang, fatal error, slow yield, no hello, fuzz failures + summary, checkpoint switch, expiry, coordinator give-back, tampered / unknown-key / bad-signature builds, disk cap, profile resend, revoked token (only the coordinator's own `revoked`), an unknown token kept (tray "can't sign in", one try then a wait), a WAF's 403/401 HTML on lease requests, uploads and beats retried as network errors, quit event, launcher events, rev 2 (stale chunks, `done` missing, `upload_diag`, repeated checkpoints, duplicate ids, `x-farm-agent`); rev 3: starvation past slack gives back, brief starvation counted and kept, pause + starvation add up, availability recorded, the worker job's UI restrictions; rev 17: a build of another platform refused before anything but its manifest is downloaded (`refused: "platform"`, one `definition` report, the start-failure wait) |
 | `agent/tests/definitions` | 5 | signed definitions (PROTOCOL 7): the job line is the signed template + per-lease fields + the agent's own fields only (a coordinator's `prefix`, `models`, `out_dir`, `runtime_dir`, `threads`, settings dropped or overwritten), the definition remembered; an eval definition's seats and networks (the coordinator's seats ignored); a mid-lease network the definition doesn't name never fetched; refusals (`done` with `refused`, a `definition` report once per reason, a wait): signed with the release key, tampered bytes, an older version, another run's definition, expired, a build or runtime it doesn't name, a checkpoint hash, a job kind it has no template for, per-lease fields out of range; a legacy lease's allowlist (the review's UNC `models` and `prefix` never reach the worker; a path or a kind mismatch refuses it); a declared checkpoint size over the disk cap never downloaded |
 | `agent/tests/rolling` | 13 | rolling self-play leases (rev 15, PROTOCOL 10) with the fakeworker's rolling mode: `features: ["rolling"]` in lease requests; the job line's `rolling`, `flush_s`, `conc` / `groups` (the run's number, "auto" on the CPU) and released `games`; an extension of 2 x `conc` per `low` until the block is used up (`finish`), every id credited once, Stats `inflight` / `released`, beats with `gen`; `wait_s` honoured; the coordinator's `finish` (unfinished = released ids not played); a new generation with a verified definition switched to in place (`checkpoint` with `sha256`, self-tested, fetched once, the version remembered, chunks with the new `x-gen`); a changed template and a definition that fails a check finishing the lease (the latter reported once); a worker without the feature running it as a classic lease (no `extend`); a ready agent update finishing it, then exit 75; a 410 on an extension stopping it like a lost lease; classic leases unchanged; memory (0.2.14, the fakeworker committing real memory against the job's limit): a worker that runs into the limit with a fatal "bad allocation" or a silent abort started again with fewer games (ids after the released ones, its own `out_dir`, the lost ids unfinished, every id credited once, one crash report), the measured cost remembered and capping the run's next lease; a worker past 92 % finishing its games and the lease going on with fewer from the first id it never started, nothing lost, no crash report |
 | `agent/tests/eval` | 3 | eval leases (PROTOCOL 5.2) with the fakeworker's eval mode: two networks and their references downloaded, verified and cached; the job line's `models` (absolute paths, hashes, `model` null); every game uploaded with `x-ids` and no `x-gen`, files that split a pair, seat order per game; per-gen `selftest` in Stats; cached checkpoints in the next lease request; a tampered checkpoint refused before any worker starts, then a wait (no lease storm); a network failing its self-test reported once, with every gen's result |
@@ -85,6 +93,7 @@ Install tests use a temp root, a temp shortcut folder and the registry name
 | `agent/tests/update` | 6 | self-update in process: download + verify + `state\pending` + exit 75; `{"update"}` answer; tampered update refused; rolled-back version not retried; a required update that can't happen doesn't spin; older/equal ignored |
 | `agent/tests/selfupdate_e2e` | 2 | real launcher + real agent processes: update through the launcher; a version that never becomes healthy is rolled back, reported by the old agent, never re-downloaded, cleaned up |
 | `agent/tests/launcher_update` | 7 | the launcher updating itself. In process: swap + exit 76 + `launcher-swap`; with a pre-0.2 launcher, swap only (next logon); selftest failure never installs and isn't retried; `plan` (current + healthy only, verified package, never a downgrade or same version, no VERSIONINFO = 0.0.0, bad for 24 h). Real processes: the real launcher hands over to a newer real launcher (old exits 0, new runs the agent, `.old` deleted); fake new launchers that exit at once or never confirm are killed and rolled back, reported, not retried, `.bad` deleted |
+| `agent/tests/install_macos` | 2 (macOS) | `ZeroFarm setup --invite` from an unpacked package with the real launcher and agent (token file 0600 in a 0700 `state/`, 0755 executables, the LaunchAgent plist, enrollment, the launcher starting the agent), the CLI against the running agent (`status` with the CPU threads, `set` and `pause` / `resume` through request files, a bad value refused, `quit`), `set` with no agent running, `uninstall`; a tampered package and a Windows package refused |
 | `agent/tests/install` | 5 | install/uninstall with a test registry name (Run value, Uninstall entry, shortcut, files, self-deleting stage 2), install starting the launcher and uninstall stopping it, tampered package refused, upgrade keeps previous / no downgrade, path normalisation |
 | `agent/tests/enroll` | 2 | invite → DPAPI token, single use, 426 keeps the invite and shows the download link |
 | `agent/tests/diag` | 2 | "Send diagnostics": logs body (header, tail caps), `x-farm-diag: user`, the once-an-hour 429 message, unrequested uploads without the header still refused; no user name or profile path in a log line as written, in an uploaded logs body (old logs too, JSON-escaped and `/` spellings), a crash report or Stats |
@@ -99,6 +108,68 @@ set once by the harness), so other builds or training at normal priority can't s
 timeouts as they could the idle-priority worker; and their waits on the mock coordinator's state
 wake on each request it answers (`MockCoord::wait`) instead of polling. Starvation itself is still
 tested, with simulated signals.
+
+## macOS (Apple silicon, PROTOCOL 11, agent 0.3.0)
+
+The same workspace builds and tests on a Mac (Rust 1.95; the Xcode command-line tools provide the linker, which
+ad-hoc signs the arm64 binaries). There the outputs are `farm-agent` and `ZeroFarm` (no `.exe`); `ZeroFarmSetup` only
+says it is the Windows installer, and `farm-release` stays the Windows desktop's tool (it keeps the release key with
+DPAPI; its tests run on Windows only). The macOS code sits next to the Windows code behind `cfg`: `agent/src/macos.rs`
+(sysctl, IOKit, Low Power Mode, memory, per-process accounting), `signals_macos.rs`, `worker_unix.rs`,
+`install_macos.rs`, `headless.rs`, `common/src/names_unix.rs`, `common/src/binver.rs`.
+
+```
+cd agent
+cargo build --release -p farm-agent -p zerofarm-launcher            # what ships (on the Mac)
+cargo test --workspace --all-features -- --test-threads=2           # on the Mac too
+```
+
+| | Windows | macOS |
+|---|---|---|
+| root | `%LOCALAPPDATA%\ZeroFarm` | `~/Library/Application Support/ZeroFarm` |
+| autostart | HKCU `Run` value | LaunchAgent `~/Library/LaunchAgents/com.zerofarm.agent.plist` (`RunAtLoad`, no `KeepAlive`, `ProcessType` `Interactive`), `launchctl bootstrap gui/<uid>` / `bootout` |
+| token | DPAPI in `state\machine.json` | in the clear in `state/machine.json`, mode 0600, `state/` 0700 |
+| single instance, quit | named mutexes, a named quit event | `flock` on `state/<role>.lock` (holding the pid), SIGTERM; the launcher passes a quit on to its agent; an agent whose launcher is gone quits |
+| worker | job object (kill on close, memory limit, UI restrictions), idle priority + EcoQoS, NtSuspendProcess | own process group, nice 19 (never background QoS), SIGSTOP/SIGCONT to the group, the memory cap enforced by the agent on the group's physical footprint (checked at least every 100 ms, killed past it), leftover groups killed at the next start |
+| when it works | idle time, fullscreen, power, battery saver, memory, GPU | IOKit `HIDIdleTime`, the power source, Low Power Mode, memory pressure; no fullscreen detection, no GPU work |
+| keep awake | - | an IOKit `PreventUserIdleSystemSleep` assertion while a lease runs on AC power (`keep_awake`, default on) |
+| launcher version | VERSIONINFO | a 32-byte marker in the binary (`binver.rs`) |
+| UI | tray, invite dialog | headless CLI: `ZeroFarm status \| pause [minutes] \| resume \| set <key> <value> \| quit \| uninstall \| setup` |
+| rolling "auto" (CPU) | 32 in flight in 4 groups | 144 per physical core in groups of 192 (an M4 Max: 2,304 in 12), planned at 1 GB + 4 MB per game of physical footprint |
+
+**Install** (what `curl -fsSL https://farm.greggg230.com/install-macos.sh | sh -s -- --invite CODE` ends in): the
+tarball `ZeroFarm-macos-arm64.tar.gz` holds `ZeroFarm`, `farm-agent`, `manifest.json` and its signature. `./ZeroFarm
+setup [--invite CODE] [--name NAME]` verifies that package against the launcher's compiled-in release keys and runs
+its `farm-agent setup`, which installs it (the package must name `macos-arm64`), writes the LaunchAgent, enrolls (the
+code and name asked on `/dev/tty` when not given; the name defaults to the host name) and loads the LaunchAgent, which
+starts the launcher. Options for tests and odd setups: `--root`, `--launch-agents-dir`, `--label`, `--no-launchctl`
+(start the launcher directly), `--no-start`, `--coordinator`. Uninstall: `ZeroFarm uninstall` (quits, unloads and
+removes the LaunchAgent, deletes the root). Without an enrollment the agent waits for one instead of exiting.
+
+**CLI** (`<root>/ZeroFarm`; everything but `quit` is forwarded to the current `farm-agent`): `status` (what the
+running agent wrote to `state/status.json`: its state, games today, CPU threads with their automatic number, the
+settings), `pause [minutes]` (no minutes: until `resume`), `resume`, `set <key> <value>` with the keys `cpu_threads`
+(N or `auto`: one per physical core, 12 performance + 4 efficiency on an M4 Max), `work_when` (`idle` | `active`),
+`idle_minutes`, `on_battery` (also work on battery and in Low Power Mode; default false), `keep_awake` (default true),
+`hours` (`HH:MM-HH:MM` | `off`), `max_ram_mb` (N or `auto`: half the RAM), `disk_cap_mb`. A change goes to the running
+agent as a request file in `state/requests/` plus SIGUSR1 (applied as the tray applies its menu, answered within a
+second); with no agent running the CLI changes `machine.json` itself. An owner's own Mac that should work like the
+SSH self-play does: `set work_when active` and `set on_battery true`.
+
+**Release** (desktop): `tools/mac-agent-build.sh [DEST]` pushes HEAD to a bare repository on the Mac (git remote `mac`,
+or `ZEROFARM_MAC_REMOTE`), builds `farm-agent` and `ZeroFarm` there in release (`ZEROFARM_MAC` = its ssh target; the
+binaries checked: arm64, ad-hoc signature, versions, trusted keys) and copies them into `agent/dist/macos-arm64-prebuilt`.
+Then
+```
+farm-release release-agent --platform macos-arm64 --prebuilt agent/dist/macos-arm64-prebuilt --url https://farm.greggg230.com --token %ZEROFARM_ADMIN_TOKEN% --channel canary --min-agent 0.3.0 --github greggg230/zero-farm
+```
+reads what it can't ask a Mac binary to print from its bytes (arm64 Mach-O, no test-only names, the version markers,
+exactly the trusted keys of `common/trusted_keys.txt` + `trusted_data_keys.txt`), signs the package for `macos-arm64`
+(`dist/agent-macos-<v>/`), makes the tarball (`dist/agent-macos-<v>-github/`), uploads and registers the build, makes
+the GitHub Release `agent-macos-v<version>` (the tarball, `SHA256SUMS` with its line, `SHA256SUMS.minisig`; a prerelease
+for canary; never marked Latest, which stays the Windows release) and then `POST /v1/admin/agent/release` with
+`"platform": "macos-arm64"` and the tarball's GitHub URL. Worker builds and runtime packs for Macs:
+`farm-release sign ... --platform macos-arm64 --min-agent 0.3.0`.
 
 ## Install flow (`farm-agent install`, run by ZeroFarmSetup.exe)
 
@@ -402,6 +473,7 @@ Agent exit codes: 0 quit, 75 switch to `state\pending`, 76 hand over to the new 
   gating on the job's own adapter only (today the busiest adapter gates every GPU job). An AppContainer
   worker would need the `packageQuery` capability for Windows ML's provider catalog.
 - Authenticode signing (planned before more friends).
+- macOS: a menu-bar icon, a notarized `.pkg` / `.app` (Developer ID), fullscreen detection, GPU work (Core ML).
 - Autotuning sweeps and `diag` jobs beyond passing them to the worker.
 
 ### Design note: the worker sandbox (AppContainer)

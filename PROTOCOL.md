@@ -1366,22 +1366,24 @@ Platform names: `windows-x64` and `macos-arm64` (Apple silicon, macOS 13 or newe
   channel and platform). So `latest` and `min_agent` are per platform: a Windows-only release never asks a Mac to
   update, and the reverse.
 - GitHub (section 2.1): a macOS release is the GitHub Release `agent-macos-v<version>` (never marked Latest;
-  `agent-v<version>` stays Windows), assets `ZeroFarm-macos-arm64.tar.gz`, `SHA256SUMS`, `SHA256SUMS.minisig` (same
-  rules as 2.1). Its `github_url` must be exactly
+  `agent-v<version>` stays Windows), assets `ZeroFarm-macos-arm64.tar.gz`, `SHA256SUMS` (its one line: the tarball),
+  `SHA256SUMS.minisig` (same rules as 2.1). Its `github_url` must be exactly
   `https://github.com/<GITHUB_REPO>/releases/download/agent-macos-v<version>/ZeroFarm-macos-arm64.tar.gz`.
 - `GET /download?platform=macos-arm64` (optional `channel` as today) → 302 to the newest macOS release's tarball.
   `GET /install-macos.sh` (optional `?channel=canary`) → a POSIX shell script (`text/plain`) that downloads that
   tarball, checks it against the release's `SHA256SUMS`, unpacks it into a temporary directory and runs
   `./ZeroFarm setup "$@"` (so `curl -fsSL https://farm.greggg230.com/install-macos.sh | sh -s -- --invite CODE`
   works, and without `--invite` the setup asks on the terminal). The tarball holds the launcher `ZeroFarm`, the
-  agent package (its signed manifest and files) and nothing else; `ZeroFarm setup` verifies the package's manifest
-  against its embedded release keys before installing it.
+  agent package (its signed manifest and files) and nothing else, flat (`ZeroFarm`, `farm-agent`, `manifest.json`,
+  `manifest.json.minisig`; executables 0755); `ZeroFarm setup` verifies the package's manifest against its embedded
+  release keys before installing it.
 
 ### 11.3 Builds per platform
 
-- Manifests (`agent`, `worker`, `runtime`) take an optional `"platform"`; absent = `windows-x64`. A manifest that
-  names a platform has `min_agent` 0.3.0 or newer (`farm-release sign` refuses less; agents before 0.3.0 refuse the
-  unknown field anyway, and the coordinator never leases them such a build).
+- Manifests (`agent`, `worker`, `runtime`) take an optional `"platform"` (`[a-z0-9-]{1,32}`); absent = `windows-x64`.
+  A manifest that names a platform has `min_agent` 0.3.0 or newer (`farm-release sign --platform` refuses less; the
+  agent's parser doesn't check it). Agents before 0.3.0 ignore the unknown field (manifest/1 parsing allows unknown
+  fields) and would try to run the build: the coordinator never leases them one.
 - On macOS executables have no extension (`entry: "mtgz-worker"`; an agent package's `farm-agent` and `ZeroFarm`)
   and a runtime pack carries `libonnxruntime.dylib` (the name the worker loads from aw/1 `runtime_dir`). The
   executable bit is not in the manifest: the agent sets mode 0755 on a build's `entry` (and an agent package's
@@ -1389,9 +1391,11 @@ Platform names: `windows-x64` and `macos-arm64` (Apple silicon, macOS 13 or newe
   files the agent downloads itself carry no quarantine attribute, so Gatekeeper doesn't check them.
 - `POST /v1/admin/build` stores the manifest's platform (`builds.platform`, migration 0013); an unknown platform →
   400.
-- An agent from 0.3.0 checks, before downloading anything else, that the lease's worker build (and runtime pack)
-  manifest names its own platform. A mismatch → `done` with `refused: "platform"`, a crash report of kind
-  `definition` at most once a day per build, and the start-failure wait (section 9.5's pattern).
+- An agent from 0.3.0 checks, after the lease's definition (section 7) and before downloading anything but the
+  manifests (fetched and verified alone, as in 9.5), that the lease's worker build (and runtime pack) manifest names
+  its own platform (a manifest without one is `windows-x64`'s: a Mac refuses it). A mismatch → `done` with
+  `refused: "platform"` (`given_back`, no `unfinished`), a crash report of kind `definition` ("lease refused (platform
+  <build_id>): ...") at most once a day per build, and the start-failure wait (1 min doubling to 1 h, 9.5's pattern).
 
 ### 11.4 Which build a machine gets
 
@@ -1424,28 +1428,59 @@ Platform names: `windows-x64` and `macos-arm64` (Apple silicon, macOS 13 or newe
 ### 11.5 The macOS agent
 
 - **Layout.** `~/Library/Application Support/ZeroFarm/`, the same tree as section 6 without `.exe`
-  (`ZeroFarm`, `versions/<v>/farm-agent`). Autostart: the LaunchAgent `~/Library/LaunchAgents/com.zerofarm.agent.plist`
-  runs `<root>/ZeroFarm` at login (`RunAtLoad`; no `KeepAlive`: the launcher restarts the agent itself, as on
-  Windows). Exit codes, `pending`/`healthy-<v>`/`bad-<v>`, the rollback and the launcher's own update (exit 76,
-  `--takeover`, `launcher-swap`) behave as in section 6; single-instance and "quit" use POSIX means (an exclusive
-  `flock` per role in `state/`, signals) instead of named mutexes and events.
+  (`ZeroFarm`, `versions/<v>/farm-agent`; launcher leftovers `ZeroFarm.old-<n>`, `ZeroFarm.bad-<n>`, `ZeroFarm.new`).
+  Autostart: the LaunchAgent `~/Library/LaunchAgents/com.zerofarm.agent.plist` runs `<root>/ZeroFarm` at login
+  (`RunAtLoad`; no `KeepAlive`: the launcher restarts the agent itself, as on Windows; `ProcessType` `Interactive`, as
+  launchd otherwise throttles an agent's CPU and I/O). Exit codes, `pending`/`healthy-<v>`/`bad-<v>`, the rollback and
+  the launcher's own update (exit 76, `--takeover`, `launcher-swap`) behave as in section 6; a launcher's version
+  (there is no VERSIONINFO) is a 32-byte marker in the binary: `\0ZFVERSION:` and its semver, NUL-padded. A
+  launcher taking over runs in a session of its own (launchd ends the old launcher's process group with it).
+- **Single instance and quit.** An exclusive `flock` on `state/<role>.lock` (`launcher`, `agent`), which holds the
+  holder's pid (trusted only while the lock is held). "Quit" (`ZeroFarm quit`, uninstall, re-install) is SIGTERM to
+  both holders; SIGTERM, SIGINT and SIGHUP quit the launcher and the agent (launchd sends SIGTERM at logout and on
+  `bootout`; not a crash, there are no session-end codes); the launcher passes a quit on to its agent, and an agent
+  whose launcher is gone (it was reparented) quits, as the job object's kill-on-close does on Windows.
 - **Token.** `state/machine.json` (mode 0600, `state/` 0700) holds the token in the clear instead of DPAPI. The
   Keychain is not used: the agent's code identity changes with every self-update, so the Keychain would prompt.
 - **Worker.** Its own process group; CPU work at nice 19 (never the background QoS / `PRIO_DARWIN_BG`, which
   confines a process to the efficiency cores); yield/resume = `SIGSTOP`/`SIGCONT` to the group; the memory cap and
-  the rolling memory plan (10.6) read the worker's physical footprint (there are no job objects); the group is
-  killed when the agent exits, and a worker whose stdin closes exits by itself.
-- **When it works.** Input idle time from IOKit (`HIDIdleTime`); `on_battery` and `battery_saver` (Low Power Mode)
-  from the power source; `low_memory` from memory pressure; no fullscreen detection in 0.3.0. While it holds a
-  lease on AC power the agent keeps the Mac from idle-sleeping (an IOKit power assertion like `caffeinate -i`; the
-  display still sleeps), setting `keep_awake` (default on): a Mac otherwise sleeps whenever the user leaves.
-- **Profile.** `os` (e.g. `macOS 26.1`), `cpu` (`machdep.cpu.brand_string`), `cores`/`threads`,
-  `perf_cores`/`eff_cores` (`hw.perflevel0/1.physicalcpu`), `ram_mb`, `disk_free_mb`, `gpus: []`, `providers:
-  ["cpu"]`. No GPU work on Macs in rev 17 (Core ML later, behind the same probe and bench as section 9.6).
+  the rolling memory plan (10.6) read the group's physical footprint (`proc_pid_rusage` `ri_phys_footprint`, summed;
+  there are no job objects): the agent reads it at least every 100 ms and kills a group past the cap, which then
+  counts as running into the limit (its peak is past the cap). The group is killed when the agent exits; a worker
+  whose stdin closes exits by itself; the agent records each worker (pid and start time) in its working directory
+  and kills a group a dead agent left behind at its next start (a stopped worker can't see its stdin close). The
+  runtime pack is passed as `ZEROFARM_RUNTIME_DIR` and first on `DYLD_LIBRARY_PATH`.
+- **Rolling leases (10.6) on macOS.** "auto" on the CPU is 144 games in flight per physical core (performance and
+  efficiency) in groups of 192 (16 cores: 2,304 in 12 groups); the memory plan's default cost is 1,024 MB + 4 MB per
+  game in flight, in physical footprint (the live self-play of 2026-11-18: about 2.7 MB per game with the process).
+- **When it works.** Input idle time from IOKit (`HIDIdleTime`); `on_battery` from the providing power source and
+  `battery_saver` from Low Power Mode (`NSProcessInfo`); `low_memory` when memory pressure is at least "warning"
+  (`kern.memorystatus_vm_pressure_level`) or free + inactive memory is below the floor; no fullscreen detection in
+  0.3.0. While it holds a lease on AC power the agent keeps the Mac from idle-sleeping (an IOKit power assertion
+  `PreventUserIdleSystemSleep`, as `caffeinate -i`; the display still sleeps), setting `keep_awake` (default on): a
+  Mac otherwise sleeps whenever the user leaves. The setting `on_battery` (both platforms, default off) lets an
+  owner's computer work on battery and in battery saver / Low Power Mode too; `work_when active` (the tray's
+  "always") while it is in use.
+- **Profile.** `os` (e.g. `macOS 26.1`), `cpu` (`machdep.cpu.brand_string`), `cores`/`threads`
+  (`hw.physicalcpu`/`hw.logicalcpu`), `perf_cores`/`eff_cores` (`hw.perflevel0/1.physicalcpu`), `ram_mb`,
+  `disk_free_mb`, `gpus: []`, `providers: ["cpu"]`, `platform`. No GPU work on Macs in rev 17 (Core ML later,
+  behind the same probe and bench as section 9.6). The CPU threads a job gets: one per physical core (as on
+  Windows; an M4 Max: 16, 12 performance + 4 efficiency), or the `cpu_threads` setting.
 - **No tray in 0.3.0.** The agent runs headless; `ZeroFarm status | pause [minutes] | resume | set <key> <value> |
-  quit | uninstall` work from a terminal.
-- **Install.** `curl -fsSL https://farm.greggg230.com/install-macos.sh | sh -s -- --invite CODE` (11.2). A browser
-  download (a `.pkg` or `.app`) would need Developer ID signing and notarization: later, the owner's decision.
+  quit | uninstall` work from a terminal (`<root>/ZeroFarm`; all but `quit` are forwarded to the current
+  `farm-agent`). The running agent writes `state/status.json` (what the tray would show, the CPU threads, the
+  settings); `pause`, `resume` and `set` are request files in `state/requests/` plus SIGUSR1 to the agent, which applies
+  them as the tray does and answers in `<request>.done`; with no agent running the CLI changes `state/machine.json`
+  itself. Keys of `set`: `cpu_threads` (N or `auto`), `work_when` (`idle` | `active`), `idle_minutes`, `on_battery`,
+  `keep_awake`, `hours` (`HH:MM-HH:MM` | `off`), `max_ram_mb` (N or `auto`), `disk_cap_mb`. Without an enrollment the
+  agent waits for one (`ZeroFarm setup --invite`) instead of exiting.
+- **Install.** `curl -fsSL https://farm.greggg230.com/install-macos.sh | sh -s -- --invite CODE` (11.2). `ZeroFarm
+  setup [--invite CODE] [--name NAME]` verifies the package it sits in, runs that package's `farm-agent setup`:
+  install (the package must name `macos-arm64`), the LaunchAgent written, the enrollment (the invite code and name
+  asked on `/dev/tty` when not given: `curl | sh` leaves stdin to the script), then `launchctl bootstrap gui/<uid>`
+  (which starts the launcher). Uninstall: quit, `launchctl bootout gui/<uid>/com.zerofarm.agent`, the plist (only one
+  that runs this root's launcher) and the root removed. A browser download (a `.pkg` or `.app`) would need Developer
+  ID signing and notarization: later, the owner's decision.
 
 ## Changes
 - v1 rev 17 (2026-11-18; coordinator migration 0013, agents from 0.3.0): platforms (section 11). Header
