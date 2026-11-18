@@ -67,6 +67,7 @@ npm run admin -- campaign fuzz-delver campaign.json
 npm run admin -- definition definition.json         # + definition.json.minisig (a data key's), PROTOCOL 7
 npm run admin -- agent-release 0.2.0 <build_id> canary 0.1.0 --github-url <installer asset URL>
 npm run admin -- external report.json               # the owner's own machines (admin page only)
+npm run admin -- routing '{"eval_horizon_s": 900}'  # hardware routing (PROTOCOL 12); no argument shows it
 npm run admin -- stats
 ```
 

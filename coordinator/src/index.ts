@@ -66,6 +66,8 @@ const routes: [string, RegExp, Handler][] = [
   ["POST", /^\/v1\/admin\/pause$/, admin.pause],
   ["POST", /^\/v1\/admin\/evict$/, admin.evict],
   ["GET", /^\/v1\/admin\/evict$/, admin.getEvict],
+  ["POST", /^\/v1\/admin\/routing$/, admin.routing],
+  ["GET", /^\/v1\/admin\/routing$/, admin.getRouting],
   ["POST", /^\/v1\/admin\/diag$/, admin.diag],
   ["GET", /^\/v1\/admin\/diag$/, admin.diagList],
   ["GET", /^\/v1\/admin\/stats$/, admin.stats],

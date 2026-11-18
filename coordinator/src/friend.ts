@@ -30,7 +30,14 @@ import {
   storedRouting,
   verifiedProviders,
   GPU_VENDORS_OFF,
+  CPU_SELFPLAY_TIER,
+  DEFERRED_EVAL_RANK,
+  type HwRouting,
+  evalBehind,
+  evalCpuFloor,
+  hwRoutingOf,
 } from "./routing";
+import { presenceOf } from "./presence";
 import { cleanStats, telemetry } from "./telemetry";
 import {
   BUILD_RE,
@@ -227,8 +234,11 @@ interface Candidate {
   run?: string;
   campaign?: string;
   priority: number;
-  tier: number; // 1: a run's games; 2: backfill (fuzz, or a GPU-preferring job on a PC that isn't GPU-eligible)
+  tier: number; // 1: a run's games; 2: backfill (fuzz, or a GPU-preferring job on a PC that isn't GPU-eligible); 3 (rev 18): CPU self-play of a run with a GPU version
   fit: number;
+  gpu_play?: boolean; // rev 18: self-play this PC plays on its GPU (a GPU lease whose GPU pays here)
+  unissued?: number; // rev 18: an eval batch's unissued games
+  deferred?: boolean; // rev 18: an eval batch this GPU self-play PC takes after its self-play (not behind)
   configured: "auto" | number;
   gpu_configured?: "auto" | number; // rev 11: the job's gpu_games_per_lease (absent: none)
   max_stale?: number; // self-play: the run's staleness window in gens
@@ -361,6 +371,10 @@ export async function lease(c: Ctx): Promise<Response> {
     // Rev 11 (PROTOCOL 9.4): a GPU lease gets enough games for big batches.
     if (cd.gpu_lease && cd.run && (cd.kind === "selfplay" || cd.kind === "eval")) {
       want = await gpuLeaseSize(db, cd, want, o.rate.get(key) ?? null, gpuGames.get(cd.run));
+    } else if (cd.kind === "eval" && cd.configured === "auto") {
+      // Rev 18 (PROTOCOL 12.3): an eval lease takes about as long as its slowest game, so a CPU lease of a few games
+      // measures a low rate and stays small; enough games keep every thread busy.
+      want = Math.max(want, evalCpuFloor(o.hw.eval_games_per_thread, caps.threads, caps.ram_mb, SIZING.eval.min, SIZING.eval.max));
     }
     const l = unwrap(
       await bookFor(c.env, cd.scope).grant({
@@ -404,6 +418,26 @@ interface Offer {
   rank: (cd: Candidate) => number;
   rate: Map<string, number>;
   classRate: Map<string, number>;
+  hw: HwRouting; // rev 18: the owner's hardware-routing setting
+}
+
+// Rev 18 (PROTOCOL 12.2): the eval rate (games per second, summed) of the PCs that would play an eval batch on the CPU
+// and are online and free to work: not playing self-play on a GPU (the `gpu_play` their last offer recorded), seen in
+// the last ONLINE_S, not paused or revoked, no fresh presence (in use by their owner). Each counts its measured rate for
+// this batch, else its average over every eval it played, else nothing (unknown: the batch counts as behind sooner).
+export const ONLINE_S = 300;
+async function cpuEvalRate(db: D1Database, scope: string, self: string, now: number): Promise<number> {
+  const { results } = await db
+    .prepare(
+      `SELECT m.last_seen, m.presence, m.presence_t,
+         (SELECT r.rate FROM rates r WHERE r.machine_id = m.machine_id AND r.kind = 'eval' AND r.scope = ?) AS own,
+         (SELECT AVG(r.rate) FROM rates r WHERE r.machine_id = m.machine_id AND r.kind = 'eval') AS any_rate
+       FROM machines m
+       WHERE m.machine_id != ? AND COALESCE(m.gpu_play, 0) = 0 AND m.revoked_at IS NULL AND m.paused = 0 AND m.last_seen >= ?`,
+    )
+    .bind(scope, self, now - ONLINE_S)
+    .all<{ last_seen: number | null; presence: string | null; presence_t: number | null; own: number | null; any_rate: number | null }>();
+  return results.filter((x) => !presenceOf(x, now)).reduce((s, x) => s + (x.own ?? x.any_rate ?? 0), 0);
 }
 
 async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | null): Promise<Offer> {
@@ -419,7 +453,7 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
   const placeFor = (kind: "selfplay" | "eval" | "fuzz", r: Routing, runtime: string | null) =>
     place(kind, r, gpuEligible(caps.gpu, verifiedProviders(machineProfile, runtime), r.providers), caps.gpu);
 
-  const [runsR, campsR, releaseR, pausedR, activeR, poolR, ratesR, classR, diagR, mineR] = await db.batch<any>([
+  const [runsR, campsR, releaseR, pausedR, activeR, poolR, ratesR, classR, diagR, mineR, hwR] = await db.batch<any>([
     db.prepare(`SELECT * FROM runs WHERE state = 'active'`),
     db.prepare(`SELECT * FROM campaigns WHERE state = 'active'`),
     db.prepare(`SELECT * FROM agent_releases WHERE channel = ? ORDER BY id DESC LIMIT 1`).bind(m.channel),
@@ -441,7 +475,9 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
       .bind(m.machine_id),
     // This machine's live leases (an expired one not swept yet doesn't count).
     db.prepare(`SELECT COUNT(*) AS n FROM leases WHERE machine_id = ? AND state = 'active' AND expires_at >= ?`).bind(m.machine_id, c.now),
+    db.prepare(`SELECT value FROM settings WHERE key = 'hw_routing'`),
   ]);
+  const hw = hwRoutingOf(hwR.results[0]?.value ?? null);
   const defs = await currentDefs(db);
   const runs = runsR.results as book.RunRow[];
   const camps = campsR.results as book.CampaignRow[];
@@ -512,6 +548,9 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
     const gpuLease = eligible && withPack.some((p) => isGpuProvider(p) && (!routing.providers || (routing.providers as string[]).includes(p)));
     return { build_id: r.build_id, runtime: r.runtime, alt: false, eligible, gpuLease };
   };
+  // Rev 18 (PROTOCOL 12.1): a run has a GPU version when it lists an alternate for a GPU vendor the farm uses, or its
+  // default runtime pack requires a GPU (a default pack that only may use one, DirectML, counts by its alternates).
+  const hasGpuVersion = (r: book.RunRow) => altsOf(r).some((x) => !GPU_VENDORS_OFF.includes(x.when.vendor)) || needOf(r.runtime) !== null;
   for (const r of runs) {
     const scope = book.runScope(r.run);
     if (kinds.has("selfplay") && r.selfplay && r.current_gen !== null) {
@@ -521,12 +560,17 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
       const at = routing && v ? place("selfplay", routing, v.eligible, caps.gpu) : null;
       if (sp && routing && v && at && needsOk(sp.needs) && diskOk([v.build_id, v.runtime])) {
         const ckptBonus = cachedCkpts.has(`${r.run}/${r.current_gen}`) ? 1.1 : 1;
+        // Rev 18 (PROTOCOL 12.1): played on this PC's GPU (a GPU lease, and the agent's bench didn't say no GPU pays
+        // for this run here); else, while the run has a GPU version, this PC's self-play is the last resort.
+        const gpuPlay = altAware && v.gpuLease && a.gpuGames.get(r.run) !== 0;
+        const cpuBackfill = hw.on && !gpuPlay && hasGpuVersion(r);
         cands.push({
           scope,
           kind: "selfplay",
           run: r.run,
           priority: r.priority,
-          tier: at.tier,
+          tier: cpuBackfill ? CPU_SELFPLAY_TIER : at.tier,
+          gpu_play: gpuPlay,
           fit: at.fit * (cachedBuilds.has(v.build_id) ? 1.2 : 1) * ckptBonus,
           configured: sp.games_per_lease,
           gpu_configured: sp.gpu_games_per_lease,
@@ -565,6 +609,8 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
             priority: r.priority,
             tier: at.tier,
             fit: at.fit * (cachedBuilds.has(v.build_id) ? 1.2 : 1) * ckptBonus,
+            // (a batch that requires a GPU has no CPU PCs to wait for: never deferred)
+            ...(routing.gpu === "required" ? {} : { unissued: poolN.get(`${scope}|eval:${ev.batch}`) ?? 0 }),
             configured: ev.games_per_lease,
             gpu_configured: ev.gpu_games_per_lease,
             providers: routing.providers,
@@ -640,8 +686,28 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
   const score = (cd: Candidate) => (cd.priority * cd.fit) / (1 + (active.get(`${cd.scope}|${cd.kind}`) ?? 0));
   // Rev 13: the runs' active leases (self-play and eval), for a background batch's share.
   const activeRuns = (activeR.results as any[]).filter((x) => x.kind === "selfplay" || x.kind === "eval").reduce((t, x) => t + x.n, 0);
-  const rank = (cd: Candidate) => jobRank(cd.kind, cd.share, active.get(`${cd.scope}|${cd.kind}`) ?? 0, activeRuns);
-  // Within a tier, evaluation before self-play (rev 7; a background batch only within its share, rev 13), then by score.
+
+  // Rev 18 (PROTOCOL 12): a PC that plays some run's self-play on its GPU records it (the CPU PCs' eval capacity reads
+  // it), and takes an eval batch after that self-play unless the CPU PCs online couldn't finish it within the horizon.
+  const gpuPlay = usable.some((cd) => cd.kind === "selfplay" && cd.gpu_play);
+  if (m.gpu_play !== (gpuPlay ? 1 : 0)) {
+    await db.prepare(`UPDATE machines SET gpu_play = ? WHERE machine_id = ?`).bind(gpuPlay ? 1 : 0, m.machine_id).run();
+    m.gpu_play = gpuPlay ? 1 : 0;
+  }
+  if (hw.on && gpuPlay && hw.eval_horizon_s > 0) {
+    for (const cd of usable) {
+      if (cd.kind !== "eval" || cd.tier !== 1 || cd.unissued === undefined) continue;
+      cd.deferred = !evalBehind(cd.unissued, await cpuEvalRate(db, cd.scope, m.machine_id, c.now), hw.eval_horizon_s);
+    }
+  }
+
+  // A deferred batch (rev 18) ranks after the self-play, and never before where its share (rev 13) puts it.
+  const rank = (cd: Candidate) => {
+    const r = jobRank(cd.kind, cd.share, active.get(`${cd.scope}|${cd.kind}`) ?? 0, activeRuns);
+    return cd.deferred ? Math.max(r, DEFERRED_EVAL_RANK) : r;
+  };
+  // Within a tier, evaluation before self-play (rev 7; a background batch only within its share, rev 13; a GPU self-play
+  // PC's batch only when behind, rev 18), then by score.
   usable.sort((x, y) => x.tier - y.tier || rank(x) - rank(y) || score(y) - score(x) || x.scope.localeCompare(y.scope));
   return {
     usable,
@@ -653,6 +719,7 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
     rank,
     rate,
     classRate,
+    hw,
   };
 }
 
@@ -776,12 +843,24 @@ export async function otherWorkWaits(c: Ctx, m: MachineRow, l: book.LeaseRow): P
   const ownTier = own?.tier ?? 1;
   const ownRank = own ? o.rank(own) : kindRank("selfplay");
   const ownPriority = own?.priority ?? ownRun?.priority ?? 0;
+  // Rev 18 (PROTOCOL 12.2): a deferred eval batch still waits while the lease's own generation has no headroom (the
+  // rolling lease would only wait for the next generation), as every eval batch did before.
+  let ownFull: boolean | null = null;
+  const ownQuotaFull = async () => {
+    if (ownFull === null) {
+      const sp = ownRun ? parseJson<book.SelfplayCfg | null>(ownRun.selfplay, null) : null;
+      ownFull = !ownRun || !sp || (await book.selfplayState(db, ownRun, sp)).headroom < 1;
+    }
+    return ownFull;
+  };
   for (const cd of o.usable) {
     if (cd === own) continue;
     if (cd.tier > ownTier) continue;
     if (cd.tier === ownTier) {
       const rk = o.rank(cd);
-      if (rk > ownRank || (rk === ownRank && !(cd.priority > ownPriority))) continue;
+      if (rk > ownRank || (rk === ownRank && !(cd.priority > ownPriority))) {
+        if (!(cd.deferred && (await ownQuotaFull()))) continue;
+      }
     }
     if (cd.kind === "selfplay") {
       const r = await book.getRun(db, cd.run!);
