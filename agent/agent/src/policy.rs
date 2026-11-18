@@ -111,6 +111,19 @@ impl Block {
             Block::UserActive => "you're using the PC",
         }
     }
+
+    /// The reason sent to the coordinator (PROTOCOL 3, `POST /v1/presence`, rev 16).
+    pub fn slug(self) -> &'static str {
+        match self {
+            Block::Paused => "paused",
+            Block::OutsideHours => "outside_hours",
+            Block::OnBattery => "on_battery",
+            Block::BatterySaver => "battery_saver",
+            Block::Fullscreen => "fullscreen",
+            Block::LowMemory => "low_memory",
+            Block::UserActive => "user_active",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

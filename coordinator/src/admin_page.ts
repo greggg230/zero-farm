@@ -146,7 +146,7 @@ function render(s) {
   const w2 = (x) => num(x.h1) + " / " + num(x.h24);
   h += "<h2>Contributors</h2>" + table([
     ["name", (c) => esc(c.name) + (c.origin === "farm" ? '<br><code class="muted">' + esc(c.id) + "</code>" : "")],
-    ["origin", (c) => origin(c)], ["status", (c) => stat(c) + ' <span class="muted">' + ago(c.last_seen, now) + "</span>"],
+    ["origin", (c) => origin(c)], ["status", (c) => stat(c) + (c.presence ? ' <span class="warn">' + esc(c.presence.replace(/_/g, " ")) + "</span>" : "") + ' <span class="muted">' + ago(c.last_seen, now) + "</span>"],
     ["hardware", (c) => esc(c.hardware || "")], ["working on", (c) => esc((c.working_on || []).join(", "))],
     ["self-play 1 h / 24 h", (c) => w2(c.selfplay), "n"], ["eval 1 h / 24 h", (c) => w2(c.eval), "n"],
     ["fuzz seeds 1 h / 24 h", (c) => w2(c.fuzz), "n"], ["busy h 24 h", (c) => (c.busy_h_24h === null ? "" : Number(c.busy_h_24h).toFixed(1)), "n"],

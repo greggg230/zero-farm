@@ -7,7 +7,7 @@ A change to anything here is a protocol change: bump the version it belongs to a
 bottom.
 
 Versions: HTTP API `v1` (path prefix), agent↔worker protocol `aw/1`, network files `zero-onnx/1`,
-manifests `manifest/1`. Current revision: v1 rev 15 (section 10, rolling self-play leases).
+manifests `manifest/1`. Current revision: v1 rev 16 (section 3, `POST /v1/presence`).
 
 ## 1. Conventions
 
@@ -291,6 +291,17 @@ lease (else 400). `returned` is how many ids went back. Repeating `done` → 200
   the machine; the machine's channel as the coordinator holds it is the one that counts. Rev 12:
   `"evict": ["<build_id>", ...]` (only when the owner's evict list is not empty, `POST /v1/admin/evict`):
   agents from 0.2.11 delete those builds from their cache at once (section 9.8); older agents ignore the key.
+- `POST /v1/presence` `{"reason": "user_active"}` → `{"ok": true}` (rev 16; migration 0012). An agent that may
+  not work right now sends why, at most every 60 s: when the reason changes and every 5 min while it lasts, in
+  the background (a failure changes nothing; a coordinator without it answers 404, which the agent ignores).
+  Reasons (agent policy `Block`): `user_active` (input within the idle threshold), `fullscreen`, `outside_hours`,
+  `on_battery`, `battery_saver`, `low_memory`, `paused` (paused from the tray). Any slug
+  `[a-z][a-z0-9_]{0,31}` is stored, so a newer agent's reason needs no coordinator change. The coordinator
+  keeps it on the machine (`presence`, `presence_t`) and moves `last_seen`, so an agent that is on but not
+  allowed to work stays online. The admin stats show it (machine and contributor `presence`) while it is
+  under 10 min old and no later contact replaced it (a contact more than 30 s after it); a contributor
+  with an active lease has none. Rate limit 60 s, burst 5. Before rev 16 such an agent was silent, so a PC
+  in use and a PC switched off looked the same.
 - `POST /v1/crash` `{"build_id", "kind": "panic" | "crash" | "agent" | "blocked" | "definition" | "probe_unfinished",
   "message", "backtrace", "lease_id", "os_error"?}` → `{"ok": true}` (message kept to 4 KB,
   backtrace to 64 KB). Rev 6: at most `MAX_CRASHES_PER_DAY` (100) rows per machine per 24 h are
@@ -1326,7 +1337,11 @@ Coordinator details (from building it, rev 15):
   "rolling" column in Runs and a "Rolling leases" table.
 
 ## Changes
-- v1 rev 15, agent 0.2.14 (2026-11-17; canary first; no coordinator or wire change): **rolling leases and memory**
+- v1 rev 16 (2026-11-17; coordinator migration 0012, agent 0.2.14): `POST /v1/presence` (section
+  3, Other): an agent that is on but may not work says why (owner using the PC, fullscreen app, battery, outside
+  its hours, paused, low memory) every 5 min and when the reason changes; stats carry `presence`. Older agents
+  stay silent while blocked, as before.
+- v1 rev 15, agent 0.2.14 (2026-11-17; canary first; no coordinator or wire change for this part): **rolling leases and memory**
   (section 10.6, **Memory**). "auto" plans the games in flight to commit at most 85% of the worker's memory limit at a
   measured cost per game; a worker at 92% of its limit finishes its games and the lease goes on with a new worker with
   fewer in flight; one that runs into the limit is started again with fewer (its games in flight lost, nothing else);

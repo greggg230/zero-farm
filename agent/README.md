@@ -71,7 +71,7 @@ key, uses the CPU (the fake worker sleeps) or reaches the network beyond its own
 Install tests use a temp root, a temp shortcut folder and the registry name
 `ZeroFarmTest-<pid>-<n>`, removed by a guard even when an assertion fails.
 
-184 tests (+1 ignored), about 3 minutes on an otherwise idle PC:
+250 tests (+2 ignored), about 3 minutes on an otherwise idle PC:
 
 | Suite | Tests | Covers |
 |---|---|---|

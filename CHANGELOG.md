@@ -13,6 +13,12 @@ version is a GitHub Release tagged `agent-v<version>`.
   with fewer games instead of giving the work back to the farm (only the games that were in progress are lost).
   Either way it remembers how much memory that run's games need on this PC and plans its next jobs with it.
 
+- **The farm can now tell a PC that's in use from one that's switched off.** While Zero Farm is waiting
+  because you're using the PC (or a fullscreen game is running, it's on battery, it's outside the hours
+  you picked, or you paused it), it now tells the farm why, every 5 minutes. Before, it said nothing at
+  all while waiting, so the farm showed the PC as offline. Nothing about when Zero Farm works changes,
+  and the message is only the reason (for example "user_active"): nothing about what you're doing.
+
 ## 0.2.13 (2026-11-17, canary)
 
 - **Long self-play jobs that keep the PC's processor or graphics card fully busy.** For runs that use them, a job

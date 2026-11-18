@@ -137,6 +137,8 @@ export interface Contributor {
   eval: Window;
   fuzz: Window;
   busy_h_24h: number | null;
+  // Rev 16: farm PCs only - why an online agent with no lease isn't working (POST /v1/presence).
+  presence?: string | null;
 }
 
 export interface Totals {
