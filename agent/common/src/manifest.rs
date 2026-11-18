@@ -92,6 +92,21 @@ pub const ZST_WINDOW_LOG_MAX: u32 = 27;
 /// The first agent that reads `zst` and `gpu` (PROTOCOL 9).
 pub const ZST_MIN_AGENT: &str = "0.2.10";
 
+/// rev 17 (PROTOCOL 11): the platforms builds and agents are made for. A manifest without `platform` is
+/// [`PLATFORM_WINDOWS_X64`]'s, as is an agent request without `x-farm-platform`.
+pub const PLATFORM_WINDOWS_X64: &str = "windows-x64";
+pub const PLATFORM_MACOS_ARM64: &str = "macos-arm64";
+/// Every platform `farm-release sign --platform` takes.
+pub const PLATFORMS: [&str; 2] = [PLATFORM_WINDOWS_X64, PLATFORM_MACOS_ARM64];
+/// The first agent that knows platforms (PROTOCOL 11): a manifest that names one needs `min_agent` this or newer.
+pub const PLATFORM_MIN_AGENT: &str = "0.3.0";
+
+/// A well-formed platform name (`[a-z0-9-]{1,32}`). An agent refuses a build of a platform it doesn't know as one of
+/// another platform (PROTOCOL 11.3), so the manifest parser accepts any such name; `farm-release` only [`PLATFORMS`].
+pub fn is_platform_name(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 32 && s.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
+}
+
 /// Provider names a manifest may list (PROTOCOL 3).
 pub const PROVIDERS: [&str; 7] = ["cpu", "tensorrt_rtx", "cuda", "migraphx", "amdgpu", "openvino", "dml"];
 
@@ -151,6 +166,9 @@ pub struct Manifest {
     /// rev 11 (PROTOCOL 9.2), runtime packs only: the hardware the pack needs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gpu: Option<GpuNeed>,
+    /// rev 17 (PROTOCOL 11.3): the platform the build is for; absent = `windows-x64` ([`Manifest::platform_name`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
     pub files: Vec<FileEntry>,
 }
 
@@ -299,6 +317,14 @@ impl Manifest {
                 return inv(&format!("a runtime manifest with gpu needs min_agent {ZST_MIN_AGENT} or newer"));
             }
         }
+        if let Some(p) = &self.platform {
+            if !is_platform_name(p) {
+                return inv(&format!("platform {p:?} must be a platform name (e.g. {PLATFORM_MACOS_ARM64})"));
+            }
+            if !self.min_agent.as_deref().is_some_and(|m| semver_at_least(m, PLATFORM_MIN_AGENT)) {
+                return inv(&format!("a manifest with a platform needs min_agent {PLATFORM_MIN_AGENT} or newer"));
+            }
+        }
         match self.kind {
             Kind::Agent | Kind::Worker => {
                 let Some(entry) = &self.entry else { return inv("entry is required for agent and worker manifests") };
@@ -317,6 +343,11 @@ impl Manifest {
 
     pub fn total_size(&self) -> u64 {
         self.files.iter().map(|f| f.size).sum()
+    }
+
+    /// The platform the build is for (PROTOCOL 11.3): its `platform`, else `windows-x64`.
+    pub fn platform_name(&self) -> &str {
+        self.platform.as_deref().unwrap_or(PLATFORM_WINDOWS_X64)
     }
 }
 
@@ -496,6 +527,7 @@ mod tests {
             requires_runtime: None,
             entry: Some("w.exe".into()),
             gpu: None,
+            platform: None,
             files: vec![f.clone()],
         };
         assert!(m.validate().is_ok());
@@ -552,6 +584,7 @@ mod tests {
             requires_runtime: None,
             entry: None,
             gpu: None,
+            platform: None,
             files: vec![f],
         };
         assert!(m.validate().unwrap_err().to_string().contains("min_agent"), "zst before 0.2.10");
@@ -579,6 +612,52 @@ mod tests {
         let m2 = Manifest::parse(old.as_bytes()).unwrap();
         assert!(m2.gpu.is_none() && m2.files[0].zst.is_none());
         assert!(!String::from_utf8(serde_json::to_vec(&m2).unwrap()).unwrap().contains("zst"));
+    }
+
+    #[test]
+    fn platform_needs_agent_0_3_0() {
+        let f = FileEntry { path: "mtgz-worker".into(), sha256: "0".repeat(64), size: 1, zst: None };
+        let mut m = Manifest {
+            manifest: 1,
+            kind: Kind::Worker,
+            version: "x".into(),
+            created: 0,
+            game: Some("mtg".into()),
+            engine_commit: None,
+            core_commit: None,
+            profile: None,
+            aw: Some(1),
+            zero_onnx: None,
+            min_agent: Some("0.2.14".into()),
+            requires_runtime: None,
+            entry: Some("mtgz-worker".into()),
+            gpu: None,
+            platform: None,
+            files: vec![f],
+        };
+        assert!(m.validate().is_ok());
+        assert_eq!(m.platform_name(), PLATFORM_WINDOWS_X64, "absent = windows-x64");
+        m.platform = Some(PLATFORM_MACOS_ARM64.into());
+        assert!(m.validate().unwrap_err().to_string().contains("min_agent 0.3.0"));
+        m.min_agent = None;
+        assert!(m.validate().is_err());
+        m.min_agent = Some("0.3.0".into());
+        assert!(m.validate().is_ok());
+        assert_eq!(m.platform_name(), PLATFORM_MACOS_ARM64);
+        // A platform this agent doesn't know is well formed (refused later as another platform's build) ...
+        m.platform = Some("linux-x64".into());
+        assert!(m.validate().is_ok());
+        // ... a malformed one is not.
+        for bad in ["", "MacOS", "macos arm64", "a/b", &"x".repeat(33)] {
+            m.platform = Some(bad.to_string());
+            assert!(m.validate().is_err(), "{bad:?}");
+        }
+        m.platform = Some(PLATFORM_MACOS_ARM64.into());
+        let back = Manifest::parse(&serde_json::to_vec(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+        // Manifests without it serialise as before (no "platform" key).
+        m.platform = None;
+        assert!(!String::from_utf8(serde_json::to_vec(&m).unwrap()).unwrap().contains("platform"));
     }
 
     #[test]

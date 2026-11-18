@@ -22,7 +22,10 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use zerofarm_common::http::{with_retry, Backoff, Client};
 use zerofarm_common::keys::TrustedKeys;
-use zerofarm_common::manifest::{verify_dir, Expect, GpuNeed, Kind, Manifest, Packed, VerifiedBuild, MANIFEST_FILE, SIG_FILE, ZST_MIN_AGENT};
+use zerofarm_common::manifest::{
+    verify_dir, Expect, GpuNeed, Kind, Manifest, Packed, VerifiedBuild, MANIFEST_FILE, PLATFORMS, PLATFORM_MIN_AGENT, PLATFORM_WINDOWS_X64, SIG_FILE,
+    ZST_MIN_AGENT,
+};
 use zerofarm_common::sign::{list_files, sign_dir_zst, template, SigningKey};
 
 pub const KEY_FORMAT: &str = "zero-farm-release-key/1";
@@ -184,6 +187,9 @@ pub struct SignOpts {
     pub gpu: Option<GpuNeed>,
     /// rev 11 (PROTOCOL 9.3): make zstd copies of the files at this level (in `<dir>.zst`, see [`zst_dir`]).
     pub zst_level: Option<i32>,
+    /// rev 17 (PROTOCOL 11.3): the platform the build is for (one of [`PLATFORMS`]); written into the manifest, which
+    /// then needs `min_agent` 0.3.0 or newer. None: no `platform` field (= windows-x64, as before).
+    pub platform: Option<String>,
 }
 
 /// Where `sign --zst` puts a build directory's compressed copies (next to it, so the build directory itself
@@ -240,8 +246,19 @@ pub fn sign(dir: &Path, opts: &SignOpts, key: &SigningKey) -> Result<(String, Ma
     if TrustedKeys::compiled_data().contains_b64(&key.public_b64()) {
         return Err(format!("key {} is a data key: it signs definitions only; builds are signed with the release key", key.key_id_hex()));
     }
+    // rev 17 (PROTOCOL 11.3): a platform this tool knows, and only with agents that know platforms
+    if let Some(p) = &opts.platform {
+        if !PLATFORMS.contains(&p.as_str()) {
+            return Err(format!("--platform {p:?}: one of {}", PLATFORMS.join(", ")));
+        }
+        if !opts.min_agent.as_deref().is_some_and(|m| zerofarm_common::manifest::semver_at_least(m, PLATFORM_MIN_AGENT)) {
+            return Err(format!("--platform needs --min-agent {PLATFORM_MIN_AGENT} or newer (older agents don't know platforms)"));
+        }
+    }
+    let windows = opts.platform.as_deref().is_none_or(|p| p == PLATFORM_WINDOWS_X64);
     // Re-signing: the old manifest/signature are not part of the file list anyway.
     let mut t = template(kind, "");
+    t.platform = opts.platform.clone();
     match kind {
         Kind::Worker => {
             let game = opts.game.clone().ok_or("worker builds need --game")?;
@@ -261,7 +278,7 @@ pub fn sign(dir: &Path, opts: &SignOpts, key: &SigningKey) -> Result<(String, Ma
             t.requires_runtime = opts.requires_runtime.clone();
             t.entry = Some(match &opts.entry {
                 Some(e) => e.clone(),
-                None => single_exe(dir)?,
+                None => single_exe(dir, windows)?,
             });
         }
         Kind::Agent => {
@@ -270,7 +287,7 @@ pub fn sign(dir: &Path, opts: &SignOpts, key: &SigningKey) -> Result<(String, Ma
                 return Err(format!("agent version {v:?} is not semver"));
             }
             t.version = v;
-            t.entry = Some(opts.entry.clone().unwrap_or_else(|| "farm-agent.exe".into()));
+            t.entry = Some(opts.entry.clone().unwrap_or_else(|| if windows { "farm-agent.exe" } else { "farm-agent" }.into()));
             t.min_agent = opts.min_agent.clone();
         }
         Kind::Runtime => {
@@ -315,16 +332,20 @@ fn semver_ok(v: &str) -> Option<()> {
     (parts.len() == 3 && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()))).then_some(())
 }
 
-fn single_exe(dir: &Path) -> Result<String, String> {
+/// The worker's executable when `--entry` isn't given: the one `.exe` in `dir`; for another platform (PROTOCOL 11.3:
+/// no extension) the one top-level file without an extension.
+fn single_exe(dir: &Path, windows: bool) -> Result<String, String> {
     let exes: Vec<String> = std::fs::read_dir(dir)
         .map_err(|e| e.to_string())?
         .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()))
         .filter_map(|e| e.file_name().to_str().map(String::from))
-        .filter(|n| n.to_ascii_lowercase().ends_with(".exe"))
+        .filter(|n| if windows { n.to_ascii_lowercase().ends_with(".exe") } else { !n.contains('.') })
         .collect();
     match exes.as_slice() {
         [one] => Ok(one.clone()),
-        _ => Err(format!("give --entry: {} .exe files in {}", exes.len(), dir.display())),
+        _ if windows => Err(format!("give --entry: {} .exe files in {}", exes.len(), dir.display())),
+        _ => Err(format!("give --entry: {} files without an extension in {}", exes.len(), dir.display())),
     }
 }
 

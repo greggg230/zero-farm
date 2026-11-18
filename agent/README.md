@@ -206,10 +206,14 @@ Worker builds and runtime packs:
 farm-release sign <dir> --kind worker --game mtg --engine-commit <sha> --core-commit <sha> [--profile fuzz] [--min-agent 0.2.0]
 farm-release sign <dir> --kind runtime --version ort-1.23-cpu
 farm-release sign <dir> --kind runtime --version cuda-... --min-agent 0.2.10 --gpu-vendor nvidia --gpu-min-driver 527.41 --gpu-providers cuda --zst
+farm-release sign <dir> --kind worker --game mtg --engine-commit <sha> --core-commit <sha> --platform macos-arm64 --min-agent 0.3.0
 farm-release verify <dir>
 farm-release publish <dir> --url ... --token ...
 ```
 Signatures are minisign-compatible: `minisign -Vm <dir>\manifest.json -p release.key.pub`.
+`--platform windows-x64|macos-arm64` (PROTOCOL 11.3) writes the manifest's `platform` and needs `--min-agent 0.3.0` or
+newer; without it the manifest has no `platform` (= `windows-x64`, as before). A macOS build's executables have no
+extension: the entry defaults to the one file in `<dir>` without one (`--entry` when there are several).
 
 ## What the friend sees
 
@@ -306,7 +310,7 @@ Signatures are minisign-compatible: `minisign -Vm <dir>\manifest.json -p release
   of its limit it finishes its games and a new worker goes on in the same lease with fewer in flight (the released ids
   its predecessor never started, its own results directory); a worker that runs into the limit (an allocation failure,
   or Windows' job peak at the limit) is started again the same way, its games in flight lost and reported once; at most
-  4 restarts a lease; the cost per game measured is kept per run and CPU / GPU in `stateolling_memory.json` and plans
+  4 restarts a lease; the cost per game measured is kept per run and CPU / GPU in `state\rolling_memory.json` and plans
   the run's next leases. The
   worker's `low` asks `POST /v1/lease/{id}/extend` for 2 x `conc` (at most every 10 s; `wait_s`, `finish`, a lost
   lease and errors handled); beats carry `gen`, and a newer generation's definition is verified off the lease's

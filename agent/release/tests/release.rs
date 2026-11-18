@@ -106,6 +106,74 @@ fn sign_refuses_incomplete_manifests() {
 }
 
 #[test]
+fn sign_platform_writes_the_field_and_needs_agent_0_3_0() {
+    use zerofarm_common::keys::TrustedKeys;
+    let t = tempfile::tempdir().unwrap();
+    let k = t.path().join("release.key");
+    farm_release::keygen(&k).unwrap();
+    let keys = TrustedKeys::parse(&[farm_release::load_key(&k).unwrap().public_b64()]).unwrap();
+    // A macOS worker build: executables have no extension (PROTOCOL 11.3), the entry is found without --entry.
+    let d = t.path().join("mac-worker");
+    std::fs::create_dir_all(&d).unwrap();
+    std::fs::write(d.join("mtgz-worker"), b"macho worker bytes").unwrap();
+    std::fs::write(d.join("libmimalloc.dylib"), vec![7u8; 3000]).unwrap();
+    let sign = |extra: &[&str]| {
+        let mut a = vec!["sign", d.to_str().unwrap(), "--kind", "worker", "--key", k.to_str().unwrap(), "--game", "mtg", "--engine-commit", EC, "--core-commit", CC];
+        a.extend_from_slice(extra);
+        cli(&a, &[])
+    };
+    for (extra, why) in [
+        (&["--platform", "macos-arm64"][..], "--min-agent 0.3.0"),
+        (&["--platform", "macos-arm64", "--min-agent", "0.2.14"][..], "--min-agent 0.3.0"),
+        (&["--platform", "linux-x64", "--min-agent", "0.3.0"][..], "one of windows-x64, macos-arm64"),
+        (&["--platform", "--min-agent", "0.3.0"][..], "--platform"),
+    ] {
+        let o = sign(extra);
+        assert!(!o.status.success() && text(&o).contains(why), "{extra:?}: {}", text(&o));
+        assert!(!d.join(MANIFEST_FILE).exists(), "{extra:?}: nothing signed");
+    }
+    let o = sign(&["--platform", "macos-arm64", "--min-agent", "0.3.0"]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(text(&o).contains("for macos-arm64"), "{}", text(&o));
+    let raw = std::fs::read_to_string(d.join(MANIFEST_FILE)).unwrap();
+    assert!(raw.contains(r#""platform": "macos-arm64""#), "{raw}");
+    let v = farm_release::verify(&d, &keys).unwrap();
+    assert_eq!(v.manifest.platform.as_deref(), Some("macos-arm64"));
+    assert_eq!(v.manifest.platform_name(), "macos-arm64");
+    assert_eq!(v.manifest.entry.as_deref(), Some("mtgz-worker"));
+    assert_eq!(v.manifest.min_agent.as_deref(), Some("0.3.0"));
+    // Two files without an extension: --entry is needed.
+    std::fs::write(d.join("helper"), b"x").unwrap();
+    let o = sign(&["--platform", "macos-arm64", "--min-agent", "0.3.0"]);
+    assert!(!o.status.success() && text(&o).contains("give --entry"), "{}", text(&o));
+    let o = sign(&["--platform", "macos-arm64", "--min-agent", "0.3.1", "--entry", "mtgz-worker"]);
+    assert!(o.status.success(), "{}", text(&o));
+    // An explicit windows-x64 is written too (and needs 0.3.0 the same way); without --platform there is no field.
+    let w = worker_dir(t.path());
+    let o = cli(&["sign", w.to_str().unwrap(), "--kind", "worker", "--key", k.to_str().unwrap(), "--game", "mtg", "--engine-commit", EC, "--core-commit", CC, "--platform", "windows-x64", "--min-agent", "0.3.0"], &[]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert_eq!(farm_release::verify(&w, &keys).unwrap().manifest.platform.as_deref(), Some("windows-x64"));
+    let o = cli(&["sign", w.to_str().unwrap(), "--kind", "worker", "--key", k.to_str().unwrap(), "--game", "mtg", "--engine-commit", EC, "--core-commit", CC], &[]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert!(!std::fs::read_to_string(w.join(MANIFEST_FILE)).unwrap().contains("platform"));
+    // A runtime pack and a macOS agent package (its entry defaults to farm-agent).
+    let r = t.path().join("ort");
+    std::fs::create_dir_all(&r).unwrap();
+    std::fs::write(r.join("libonnxruntime.dylib"), vec![1u8; 4000]).unwrap();
+    let o = cli(&["sign", r.to_str().unwrap(), "--kind", "runtime", "--key", k.to_str().unwrap(), "--version", "ort-1.23-cpu-macos", "--platform", "macos-arm64", "--min-agent", "0.3.0"], &[]);
+    assert!(o.status.success(), "{}", text(&o));
+    assert_eq!(farm_release::verify(&r, &keys).unwrap().manifest.platform.as_deref(), Some("macos-arm64"));
+    let a = t.path().join("agent");
+    std::fs::create_dir_all(&a).unwrap();
+    std::fs::write(a.join("farm-agent"), b"agent").unwrap();
+    std::fs::write(a.join("ZeroFarm"), b"launcher").unwrap();
+    let o = cli(&["sign", a.to_str().unwrap(), "--kind", "agent", "--key", k.to_str().unwrap(), "--version", "0.3.0", "--platform", "macos-arm64", "--min-agent", "0.3.0"], &[]);
+    assert!(o.status.success(), "{}", text(&o));
+    let m = farm_release::verify(&a, &keys).unwrap().manifest;
+    assert_eq!((m.entry.as_deref(), m.platform.as_deref()), (Some("farm-agent"), Some("macos-arm64")));
+}
+
+#[test]
 fn publish_uploads_files_then_registers_the_build() {
     let t = tempfile::tempdir().unwrap();
     let k = t.path().join("release.key");

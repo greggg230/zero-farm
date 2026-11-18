@@ -10,6 +10,10 @@
 //!              [--gpu-vendor V --gpu-providers a,b [--gpu-min-driver D]]   runtime packs, rev 11 (PROTOCOL 9.2)
 //!              [--zst | --zst-level N]   zstd copies of the files in DIR.zst (rev 11, PROTOCOL 9.3; both need
 //!                                        --min-agent 0.2.10 or newer)
+//!              [--platform windows-x64|macos-arm64]   rev 17 (PROTOCOL 11.3): the manifest's platform (needs
+//!                                        --min-agent 0.3.0 or newer; without it: no field, = windows-x64). For
+//!                                        macos-arm64 the default --entry is the one file without an extension
+//!                                        (an agent package's: farm-agent)
 //! farm-release verify DIR [--pubkey B64 | --key FILE]
 //! farm-release publish DIR --url URL [--token T] [--pubkey B64 | --key FILE]   (files over 64 MiB in parts; the
 //!              compressed copies of DIR.zst too)
@@ -193,9 +197,18 @@ fn run(a: &Args) -> Result<(), String> {
                     (true, None) => Some(19),
                     _ => None,
                 },
+                // rev 17 (PROTOCOL 11.3): --platform macos-arm64
+                platform: match (a.get("platform"), a.has("platform")) {
+                    (Some(p), _) => Some(p),
+                    (None, true) => return Err(format!("--platform {}", zerofarm_common::manifest::PLATFORMS.join("|"))),
+                    (None, false) => None,
+                },
             };
             let (id, m) = sign(&dir, &opts, &key)?;
-            println!("signed {} {} ({} files) build_id {id}", m.kind, m.version, m.files.len());
+            match &m.platform {
+                Some(p) => println!("signed {} {} for {p} ({} files) build_id {id}", m.kind, m.version, m.files.len()),
+                None => println!("signed {} {} ({} files) build_id {id}", m.kind, m.version, m.files.len()),
+            }
             Ok(())
         }
         Some("verify") => {
