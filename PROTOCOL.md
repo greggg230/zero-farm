@@ -816,6 +816,18 @@ signs, uploads and registers a definition. `farm_h2h`, campaign creation and the
 remote produce a new version whenever builds, checkpoints or job settings change; self-play adds
 each new checkpoint gen.
 
+**Declared setting classes (no revision; zero-core docs/az.md 61, 2026-11-17).** A self-play or eval
+template's `settings` may hold the key `setting_classes`: `{"<run setting>": "play" | "trainer" |
+"python_only" | "param:<switch>"}`, the trainer's classification of every setting of the run (zero-core's
+table and the game package's own). It is part of the settings object, which agents and the coordinator
+keep opaque (only the path checks above apply; class names have no path-like text), so it is signed with
+the template and reaches the worker unchanged: no new field, no agent change, no `min_agent`. The desktop
+adds it only for a worker build whose `info` / `hello` `features` list `setting_classes`; such a build's
+`check-config` takes a setting it does not know but that is declared `trainer` as unused (a new
+trainer-only setting needs no new worker build), still refuses an unknown setting declared `play` or not
+declared at all, and refuses a known setting declared with another class than its own. A build without
+the feature is never given the key (its check-config would call it unknown); for it nothing changes.
+
 **Rollout.** The coordinator keeps serving legacy leases (without `definition`) only to agents
 older than the first definition-aware agent, until that agent is `min_agent` on both channels. After
 that, a lease without a definition is never issued, and a definition-aware agent never runs one.
