@@ -397,6 +397,53 @@ fn tampered_build_is_never_run() {
     h.stop();
 }
 
+/// rev 17 (PROTOCOL 11.3): a lease whose worker build is of another platform (a Mac's on a Windows PC, a Windows build
+/// - or one without `platform` - on a Mac) is refused before anything but its manifest is downloaded: `done` with
+/// `refused: "platform"`, one crash report of kind `definition` per build and day, then the start-failure wait.
+#[test]
+fn a_build_of_another_platform_is_refused_before_its_files_are_downloaded() {
+    use mockcoord::testkit::{bin, FAKEWORKER};
+    use zerofarm_common::manifest::Kind;
+    let mut h = H::new();
+    let other = if cfg!(windows) { zerofarm_common::manifest::PLATFORM_MACOS_ARM64 } else { zerofarm_common::manifest::PLATFORM_WINDOWS_X64 };
+    let dir = h.dir.path().join("foreign");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::copy(bin("fakeworker"), dir.join(FAKEWORKER)).unwrap();
+    let mut t = zerofarm_common::sign::template(Kind::Worker, "fake-foreign");
+    t.game = Some("fake".into());
+    t.aw = Some(1);
+    t.zero_onnx = Some(vec![1]);
+    t.profile = Some("release".into());
+    t.entry = Some(FAKEWORKER.into());
+    t.min_agent = Some("0.3.0".into());
+    // (Windows: a Mac build; macOS: a build that names no platform, which is windows-x64's)
+    t.platform = (other != zerofarm_common::manifest::PLATFORM_WINDOWS_X64).then(|| other.to_string());
+    let foreign = zerofarm_common::sign::sign_dir(&dir, t, &h.key.key).unwrap().0;
+    h.mock.add_build_dir(&dir);
+    for id in ["l_PF", "l_PF2"] {
+        let mut l = h.lease(id, selfplay(4, 0, json!({})));
+        l["build"] = json!({"build_id": foreign, "manifest": format!("builds/{foreign}/manifest.json")});
+        h.push(l);
+    }
+    h.start();
+    let done = h.wait_done("l_PF");
+    assert_eq!((done["refused"].clone(), done["given_back"].clone()), (json!("platform"), json!(true)), "{done}");
+    let err = done["stats"]["error"].as_str().unwrap();
+    assert!(err.contains(other) && err.contains(zerofarm_common::PLATFORM), "{done}");
+    assert_eq!(h.mock.count("GET", &format!("/v1/artifact/builds/{foreign}/{FAKEWORKER}")), 0, "no file but the manifest");
+    assert!(!h.layout.cache_builds().join(&foreign).exists());
+    let crashes = h.crashes();
+    assert_eq!(crashes.len(), 1, "{crashes:?}");
+    assert_eq!(crashes[0]["kind"], "definition");
+    assert!(crashes[0]["message"].as_str().unwrap().contains(&format!("platform {foreign}")), "{crashes:?}");
+    // the start-failure wait (1 min): the next lease isn't asked for meanwhile
+    let leases = h.mock.count("POST", "/v1/lease");
+    std::thread::sleep(Duration::from_millis(1500));
+    assert_eq!(h.mock.count("POST", "/v1/lease"), leases, "no lease storm");
+    assert!(h.mock.with(|s| !s.dones.iter().any(|(l, _)| l == "l_PF2")));
+    h.stop();
+}
+
 #[test]
 fn build_signed_by_an_unknown_key_is_never_run() {
     let mut h = H::new();

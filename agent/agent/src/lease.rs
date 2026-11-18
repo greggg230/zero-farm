@@ -269,8 +269,9 @@ impl Engine {
         self.refuse_as(lease, why, "definition")
     }
 
-    /// `refuse`, with the `refused` reason `done` sends: `definition` (PROTOCOL 7) or, rev 11, `runtime` (the agent's
-    /// guard refused a runtime pack this PC shouldn't download, PROTOCOL 9.5).
+    /// `refuse`, with the `refused` reason `done` sends: `definition` (PROTOCOL 7), rev 11 `runtime` (the agent's
+    /// guard refused a runtime pack this PC shouldn't download, PROTOCOL 9.5) or rev 17 `platform` (a build of another
+    /// platform, PROTOCOL 11.3).
     fn refuse_as(&mut self, lease: &Lease, why: &str, reason: &str) -> LeaseEnd {
         let id = &lease.lease_id;
         log::error!("lease {id}: refused ({reason}): {why}");
@@ -283,6 +284,8 @@ impl Engine {
         self.uploader.wake();
         let scope = match (&lease.definition, reason) {
             (_, "runtime") => format!("runtime {}", lease.runtime.as_ref().map(|r| r.build_id.as_str()).unwrap_or("none")),
+            // rev 17 (PROTOCOL 11.3): once a day per build
+            (_, "platform") => format!("platform {}", lease.build.build_id),
             (Some(d), _) => d.key.clone(),
             (None, _) => format!("legacy {}", lease.run.as_deref().or(lease.campaign.as_deref()).unwrap_or(&lease.kind)),
         };
@@ -349,6 +352,41 @@ impl Engine {
             })
         };
         (pump_stop, pump)
+    }
+
+    /// rev 17 (PROTOCOL 11.3), before anything but manifests is downloaded: the lease's worker build and runtime pack
+    /// must be of this agent's platform (a manifest without `platform` is `windows-x64`'s).
+    fn platform_guard(&mut self, lease: &Lease) -> Result<(), PlanError> {
+        let mut refs = vec![(&lease.build, Kind::Worker)];
+        if let Some(rt) = &lease.runtime {
+            refs.push((rt, Kind::Runtime));
+        }
+        for (r, kind) in refs {
+            // A cached build's manifest: its signature checked, not its files (they are, before the worker starts), so
+            // the check costs a lease nothing; else the manifest alone is fetched and verified.
+            use zerofarm_common::manifest::{verify_manifest_bytes, MANIFEST_FILE, SIG_FILE};
+            let dir = self.cfg.layout.cache_builds().join(&r.build_id);
+            let cached = match (std::fs::read(dir.join(MANIFEST_FILE)), std::fs::read_to_string(dir.join(SIG_FILE))) {
+                (Ok(b), Ok(sig)) if zerofarm_common::is_build_id(&r.build_id) => {
+                    verify_manifest_bytes(&self.cfg.keys, &b, &sig).ok().filter(|(m, id)| *id == r.build_id && m.kind == kind).map(|(m, _)| m)
+                }
+                _ => None,
+            };
+            let m = match cached {
+                Some(m) => m,
+                None => self.signed_manifest(r, kind)?,
+            };
+            if m.platform_name() != zerofarm_common::PLATFORM {
+                return Err(PlanError::Refused(format!(
+                    "{} build {} is for {}; this agent runs on {}",
+                    kind,
+                    r.build_id,
+                    m.platform_name(),
+                    zerofarm_common::PLATFORM
+                )));
+            }
+        }
+        Ok(())
     }
 
     /// The agent's guard (rev 11, PROTOCOL 9.5), before anything but manifests is downloaded: a lease whose runtime is
@@ -599,6 +637,16 @@ impl Engine {
             }
             Err(PlanError::Refused(why)) => return self.refuse(lease, &why),
         };
+        // rev 17 (PROTOCOL 11.3): a build of another platform is refused before anything else is downloaded
+        match self.platform_guard(lease) {
+            Ok(()) => {}
+            Err(PlanError::Stopped) => {
+                self.give_back_unstarted(lease, "agent quitting");
+                return LeaseEnd::Quit;
+            }
+            Err(PlanError::Unavailable(why)) => return self.setup_failed(lease, &format!("build manifest unavailable: {why}")),
+            Err(PlanError::Refused(why)) => return self.refuse_as(lease, &why, "platform"),
+        }
         // rev 11 (PROTOCOL 9.5): a GPU vendor's runtime pack only where it can run, before it is downloaded
         let need = match self.runtime_guard(lease, &plan) {
             Ok(n) => n,
