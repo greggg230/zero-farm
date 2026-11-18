@@ -7,6 +7,11 @@
 //   - claimed: credited to the first result that reported it (table claims), or
 //   - unclaimed inside an active lease's [lo, hi), or
 //   - in the pool (handed back by an expired / given-back / cancelled / finished lease).
+// Rev 15 (PROTOCOL 10): a rolling self-play lease's [lo, hi) is a block reserved from next_gid (never from the
+// pool); only its released ids [lo, rel_hi) are game ids (claimable, counted as leased for the quota). Closing it
+// returns the released unclaimed ids to the pool and the unreleased tail [rel_hi, hi) to next_gid when nothing was
+// taken after the block (next_gid = hi), else to the pool. Everything that means "the lease's ids" uses
+// COALESCE(rel_hi, hi) / relHi(); a classic lease's rel_hi is NULL.
 // A late result can claim ids that were already handed to another lease or back to the pool: the
 // first copy wins, the pool loses them, and the other lease's copy is counted as a duplicate.
 //
@@ -66,7 +71,20 @@ export interface SelfplayCfg {
   needs: Needs;
   job: Record<string, Json>;
   share?: number; // rev 13 (PROTOCOL 5.3): a background self-play (an analysis campaign's), as EvalCfg's
+  rolling?: RollingCfg; // rev 15 (PROTOCOL 10.1): rolling leases for agents that take them (absent: classic only)
 }
+
+// Rev 15 (PROTOCOL 10.1): a run's rolling self-play leases.
+export interface RollingCfg {
+  inflight: "auto" | number; // games in flight of a CPU job
+  gpu_inflight: "auto" | number; // of a GPU job
+  block: number; // ids a lease reserves
+  max_s: number; // how long a lease runs before the coordinator decides whether it goes on
+  flush_s: number; // the longest a finished game waits in the worker before it is uploaded
+}
+export const ROLLING_AUTO_INFLIGHT = 256; // "auto" counts this much when sizing a grant's first release
+export const ROLLING_QUOTA_WAIT_S = 60; // an extension with no headroom: ask again after this
+export const MAX_GID = 2 ** 32; // a rolling block never reaches past this game id (PROTOCOL 10.3)
 export interface EvalCfg {
   batch: string;
   games: number;
@@ -173,7 +191,16 @@ export interface LeaseRow {
   closed_at: number | null;
   close_reason: string | null;
   def_version: number | null; // the definition it was issued with (null: legacy)
+  // Rev 15 (PROTOCOL 10, migration 0011): a rolling lease reserves the block [lo, hi) and its game ids are the
+  // released ones, [lo, rel_hi); NULL for a classic lease (its ids are all of [lo, hi)).
+  rel_hi: number | null;
+  until: number | null; // rolling: the lease runs to at least this time (renewals move it on)
+  cur_gen: number | null; // rolling: the newest generation the agent reported (`gen` stays the first)
 }
+
+// Rev 15: a lease's game ids end here: the released ids of a rolling lease, all of [lo, hi) of a classic one.
+export const relHi = (l: Pick<LeaseRow, "hi" | "rel_hi">): number | null => l.rel_hi ?? l.hi;
+export const isRolling = (l: Pick<LeaseRow, "rel_hi">): boolean => l.rel_hi !== null && l.rel_hi !== undefined;
 
 export interface CheckpointRow {
   run: string;
@@ -332,7 +359,8 @@ export async function selfplayState(db: D1Database, run: RunRow, sp: SelfplayCfg
   const [acc, leased, pending] = await db.batch<{ n: number }>([
     db.prepare(`SELECT accepted AS n FROM quotas WHERE run = ? AND gen = ?`).bind(run.run, run.current_gen ?? -1),
     db
-      .prepare(`SELECT COALESCE(SUM(hi - lo - claimed), 0) AS n FROM leases WHERE scope = ? AND kind = 'selfplay' AND state = 'active'`)
+      // rev 15: a rolling lease counts only its released ids
+      .prepare(`SELECT COALESCE(SUM(COALESCE(rel_hi, hi) - lo - claimed), 0) AS n FROM leases WHERE scope = ? AND kind = 'selfplay' AND state = 'active'`)
       .bind(scope),
     db
       .prepare(`SELECT COALESCE(SUM(games), 0) AS n FROM results WHERE scope = ? AND kind = 'selfplay' AND acked_at IS NULL`)
@@ -434,13 +462,25 @@ async function closeLease(
   const stmts: Stmt[] = [];
   let unfinished: Range[] = [];
   if (l.pool !== null && l.lo !== null && l.hi !== null) {
-    unfinished = subtract([[l.lo, l.hi]], await claimedIn(db, l.scope, [[l.lo, l.hi]]));
+    const rel = relHi(l)!;
+    unfinished = subtract([[l.lo, rel]], await claimedIn(db, l.scope, [[l.lo, rel]]));
+    let back = unfinished;
     let keep = true;
     if (l.pool.startsWith("eval:") && l.run) {
       const run = await getRun(db, l.run);
       keep = run?.eval_batch === l.pool.slice(5);
     }
-    if (keep) stmts.push(...(await poolAdd(db, l.scope, l.pool, unfinished)));
+    // Rev 15: a rolling lease's unreleased tail [rel_hi, hi) belongs to no game yet: back to next_gid when nothing
+    // was taken after the block, else to the pool with the released unclaimed ids.
+    if (rel < l.hi && l.run) {
+      const run = await getRun(db, l.run);
+      if (run && run.next_gid === l.hi) {
+        stmts.push(db.prepare(`UPDATE runs SET next_gid = ? WHERE run = ? AND next_gid = ?`).bind(rel, l.run, l.hi));
+      } else {
+        back = normalize([...unfinished, [rel, l.hi]]);
+      }
+    }
+    if (keep) stmts.push(...(await poolAdd(db, l.scope, l.pool, back)));
   }
   stmts.push(
     db
@@ -491,6 +531,18 @@ export interface GrantReq {
   // Rev 11 (PROTOCOL 9.4): one of the run's alternates, chosen for this machine by friend.ts (absent:
   // the run's default build and runtime). Checked again here against the run's stored alternates.
   alt?: { build_id: string; runtime: string };
+  // Rev 15 (PROTOCOL 10.2): the agent takes rolling leases (ROLLING_AGENT or newer, `features: ["rolling"]`): a
+  // self-play lease of a run with `selfplay.rolling` set is then rolling. Ignored for every other lease.
+  rolling?: boolean;
+}
+
+// Rev 15 (PROTOCOL 10.3): what a rolling lease adds.
+export interface RollingLease {
+  block: [number, number]; // ids [lo, hi) reserved for the lease; its game ids are [lo, lo + job.games)
+  inflight: { cpu: "auto" | number; gpu: "auto" | number };
+  until: number;
+  max_s: number;
+  flush_s: number;
 }
 
 export interface Lease {
@@ -514,6 +566,7 @@ export interface Lease {
   // Rev 7 (PROTOCOL 8): the job's provider allowlist, a routing hint that is not part of the signed
   // job (null: any). friend.ts adds it to the answer; the stored lease JSON doesn't carry it.
   providers?: Provider[] | null;
+  rolling?: RollingLease; // rev 15: a rolling self-play lease (absent: classic)
 }
 
 const buildRef = (id: string) => ({ build_id: id, manifest: `builds/${id}/manifest.json` });
@@ -528,8 +581,8 @@ function insertLease(db: D1Database, l: Lease, row: Partial<LeaseRow> & { scope:
   return db
     .prepare(
       `INSERT INTO leases (lease_id, machine_id, scope, run, campaign, kind, pool, lo, hi, gen, build_id, diag_id,
-         lease, state, beat_s, slack_s, issued_at, expires_at, def_version)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)`,
+         lease, state, beat_s, slack_s, issued_at, expires_at, def_version, rel_hi, until)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       l.lease_id,
@@ -550,6 +603,8 @@ function insertLease(db: D1Database, l: Lease, row: Partial<LeaseRow> & { scope:
       l.issued_at,
       l.expires_at,
       row.def_version ?? null,
+      row.rel_hi ?? null,
+      l.rolling?.until ?? null,
     );
 }
 
@@ -610,6 +665,8 @@ async function grantRunGames(env: Env, req: GrantReq): Promise<Lease | null> {
   let gen: number | null = null;
   let job: Record<string, Json>;
   let evalCkpts: CheckpointRow[] | null = null;
+  let relHiAt: number | null = null; // rev 15: a rolling lease's released ids end here
+  let rolling: RollingLease | undefined;
 
   if (req.kind === "selfplay") {
     const sp = parseJson<SelfplayCfg | null>(run.selfplay, null);
@@ -618,17 +675,35 @@ async function grantRunGames(env: Env, req: GrantReq): Promise<Lease | null> {
     const n = Math.min(req.want, st.headroom);
     if (n < 1) return null;
     pool = "selfplay";
-    const took = await poolTake(db, scope, pool, n);
-    if (took) {
-      range = took.range;
-      stmts.push(...took.stmts);
-    } else {
-      range = [run.next_gid, run.next_gid + n];
+    if (req.rolling && def && sp.rolling) {
+      // Rev 15 (PROTOCOL 10.3): a fresh block from next_gid (never the pool), of which the first ids are released:
+      // the headroom, the block, or 2 x the larger in-flight count ("auto" counting ROLLING_AUTO_INFLIGHT).
+      const r = sp.rolling;
+      range = [run.next_gid, Math.min(run.next_gid + r.block, MAX_GID)];
+      if (range[1] <= range[0]) return null;
+      const cnt = (x: "auto" | number) => (x === "auto" ? ROLLING_AUTO_INFLIGHT : x);
+      relHiAt = range[0] + Math.min(st.headroom, range[1] - range[0], 2 * Math.max(cnt(r.inflight), cnt(r.gpu_inflight)));
       stmts.push(db.prepare(`UPDATE runs SET next_gid = ? WHERE run = ? AND next_gid = ?`).bind(range[1], run.run, run.next_gid));
+      rolling = {
+        block: [range[0], range[1]],
+        inflight: { cpu: r.inflight, gpu: r.gpu_inflight },
+        until: req.now + r.max_s,
+        max_s: r.max_s,
+        flush_s: r.flush_s,
+      };
+    } else {
+      const took = await poolTake(db, scope, pool, n);
+      if (took) {
+        range = took.range;
+        stmts.push(...took.stmts);
+      } else {
+        range = [run.next_gid, run.next_gid + n];
+        stmts.push(db.prepare(`UPDATE runs SET next_gid = ? WHERE run = ? AND next_gid = ?`).bind(range[1], run.run, run.next_gid));
+      }
     }
     gen = run.current_gen;
     // The seed is the run's (its job's `seed`, else from its name) with or without a definition.
-    const per = { kind: "selfplay", games: range[1] - range[0], gid_base: range[0], seed: baseSeed(run.run, sp.job) };
+    const per = { kind: "selfplay", games: (relHiAt ?? range[1]) - range[0], gid_base: range[0], seed: baseSeed(run.run, sp.job) };
     job = def ? per : { ...sp.job, ...per };
   } else {
     // Rev 5: an eval lease carries every network its seats name (`checkpoints`), never one
@@ -670,8 +745,11 @@ async function grantRunGames(env: Env, req: GrantReq): Promise<Lease | null> {
     checkpoints: evalCkpts ? evalCkpts.map(checkpointOf) : null,
     ...(def ? { definition: defRef(def) } : {}),
     job,
+    ...(rolling ? { rolling } : {}),
   };
-  stmts.push(insertLease(db, lease, { scope, machine_id: req.machine_id, pool, lo: range[0], hi: range[1], def_version: def?.version ?? null }));
+  stmts.push(
+    insertLease(db, lease, { scope, machine_id: req.machine_id, pool, lo: range[0], hi: range[1], def_version: def?.version ?? null, rel_hi: relHiAt }),
+  );
   await db.batch(stmts);
   return lease;
 }
@@ -773,12 +851,16 @@ export interface BeatReq {
   state: "running" | "paused";
   progress: Json | undefined;
   stats: Json | undefined;
+  gen?: number | null; // rev 15: a rolling lease's newest generation in play (ignored for classic leases)
 }
 
 export interface BeatAnswer {
   action: "continue" | "cancel" | "give_back";
   expires_at: number;
   checkpoint: ReturnType<typeof checkpointOf> | null;
+  // Rev 15 (PROTOCOL 10.6): with a checkpoint offered to a rolling lease, the current definition, which signs it.
+  // Never on a classic lease's answer.
+  definition?: { key: string; sha256: string };
 }
 
 async function ownLease(db: D1Database, leaseId: string, machineId: string): Promise<LeaseRow> {
@@ -801,6 +883,10 @@ export async function beat(env: Env, r: BeatReq): Promise<BeatAnswer> {
   const pausedSince = paused ? (l.beat_state === "paused" ? (l.paused_since ?? r.now) : r.now) : null;
   const progress = r.progress === undefined ? l.progress : JSON.stringify(r.progress);
   const stats = r.stats === undefined ? l.stats : JSON.stringify(r.stats);
+  // Rev 15: a rolling lease reports the newest generation its worker plays (never older than its first).
+  const rolling = isRolling(l);
+  let curGen = l.cur_gen;
+  if (rolling && typeof r.gen === "number" && (l.gen === null || r.gen >= l.gen)) curGen = r.gen;
 
   let action: BeatAnswer["action"] = "continue";
   if (l.pending === "cancel") action = "cancel";
@@ -810,7 +896,7 @@ export async function beat(env: Env, r: BeatReq): Promise<BeatAnswer> {
   const upd = db
     .prepare(
       `UPDATE leases SET last_beat = ?, beat_state = ?, paused_since = ?, paused_s = ?, progress = ?, stats = ?,
-         expires_at = ?, pending = ? WHERE lease_id = ?`,
+         expires_at = ?, pending = ?, cur_gen = ? WHERE lease_id = ?`,
     )
     .bind(
       r.now,
@@ -821,6 +907,7 @@ export async function beat(env: Env, r: BeatReq): Promise<BeatAnswer> {
       stats,
       action === "cancel" ? l.expires_at : r.now + EXPIRE_BEATS * l.beat_s,
       action === "give_back" ? "give_back" : l.pending,
+      curGen,
       l.lease_id,
     );
   if (action === "cancel") {
@@ -837,6 +924,20 @@ export async function beat(env: Env, r: BeatReq): Promise<BeatAnswer> {
   // every checkpoint against the lease's definition). A new gen normally comes with a new
   // definition version, so it reaches new leases instead.
   let checkpoint: BeatAnswer["checkpoint"] = null;
+  if (rolling && l.run) {
+    // Rev 15 (PROTOCOL 10.6): a rolling lease switches in place to the run's current gen once the *current*
+    // definition signs it; the answer names that definition, which the agent verifies before it switches.
+    const run = await getRun(db, l.run);
+    const have = curGen ?? l.gen;
+    if (run && run.current_gen !== null && (have === null || run.current_gen > have)) {
+      const c = await getCheckpoint(db, l.run, run.current_gen);
+      const def = c ? await currentDef(db, "run", l.run) : null;
+      if (c && def && !checkpointProblem(def, ckptFacts(c))) {
+        return { action, expires_at: r.now + EXPIRE_BEATS * l.beat_s, checkpoint: checkpointOf(c), definition: defRef(def) };
+      }
+    }
+    return { action, expires_at: r.now + EXPIRE_BEATS * l.beat_s, checkpoint: null };
+  }
   if (l.kind === "selfplay" && l.run) {
     const run = await getRun(db, l.run);
     if (run && run.current_gen !== null && (l.gen === null || run.current_gen > l.gen)) {
@@ -846,6 +947,68 @@ export async function beat(env: Env, r: BeatReq): Promise<BeatAnswer> {
     }
   }
   return { action, expires_at: r.now + EXPIRE_BEATS * l.beat_s, checkpoint };
+}
+
+// ---------- extend (rev 15, PROTOCOL 10.4) ----------
+
+export interface ExtendReq {
+  now: number;
+  machine_id: string;
+  lease_id: string;
+  scope: string;
+  games: number; // ids to release (k >= 1)
+  paused: boolean; // the machine, or the whole farm, is paused (the Worker knows)
+  // Past `until`: what else waits for this machine, in the order PROTOCOL 3 picks work (friend.ts works it out;
+  // null: nothing, so the lease is renewed). Not looked at before `until`.
+  waiting: string | null;
+}
+
+export interface ExtendAnswer {
+  games: number; // the lease's ids are [lo, lo + games)
+  wait_s?: number;
+  finish?: true;
+  reason?: "quota" | "max_s" | "block" | "state";
+}
+
+export async function extend(env: Env, r: ExtendReq): Promise<ExtendAnswer> {
+  const db = env.DB;
+  await sweep(env, r.scope, r.now);
+  const l = await ownLease(db, r.lease_id, r.machine_id);
+  if (l.kind !== "selfplay" || !isRolling(l) || l.lo === null || l.hi === null) {
+    throw bad("only a rolling self-play lease is extended (PROTOCOL 10.4)");
+  }
+  if (l.state === "expired") throw gone("lease expired");
+  if (l.state === "cancelled") throw gone("lease was cancelled");
+  if (l.state !== "active") throw gone("lease is closed");
+  const lo = l.lo;
+  const hi = l.hi;
+  const rel = l.rel_hi!;
+  const finish = (reason: "max_s" | "block" | "state"): ExtendAnswer => ({ games: rel - lo, finish: true, reason });
+
+  // The run's self-play is no longer rolling, the run or the machine is paused, or the lease is being cancelled or
+  // given back (its next beat says so).
+  const run = l.run ? await getRun(db, l.run) : null;
+  const sp = run ? parseJson<SelfplayCfg | null>(run.selfplay, null) : null;
+  if (!run || run.state !== "active" || !sp || !sp.rolling || run.current_gen === null || l.pending !== null || r.paused) {
+    return finish("state");
+  }
+  if (rel >= hi) return finish("block");
+
+  const stmts: Stmt[] = [];
+  if (l.until === null || r.now >= l.until) {
+    // Past `until`: renewed unless other work waits for this machine.
+    if (r.waiting !== null) return finish("max_s");
+    stmts.push(db.prepare(`UPDATE leases SET until = ? WHERE lease_id = ?`).bind((l.until ?? r.now) + sp.rolling.max_s, l.lease_id));
+  }
+  const st = await selfplayState(db, run, sp);
+  const n = Math.min(r.games, st.headroom, hi - rel);
+  if (n < 1) {
+    if (stmts.length) await db.batch(stmts);
+    return { games: rel - lo, wait_s: ROLLING_QUOTA_WAIT_S, reason: "quota" };
+  }
+  stmts.push(db.prepare(`UPDATE leases SET rel_hi = ? WHERE lease_id = ? AND rel_hi = ?`).bind(rel + n, l.lease_id, rel));
+  await db.batch(stmts);
+  return { games: rel + n - lo };
 }
 
 // ---------- results ----------
@@ -1059,7 +1222,7 @@ export async function putResult(env: Env, r: ResultReq): Promise<ResultCommit> {
   let ids: Range[] = [];
   if (r.ids !== null) {
     if (l.pool === null) throw bad("x-ids: a diag lease has no ids");
-    ids = parseRanges(r.ids, "x-ids", [l.lo!, l.hi!]);
+    ids = parseRanges(r.ids, "x-ids", [l.lo!, relHi(l)!]); // rev 15: a rolling lease's released ids
   }
 
   let gen: number | null = l.gen;
@@ -1073,7 +1236,9 @@ export async function putResult(env: Env, r: ResultReq): Promise<ResultCommit> {
       }
       gen = r.gen;
     }
-    if (run && sp && run.current_gen !== null && gen !== null && gen < run.current_gen - sp.max_stale) {
+    // Rev 15 (PROTOCOL 10.7): a rolling lease's chunks are never refused as stale (the trainer judges each row by
+    // the network that searched it); x-gen is still checked above.
+    if (!isRolling(l) && run && sp && run.current_gen !== null && gen !== null && gen < run.current_gen - sp.max_stale) {
       throw gone(`stale: played with checkpoint ${gen}, current is ${run.current_gen}, max_stale ${sp.max_stale}`);
     }
   }
@@ -1138,7 +1303,9 @@ export async function putResult(env: Env, r: ResultReq): Promise<ResultCommit> {
     const lo = credited[0][0];
     const hi = credited[credited.length - 1][1];
     const { results } = await db
-      .prepare(`SELECT lease_id, lo, hi FROM leases WHERE scope = ? AND state = 'active' AND pool IS NOT NULL AND lo < ? AND hi > ?`)
+      .prepare(
+        `SELECT lease_id, lo, COALESCE(rel_hi, hi) AS hi FROM leases WHERE scope = ? AND state = 'active' AND pool IS NOT NULL AND lo < ? AND COALESCE(rel_hi, hi) > ?`,
+      )
       .bind(l.scope, hi, lo)
       .all<{ lease_id: string; lo: number; hi: number }>();
     for (const o of results) {
@@ -1234,7 +1401,7 @@ export async function done(env: Env, r: DoneReq): Promise<DoneAnswer> {
   if (r.unfinished !== null && l.pool !== null) {
     const field = l.kind === "fuzz" ? "seeds" : "gids";
     const u = r.unfinished;
-    if (u[field] !== undefined) parseRanges(u[field], `unfinished.${field}`, [l.lo!, l.hi!]);
+    if (u[field] !== undefined) parseRanges(u[field], `unfinished.${field}`, [l.lo!, relHi(l)!]); // rev 15: released ids
   }
   const stats = r.stats === undefined ? null : JSON.stringify(r.stats);
 

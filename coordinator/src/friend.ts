@@ -23,6 +23,7 @@ import {
   hasAdapter,
   isGpuProvider,
   jobRank,
+  kindRank,
   place,
   requiresRuntimeOf,
   runtimeProvidersOf,
@@ -308,16 +309,14 @@ export async function lease(c: Ctx): Promise<Response> {
   const cachedCkpts = new Set(strList(cachedIn.ckpts, "cached.ckpts", { optional: true, max: 1000, itemMax: 128 }));
   // Kinds this coordinator doesn't know are ignored (a newer agent may offer more).
   const kinds = new Set(strList(b.kinds, "kinds", { max: 32, itemMax: 32 }).filter((k) => (KINDS as readonly string[]).includes(k)));
+  // Rev 15 (PROTOCOL 10.2): optional features of the agent; names this coordinator doesn't know are ignored.
+  const features = new Set(strList(b.features, "features", { optional: true, max: 32, itemMax: 64 }));
   const agent = c.req.headers.get("x-farm-agent");
   if (!agent || !isSemver(agent)) throw bad("x-farm-agent header (the agent's semver) is required");
   const awHeader = c.req.headers.get("x-farm-aw") ?? "1";
   if (!/^\d{1,4}$/.test(awHeader)) throw bad("x-farm-aw must be an integer");
   const aw = Number(awHeader);
   const cfg = config(c.env);
-  // Rev 6 (PROTOCOL 7): this agent verifies definitions, so it gets leases only with one.
-  const defAware = cmpSemver(agent, cfg.definitionAgent) >= 0;
-  // Rev 11 (PROTOCOL 9): this agent takes run alternates and packs with a GPU requirement.
-  const altAware = defAware && cmpSemver(agent, cfg.altRuntimeAgent) >= 0;
 
   // Profile: the digest is the agent's; we only compare it with the last one.
   if (digest !== m.profile_digest) {
@@ -332,6 +331,89 @@ export async function lease(c: Ctx): Promise<Response> {
   if (capsJson !== m.caps) await db.prepare(`UPDATE machines SET caps = ? WHERE machine_id = ?`).bind(capsJson, m.machine_id).run();
   // Rev 7 routing reads the profile the coordinator keeps: the one just sent, else the stored one.
   const machineProfile = profile && digest !== m.profile_digest ? profile : parseJson<Profile | null>(m.profile, null);
+  const o = await offer(c, m, { caps, gpuAllowed, gpuGames, cachedBuilds, cachedCkpts, kinds, agent, aw }, machineProfile);
+  if (o.need && cmpSemver(agent, o.need) < 0) return json({ update: { min_agent: o.need } });
+
+  const uploadDiag = await takeUploadDiag(db, m, c.now);
+  const withDiag = (x: Record<string, unknown>) => json(uploadDiag ? { ...x, upload_diag: uploadDiag } : x);
+
+  if (o.farmPaused || m.paused) return withDiag({ wait_s: WAIT_S, reason: "paused_by_admin" });
+  // Review M4: one machine can't hoard work (an agent runs one lease at a time; one more covers a
+  // lease it is still closing).
+  if (o.mine >= cfg.maxActiveLeases) return withDiag({ wait_s: WAIT_S, reason: "too_many_leases" });
+
+  // --- diagnostics asked for this machine come first (legacy agents only: PROTOCOL 7) ---
+  if (kinds.has("diag") && !o.defAware) {
+    for (const id of o.diag) {
+      const l = unwrap(
+        await bookFor(c.env, book.DIAG_SCOPE).grant({ now: c.now, machine_id: m.machine_id, kind: "diag", want: 0, diag_id: id, def_aware: o.defAware }),
+      );
+      if (l) return withDiag({ lease: { ...l, providers: null } });
+    }
+  }
+
+  // Rev 15 (PROTOCOL 10.2): this agent takes rolling self-play leases (a run with `selfplay.rolling` then gives one).
+  const rolling = o.defAware && features.has("rolling") && cmpSemver(agent, cfg.rollingAgent) >= 0;
+  // --- then runs' games by priority and fit, then backfill; share by active leases (offer's order) ---
+  for (const cd of o.usable) {
+    const key = `${cd.scope}|${cd.kind}`;
+    let want = leaseSize(cd.kind as Exclude<book.Kind, "diag">, cd.configured, o.rate.get(key) ?? o.classRate.get(key) ?? null);
+    // Rev 11 (PROTOCOL 9.4): a GPU lease gets enough games for big batches.
+    if (cd.gpu_lease && cd.run && (cd.kind === "selfplay" || cd.kind === "eval")) {
+      want = await gpuLeaseSize(db, cd, want, o.rate.get(key) ?? null, gpuGames.get(cd.run));
+    }
+    const l = unwrap(
+      await bookFor(c.env, cd.scope).grant({
+        now: c.now,
+        machine_id: m.machine_id,
+        kind: cd.kind,
+        want,
+        run: cd.run,
+        campaign: cd.campaign,
+        def_aware: o.defAware,
+        ...(cd.alt ? { alt: { build_id: cd.build_id, runtime: cd.runtime! } } : {}),
+        ...(rolling && cd.kind === "selfplay" ? { rolling: true } : {}),
+      }),
+    );
+    // Rev 7: the job's provider allowlist rides along (a routing hint, not part of the signed job).
+    if (l) return withDiag({ lease: { ...l, providers: cd.providers } });
+  }
+  return withDiag({ wait_s: WAIT_S, reason: "no_work" });
+}
+
+// What a machine asks with (POST /v1/lease); for an extension's renewal (rev 15), what the coordinator last stored.
+interface Ask {
+  caps: Caps;
+  gpuAllowed: boolean;
+  gpuGames: Map<string, number>;
+  cachedBuilds: Set<string>;
+  cachedCkpts: Set<string>;
+  kinds: Set<string>;
+  agent: string;
+  aw: number;
+}
+
+// The work a machine could get now, in the order PROTOCOL 3 picks it (lease(), and rev 15's renewal decision).
+interface Offer {
+  usable: Candidate[]; // sorted: tier, rank, score
+  need: string | null; // an agent version some job needs that the machine's channel offers
+  defAware: boolean;
+  farmPaused: boolean;
+  mine: number; // the machine's live leases
+  diag: number[]; // diagnostics requests for it (diag leases)
+  rank: (cd: Candidate) => number;
+  rate: Map<string, number>;
+  classRate: Map<string, number>;
+}
+
+async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | null): Promise<Offer> {
+  const db = c.env.DB;
+  const { caps, gpuAllowed, cachedBuilds, cachedCkpts, kinds, agent, aw } = a;
+  const cfg = config(c.env);
+  // Rev 6 (PROTOCOL 7): this agent verifies definitions, so it gets leases only with one.
+  const defAware = cmpSemver(agent, cfg.definitionAgent) >= 0;
+  // Rev 11 (PROTOCOL 9): this agent takes run alternates and packs with a GPU requirement.
+  const altAware = defAware && cmpSemver(agent, cfg.altRuntimeAgent) >= 0;
   // Where a job goes on this machine (PROTOCOL 8): GPU-eligible when it may use the GPU and
   // verified a provider the job allows, with the job's runtime pack if the profile says.
   const placeFor = (kind: "selfplay" | "eval" | "fuzz", r: Routing, runtime: string | null) =>
@@ -551,59 +633,27 @@ export async function lease(c: Ctx): Promise<Response> {
     const worker = infos.find((i) => i!.kind === "worker");
     return !worker || worker.aw === null || worker.aw === aw;
   });
-  if (need && cmpSemver(agent, need) < 0) return json({ update: { min_agent: need } });
 
-  const uploadDiag = await takeUploadDiag(db, m, c.now);
-  const withDiag = (o: Record<string, unknown>) => json(uploadDiag ? { ...o, upload_diag: uploadDiag } : o);
-
-  if (pausedR.results[0]?.value === "1" || m.paused) return withDiag({ wait_s: WAIT_S, reason: "paused_by_admin" });
-  // Review M4: one machine can't hoard work (an agent runs one lease at a time; one more covers a
-  // lease it is still closing).
-  if ((mineR.results[0]?.n ?? 0) >= cfg.maxActiveLeases) return withDiag({ wait_s: WAIT_S, reason: "too_many_leases" });
-
-  // --- diagnostics asked for this machine come first (legacy agents only: PROTOCOL 7) ---
-  if (kinds.has("diag") && !defAware) {
-    for (const d of diagR.results as { id: number }[]) {
-      const l = unwrap(
-        await bookFor(c.env, book.DIAG_SCOPE).grant({ now: c.now, machine_id: m.machine_id, kind: "diag", want: 0, diag_id: d.id, def_aware: defAware }),
-      );
-      if (l) return withDiag({ lease: { ...l, providers: null } });
-    }
-  }
-
-  // --- then runs' games by priority and fit, then backfill; share by active leases ---
-  const active = new Map<string, number>((activeR.results as any[]).map((a) => [`${a.scope}|${a.kind}`, a.n]));
+  const active = new Map<string, number>((activeR.results as any[]).map((x) => [`${x.scope}|${x.kind}`, x.n]));
   const rate = new Map<string, number>((ratesR.results as any[]).map((x) => [`${x.scope}|${x.kind}`, x.rate]));
   const classRate = new Map<string, number>((classR.results as any[]).map((x) => [`${x.scope}|${x.kind}`, x.rate]));
   const score = (cd: Candidate) => (cd.priority * cd.fit) / (1 + (active.get(`${cd.scope}|${cd.kind}`) ?? 0));
   // Rev 13: the runs' active leases (self-play and eval), for a background batch's share.
-  const activeRuns = (activeR.results as any[]).filter((a) => a.kind === "selfplay" || a.kind === "eval").reduce((t, a) => t + a.n, 0);
+  const activeRuns = (activeR.results as any[]).filter((x) => x.kind === "selfplay" || x.kind === "eval").reduce((t, x) => t + x.n, 0);
   const rank = (cd: Candidate) => jobRank(cd.kind, cd.share, active.get(`${cd.scope}|${cd.kind}`) ?? 0, activeRuns);
   // Within a tier, evaluation before self-play (rev 7; a background batch only within its share, rev 13), then by score.
-  usable.sort((a, b) => a.tier - b.tier || rank(a) - rank(b) || score(b) - score(a) || a.scope.localeCompare(b.scope));
-  for (const cd of usable) {
-    const key = `${cd.scope}|${cd.kind}`;
-    let want = leaseSize(cd.kind as Exclude<book.Kind, "diag">, cd.configured, rate.get(key) ?? classRate.get(key) ?? null);
-    // Rev 11 (PROTOCOL 9.4): a GPU lease gets enough games for big batches.
-    if (cd.gpu_lease && cd.run && (cd.kind === "selfplay" || cd.kind === "eval")) {
-      want = await gpuLeaseSize(db, cd, want, rate.get(key) ?? null, gpuGames.get(cd.run));
-    }
-    const l = unwrap(
-      await bookFor(c.env, cd.scope).grant({
-        now: c.now,
-        machine_id: m.machine_id,
-        kind: cd.kind,
-        want,
-        run: cd.run,
-        campaign: cd.campaign,
-        def_aware: defAware,
-        ...(cd.alt ? { alt: { build_id: cd.build_id, runtime: cd.runtime! } } : {}),
-      }),
-    );
-    // Rev 7: the job's provider allowlist rides along (a routing hint, not part of the signed job).
-    if (l) return withDiag({ lease: { ...l, providers: cd.providers } });
-  }
-  return withDiag({ wait_s: WAIT_S, reason: "no_work" });
+  usable.sort((x, y) => x.tier - y.tier || rank(x) - rank(y) || score(y) - score(x) || x.scope.localeCompare(y.scope));
+  return {
+    usable,
+    need,
+    defAware,
+    farmPaused: pausedR.results[0]?.value === "1",
+    mine: mineR.results[0]?.n ?? 0,
+    diag: (diagR.results as { id: number }[]).map((d) => d.id),
+    rank,
+    rate,
+    classRate,
+  };
 }
 
 // Rev 11 (PROTOCOL 9.4): the size of a GPU lease. `gpu_games_per_lease` a number: exactly that. "auto", or absent
@@ -665,14 +715,82 @@ export async function beat(c: Ctx, leaseId: string): Promise<Response> {
   const state = oneOf(b.state, "state", ["running", "paused"] as const);
   const progress = cleanProgress(b.progress);
   const stats = cleanStats(b.stats);
+  // Rev 15 (PROTOCOL 10.6): a rolling lease's newest generation in play (ignored for a classic lease).
+  const gen = int(b.gen, "gen", { optional: true, min: 0, max: 999_999_999 }) ?? null;
   const ans = unwrap(
-    await bookFor(c.env, l.scope).beat({ now: c.now, machine_id: m.machine_id, lease_id: leaseId, scope: l.scope, state, progress, stats }),
+    await bookFor(c.env, l.scope).beat({ now: c.now, machine_id: m.machine_id, lease_id: leaseId, scope: l.scope, state, progress, stats, gen }),
   );
   if (stats) {
     telemetry(c.env.TELEMETRY).write({ machine_id: m.machine_id, class: m.class, lease_id: leaseId, kind: l.kind, scope: l.scope, event: "beat", stats });
   }
   const uploadDiag = await takeUploadDiag(c.env.DB, m, c.now);
   return json(uploadDiag ? { ...ans, upload_diag: uploadDiag } : ans);
+}
+
+// Rev 15 (PROTOCOL 10.4): POST /v1/lease/{id}/extend `{"games": k}` releases k more ids of a rolling lease (fewer at
+// the run's headroom or the block's end), answers `wait_s` when the generation's quota is full, or `finish`. Past
+// `until` the lease is renewed unless other work waits for this machine (otherWorkWaits). The beat bucket limits it.
+export async function extend(c: Ctx, leaseId: string): Promise<Response> {
+  const m = await authMachine(c);
+  await take(c, m.machine_id, "beat", "extension");
+  const l = await ownLeaseRow(c, m, leaseId);
+  const b = await readJson(c.req, 64 * 1024);
+  const games = int(b.games, "games", { min: 1, max: book.MAX_LEASE_IDS });
+  if (l.kind !== "selfplay" || !book.isRolling(l)) throw bad("only a rolling self-play lease is extended (PROTOCOL 10.4)");
+  const farm = await c.env.DB.prepare(`SELECT value FROM settings WHERE key = 'paused'`).first<{ value: string }>();
+  const paused = !!m.paused || farm?.value === "1";
+  const due = l.state === "active" && !paused && (l.until === null || c.now >= l.until);
+  const waiting = due ? await otherWorkWaits(c, m, l) : null;
+  const ans = unwrap(
+    await bookFor(c.env, l.scope).extend({ now: c.now, machine_id: m.machine_id, lease_id: leaseId, scope: l.scope, games, paused, waiting }),
+  );
+  return json(ans);
+}
+
+// Rev 15 (PROTOCOL 10.4): what else waits for this machine, in the order PROTOCOL 3 picks work (offer(), with the caps
+// and profile the coordinator last stored for it, every job kind and nothing cached): a diagnostics request it would
+// get as a lease; a job that ranks before the rolling lease's own self-play by tier and rank (an eval batch with
+// unissued ids, a fuzz campaign or a background job within its share); or, at the same rank, another run's
+// self-play with a higher priority. A self-play counts only with headroom. Null: nothing waits.
+export async function otherWorkWaits(c: Ctx, m: MachineRow, l: book.LeaseRow): Promise<string | null> {
+  const db = c.env.DB;
+  const stored = parseJson<Partial<Caps> | null>(m.caps, null) ?? {};
+  const caps: Caps = {
+    threads: typeof stored.threads === "number" ? stored.threads : 1,
+    ram_mb: typeof stored.ram_mb === "number" ? stored.ram_mb : 0,
+    gpu: stored.gpu === true,
+    disk_mb: typeof stored.disk_mb === "number" ? stored.disk_mb : 0,
+  };
+  const agent = m.agent_version && isSemver(m.agent_version) ? m.agent_version : "0.0.0";
+  const awHeader = c.req.headers.get("x-farm-aw") ?? "1";
+  const aw = /^\d{1,4}$/.test(awHeader) ? Number(awHeader) : 1;
+  const o = await offer(
+    c,
+    m,
+    { caps, gpuAllowed: caps.gpu, gpuGames: new Map(), cachedBuilds: new Set(), cachedCkpts: new Set(), kinds: new Set(KINDS), agent, aw },
+    parseJson<Profile | null>(m.profile, null),
+  );
+  if (!o.defAware && o.diag.length) return "diag";
+  const own = o.usable.find((cd) => cd.scope === l.scope && cd.kind === "selfplay");
+  const ownRun = await book.getRun(db, l.run!);
+  const ownTier = own?.tier ?? 1;
+  const ownRank = own ? o.rank(own) : kindRank("selfplay");
+  const ownPriority = own?.priority ?? ownRun?.priority ?? 0;
+  for (const cd of o.usable) {
+    if (cd === own) continue;
+    if (cd.tier > ownTier) continue;
+    if (cd.tier === ownTier) {
+      const rk = o.rank(cd);
+      if (rk > ownRank || (rk === ownRank && !(cd.priority > ownPriority))) continue;
+    }
+    if (cd.kind === "selfplay") {
+      const r = await book.getRun(db, cd.run!);
+      const sp = r ? parseJson<book.SelfplayCfg | null>(r.selfplay, null) : null;
+      if (!r || !sp || (await book.selfplayState(db, r, sp)).headroom < 1) continue;
+    }
+    return `${cd.kind}:${cd.run ?? cd.campaign}`;
+  }
+  return null;
 }
 
 export async function result(c: Ctx, leaseId: string, seqStr: string): Promise<Response> {
@@ -707,7 +825,7 @@ export async function result(c: Ctx, leaseId: string, seqStr: string): Promise<R
   if (l.state === "cancelled") throw new HttpError(410, "gone", "lease was cancelled");
   if (ids !== null) {
     if (l.pool === null) throw bad("x-ids: a diag lease has no ids");
-    parseRanges(ids, "x-ids", [l.lo!, l.hi!]);
+    parseRanges(ids, "x-ids", [l.lo!, book.relHi(l)!]); // rev 15: a rolling lease's released ids
   }
   // Review M3: chunks and bytes per lease, and no results long after it closed. Checked before
   // the body is read (with its declared length) and again by LeaseBook with the real size.

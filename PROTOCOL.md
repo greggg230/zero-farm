@@ -388,7 +388,7 @@ tools also send an Access service token (`CF-Access-Client-Id`, `CF-Access-Clien
 | `POST /v1/admin/build` | `{"build_id"}` after its manifest, signature and files are uploaded; the coordinator checks presence + sizes + hashes, and the signature and its trusted comment (`build_id=`, `kind=`) when the Worker var `RELEASE_PUBKEYS` is set → `{"ok": true, "build_id", "kind", "version", "size", "sig_verified"}`; failures → 400 with `"problems": [...]` |
 | `POST /v1/admin/agent/release` | `{"version", "build_id", "channel": "canary" \| "stable", "min_agent", "github_url": "<url>" \| null}`: `build_id` must be a registered agent build of that version, `min_agent` ≤ `version`. `github_url` (rev 4): the installer asset of the release's GitHub Release, where `GET /download` redirects; create the GitHub Release first. Rev 6: exactly `https://github.com/<GITHUB_REPO>/releases/download/agent-v<version>/ZeroFarmSetup.exe` (the var defaults to `greggg230/zero-farm`), else 400. `setup` (rev 3) → 400 → `{"ok": true, "channel", "version", "build_id", "min_agent", "github_url"}` |
 | `PUT /v1/admin/definition` | rev 6, section 7: `{"kind": "run" \| "campaign", "id", "version", "key", "sha256"}` after `definition.json` and `.minisig` are uploaded to `key` = `defs/<kind>/<id>/<version>/definition.json` → `{"ok": true, "kind", "id", "version", "key", "sha256", "unchanged", "current": true}`; failures → 400 with `"problems"`, a version not above the current one (or the same with other bytes) → 409 |
-| `PUT /v1/admin/run/{run}` | `{"game", "build_id", "runtime", "priority": 1.0, "min_agent": "0.2.8" \| null, "alternates": [{"build_id", "runtime", "when": {"vendor", "min_driver"?}}] \| null (rev 11, section 9.4), "selfplay": {"quota": 600, "slack": 0.1, "max_stale": 1, "games_per_lease": "auto", "gpu_games_per_lease": 24 | "auto" (rev 11, optional, section 9.4), "gpu": "any" \| "preferred" \| "required", "providers": ["dml", "cpu"] \| null, "needs": {"threads", "ram_mb"}, "job": {...}, "share": 0.25 \| null (rev 13, section 5.3)} \| null, "eval": {"batch": "it81", "games": 110, "checkpoints": [81, 70], "games_per_lease": "auto", "gpu", "providers", "needs", "job": {"settings", "seats", "paired"}, "share" (rev 13)} \| null, "state": "active" \| "paused"}` → `{"ok": true, "created"}`. `build_id` must be a registered worker build, `runtime` a runtime build. A new eval `batch` reserves `games` fresh game ids (the old batch's unissued ones are dropped); its rules and checks are in section 5.2 (rev 5: `checkpoints` replaces `gen`, which is now refused). Pausing a run, or dropping its `selfplay`/`eval`, cancels those leases at their next beat. Rev 9: `min_agent` (semver, optional; absent or null: none) - the run's leases (self-play and eval) go only to agents at or above it (section 3's update rule); a PUT is the whole configuration, so a PUT without it removes the limit; leases already issued run on (migration 0007) |
+| `PUT /v1/admin/run/{run}` | `{"game", "build_id", "runtime", "priority": 1.0, "min_agent": "0.2.8" \| null, "alternates": [{"build_id", "runtime", "when": {"vendor", "min_driver"?}}] \| null (rev 11, section 9.4), "selfplay": {"quota": 600, "slack": 0.1, "max_stale": 1, "games_per_lease": "auto", "gpu_games_per_lease": 24 | "auto" (rev 11, optional, section 9.4), "gpu": "any" \| "preferred" \| "required", "providers": ["dml", "cpu"] \| null, "needs": {"threads", "ram_mb"}, "job": {...}, "share": 0.25 \| null (rev 13, section 5.3), "rolling": {...} \| null (rev 15, section 10.1)} \| null, "eval": {"batch": "it81", "games": 110, "checkpoints": [81, 70], "games_per_lease": "auto", "gpu", "providers", "needs", "job": {"settings", "seats", "paired"}, "share" (rev 13)} \| null, "state": "active" \| "paused"}` → `{"ok": true, "created"}`. `build_id` must be a registered worker build, `runtime` a runtime build. A new eval `batch` reserves `games` fresh game ids (the old batch's unissued ones are dropped); its rules and checks are in section 5.2 (rev 5: `checkpoints` replaces `gen`, which is now refused). Pausing a run, or dropping its `selfplay`/`eval`, cancels those leases at their next beat. Rev 9: `min_agent` (semver, optional; absent or null: none) - the run's leases (self-play and eval) go only to agents at or above it (section 3's update rule); a PUT is the whole configuration, so a PUT without it removes the limit; leases already issued run on (migration 0007) |
 | `GET /v1/admin/run/{run}` | config (rev 9: with `min_agent`) + state: `current_gen`, `next_gid`, `pool`, `selfplay_state` (`cap`, `accepted`, `leased`, `pending`, `in_flight`, `headroom`), `checkpoints` (registered gens, rev 5), `eval_state` (the current batch's progress, section 5.2) and `eval_batches` (every batch of the run, newest first, same fields); rev 6 `definition` (as in stats; `GET /v1/admin/campaign/{id}` too) |
 | `PUT /v1/admin/run/{run}/checkpoint/{gen}` | `{"model", "sha256", "reference", "reference_sha256"}` (files under `ckpt/<run>/`, uploaded first); makes `gen` current for self-play and resets that generation's quota counter → `{"ok": true, "unchanged", "current"}`. Rev 5: a `gen` older than the current one is registered without becoming current (`"current": false`: an eval opponent or a head-to-head label); the same `gen` with other files → 409. Rev 6: a gen the current definition already signs must be exactly those files (else 400); self-play with a definition plays the new current gen once a definition signs it |
 | `GET /v1/admin/run/{run}/results?after={cursor}&limit=500` | → `{"results": [{"id", "key", "lease_id", "seq", "machine_id", "kind", "gen", "games", "ids", "dup_ids", "sha256", "size", "t"}], "cursor"}`. `ids`/`games`: the game ids credited to this chunk; `dup_ids`: ids in it that an earlier chunk was credited with (skip those games). Eval chunks (rev 5) also carry `batch`, `held` and `also`, and their `games` counts `also` too (section 5.2). `limit` ≤ 1000 |
@@ -1153,7 +1153,7 @@ are unchanged; everything below is additive.
 
 `PUT /v1/admin/run/{run}` `selfplay.rolling`: `{"inflight": n | "auto", "gpu_inflight": n | "auto", "block": 65536,
 "max_s": 7200, "flush_s": 120}` or null / absent (classic leases only). `inflight` / `gpu_inflight` (1 to 4,096 or
-`"auto"`): the games in flight of a CPU / GPU job (`"auto"`: the agent's choice, 10.6); `block` (1 to `MAX_LEASE_IDS`,
+`"auto"`, default `"auto"`): the games in flight of a CPU / GPU job (`"auto"`: the agent's choice, 10.6); `block` (1 to `MAX_LEASE_IDS`,
 default 65,536): the ids a lease reserves; `max_s` (600 to 86,400, default 7,200): how long a lease runs before the
 coordinator decides whether it goes on (10.4); `flush_s` (10 to 3,600, default 120): the longest a finished game waits
 in the worker before it is uploaded. Missing keys take the defaults; unknown keys → 400. The desktop sets `rolling` only
@@ -1194,8 +1194,9 @@ A rolling lease is a self-play lease (section 3) plus
   full); ask again after `wait_s`;
 - `{"games": total, "finish": true, "reason": "max_s" | "block" | "state"}`: no id will ever be released: finish the
   games in flight and close the lease (`done`). `max_s`: `until` has passed and the coordinator does not renew it;
-  `block`: the block is used up; `state`: the run's self-play is no longer rolling, or the run or the machine is paused
-  (a paused run's leases are also cancelled at their next beat, section 4).
+  `block`: the block is used up; `state`: the run's self-play is no longer rolling, or the run, the machine or the
+  whole farm (`POST /v1/admin/pause`) is paused, or the lease's next beat cancels it or gives it back (a paused run's
+  leases are also cancelled at their next beat, section 4).
 - **Renewal.** Past `until`, the coordinator renews the lease (`until` += `max_s`, and the answer releases ids as
   usual) unless something else is waiting for this machine, in the order section 3 picks work: a diagnostics request
   for it; an eval batch of an active run with unissued ids; a fuzz campaign with a `share` that is below it (5.4);
@@ -1275,6 +1276,31 @@ A rolling lease is a self-play lease (section 3) plus
   don't apply to rolling leases.
 - The D1 lease row gains `rel_hi` (released ids `[lo, rel_hi)`; NULL for classic leases), `until` and `cur_gen` (the
   newest generation the agent reported). Migration 0011.
+
+Coordinator details (from building it, rev 15):
+- **Order of the checks on extend.** 404 (not this machine's lease), 400 (`games` not an integer 1 to `MAX_LEASE_IDS`,
+  or a classic lease, even a closed one), 410 (not active), then `finish` `state`, `finish` `block`, the renewal
+  decision past `until`, and the release (or `wait_s` `quota`). A renewal is stored even when the answer is
+  `wait_s`. `wait_s` is 60.
+- **What waits for the machine** (renewal) is worked out like a lease request (section 3's candidates), from what
+  the coordinator last stored for the machine: its caps of its last `/v1/lease` (`caps.gpu` standing in for
+  `gpu_allowed`, no `gpu_games`), its stored profile and agent version, every job kind and nothing cached. A job
+  waits when section 3 would rank it before the rolling lease's own self-play by tier and then by rank (evaluation,
+  rev 13's background jobs and rev 14's fuzz shares within their share), or, at the same tier and rank, when it is
+  another run's self-play with a higher `priority`; a self-play job waits only with headroom. A diagnostics request
+  counts only when the agent would get it as a lease, which since rev 6 is never the case for a definition-aware
+  agent (logs requests ride on beat answers and need no new lease), so for rolling leases it never ends one.
+- **Generations.** A beat's `gen` (an integer, else 400) is stored as `cur_gen` only for a rolling lease and only when
+  it is not older than the lease's first gen; a classic lease's beat ignores it and its answer keeps exactly the keys
+  of before. The offer compares the run's current gen with `cur_gen` (before any report: the lease's first gen) and is
+  made only when the current definition signs the current gen's files as registered; `definition` is that
+  definition's `{key, sha256}`.
+- **Closing.** `done`'s `returned` counts the released ids that went back to the pool; the unreleased tail (to
+  `next_gid` or the pool) is not in it. `done`'s `unfinished` must lie in the released ids.
+- **Admin.** `GET /v1/admin/run/{run}` shows the setting in `selfplay.rolling` and adds `rolling_leases` (each active
+  rolling lease: `lease_id`, `machine_id`, `name`, `block`, `released`, `claimed`, `until`, `gen`, `cur_gen`,
+  `issued_at`); the stats add per run `rolling` (the setting or null) and `rolling_leases`; the admin page shows a
+  "rolling" column in Runs and a "Rolling leases" table.
 
 ## Changes
 - v1 rev 15 (2026-11-16; coordinator migration 0011, agent 0.2.13 canary first, worker feature `rolling`): **rolling

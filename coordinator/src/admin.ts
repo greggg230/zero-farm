@@ -266,6 +266,27 @@ function selfplayOf(v: unknown): book.SelfplayCfg | null {
     needs: needsOf(o.needs, "selfplay.needs"),
     job: jobOf(o.job, "selfplay.job"),
     ...shareOf(o.share, "selfplay.share"),
+    ...rollingOf(o.rolling),
+  };
+}
+
+// Rev 15 (PROTOCOL 10.1): a run's rolling self-play leases; null or absent: classic leases only (the key is then left
+// out of the stored config: the body of before). Missing keys take the defaults; unknown keys are refused.
+const ROLLING_KEYS = ["inflight", "gpu_inflight", "block", "max_s", "flush_s"];
+export function rollingOf(v: unknown): { rolling?: book.RollingCfg } {
+  if (v === undefined || v === null) return {};
+  const o = obj(v, "selfplay.rolling");
+  for (const k of Object.keys(o)) if (!ROLLING_KEYS.includes(k)) throw bad(`selfplay.rolling.${k}: unknown field`);
+  const inflight = (x: unknown, name: string): "auto" | number =>
+    x === undefined || x === null || x === "auto" ? "auto" : int(x, name, { min: 1, max: 4096 });
+  return {
+    rolling: {
+      inflight: inflight(o.inflight, "selfplay.rolling.inflight"),
+      gpu_inflight: inflight(o.gpu_inflight, "selfplay.rolling.gpu_inflight"),
+      block: int(o.block, "selfplay.rolling.block", { optional: true, min: 1, max: book.MAX_LEASE_IDS }) ?? 65536,
+      max_s: int(o.max_s, "selfplay.rolling.max_s", { optional: true, min: 600, max: 86400 }) ?? 7200,
+      flush_s: int(o.flush_s, "selfplay.rolling.flush_s", { optional: true, min: 10, max: 3600 }) ?? 120,
+    },
   };
 }
 
@@ -419,9 +440,35 @@ export async function getRunRoute(c: Ctx, run: string): Promise<Response> {
     eval_state: batches.find((b) => b.batch === r.eval_batch && b.replaced_at === null) ?? null,
     eval_batches: batches,
     pool: await book.poolSize(c.env.DB, scope),
+    rolling_leases: await rollingLeases(c.env.DB, scope),
     definition: await definitionStatus(c, "run", r.run, r, null),
     alternates: await alternatesStatus(c, r),
   });
+}
+
+// Rev 15 (PROTOCOL 10): a run's active rolling leases: the block, the ids released so far, until when it runs at least,
+// and its first and newest generation.
+export async function rollingLeases(db: D1Database, scope: string) {
+  const { results } = await db
+    .prepare(
+      `SELECT l.lease_id, l.machine_id, m.name, l.lo, l.hi, l.rel_hi, l.until, l.gen, l.cur_gen, l.claimed, l.issued_at
+       FROM leases l LEFT JOIN machines m ON m.machine_id = l.machine_id
+       WHERE l.scope = ? AND l.state = 'active' AND l.rel_hi IS NOT NULL ORDER BY l.issued_at, l.lease_id`,
+    )
+    .bind(scope)
+    .all<any>();
+  return results.map((x) => ({
+    lease_id: x.lease_id,
+    machine_id: x.machine_id,
+    name: x.name ?? null,
+    block: [x.lo, x.hi],
+    released: x.rel_hi - x.lo,
+    claimed: x.claimed,
+    until: x.until,
+    gen: x.gen,
+    cur_gen: x.cur_gen ?? x.gen,
+    issued_at: x.issued_at,
+  }));
 }
 
 // Rev 11: a run's alternates, each with why its current definition doesn't authorize it (`problems`).
@@ -935,6 +982,7 @@ export async function stats(c: Ctx): Promise<Response> {
       .bind(scope, scope, scope)
       .first<any>();
     const cur = r.eval_batch ? await book.getBatch(db, r.run, r.eval_batch) : null;
+    const spCfg = parseJson<book.SelfplayCfg | null>(r.selfplay, null);
     runs.push({
       run: r.run,
       game: r.game,
@@ -945,6 +993,9 @@ export async function stats(c: Ctx): Promise<Response> {
       current_gen: r.current_gen,
       next_gid: r.next_gid,
       selfplay: sp,
+      // Rev 15 (PROTOCOL 10): the run's rolling setting (null: classic leases only) and its active rolling leases.
+      rolling: spCfg?.rolling ?? null,
+      rolling_leases: await rollingLeases(db, scope),
       eval: cur ? await book.evalProgress(db, cur) : null,
       active_leases: extra.active,
       unacked_results: extra.unacked,
