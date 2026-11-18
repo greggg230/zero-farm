@@ -324,3 +324,8 @@ export function parseJson<T>(s: string | null | undefined, fallback: T): T {
     return fallback;
   }
 }
+
+// An IN list as ONE bound parameter (D1 allows at most 100 per statement, and a list from data
+// - fuzz failures, swept ids - can be longer): `x IN ${IN_JSON}` bound with inJson(values).
+export const IN_JSON = "(SELECT value FROM json_each(?))";
+export const inJson = (values: readonly (string | number)[]): string => JSON.stringify(values);

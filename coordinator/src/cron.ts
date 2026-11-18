@@ -4,6 +4,7 @@ import { config } from "./config";
 import { pruneExternal } from "./external";
 import { bookFor } from "./leasebook";
 import { prune } from "./ratelimit";
+import { IN_JSON, inJson } from "./util";
 
 const BATCH = 500; // rows (and R2 objects) per sweep per minute
 
@@ -37,8 +38,8 @@ export async function runCron(env: Env, now: number): Promise<CronResult> {
     .all<{ id: number; key: string }>();
   if (old.results.length) {
     await env.BUCKET.delete(old.results.map((r) => r.key));
-    await db.prepare(`UPDATE results SET deleted_at = ? WHERE id IN (${old.results.map(() => "?").join(",")})`)
-      .bind(now, ...old.results.map((r) => r.id))
+    await db.prepare(`UPDATE results SET deleted_at = ? WHERE id IN ${IN_JSON}`)
+      .bind(now, inJson(old.results.map((r) => r.id)))
       .run();
   }
 
@@ -60,10 +61,10 @@ export async function runCron(env: Env, now: number): Promise<CronResult> {
     await env.BUCKET.delete(keys);
     const stmts = [];
     if (ups.results.length) {
-      stmts.push(db.prepare(`DELETE FROM diag_uploads WHERE id IN (${ups.results.map(() => "?").join(",")})`).bind(...ups.results.map((r) => r.id)));
+      stmts.push(db.prepare(`DELETE FROM diag_uploads WHERE id IN ${IN_JSON}`).bind(inJson(ups.results.map((r) => r.id))));
     }
     if (res.results.length) {
-      stmts.push(db.prepare(`DELETE FROM results WHERE id IN (${res.results.map(() => "?").join(",")})`).bind(...res.results.map((r) => r.id)));
+      stmts.push(db.prepare(`DELETE FROM results WHERE id IN ${IN_JSON}`).bind(inJson(res.results.map((r) => r.id))));
     }
     await db.batch(stmts);
   }

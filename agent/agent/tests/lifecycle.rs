@@ -113,6 +113,27 @@ fn uploads_are_retried_after_injected_http_failures() {
 }
 
 #[test]
+fn a_lease_whose_uploads_keep_failing_does_not_hold_up_the_others() {
+    // 2026-11-17: one fuzz chunk got HTTP 500 for 17 h and the uploader stopped its pass at that
+    // lease, so every lease sorting after it never uploaded or closed and expired at the coordinator.
+    let mut h = H::new();
+    h.mock.fail_next("PUT", "/v1/lease/l_A/result", 1_000_000, 500);
+    h.push(h.lease("l_A", selfplay(4, 0, json!({"game_ms": 50, "shard_every": 2}))));
+    h.push(h.lease("l_B", selfplay(4, 100, json!({"game_ms": 50, "shard_every": 2}))));
+    h.start();
+    let done = h.wait_done("l_B");
+    assert_eq!(done["given_back"], false);
+    assert_eq!(h.mock.results_for("l_B").len(), 2);
+    assert!(h.mock.done_for("l_A").is_none(), "l_A still waits for its uploads");
+    assert!(h.layout.results_pending().join("l_A").join("0").exists(), "l_A's results are kept for the next retry");
+    // Once the coordinator takes them, l_A closes too.
+    h.mock.clear_failures();
+    let done_a = h.wait_done("l_A");
+    assert_eq!(done_a["results"], json!([0, 1]));
+    h.stop();
+}
+
+#[test]
 fn agent_restart_uploads_pending_results() {
     let mut h = H::new();
     h.mock.fail_next("PUT", "/v1/lease/l_D/result", 10_000, 503);

@@ -64,6 +64,8 @@ import {
   strList,
   unwrap,
   uriDecode,
+  IN_JSON,
+  inJson,
 } from "./util";
 
 export const KINDS = ["fuzz", "eval", "selfplay", "diag"] as const;
@@ -269,8 +271,8 @@ export async function takeUploadDiag(db: D1Database, m: MachineRow, now: number)
   const { results } = await pendingLogsQuery(db, m, now).all<{ id: number }>();
   if (!results.length) return null;
   await db
-    .prepare(`UPDATE diag_requests SET delivered_at = ? WHERE id IN (${results.map(() => "?").join(",")})`)
-    .bind(now, ...results.map((r) => r.id))
+    .prepare(`UPDATE diag_requests SET delivered_at = ? WHERE id IN ${IN_JSON}`)
+    .bind(now, inJson(results.map((r) => r.id)))
     .run();
   return ["logs"];
 }
