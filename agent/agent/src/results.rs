@@ -21,7 +21,8 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
 use zerofarm_common::fsutil::{atomic_write, dir_size, remove_dir_all_retry};
 use zerofarm_common::http::{Backoff, CallError, Client};
 use zerofarm_common::layout::Layout;
@@ -270,54 +271,73 @@ impl Drop for Uploader {
 }
 
 fn run(store: &ResultStore, client: &Client, sh: &Shared, rescan: Duration) {
-    let mut backoff = Backoff::default();
+    // Each lease backs off on its own: a lease whose upload keeps failing (a chunk the coordinator
+    // can't take, 2026-11-17: HTTP 500 for 17 h) must not hold up the other leases' results and
+    // `done` - they would go stale or expire while it waits. A revoked token stops the whole pass.
+    let mut per_lease: HashMap<String, (Backoff, Instant)> = HashMap::new();
+    let mut revoked = Backoff::default();
     let stopped = || sh.stop.load(Ordering::SeqCst);
     while !stopped() {
-        let mut failure = None;
-        for id in store.lease_ids() {
+        let ids = store.lease_ids();
+        per_lease.retain(|id, _| ids.contains(id));
+        let mut next_retry: Option<Instant> = None;
+        let mut stop_pass = None;
+        for id in ids {
             if stopped() {
                 return;
             }
+            if let Some((_, at)) = per_lease.get(&id) {
+                if *at > Instant::now() {
+                    next_retry = Some(next_retry.map_or(*at, |t| t.min(*at)));
+                    continue;
+                }
+            }
             match process(store, client, sh, &id) {
-                Step::Done => {}
+                Step::Done => {
+                    per_lease.remove(&id);
+                }
                 Step::Retry(e) => {
-                    log::warn!("upload for lease {id} failed: {e}; will retry");
-                    failure = Some(e);
-                    break;
+                    let entry = per_lease.entry(id.clone()).or_insert_with(|| (Backoff::default(), Instant::now()));
+                    let at = Instant::now() + entry.0.delay_for(&e);
+                    entry.1 = at;
+                    next_retry = Some(next_retry.map_or(at, |t| t.min(at)));
+                    log::warn!("upload for lease {id} failed: {e}; will retry (the other leases go on)");
                 }
                 Step::Revoked => {
                     log::error!("the coordinator no longer accepts this machine's token");
                     sh.revoked.store(true, Ordering::SeqCst);
-                    failure = Some(CallError::Stopped);
+                    stop_pass = Some(CallError::Stopped);
                     break;
                 }
             }
         }
-        let wait = match &failure {
-            Some(e) => backoff.delay_for(e),
+        // Revoked: everything waits. Otherwise wait for new results (a wake), a lease's own retry
+        // time, or the periodic rescan, whichever comes first; a wake never retries a lease early.
+        let wait = match &stop_pass {
+            Some(e) => revoked.delay_for(e),
             None => {
-                backoff.reset();
-                rescan
+                revoked.reset();
+                next_retry.map_or(rescan, |t| t.saturating_duration_since(Instant::now()).min(rescan))
             }
         };
-        // On failure, honour the backoff (wakes don't shorten it); otherwise wake on demand.
+        let wakeable = stop_pass.is_none();
         let mut woken = sh.wake.lock().unwrap();
-        if failure.is_none() && *woken {
+        if wakeable && *woken {
             *woken = false;
             continue;
         }
-        let end = std::time::Instant::now() + wait;
+        let end = Instant::now() + wait;
         loop {
             if stopped() {
                 return;
             }
-            let now = std::time::Instant::now();
+            let now = Instant::now();
             if now >= end {
                 break;
             }
             let (g, _) = sh.cv.wait_timeout(woken, end - now).unwrap();
             woken = g;
-            if *woken && failure.is_none() {
+            if *woken && wakeable {
                 break;
             }
         }
