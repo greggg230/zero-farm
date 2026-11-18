@@ -2,7 +2,7 @@
 
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
-import { leaseSize, SIZING, TARGET_S } from "../src/friend";
+import { classOf, leaseSize, SIZING, TARGET_S } from "../src/friend";
 import { blake2b512, verifyBuild, verifyMinisign } from "../src/manifest";
 import { intersect, normalize, parseRanges, subtract, total, type Range } from "../src/ranges";
 import { cleanStats, DOUBLES, telemetry } from "../src/telemetry";
@@ -181,5 +181,23 @@ describe("telemetry", () => {
       paused_ms: 20000,
       resume_ms_max: 80,
     });
+  });
+});
+
+describe("hardware class", () => {
+  it("names the GPU with the most VRAM, not the first one listed", () => {
+    const laptop = {
+      cpu: "Laptop CPU",
+      gpus: [
+        { vendor: "intel", name: "Integrated Graphics", vram_mb: 128 },
+        { vendor: "nvidia", name: "Discrete Laptop GPU", vram_mb: 8044 },
+      ],
+    };
+    expect(classOf(laptop)).toBe("Laptop CPU / Discrete Laptop GPU");
+    expect(classOf({ cpu: "C", gpus: [{ name: "A", vram_mb: 8 }, { name: "B", vram_mb: 8 }] })).toBe("C / A");
+    expect(classOf({ cpu: "C", gpus: [{ name: "A" }] })).toBe("C / A");
+    expect(classOf({ cpu: "C", gpus: [] })).toBe("C / no gpu");
+    expect(classOf({ gpus: [{ vram_mb: 9000 }] })).toBe("unknown cpu / no gpu");
+    expect(classOf(null)).toBeNull();
   });
 });

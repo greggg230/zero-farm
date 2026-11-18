@@ -134,9 +134,13 @@ export function cleanProfile(p: Record<string, any>): Profile {
   return p as Profile;
 }
 
+// A machine's hardware class: its CPU and its biggest GPU (most VRAM; the first listed on a tie). On a laptop
+// with switchable graphics Windows lists the integrated GPU first, so the first GPU would name the Intel part.
 export function classOf(p: Profile | null): string | null {
   if (!p) return null;
-  const gpu = p.gpus?.find((g) => g.name)?.name ?? "no gpu";
+  const named = (p.gpus ?? []).filter((g) => g.name);
+  const best = named.reduce<(typeof named)[number] | undefined>((b, g) => (!b || (g.vram_mb ?? 0) > (b.vram_mb ?? 0) ? g : b), undefined);
+  const gpu = best?.name ?? "no gpu";
   return `${p.cpu ?? "unknown cpu"} / ${gpu}`.slice(0, 200);
 }
 
