@@ -162,4 +162,17 @@ describe("result uploads", () => {
     expect(await env.BUCKET.head(key)).toBeNull();
     expect((await runCron(env, clock.now + 8 * 86400)).deleted).toBe(0);
   });
+
+  it("deletes more acked results per sweep than D1's 100 bound parameters", async () => {
+    // 2026-11-17: an IN list with one parameter per id broke at 100 ids (D1 "too many SQL variables").
+    const stmts = Array.from({ length: 150 }, (_, i) =>
+      env.DB.prepare(
+        `INSERT INTO results (scope, lease_id, seq, machine_id, kind, key, sha256, size, games, ids, dup_ids, t, acked_at)
+         VALUES ('run:r', 'l_x', ?, 'm_x', 'selfplay', ?, ?, 1, 0, '[]', '[]', ?, ?)`,
+      ).bind(i, `results/r/l_x/${i}`, "0".repeat(64), clock.now, clock.now),
+    );
+    await env.DB.batch(stmts);
+    expect((await runCron(env, clock.now + 7 * 86400 + 1)).deleted).toBe(150);
+    expect((await env.DB.prepare(`SELECT COUNT(*) AS n FROM results WHERE deleted_at IS NULL`).first<any>()).n).toBe(0);
+  });
 });

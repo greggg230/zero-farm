@@ -38,6 +38,8 @@ import {
   newLeaseId,
   notFound,
   parseJson,
+  IN_JSON,
+  inJson,
 } from "./util";
 
 export { baseSeed } from "./definitions";
@@ -1151,8 +1153,8 @@ export async function putResult(env: Env, r: ResultReq): Promise<ResultCommit> {
     const sites = new Set(
       (
         await db
-          .prepare(`SELECT DISTINCT site FROM failures WHERE campaign = ? AND site IN (${fuzz.failures.map(() => "?").join(",")})`)
-          .bind(l.campaign, ...fuzz.failures.map((f) => f.site))
+          .prepare(`SELECT DISTINCT site FROM failures WHERE campaign = ? AND site IN ${IN_JSON}`)
+          .bind(l.campaign, inJson([...new Set(fuzz.failures.map((f) => f.site))]))
           .all<{ site: string }>()
       ).results.map((x) => x.site),
     );

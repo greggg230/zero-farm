@@ -80,6 +80,21 @@ describe("fuzz campaigns", () => {
     expect(ok(await admin("GET", "/v1/admin/campaign/fz"))).toMatchObject({ failures: 3, sites: 2, seeds_done: 100 });
   });
 
+  it("takes a result with more failures and sites than D1's 100 bound parameters", async () => {
+    // 2026-11-17: a fuzz campaign failing on every seed made chunks with 600+ failures; the site
+    // lookup bound one parameter per failure and every such upload got a 500 (D1 "too many SQL variables").
+    await makeCampaign("fz", { seed_base: 0, chunk: 200 });
+    const m = await enroll("a");
+    const l = await lease(m);
+    const fails = Array.from({ length: 150 }, (_, i) => ({ seed: i, panic: "boom", site: `engine/src/x.rs:${i % 120}`, repro: `(r, ${i})` }));
+    ok(await upload(m, l.lease_id, 0, fuzzResult(0, 200, 150, fails.slice(0, 50))));
+    ok(await upload(m, l.lease_id, 1, fuzzResult(0, 200, 200, fails), { ids: [[0, 200]] }));
+    ok(await finish(m, l.lease_id, [0, 1]));
+    expect(ok(await admin("GET", "/v1/admin/campaign/fz"))).toMatchObject({ failures: 150, sites: 120, seeds_done: 200 });
+    const firsts = await env.DB.prepare(`SELECT COUNT(*) AS n FROM failures WHERE first_of_site = 1`).first<any>();
+    expect(firsts.n).toBe(120);
+  });
+
   it("rejects malformed fuzz results", async () => {
     await makeCampaign("fz", { seed_base: 0, chunk: 100 });
     const m = await enroll("a");
