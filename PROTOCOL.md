@@ -1352,30 +1352,40 @@ Platform names: `windows-x64` and `macos-arm64` (Apple silicon, macOS 13 or newe
   (every older agent). The profile may carry the same value as `platform` (informational; the header counts).
 - `POST /v1/enroll` with an unknown platform → 400. The coordinator stores the platform with the machine
   (`machines.platform`, migration 0013; existing machines `windows-x64`). It is fixed at enrollment: a later request
-  whose header names another platform → 409 `conflict` with `"reason": "platform"` (a machine token copied to
-  another computer: install there instead).
-- The admin stats and `GET /v1/admin/machines` show each machine's `platform`.
+  whose header names another platform (no header: `windows-x64`) → 409 `conflict` with `"reason": "platform"` (a
+  machine token copied to another computer: install there instead); an unknown platform → 400.
+- The admin stats and `GET /v1/admin/machines` show each machine's `platform`; the stats' `limits` add
+  `platform_agent`.
 
 ### 11.2 Agent releases per platform
 
 - `agent_releases.platform` (migration 0013; existing rows `windows-x64`). `POST /v1/admin/agent/release` takes
-  `"platform"` (default `windows-x64`), which must equal the agent build's manifest platform (11.3).
+  `"platform"` (default `windows-x64`), which must equal the agent build's manifest platform (11.3); the answer adds
+  `platform`.
 - Every lookup of "the channel's latest release" uses the newest release of (channel, platform), with the
   machine's platform (or the request's, before enrollment): enroll's 426, the update rule of `POST /v1/lease`
   (section 3), `GET /v1/agent/latest`, `GET /download`, the onboarding page and the stats' `releases` (one per
-  channel and platform). So `latest` and `min_agent` are per platform: a Windows-only release never asks a Mac to
-  update, and the reverse.
+  channel and platform, with `platform`). So `latest` and `min_agent` are per platform: a Windows-only release never
+  asks a Mac to update, and the reverse. Enroll's 426 `download` names the platform when it isn't `windows-x64`
+  (`/download?platform=macos-arm64`, `&channel=canary` as before).
 - GitHub (section 2.1): a macOS release is the GitHub Release `agent-macos-v<version>` (never marked Latest;
   `agent-v<version>` stays Windows), assets `ZeroFarm-macos-arm64.tar.gz`, `SHA256SUMS`, `SHA256SUMS.minisig` (same
   rules as 2.1). Its `github_url` must be exactly
   `https://github.com/<GITHUB_REPO>/releases/download/agent-macos-v<version>/ZeroFarm-macos-arm64.tar.gz`.
-- `GET /download?platform=macos-arm64` (optional `channel` as today) → 302 to the newest macOS release's tarball.
+- `GET /download?platform=macos-arm64` (optional `channel` as today) → 302 to the newest macOS release's tarball;
+  every `/download` answer adds `x-farm-platform`; an unknown `platform` → 400.
   `GET /install-macos.sh` (optional `?channel=canary`) → a POSIX shell script (`text/plain`) that downloads that
   tarball, checks it against the release's `SHA256SUMS`, unpacks it into a temporary directory and runs
   `./ZeroFarm setup "$@"` (so `curl -fsSL https://farm.greggg230.com/install-macos.sh | sh -s -- --invite CODE`
   works, and without `--invite` the setup asks on the terminal). The tarball holds the launcher `ZeroFarm`, the
   agent package (its signed manifest and files) and nothing else; `ZeroFarm setup` verifies the package's manifest
-  against its embedded release keys before installing it.
+  against its embedded release keys before installing it. The script (`set -eu`, every failure a message and exit 1)
+  stops unless `uname -s` is `Darwin` and `uname -m` is `arm64`; reads the tarball's URL from the coordinator's own
+  `/download?platform=macos-arm64[&channel=]` (the request's origin) and goes on only for
+  `https://github.com/<GITHUB_REPO>/releases/download/agent-macos-v<version>/ZeroFarm-macos-arm64.tar.gz`; fetches
+  `SHA256SUMS` from that release (`shasum -a 256 -c` of the tarball's line); and, piped into `sh`, gives setup the
+  terminal (`/dev/tty`) as its stdin. It is served before any macOS release too (it then says there is none).
+- The onboarding page shows the macOS install command once a macOS release names a `github_url`.
 
 ### 11.3 Builds per platform
 
@@ -1387,8 +1397,9 @@ Platform names: `windows-x64` and `macos-arm64` (Apple silicon, macOS 13 or newe
   executable bit is not in the manifest: the agent sets mode 0755 on a build's `entry` (and an agent package's
   `ZeroFarm`) after verifying it. Binaries are ad-hoc code-signed (the arm64 linker does it) and not notarized;
   files the agent downloads itself carry no quarantine attribute, so Gatekeeper doesn't check them.
-- `POST /v1/admin/build` stores the manifest's platform (`builds.platform`, migration 0013); an unknown platform →
-  400.
+- `POST /v1/admin/build` stores the manifest's platform (`builds.platform`, migration 0013) and answers it; an
+  unknown platform, or a manifest that names a platform with `min_agent` absent or below `PLATFORM_AGENT` → 400
+  (`problems`).
 - An agent from 0.3.0 checks, before downloading anything else, that the lease's worker build (and runtime pack)
   manifest names its own platform. A mismatch → `done` with `refused: "platform"`, a crash report of kind
   `definition` at most once a day per build, and the start-failure wait (section 9.5's pattern).
@@ -1396,23 +1407,36 @@ Platform names: `windows-x64` and `macos-arm64` (Apple silicon, macOS 13 or newe
 ### 11.4 Which build a machine gets
 
 - **Runs.** An alternate (9.4) takes `when.platform` (default `windows-x64`), and `when.vendor` becomes optional:
-  an alternate without `vendor` is a **CPU alternate**, offered to every machine of its platform with no GPU
-  condition (its runtime must have no `gpu`). `PUT /v1/admin/run/{run}` checks that the alternate's build and
-  runtime manifests name `when.platform` (else 400); still at most 4 alternates.
+  an alternate without `vendor` whose `when` names `platform` (`windows-x64` too) is a **CPU alternate**, offered
+  to every machine of its platform with no GPU condition (its runtime must have no `gpu`; no `min_driver`). One
+  that names neither, with a pack that names no GPU vendor, is refused as before rev 17 (a GPU pack such as Windows
+  ML needs its vendor spelled out). GPU alternates (a vendor) are `windows-x64` only in rev 17 (else 400).
+  `PUT /v1/admin/run/{run}` checks that the alternate's build and runtime manifests name `when.platform`, and that
+  the default build and runtime name one platform (else 400); still at most 4 alternates. A CPU alternate is stored
+  (and shown) with its `platform`, a GPU alternate without one, as before rev 17.
 - For a self-play or eval job and an agent of at least `ALT_RUNTIME_AGENT`, the lease carries: the first alternate
   **of the machine's platform** that it qualifies for (a GPU alternate: 9.4's conditions 1-7; a CPU alternate:
   conditions 5-7 and the build's `aw`), else the run's default when the default build's platform is the machine's,
   else nothing from that run for this machine (it gets other work). An agent older than `ALT_RUNTIME_AGENT` is
-  `windows-x64` and is never offered a build of another platform.
+  `windows-x64` and is never offered a build of another platform. When the default is of another platform, the
+  first alternate of the machine's platform that only its builds' `min_agent` keeps from this agent counts as the
+  run's build for section 3's update rule (`{"update"}` when the channel offers that agent, else nothing from the
+  run), as a default build's would.
 - **Campaigns.** `PUT /v1/admin/campaign/{id}` takes `"alternates": [{"build_id", "when": {"platform"}}] | null`
-  (at most 4 worker builds, one per platform at most, each of the campaign's game and profile; migration 0013
-  `campaigns.alternates`). A machine gets the campaign's alternate of its platform (registered, not blocked for it,
-  `min_agent` and `aw` met, listed in the campaign's current definition's `builds`), else the campaign's build when
-  its platform is the machine's, else nothing from that campaign. `GET /v1/admin/campaign/{id}` and the stats show
-  them.
-- **Diag leases** (`POST /v1/admin/diag`): a request whose build (from `params`) is of another platform than the
-  machine's → 400.
-- **The admin view.** Per run and campaign the stats add `platforms`: the platforms that can get its jobs.
+  (at most 4 worker builds, one per platform at most, each of the campaign's game and profile, not the campaign's
+  own build; `when.platform` required; migration 0013 `campaigns.alternates`; a PUT without them removes them). A
+  machine gets the campaign's alternate of its platform (registered, not blocked for it, `min_agent` and `aw` met,
+  listed in the campaign's current definition's `builds`), else the campaign's build when its platform is the
+  machine's, else nothing from that campaign (an alternate that only its `min_agent` keeps from the agent counts
+  for the update rule, as for runs). `GET /v1/admin/campaign/{id}` and the stats show them, each with `problems`
+  (why the current definition doesn't authorize it).
+- **Diag leases** (`POST /v1/admin/diag`): a request whose build (`params.build_id`, else `params.run`'s default
+  build) is of another platform than a target machine's → 400. A diag lease never carries a build of another
+  platform (diag leases go only to agents before `DEFINITION_AGENT`, all `windows-x64`).
+- The coordinator checks the builds of every lease against the machine's platform again when it grants it (under
+  the scope's lock): a build of another platform is never leased, whatever chose it.
+- **The admin view.** Per run and campaign the stats (and `GET` run and campaign) add `platforms`: the platforms
+  that can get its jobs (the default build's, and each alternate's that the current definition authorizes).
 - **Results across platforms.** What the engine alone decides is identical on every platform (fuzz seeds, record
   replay). A network's outputs differ in rounding between ONNX Runtime's x64 and arm64 kernels, so a game that
   consults a network can play out differently on a Mac. Self-play records are unaffected (the trainer replays the
@@ -1453,9 +1477,11 @@ Platform names: `windows-x64` and `macos-arm64` (Apple silicon, macOS 13 or newe
   `machines.platform`, `builds.platform`, `agent_releases.platform`, `campaigns.alternates`; manifests take
   `platform` (min_agent 0.3.0+); agent releases, `min_agent`, `/v1/agent/latest`, `/download` and the onboarding
   page are per (channel, platform); macOS GitHub Releases `agent-macos-v<version>`; `GET /install-macos.sh`;
-  run alternates take `when.platform` and may omit `when.vendor` (CPU alternates); campaign alternates per
-  platform; agents refuse a build of another platform (`refused: "platform"`); the macOS agent (layout,
-  LaunchAgent, token file, process groups, IOKit idle/power, `keep_awake`, headless CLI).
+  run alternates take `when.platform` and may omit `when.vendor` (CPU alternates, which name their platform; GPU
+  alternates `windows-x64` only); campaign alternates per platform; an alternate held back only by `min_agent` drives
+  the update rule when the default is of another platform; agents refuse a build of another platform
+  (`refused: "platform"`); the macOS agent (layout, LaunchAgent, token file, process groups, IOKit idle/power,
+  `keep_awake`, headless CLI).
 - v1 rev 16 (2026-11-17; coordinator migration 0012, agent 0.2.14): `POST /v1/presence` (section
   3, Other): an agent that is on but may not work says why (owner using the PC, fullscreen app, battery, outside
   its hours, paused, low memory) every 5 min and when the reason changes; stats carry `presence`. Older agents
