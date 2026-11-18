@@ -1,5 +1,6 @@
 //! Enrollment (PROTOCOL 3, `POST /v1/enroll`): an invite code becomes a machine id and token;
-//! the token is stored with DPAPI (CurrentUser) in `state\machine.json`.
+//! the token is stored with DPAPI (CurrentUser) in `state\machine.json` (on macOS in the clear, in the
+//! mode-0600 `state/machine.json`, PROTOCOL 11.5).
 
 use crate::settings::Machine;
 use zerofarm_common::http::{CallError, Client};
@@ -33,10 +34,18 @@ impl std::fmt::Display for EnrollError {
         match self {
             EnrollError::BadCode => write!(f, "That doesn't look like an invite code (XXXX-XXXX-XXXX)."),
             EnrollError::Refused(m) => write!(f, "The farm didn't accept that code ({m}). Codes work once; ask for a new one."),
+            #[cfg(windows)]
             EnrollError::UpdateRequired { min_agent, download } => write!(
                 f,
                 "This Zero Farm installer is too old (the farm needs version {min_agent} or newer). Please download the \
                  latest ZeroFarmSetup.exe{} and run it; your invite code still works.",
+                download.as_deref().map(|u| format!(" from {u}")).unwrap_or_default()
+            ),
+            #[cfg(not(windows))]
+            EnrollError::UpdateRequired { min_agent, download } => write!(
+                f,
+                "This Zero Farm download is too old (the farm needs version {min_agent} or newer). Please install the \
+                 latest one{} (run the install command again); your invite code still works.",
                 download.as_deref().map(|u| format!(" from {u}")).unwrap_or_default()
             ),
             EnrollError::Network(m) => write!(f, "Couldn't reach the farm: {m}"),
@@ -87,7 +96,14 @@ pub fn enroll(
     Ok(())
 }
 
+/// This Mac's name for the contributors page (its host name; the friend can change it at setup).
+#[cfg(not(windows))]
+pub fn default_machine_name() -> String {
+    crate::macos::host_name().unwrap_or_else(|| "My Mac".into())
+}
+
 /// This PC's name for the contributors page (the friend can change it in the dialog).
+#[cfg(windows)]
 pub fn default_machine_name() -> String {
     use windows_sys::Win32::System::SystemInformation::{ComputerNamePhysicalDnsHostname, GetComputerNameExW};
     let mut buf = [0u16; 256];

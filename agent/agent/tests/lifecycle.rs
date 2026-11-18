@@ -30,7 +30,7 @@ fn selfplay_lease_downloads_runs_yields_resumes_and_completes() {
     assert!(wait(|| !h.mock.results_for("l_A").is_empty()), "first result");
     // The build came from the coordinator, verified: manifest, signature and the exe.
     assert!(h.mock.count("GET", &format!("/v1/artifact/builds/{}/", h.build_id)) >= 3);
-    assert!(h.layout.cache_builds().join(&h.build_id).join("fakeworker.exe").exists());
+    assert!(h.layout.cache_builds().join(&h.build_id).join(mockcoord::testkit::FAKEWORKER).exists());
     assert!(h.layout.is_healthy("0.1.0"), "healthy marker after the first successful call");
 
     // The user comes back: yield → suspended, lease kept alive with paused beats.
@@ -58,7 +58,9 @@ fn selfplay_lease_downloads_runs_yields_resumes_and_completes() {
     assert!(!r0.headers.contains_key("x-gen"), "no checkpoint, no x-gen");
     assert!(String::from_utf8_lossy(&r0.bytes).contains("fake shard"));
     // The worker's job: no clipboard, atoms, desktops, display/system settings or logoff.
-    assert!(String::from_utf8_lossy(&r0.bytes).contains("ui_limits=254"), "{}", String::from_utf8_lossy(&r0.bytes));
+    // (macOS: no job objects; the worker is in a process group of its own)
+    let ui = if cfg!(windows) { "ui_limits=254" } else { "ui_limits=none" };
+    assert!(String::from_utf8_lossy(&r0.bytes).contains(ui), "{}", String::from_utf8_lossy(&r0.bytes));
     // The worker got the job with our thread cap and paths.
     let gids: Vec<String> = results.iter().map(|(_, r)| r.headers["x-ids"].clone()).collect();
     assert_eq!(gids, ["[[1000,1002]]", "[[1002,1004]]", "[[1004,1006]]", "[[1006,1008]]"]);
@@ -372,7 +374,7 @@ fn coordinator_give_back_flushes_and_closes() {
 }
 
 fn tampered(h: &H) {
-    let key = format!("builds/{}/fakeworker.exe", h.build_id);
+    let key = format!("builds/{}/{}", h.build_id, mockcoord::testkit::FAKEWORKER);
     h.mock.with(|s| {
         let b = s.artifacts.get_mut(&key).unwrap();
         let n = b.len();

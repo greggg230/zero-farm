@@ -6,15 +6,30 @@
 //! UAC), registers autostart and the Start-menu/uninstall entries, and starts Zero Farm (which
 //! then asks for the invite code). Arguments are passed through to `install` (e.g. `--quiet`).
 
+//!
+//! Windows only: a Mac installs from the release tarball (`ZeroFarm setup`, PROTOCOL 11.2).
+
 #![windows_subsystem = "windows"]
 
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
+#[cfg(windows)]
 use zerofarm_common::keys::TrustedKeys;
+#[cfg(windows)]
 use zerofarm_common::manifest::{verify_dir, Expect, Kind};
 
+#[cfg(windows)]
 static PAYLOAD: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/setup-payload.bin"));
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("ZeroFarmSetup is the Windows installer; on a Mac run `ZeroFarm setup` from the release tarball");
+    std::process::exit(2);
+}
+
+#[cfg(windows)]
 fn message(text: &str) {
     use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONERROR, MB_OK};
     let w = |s: &str| s.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
@@ -22,6 +37,7 @@ fn message(text: &str) {
     unsafe { MessageBoxW(std::ptr::null_mut(), t.as_ptr(), c.as_ptr(), MB_OK | MB_ICONERROR) };
 }
 
+#[cfg(windows)]
 fn run() -> Result<i32, String> {
     if PAYLOAD.is_empty() {
         return Err("This ZeroFarmSetup.exe was built without the Zero Farm files inside.".into());
@@ -51,6 +67,7 @@ fn run() -> Result<i32, String> {
     result
 }
 
+#[cfg(windows)]
 fn main() {
     match run() {
         Ok(code) => std::process::exit(code),

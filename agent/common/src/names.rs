@@ -1,15 +1,29 @@
 //! Named kernel objects shared by the launcher, the agent and the installer for one install
 //! root: a single-instance mutex per program and a manual-reset "quit" event that asks the
 //! running agent (and launcher) to exit cleanly (used by uninstall and re-install).
+//!
+//! On macOS (PROTOCOL 11.5) the same API uses POSIX means (`names_unix.rs`): an exclusive `flock`
+//! per role in `state/` holding the holder's pid, and signals for "quit".
 
+#[cfg(windows)]
 use std::path::Path;
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HANDLE, WAIT_OBJECT_0};
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::{CreateEventW, CreateMutexW, ResetEvent, SetEvent, WaitForSingleObject};
 
+#[cfg(unix)]
+#[path = "names_unix.rs"]
+mod unix;
+#[cfg(unix)]
+pub use unix::*;
+
+#[cfg(windows)]
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+#[cfg(windows)]
 /// Normalised root path (lowercase, backslashes, no `\\?\` prefix, no trailing separator).
 pub fn normalize_root(root: &Path) -> String {
     let abs = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
@@ -23,16 +37,21 @@ pub fn normalize_root(root: &Path) -> String {
     s
 }
 
+#[cfg(windows)]
 /// `Local\ZeroFarm-<what>-<16 hex of sha256(normalised root)>`.
 pub fn object_name(what: &str, root: &Path) -> String {
     let h = crate::hash::sha256_hex(normalize_root(root).as_bytes());
     format!("Local\\ZeroFarm-{what}-{}", &h[..16])
 }
 
+#[cfg(windows)]
 /// An owned kernel handle, closed on drop.
 pub struct Handle(pub HANDLE);
+#[cfg(windows)]
 unsafe impl Send for Handle {}
+#[cfg(windows)]
 unsafe impl Sync for Handle {}
+#[cfg(windows)]
 impl Drop for Handle {
     fn drop(&mut self) {
         if !self.0.is_null() {
@@ -41,6 +60,7 @@ impl Drop for Handle {
     }
 }
 
+#[cfg(windows)]
 /// Takes the single-instance mutex `what` for `root`. `None` if another process holds it.
 pub fn single_instance(what: &str, root: &Path) -> Option<Handle> {
     let name = wide(&object_name(what, root));
@@ -55,6 +75,7 @@ pub fn single_instance(what: &str, root: &Path) -> Option<Handle> {
     Some(Handle(h))
 }
 
+#[cfg(windows)]
 /// True if some process currently holds the single-instance mutex `what` for `root`. Only
 /// opens the mutex (never creates it), so probing can't make a starting instance think another
 /// copy is already running.
@@ -70,9 +91,11 @@ pub fn instance_running(what: &str, root: &Path) -> bool {
     }
 }
 
+#[cfg(windows)]
 /// The manual-reset quit event for `root` (created if needed).
 pub struct QuitEvent(Handle);
 
+#[cfg(windows)]
 impl QuitEvent {
     pub fn open(root: &Path) -> Option<QuitEvent> {
         let name = wide(&object_name("quit", root));
@@ -103,6 +126,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(windows)]
     fn names_are_stable_across_spellings() {
         let a = object_name("quit", Path::new("C:\\Users\\X\\AppData\\Local\\ZeroFarm"));
         let b = object_name("quit", Path::new("c:/users/x/appdata/local/zerofarm/"));

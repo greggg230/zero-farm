@@ -26,13 +26,13 @@ fn env() -> E {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("ZeroFarm");
     std::fs::create_dir_all(&root).unwrap();
-    std::fs::copy(bin("ZeroFarm"), root.join("ZeroFarm.exe")).unwrap();
+    std::fs::copy(bin("ZeroFarm"), root.join(zerofarm_common::layout::LAUNCHER_EXE)).unwrap();
     let layout = Layout::new(&root);
     let key = test_key();
     let mock = MockCoord::start();
     mock.trust(&key.pubkey);
     let launcher = std::fs::read(bin("ZeroFarm")).unwrap();
-    make_agent_version(&layout, "0.1.0", &bin("farm-agent"), &[("ZeroFarm.exe", &launcher)], &key.key);
+    make_agent_version(&layout, "0.1.0", &bin("farm-agent"), &[(zerofarm_common::layout::LAUNCHER_EXE, &launcher)], &key.key);
     layout.set_current("0.1.0").unwrap();
     layout.mark_healthy("0.1.0").unwrap();
     // Enrolled, pointed at the mock, paused (no leases needed: updates don't depend on idleness).
@@ -48,7 +48,7 @@ impl E {
     fn publish(&self, v: &str, exe: PathBuf, extra: &[(&str, &[u8])]) -> String {
         let pkg = self.dir.path().join(format!("pkg-{v}"));
         let launcher = std::fs::read(bin("ZeroFarm")).unwrap();
-        let mut files: Vec<(&str, &[u8])> = vec![("ZeroFarm.exe", &launcher)];
+        let mut files: Vec<(&str, &[u8])> = vec![(zerofarm_common::layout::LAUNCHER_EXE, &launcher)];
         files.extend_from_slice(extra);
         let id = make_agent_package(&pkg, v, &exe, &files, &self.key.key);
         self.mock.add_build_dir(&pkg);
@@ -57,7 +57,7 @@ impl E {
     }
     fn launch(&self) -> KillOnDrop {
         KillOnDrop(
-            Command::new(self.root.join("ZeroFarm.exe"))
+            Command::new(self.root.join(zerofarm_common::layout::LAUNCHER_EXE))
                 .env(TEST_KEYS_ENV, &self.key.pubkey)
                 .env("ZEROFARM_TEST_HEADLESS", "1")
                 .env("ZEROFARM_TEST_HEALTHY_TIMEOUT_S", "8")
@@ -91,7 +91,7 @@ fn agent_updates_itself_through_the_launcher() {
     assert!(wait_until(T, || e.agents_seen().contains(&"0.2.0".to_string())), "{:?}", e.agents_seen());
     assert_eq!(e.agents_seen()[0], "0.1.0");
     // Downloaded exactly once, verified, nothing left in staging.
-    assert_eq!(e.mock.count("GET", &format!("/v1/artifact/builds/{id2}/farm-agent.exe")), 1);
+    assert_eq!(e.mock.count("GET", &format!("/v1/artifact/builds/{id2}/{}", zerofarm_common::layout::AGENT_EXE)), 1);
     assert!(e.logs().contains("switched 0.1.0 -> 0.2.0"));
 }
 
@@ -114,7 +114,7 @@ fn version_that_never_becomes_healthy_is_rolled_back_and_reported() {
     assert!(e.layout.bad_since("0.3.0").is_some());
     // The old agent keeps running and does not fetch 0.3.0 again.
     std::thread::sleep(Duration::from_secs(3));
-    assert_eq!(e.mock.count("GET", &format!("/v1/artifact/builds/{id3}/farm-agent.exe")), 1, "{}", e.logs());
+    assert_eq!(e.mock.count("GET", &format!("/v1/artifact/builds/{id3}/{}", zerofarm_common::layout::AGENT_EXE)), 1, "{}", e.logs());
     assert!(wait_until(T, || !e.layout.version_dir("0.3.0").exists()), "old versions are cleaned up");
     assert!(std::fs::read_to_string(e.root.join("fakeagent.log")).unwrap().contains("0.3.0 start"));
 }

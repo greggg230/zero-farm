@@ -880,6 +880,7 @@ mod tests {
     /// report is read, the CPU passes. `cargo test -p farm-agent probe -- --ignored`.
     #[test]
     #[ignore]
+    #[cfg(windows)]
     fn a_real_probe_runs() {
         let (Ok(exe), Ok(rt)) = (std::env::var("ZEROFARM_TEST_PROBE_EXE"), std::env::var("ZEROFARM_TEST_RUNTIME_DIR")) else { return };
         let d = tempfile::tempdir().unwrap();

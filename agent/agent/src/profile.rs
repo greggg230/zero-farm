@@ -1,10 +1,12 @@
 //! The machine profile (PROTOCOL 3, DESIGN 5.4): CPU model, performance/efficiency cores, RAM,
 //! free disk, GPUs (DXGI, one entry per adapter LUID, plus NVML for NVIDIA driver versions), Windows build, and the ONNX Runtime
 //! providers (filled in by the runtime pack later; `cpu` for now), and availability (idle and on
-//! hours per day, availability.rs). Hardware facts and hours only.
+//! hours per day, availability.rs). Hardware facts and hours only. macOS (PROTOCOL 11.5): sysctl's CPU, cores
+//! (performance / efficiency levels), RAM and OS version; no GPUs.
 
 use zerofarm_common::protocol::{Gpu, Profile};
 
+#[cfg(windows)]
 /// CPU brand string via CPUID leaves 0x80000002..4.
 pub fn cpu_brand() -> String {
     #[cfg(target_arch = "x86_64")]
@@ -24,6 +26,7 @@ pub fn cpu_brand() -> String {
     "unknown CPU".into()
 }
 
+#[cfg(windows)]
 /// (physical cores, logical processors, performance cores, efficiency cores).
 pub fn cores() -> (u32, u32, u32, u32) {
     use windows_sys::Win32::System::SystemInformation::{
@@ -72,6 +75,7 @@ pub fn cores() -> (u32, u32, u32, u32) {
     (physical.max(1), logical.max(1), perf, eff)
 }
 
+#[cfg(windows)]
 /// "Windows 11 26100" from RtlGetVersion (GetVersionEx lies without a manifest).
 pub fn os_name() -> String {
     #[repr(C)]
@@ -158,6 +162,7 @@ pub fn dedup_by_luid(adapters: Vec<GpuAdapter>) -> Vec<GpuAdapter> {
     adapters.into_iter().filter(|a| seen.insert(a.luid)).collect()
 }
 
+#[cfg(windows)]
 /// The hardware GPU adapters (DXGI, all vendors), de-duplicated by LUID.
 pub fn adapters() -> Vec<GpuAdapter> {
     use windows::Win32::Graphics::Dxgi::{CreateDXGIFactory1, IDXGIDevice, IDXGIFactory1, DXGI_ADAPTER_FLAG_SOFTWARE};
@@ -188,6 +193,7 @@ pub fn adapters() -> Vec<GpuAdapter> {
     dedup_by_luid(out)
 }
 
+#[cfg(windows)]
 /// GPUs for the profile: [`adapters`] with their LUIDs. NVIDIA driver versions via NVML when it
 /// is loadable (and its device count checked against the NVIDIA adapters); others report the
 /// user-mode driver version DXGI gives.
@@ -231,6 +237,7 @@ pub fn providers(root: &std::path::Path, gpus: &[Gpu]) -> (Vec<String>, Option<s
     crate::probe::profile_providers(&zerofarm_common::layout::Layout::new(root), gpus)
 }
 
+#[cfg(windows)]
 pub fn detect(root: &std::path::Path) -> Profile {
     let (cores, threads, perf, eff) = cores();
     let (_, total) = crate::signals::memory_mb();
@@ -255,6 +262,60 @@ pub fn detect(root: &std::path::Path) -> Profile {
         idle_h_day: avail.map(|a| a.0),
         on_h_day: avail.map(|a| a.1),
         gpus_off,
+        // rev 17 (PROTOCOL 11.1)
+        platform: Some(zerofarm_common::PLATFORM.into()),
+    }
+}
+
+/// CPU brand string (`machdep.cpu.brand_string`, e.g. "Apple M4 Max").
+#[cfg(target_os = "macos")]
+pub fn cpu_brand() -> String {
+    crate::macos::sysctl_string("machdep.cpu.brand_string").unwrap_or_else(|| "unknown CPU".into())
+}
+
+/// (physical cores, logical processors, performance cores, efficiency cores): `hw.physicalcpu`, `hw.logicalcpu`,
+/// `hw.perflevel0.physicalcpu` and `hw.perflevel1.physicalcpu` (a Mac without efficiency cores: all performance).
+#[cfg(target_os = "macos")]
+pub fn cores() -> (u32, u32, u32, u32) {
+    use crate::macos::sysctl_u64;
+    let n = || std::thread::available_parallelism().map(|n| n.get() as u64).unwrap_or(1);
+    let physical = sysctl_u64("hw.physicalcpu").unwrap_or_else(n).max(1) as u32;
+    let logical = sysctl_u64("hw.logicalcpu").unwrap_or(physical as u64).max(1) as u32;
+    let perf = sysctl_u64("hw.perflevel0.physicalcpu").map(|p| p as u32).filter(|p| *p > 0 && *p <= physical).unwrap_or(physical);
+    let eff = sysctl_u64("hw.perflevel1.physicalcpu").map(|e| e as u32).filter(|_| perf < physical).unwrap_or(0).min(physical - perf);
+    (physical, logical, perf, eff)
+}
+
+/// "macOS 26.6".
+#[cfg(target_os = "macos")]
+pub fn os_name() -> String {
+    crate::macos::os_name()
+}
+
+/// The macOS profile (PROTOCOL 11.5): no GPU work on Macs in rev 17 (`gpus: []`, `providers: ["cpu"]`).
+#[cfg(target_os = "macos")]
+pub fn detect(root: &std::path::Path) -> Profile {
+    let (cores, threads, perf, eff) = cores();
+    let (_, total) = crate::signals::memory_mb();
+    // Rounded to 10 GB so the profile digest doesn't change with every download.
+    let free_mb = crate::util::disk_free_bytes(root).map(|b| (b >> 20) / 10240 * 10240).unwrap_or(0);
+    let avail = crate::availability::load(&zerofarm_common::layout::Layout::new(root)).means(&crate::util::local_now().0);
+    Profile {
+        os: os_name(),
+        cpu: cpu_brand(),
+        cores,
+        threads,
+        perf_cores: perf,
+        eff_cores: eff,
+        ram_mb: total,
+        disk_free_mb: free_mb,
+        gpus: vec![],
+        providers: vec!["cpu".into()],
+        runtime_providers: None,
+        idle_h_day: avail.map(|a| a.0),
+        on_h_day: avail.map(|a| a.1),
+        gpus_off: vec![],
+        platform: Some(zerofarm_common::PLATFORM.into()),
     }
 }
 

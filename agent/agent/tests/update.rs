@@ -14,11 +14,11 @@ use zerofarm_common::manifest::{verify_dir, Expect, Kind};
 fn publish(h: &H, v: &str, tamper: bool) -> String {
     let dir = h.dir.path().join(format!("pkg-{v}"));
     let launcher = std::fs::read(bin("ZeroFarm")).unwrap();
-    let id = make_agent_package(&dir, v, &bin("fakeagent"), &[("ZeroFarm.exe", &launcher)], &h.key.key);
+    let id = make_agent_package(&dir, v, &bin("fakeagent"), &[(zerofarm_common::layout::LAUNCHER_EXE, &launcher)], &h.key.key);
     h.mock.add_build_dir(&dir);
     if tamper {
         h.mock.with(|s| {
-            let b = s.artifacts.get_mut(&format!("builds/{id}/farm-agent.exe")).unwrap();
+            let b = s.artifacts.get_mut(&format!("builds/{id}/{}", zerofarm_common::layout::AGENT_EXE)).unwrap();
             b[1000] ^= 1;
         });
     }

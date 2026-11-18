@@ -19,13 +19,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use zerofarm_common::keys::TrustedKeys;
+use zerofarm_common::binver::exe_version as fixed_file_version;
 use zerofarm_common::layout::{Layout, LauncherSwap, LAUNCHER_EXE};
 use zerofarm_common::manifest::{verify_dir, Expect, Kind};
-use zerofarm_common::winres::fixed_file_version;
 
 /// A launcher marked bad is not installed again for this long.
 pub const BAD_LAUNCHER_RETRY_S: i64 = 24 * 3600;
+#[cfg(windows)]
 pub const STAGED_EXE: &str = "ZeroFarm.new.exe";
+/// macOS: no extension (PROTOCOL 11.3); the version is the binary's marker (`zerofarm_common::binver`).
+#[cfg(not(windows))]
+pub const STAGED_EXE: &str = "ZeroFarm.new";
 
 type Version = (u16, u16, u16, u16);
 
@@ -81,17 +85,15 @@ pub fn plan(layout: &Layout, version: &str, keys: &TrustedKeys) -> Option<Plan> 
 /// Runs `<exe> selftest` in the root; Ok(its output) if it exits 0 within `timeout`.
 fn selftest(exe: &Path, root: &Path, timeout: Duration) -> Result<String, String> {
     use std::io::Read;
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let mut child = Command::new(exe)
-        .arg("selftest")
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .creation_flags(CREATE_NO_WINDOW)
-        .spawn()
-        .map_err(|e| format!("could not start it: {e}"))?;
+    let mut cmd = Command::new(exe);
+    cmd.arg("selftest").current_dir(root).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let mut child = cmd.spawn().map_err(|e| format!("could not start it: {e}"))?;
     let end = Instant::now() + timeout;
     let status = loop {
         if let Some(st) = child.try_wait().map_err(|e| e.to_string())? {
@@ -133,10 +135,11 @@ pub fn apply(layout: &Layout, plan: &Plan, can_hand_over: bool, selftest_timeout
         let _ = std::fs::remove_file(&staged);
         return Err(format!("{STAGED_EXE} does not match the package's sha256"));
     }
+    zerofarm_common::fsutil::set_mode(&staged, 0o755);
     selftest(&staged, root, selftest_timeout).map_err(|e| mark_bad(format!("launcher {} failed its selftest: {e}", show(plan.to))))?;
     let mut n = zerofarm_common::now_unix();
     let old = loop {
-        let name = format!("ZeroFarm.old-{n}.exe");
+        let name = zerofarm_common::layout::launcher_leftover_name("old", n);
         if !root.join(&name).exists() {
             break name;
         }

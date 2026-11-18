@@ -56,6 +56,10 @@ impl Redactor {
             let parts: Vec<&str> = p.split(['\\', '/']).filter(|s| !s.is_empty()).collect();
             // A drive root or a single component is no profile path worth replacing.
             if parts.len() >= 2 {
+                // (a POSIX home folder, macOS: `/Users/sam` with its leading `/`, so it reads `%USERPROFILE%/...`)
+                if p.starts_with('/') {
+                    profiles.push(folded(&format!("/{}", parts.join("/"))));
+                }
                 for sep in ["\\", "/", "\\\\"] {
                     profiles.push(folded(&parts.join(sep)));
                 }
@@ -77,6 +81,17 @@ impl Redactor {
     }
 
     /// From `%USERPROFILE%` (and its short form) and `%USERNAME%`.
+    /// On macOS: the home folder (`$HOME`, `/Users/<name>`, as `%USERPROFILE%`) and `$USER`.
+    #[cfg(not(windows))]
+    pub fn from_env() -> Redactor {
+        let home = std::env::var("HOME").ok().filter(|p| p.trim().len() > 1);
+        let name = std::env::var("USER").ok().filter(|n| !n.trim().is_empty());
+        let paths: Vec<&str> = home.iter().map(String::as_str).collect();
+        let names: Vec<&str> = name.iter().map(String::as_str).collect();
+        Redactor::new(&paths, &names)
+    }
+
+    #[cfg(windows)]
     pub fn from_env() -> Redactor {
         let mut paths: Vec<String> = Vec::new();
         if let Some(p) = std::env::var("USERPROFILE").ok().filter(|p| !p.trim().is_empty()) {
@@ -178,12 +193,18 @@ fn replace_ci(hay: &str, needle: &[char], with: &str, boundary: impl Fn(Option<c
 }
 
 /// The 8.3 short form of an existing path (`C:\Users\SAMSMI~1`), if Windows has one.
+#[cfg(windows)]
 fn short_path(p: &str) -> Option<String> {
     use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
     let w: Vec<u16> = p.encode_utf16().chain(std::iter::once(0)).collect();
     let mut buf = vec![0u16; 1024];
     let n = unsafe { GetShortPathNameW(w.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
     (n > 0 && n < buf.len()).then(|| String::from_utf16_lossy(&buf[..n]))
+}
+
+#[cfg(all(test, not(windows)))]
+fn short_path(_p: &str) -> Option<String> {
+    None
 }
 
 fn global() -> &'static Redactor {

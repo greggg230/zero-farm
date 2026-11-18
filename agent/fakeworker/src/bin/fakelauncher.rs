@@ -1,5 +1,5 @@
 //! fakelauncher: stands in for a new ZeroFarm.exe in launcher self-update tests. It carries a
-//! VERSIONINFO (build.rs), so an agent sees it as newer than a launcher patched to 0.0.1.
+//! VERSIONINFO (build.rs; macOS: a version marker), so an agent sees it as newer than a launcher patched to 0.0.1.
 //!
 //! It runs from the install root (as `ZeroFarm.new.exe` for the agent's selftest, then as
 //! `ZeroFarm.exe`) and follows `<root>\fakelauncher.behaviour`, one `<when> <what>` per line:
@@ -12,6 +12,11 @@
 //! Every start appends its arguments to `<root>\fakelauncher.log`.
 
 use std::io::Write;
+
+/// macOS: the version an agent reads from the file (no VERSIONINFO there; `zerofarm_common::binver`).
+#[cfg(not(windows))]
+#[used]
+static VERSION_MARK: [u8; zerofarm_common::binver::MARK_LEN] = zerofarm_common::binver::mark(env!("CARGO_PKG_VERSION"));
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

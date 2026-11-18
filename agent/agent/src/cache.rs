@@ -144,6 +144,7 @@ pub fn download_build(
     }
     let _ = remove_dir_all_retry(&ztmp, std::time::Duration::from_secs(5));
     let v = verify_dir(tmp, keys, expect).map_err(CacheError::Verify)?;
+    mark_executable(tmp, &v.manifest);
     if dest.exists() {
         remove_dir_all_retry(dest, std::time::Duration::from_secs(10)).map_err(|e| CacheError::Bad(e.to_string()))?;
     }
@@ -152,6 +153,23 @@ pub fn download_build(
     }
     rename_retry(tmp, dest).map_err(|e| CacheError::Bad(format!("rename into place: {e}")))?;
     Ok(VerifiedBuild { dir: dest.to_path_buf(), ..v })
+}
+
+/// rev 17 (PROTOCOL 11.3): the executable bit is not in the manifest - on macOS a verified build's `entry` (and an
+/// agent package's launcher) gets mode 0755. Nothing on Windows.
+pub fn mark_executable(dir: &Path, m: &zerofarm_common::manifest::Manifest) {
+    if cfg!(windows) {
+        return;
+    }
+    let launcher = (m.kind == Kind::Agent).then_some(zerofarm_common::layout::LAUNCHER_EXE);
+    for name in m.entry.as_deref().into_iter().chain(launcher) {
+        if let Ok(rel) = check_rel_path(name) {
+            let p = dir.join(rel);
+            if p.is_file() && !zerofarm_common::fsutil::set_mode(&p, 0o755) {
+                log::warn!("could not make {} executable", p.display());
+            }
+        }
+    }
 }
 
 fn prune_unlisted(base: &Path, dir: &Path, listed: &std::collections::BTreeSet<String>) {
@@ -205,7 +223,7 @@ impl Cache {
     }
 
     fn entry_dir(&self, key: &str) -> PathBuf {
-        self.layout.cache().join(key.replace('/', "\\"))
+        self.layout.cache().join(key.replace('/', std::path::MAIN_SEPARATOR_STR))
     }
 
     /// Cached build ids and checkpoints (`<run>/<gen>`) for the lease request.

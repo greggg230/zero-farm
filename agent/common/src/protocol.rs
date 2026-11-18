@@ -45,6 +45,10 @@ pub struct Profile {
     /// (never sent): a probe or bench is then pinned to one usable adapter, so the worker doesn't touch these either.
     #[serde(skip)]
     pub gpus_off: Vec<Gpu>,
+    /// rev 17 (PROTOCOL 11.1): the agent's platform, as its `x-farm-platform` header says (informational; the header
+    /// counts). Agents from 0.3.0 always send it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub platform: Option<String>,
 }
 
 impl Profile {
@@ -369,6 +373,9 @@ pub mod headers {
     /// `1` on every answer the coordinator itself makes (not a WAF or proxy in front of it). The
     /// agent forgets its enrollment only on a coordinator-marked `revoked` (security review M1).
     pub const COORDINATOR: &str = "x-zerofarm-coordinator";
+    /// rev 17 (PROTOCOL 11.1): the agent's platform (`windows-x64`, `macos-arm64`) on every request of an agent from
+    /// 0.3.0; absent = `windows-x64`.
+    pub const PLATFORM: &str = "x-farm-platform";
 }
 
 #[cfg(test)]

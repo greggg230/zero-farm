@@ -4,6 +4,8 @@
 //! downloaded: a PC without the vendor's adapter, a driver too old, GPU work not allowed, a fuzz job or a pack
 //! that failed here before refuses it (`done` with `refused: "runtime"`). An accepted pack is fetched through its
 //! zstd copies and unpacked byte for byte.
+// GPU runtime packs and alternates: Windows only (no GPU work on macOS in rev 17)
+#![cfg(windows)]
 
 mod harness;
 

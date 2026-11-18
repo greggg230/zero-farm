@@ -15,13 +15,35 @@
 //!
 //! Exit codes: 0 quit, 75 switch to `state\pending` (launcher), 76 hand over to the new
 //! `ZeroFarm.exe` (launcher), 2 usage, 3 not enrolled (headless), 4 revoked, 70 internal error.
+//!
+//! macOS (PROTOCOL 11.5; no tray: `run` is always headless and waits for an enrollment instead of exiting 3):
+//!
+//! ```text
+//! farm-agent setup     [--source DIR] [--invite CODE] [--name NAME] [--root DIR] [--coordinator URL]
+//!                      [--launch-agents-dir DIR] [--label L] [--no-launchctl] [--no-start]
+//! farm-agent install   [--source DIR] [--root DIR] [--launch-agents-dir DIR] [--label L] [--no-launchctl] [--no-start]
+//! farm-agent uninstall [--root DIR] [--launch-agents-dir DIR] [--label L] [--no-launchctl]
+//! farm-agent status | pause [MINUTES] | resume | set KEY VALUE   [--root DIR]   (the launcher's CLI forwards these)
+//! ```
 
 #![windows_subsystem = "windows"]
 
-use farm_agent::engine::{Control, Engine, EngineExit};
+/// macOS: this binary's version, which `farm-release release-agent --platform macos-arm64` reads from the file (it
+/// can't run a Mac binary on the Windows desktop; `zerofarm_common::binver`).
+#[cfg(not(windows))]
+#[used]
+static VERSION_MARK: [u8; zerofarm_common::binver::MARK_LEN] = zerofarm_common::binver::mark(env!("CARGO_PKG_VERSION"));
+
+#[cfg(windows)]
+use farm_agent::engine::EngineExit;
+use farm_agent::engine::{Control, Engine};
 use farm_agent::settings::Machine;
-use farm_agent::signals::{SignalSource, Win32Signals};
-use farm_agent::status::{Phase, Status};
+use farm_agent::signals::SignalSource;
+#[cfg(windows)]
+use farm_agent::signals::Win32Signals;
+#[cfg(windows)]
+use farm_agent::status::Phase;
+use farm_agent::status::Status;
 use farm_agent::{agent_identity, install, test_env, AgentConfig, Timings, DEFAULT_COORDINATOR};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -31,7 +53,14 @@ use zerofarm_common::layout::{default_root, Layout};
 struct Args {
     cmd: String,
     flags: Vec<(String, Option<String>)>,
+    /// Arguments after the command that are not flags (macOS CLI: `pause 30`, `set cpu_threads 12`).
+    #[cfg_attr(windows, allow(dead_code))]
+    pos: Vec<String>,
 }
+
+/// macOS: flags that never take a value (so `--no-launchctl pause` can't swallow what follows). None on Windows,
+/// whose parsing stays as it was.
+const SWITCHES: &[&str] = if cfg!(windows) { &[] } else { &["no-start", "no-launchctl", "quiet", "headless"] };
 
 impl Args {
     fn parse() -> Args {
@@ -46,16 +75,19 @@ impl Args {
             _ => "run".into(),
         };
         let mut flags = Vec::new();
+        let mut pos = Vec::new();
         while let Some(a) = it.next() {
             if let Some(name) = a.strip_prefix("--") {
                 let value = match it.peek() {
-                    Some(v) if !v.starts_with("--") => it.next(),
+                    Some(v) if !v.starts_with("--") && !SWITCHES.contains(&name) => it.next(),
                     _ => None,
                 };
                 flags.push((name.to_string(), value));
+            } else {
+                pos.push(a);
             }
         }
-        Args { cmd, flags }
+        Args { cmd, flags, pos }
     }
     fn get(&self, name: &str) -> Option<String> {
         self.flags.iter().find(|(n, _)| n == name).and_then(|(_, v)| v.clone())
@@ -64,6 +96,7 @@ impl Args {
         self.flags.iter().any(|(n, _)| n == name)
     }
     /// Everything except the given flags, to pass along.
+    #[cfg_attr(not(windows), allow(dead_code))]
     fn passthrough(&self, except: &[&str]) -> Vec<String> {
         let mut v = Vec::new();
         for (n, val) in &self.flags {
@@ -99,11 +132,13 @@ fn root(args: &Args) -> PathBuf {
     default_root()
 }
 
+#[cfg(windows)]
 fn attach_console() {
     use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
     unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
 }
 
+#[cfg(windows)]
 fn say(quiet: bool, gui: bool, text: &str, error: bool) {
     println!("{text}");
     if gui && !quiet {
@@ -111,6 +146,7 @@ fn say(quiet: bool, gui: bool, text: &str, error: bool) {
         farm_agent::tray::message_box(std::ptr::null_mut(), text, "Zero Farm", MB_OK | if error { MB_ICONERROR } else { MB_ICONINFORMATION });
     }
 }
+
 
 fn coordinator(args: &Args, machine: &Machine) -> String {
     args.get("coordinator")
@@ -171,13 +207,50 @@ fn cmd_run(args: &Args) -> i32 {
                 token,
                 machine.clone(),
                 status.clone(),
-                Box::new(Win32Signals::new(true)) as Box<dyn SignalSource>,
+                os_signals(&machine),
                 control.clone(),
                 Box::new(move || farm_agent::profile::detect(&root)),
             )
         }
     };
 
+    // macOS (PROTOCOL 11.5): no tray; status, settings and quit go through `state/` and signals (headless.rs)
+    #[cfg(target_os = "macos")]
+    {
+        let _ = (headless, profile);
+        let start: farm_agent::headless::StartEngine = Box::new(move || {
+            let mut eng = make_engine()?;
+            Ok(std::thread::Builder::new().name("engine".into()).spawn(move || eng.run()).map_err(|e| e.to_string())?)
+        });
+        farm_agent::headless::run(machine, status, control, layout, farm_agent::headless::Cores::detect(), start)
+    }
+    #[cfg(windows)]
+    run_windows(headless, layout, cfg, profile, machine, status, control, make_engine)
+}
+
+#[cfg(windows)]
+fn os_signals(_machine: &farm_agent::settings::SharedMachine) -> Box<dyn SignalSource> {
+    Box::new(Win32Signals::new(true))
+}
+
+#[cfg(target_os = "macos")]
+fn os_signals(machine: &farm_agent::settings::SharedMachine) -> Box<dyn SignalSource> {
+    Box::new(farm_agent::signals::MacSignals::new(Some(machine.clone())))
+}
+
+/// The Windows agent: headless (`--headless`), or the invite dialog when needed and then the tray.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn run_windows(
+    headless: bool,
+    layout: Layout,
+    cfg: AgentConfig,
+    profile: zerofarm_common::protocol::Profile,
+    machine: farm_agent::settings::SharedMachine,
+    status: farm_agent::status::SharedStatus,
+    control: Arc<Control>,
+    make_engine: impl Fn() -> Result<Engine, String> + 'static,
+) -> i32 {
     if headless {
         if !machine.lock().unwrap().enrolled() {
             log::error!("not enrolled; run `farm-agent enroll --invite CODE`");
@@ -252,7 +325,10 @@ fn cmd_dry_run(args: &Args) -> i32 {
     let secs: u64 = args.get("seconds").and_then(|s| s.parse().ok()).unwrap_or(u64::MAX);
     // Log at least this often even when the decision doesn't change (with the per-GPU readings).
     let every: u64 = args.get("every").and_then(|s| s.parse().ok()).unwrap_or(60).max(1);
+    #[cfg(windows)]
     let mut signals = Win32Signals::new(true);
+    #[cfg(target_os = "macos")]
+    let mut signals = farm_agent::signals::MacSignals::new(None);
     let mut st = farm_agent::policy::PolicyState::default();
     let start = std::time::Instant::now();
     let mut last: Option<String> = None;
@@ -292,10 +368,12 @@ fn cmd_dry_run(args: &Args) -> i32 {
     0
 }
 
+#[cfg(windows)]
 fn reg_name(args: &Args) -> String {
     args.get("reg-name").unwrap_or_else(|| install::DEFAULT_REG_NAME.to_string())
 }
 
+#[cfg(windows)]
 fn cmd_install(args: &Args) -> i32 {
     let quiet = args.has("quiet");
     let opts = install::InstallOpts {
@@ -318,6 +396,7 @@ fn cmd_install(args: &Args) -> i32 {
     }
 }
 
+#[cfg(windows)]
 fn cmd_uninstall(args: &Args) -> i32 {
     let quiet = args.has("quiet");
     let opts = install::UninstallOpts {
@@ -351,6 +430,139 @@ fn cmd_uninstall(args: &Args) -> i32 {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn mac_install_opts(args: &Args, start: bool) -> install::InstallOpts {
+    install::InstallOpts {
+        root: args.get("root").map(PathBuf::from).unwrap_or_else(default_root),
+        launch_agents_dir: args.get("launch-agents-dir").map(PathBuf::from),
+        label: args.get("label").unwrap_or_else(|| install::DEFAULT_LABEL.to_string()),
+        launchctl: !args.has("no-launchctl"),
+        start,
+        source: args.get("source").map(PathBuf::from).unwrap_or_else(exe_dir),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn cmd_install(args: &Args) -> i32 {
+    let opts = mac_install_opts(args, !args.has("no-start"));
+    match install::install(&opts, &TrustedKeys::compiled()) {
+        Ok(v) => {
+            println!("Zero Farm {v} is installed in {}.", opts.root.display());
+            0
+        }
+        Err(e) => {
+            eprintln!("Zero Farm could not be installed: {e}");
+            1
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn cmd_uninstall(args: &Args) -> i32 {
+    let opts = install::UninstallOpts {
+        root: args.get("root").map(PathBuf::from).unwrap_or_else(|| root(args)),
+        launch_agents_dir: args.get("launch-agents-dir").map(PathBuf::from),
+        label: args.get("label").unwrap_or_else(|| install::DEFAULT_LABEL.to_string()),
+        launchctl: !args.has("no-launchctl"),
+    };
+    match install::uninstall(&opts) {
+        Ok(()) => {
+            println!("Zero Farm was removed from this Mac.");
+            0
+        }
+        Err(e) => {
+            eprintln!("Zero Farm could not be removed: {e}");
+            1
+        }
+    }
+}
+
+/// Reads one line from the terminal (`/dev/tty`: `curl ... | sh` leaves stdin to the script); None without one.
+#[cfg(target_os = "macos")]
+fn ask(prompt: &str) -> Option<String> {
+    use std::io::{BufRead, Write};
+    let tty = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty").ok()?;
+    let mut w = tty.try_clone().ok()?;
+    write!(w, "{prompt}").ok()?;
+    w.flush().ok()?;
+    let mut line = String::new();
+    std::io::BufReader::new(tty).read_line(&mut line).ok()?;
+    Some(line.trim().to_string())
+}
+
+/// `ZeroFarm setup` (PROTOCOL 11.2, 11.5): installs the package it runs from (the launcher verified it), enrolls this
+/// Mac (the invite code and name from the arguments, else asked on the terminal) and starts it.
+#[cfg(target_os = "macos")]
+fn cmd_setup(args: &Args) -> i32 {
+    let opts = mac_install_opts(args, false);
+    let v = match install::install(&opts, &TrustedKeys::compiled()) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("Zero Farm could not be installed: {e}");
+            return 1;
+        }
+    };
+    let root = install::clean_root(&opts.root);
+    let layout = Layout::new(&root);
+    let launcher = layout.launcher_exe();
+    let mut machine = Machine::load(&layout);
+    if let Some(c) = args.get("coordinator") {
+        machine.coordinator = Some(c);
+    }
+    if !machine.enrolled() {
+        let cfg = config(args, &layout, &machine);
+        let profile = farm_agent::profile::detect(&layout.root);
+        let default_name = farm_agent::enroll::default_machine_name();
+        let mut code = args.get("invite");
+        let mut name = args.get("name");
+        let mut tries = 0;
+        loop {
+            let c = match code.take().or_else(|| ask("Invite code (XXXX-XXXX-XXXX): ")) {
+                Some(c) if !c.is_empty() => c,
+                _ => {
+                    eprintln!("No invite code: run `{} setup --invite CODE` (Zero Farm is installed but not started).", launcher.display());
+                    return 2;
+                }
+            };
+            let n = match name.clone().or_else(|| ask(&format!("A name for this Mac on the farm's pages [{default_name}]: "))) {
+                Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+                _ => default_name.clone(),
+            };
+            name = Some(n.clone());
+            match farm_agent::enroll::enroll(&layout, &cfg.coordinator, &cfg.version, &mut machine, &c, &n, &profile) {
+                Ok(()) => {
+                    println!("Joined the farm as {n} ({}).", machine.machine_id.clone().unwrap_or_default());
+                    break;
+                }
+                Err(e @ farm_agent::enroll::EnrollError::UpdateRequired { .. }) => {
+                    eprintln!("{e}");
+                    return 1;
+                }
+                Err(e) => {
+                    eprintln!("{e}");
+                    tries += 1;
+                    if tries >= 3 || args.get("invite").is_some() {
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
+    if args.has("no-start") {
+        println!("Zero Farm {v} is installed in {} (not started: it starts at the next login).", root.display());
+        return 0;
+    }
+    if let Err(e) = install::start(&opts) {
+        eprintln!("Zero Farm {v} is installed but could not be started: {e}");
+        return 1;
+    }
+    println!("Zero Farm {v} is installed and running. It works while this Mac is idle and on power, and starts at login.");
+    println!("  status:    \"{}\" status", launcher.display());
+    println!("  settings:  \"{}\" set <key> <value>   (keys: {})", launcher.display(), farm_agent::settings::Settings::KEYS.join(", "));
+    println!("  pause:     \"{}\" pause [minutes]   /   resume   /   quit   /   uninstall", launcher.display());
+    0
+}
+
 fn cmd_enroll(args: &Args) -> i32 {
     let layout = Layout::new(root(args));
     let Some(code) = args.get("invite") else {
@@ -377,8 +589,10 @@ fn cmd_enroll(args: &Args) -> i32 {
 }
 
 fn main() {
+    #[cfg(windows)]
     attach_console();
     // Inherited by the worker: no "program has stopped working" / missing-DLL dialogs.
+    #[cfg(windows)]
     unsafe {
         use windows_sys::Win32::System::Diagnostics::Debug::{SetErrorMode, SEM_FAILCRITICALERRORS, SEM_NOGPFAULTERRORBOX};
         SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
@@ -390,6 +604,32 @@ fn main() {
         "install" => cmd_install(&args),
         "uninstall" => cmd_uninstall(&args),
         "enroll" => cmd_enroll(&args),
+        // macOS: the headless CLI (the launcher forwards `ZeroFarm setup|status|pause|resume|set` here)
+        #[cfg(target_os = "macos")]
+        "setup" => cmd_setup(&args),
+        #[cfg(target_os = "macos")]
+        "status" => farm_agent::headless::cli_status(&Layout::new(root(&args))),
+        #[cfg(target_os = "macos")]
+        "pause" | "resume" | "set" => {
+            use farm_agent::headless::Request;
+            let req = match (args.cmd.as_str(), args.pos.as_slice()) {
+                ("pause", []) => Some(Request { op: "pause".into(), key: None, value: None, minutes: None }),
+                ("pause", [m]) => m.parse().ok().map(|m| Request { op: "pause".into(), key: None, value: None, minutes: Some(m) }),
+                ("resume", []) => Some(Request { op: "resume".into(), key: None, value: None, minutes: None }),
+                ("set", [k, v]) => Some(Request { op: "set".into(), key: Some(k.clone()), value: Some(v.clone()), minutes: None }),
+                _ => None,
+            };
+            match req {
+                Some(r) => farm_agent::headless::cli_change(&Layout::new(root(&args)), &r),
+                None => {
+                    eprintln!(
+                        "usage: ZeroFarm pause [minutes] | resume | set <key> <value> (keys: {})",
+                        farm_agent::settings::Settings::KEYS.join(", ")
+                    );
+                    2
+                }
+            }
+        }
         "version" => {
             println!("{}", agent_identity(&exe_dir()).0);
             0

@@ -12,13 +12,31 @@
 //!
 //! NVML is not part of the gate; profile.rs asks it only for the NVIDIA driver version.
 
-use crate::policy::{GpuSignal, Notification, Signals};
+use crate::policy::{GpuSignal, Signals};
+#[cfg(windows)]
+use crate::policy::Notification;
+#[cfg(windows)]
 use crate::profile::GpuAdapter;
 use crate::worker::{CpuMark, WorkerProc};
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(windows)]
+use std::time::Instant;
+
+/// macOS (PROTOCOL 11.5): IOKit input idle time and power source, Low Power Mode, memory pressure; no GPU, no
+/// fullscreen detection; the power assertion that keeps a working Mac awake.
+#[cfg(target_os = "macos")]
+#[path = "signals_macos.rs"]
+mod mac;
+#[cfg(target_os = "macos")]
+pub use mac::{memory_mb, power, MacSignals};
+/// The real signal source of this platform.
+#[cfg(windows)]
+pub type OsSignals = Win32Signals;
+#[cfg(target_os = "macos")]
+pub type OsSignals = MacSignals;
 
 pub trait SignalSource: Send {
     /// `worker_pid`: our own worker, excluded from "other GPU users".
@@ -34,6 +52,10 @@ pub trait SignalSource: Send {
     fn worker_starved(&self, mark: &CpuMark, worker: &WorkerProc) -> bool {
         mark.starved_since(worker)
     }
+
+    /// The engine holds a lease (true) or not (false): macOS keeps a working Mac on AC power from idle-sleeping
+    /// meanwhile (`keep_awake`, PROTOCOL 11.5). Nothing elsewhere.
+    fn lease_active(&mut self, _active: bool) {}
 }
 
 /// The GPUs are measured at most this often; `sample` reuses the last measurement in between
@@ -44,11 +66,13 @@ pub const GPU_MEASURE_EVERY: Duration = Duration::from_secs(1);
 /// and an external GPU can come and go.
 pub const ADAPTER_REFRESH: Duration = Duration::from_secs(60);
 
+#[cfg(windows)]
 /// The real thing.
 pub struct Win32Signals {
     gpu: Option<GpuSampler>,
 }
 
+#[cfg(windows)]
 impl Win32Signals {
     /// `gpu`: measure the GPUs (false: report none, as on a PC without one).
     pub fn new(gpu: bool) -> Self {
@@ -67,6 +91,7 @@ impl Win32Signals {
     }
 }
 
+#[cfg(windows)]
 impl SignalSource for Win32Signals {
     fn sample(&mut self, worker_pid: Option<u32>) -> Signals {
         let (_, sod) = crate::util::local_now();
@@ -107,6 +132,7 @@ pub fn gpu_signal(readings: &[AdapterReading]) -> GpuSignal {
     }
 }
 
+#[cfg(windows)]
 struct GpuSampler {
     adapters: Vec<GpuAdapter>,
     adapters_at: Instant,
@@ -120,6 +146,7 @@ struct GpuSampler {
     readings: Vec<AdapterReading>,
 }
 
+#[cfg(windows)]
 impl GpuSampler {
     fn new() -> Self {
         let adapters = crate::profile::adapters();
@@ -178,6 +205,7 @@ impl GpuSampler {
     }
 }
 
+#[cfg(windows)]
 fn open_pdh() -> Option<PdhEngines> {
     match PdhEngines::open() {
         Ok(p) => Some(p),
@@ -188,6 +216,7 @@ fn open_pdh() -> Option<PdhEngines> {
     }
 }
 
+#[cfg(windows)]
 fn describe_adapters(a: &[GpuAdapter]) -> String {
     if a.is_empty() {
         return "none".into();
@@ -263,20 +292,26 @@ pub fn temp_from_deci_c(deci: u32) -> Option<u32> {
     (1..=125).contains(&c).then_some(c)
 }
 
+#[cfg(windows)]
 const GPU_ENGINE_COUNTER: &str = r"\GPU Engine(*)\Utilization Percentage";
+#[cfg(windows)]
 /// Not in windows-sys: don't cap the formatted value at 100.
 const PDH_FMT_NOCAP100: u32 = 0x8000;
 
+#[cfg(windows)]
 /// One open PDH query on the GPU Engine counters (every instance).
 struct PdhEngines {
     query: windows_sys::Win32::System::Performance::PDH_HQUERY,
     counter: windows_sys::Win32::System::Performance::PDH_HCOUNTER,
 }
 
+#[cfg(windows)]
 // SAFETY: PDH query and counter handles may be used from any thread; `&mut self` keeps it to one
 // thread at a time.
+#[cfg(windows)]
 unsafe impl Send for PdhEngines {}
 
+#[cfg(windows)]
 impl PdhEngines {
     fn open() -> Result<Self, u32> {
         use windows_sys::Win32::System::Performance::{PdhAddEnglishCounterW, PdhCloseQuery, PdhOpenQueryW};
@@ -343,12 +378,14 @@ impl PdhEngines {
     }
 }
 
+#[cfg(windows)]
 impl Drop for PdhEngines {
     fn drop(&mut self) {
         unsafe { windows_sys::Win32::System::Performance::PdhCloseQuery(self.query) };
     }
 }
 
+#[cfg(windows)]
 /// A NUL-terminated UTF-16 string (at most 1024 units read).
 ///
 /// # Safety
@@ -364,6 +401,7 @@ unsafe fn wide_ptr_to_string(p: *const u16) -> String {
     String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(p, n) })
 }
 
+#[cfg(windows)]
 /// The adapter's temperature from the D3DKMT adapter performance data, °C: the hottest physical
 /// adapter of a linked adapter. `None` when the adapter can't be opened, the driver doesn't
 /// support the query (it needs WDDM 2.4+) or reports no temperature.
@@ -408,6 +446,7 @@ pub fn adapter_temp_c(luid: u64) -> Option<u32> {
     hottest
 }
 
+#[cfg(windows)]
 /// NVML from `%SystemRoot%\System32\nvml.dll` only, where the NVIDIA driver installs it
 /// (security review L7): a bare `nvml.dll` would be searched for in the current directory and
 /// every `PATH` directory, where another program could plant one. The DLL is loaded with
@@ -417,6 +456,7 @@ pub fn load_nvml() -> Result<nvml_wrapper::Nvml, String> {
     nvml_wrapper::Nvml::builder().lib_path(path.as_os_str()).init().map_err(|e| e.to_string())
 }
 
+#[cfg(windows)]
 /// Loads `name` from System32 only and returns the full path it was loaded from. The module stays
 /// loaded (NVML loads it again by that path, which finds the same module).
 fn system32_module(name: &str) -> Option<std::path::PathBuf> {
@@ -431,6 +471,7 @@ fn system32_module(name: &str) -> Option<std::path::PathBuf> {
     (n > 0 && n < buf.len()).then(|| std::path::PathBuf::from(crate::util::from_wide(&buf[..n])))
 }
 
+#[cfg(windows)]
 pub fn idle_seconds() -> u64 {
     use windows_sys::Win32::System::SystemInformation::GetTickCount;
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO};
@@ -442,6 +483,7 @@ pub fn idle_seconds() -> u64 {
     (now.wrapping_sub(lii.dwTime) / 1000) as u64
 }
 
+#[cfg(windows)]
 pub fn notification_state() -> Notification {
     use windows_sys::Win32::UI::Shell::SHQueryUserNotificationState;
     let mut st = 0i32;
@@ -460,6 +502,7 @@ pub fn notification_state() -> Notification {
     }
 }
 
+#[cfg(windows)]
 /// (on AC: Some/None when unknown, battery saver on)
 pub fn power() -> (Option<bool>, bool) {
     use windows_sys::Win32::System::Power::{GetSystemPowerStatus, SYSTEM_POWER_STATUS};
@@ -475,6 +518,7 @@ pub fn power() -> (Option<bool>, bool) {
     (on_ac, s.SystemStatusFlag == 1)
 }
 
+#[cfg(windows)]
 /// (available, total) physical memory in MB.
 pub fn memory_mb() -> (u64, u64) {
     use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
@@ -653,6 +697,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn perfdata_layout_matches_the_sdk() {
         // d3dkmthk.h (SDK 10.0.26100): u32, five 8-aligned u64s, FanRPM, Power, Temperature, u8.
         use windows_sys::Wdk::Graphics::Direct3D::D3DKMT_ADAPTER_PERFDATA;

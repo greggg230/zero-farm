@@ -1,6 +1,8 @@
 //! install / uninstall in a temp root with a throwaway registry name (`ZeroFarmTest-<pid>-<n>`)
 //! and a temp shortcut folder. The real `ZeroFarm` entries are never touched; a guard removes
 //! the test entries even when an assertion fails.
+// Windows install (registry, shortcut, stage-2 uninstall); macOS: install_macos.rs
+#![cfg(windows)]
 
 use farm_agent::install::{remove_entries, reg_get_sz, run_value, shortcut_path, uninstall_key};
 use farm_agent::settings::{Machine, Pause};

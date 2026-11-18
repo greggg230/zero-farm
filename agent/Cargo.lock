@@ -176,14 +176,16 @@ dependencies = [
  "serde_json",
  "tempfile",
  "windows-sys 0.61.2",
+ "zerofarm-common",
 ]
 
 [[package]]
 name = "farm-agent"
-version = "0.2.14"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",
+ "libc",
  "log",
  "miniz_oxide",
  "mockcoord",
@@ -204,6 +206,7 @@ dependencies = [
  "base64 0.22.1",
  "minisign",
  "minisign-verify",
+ "miniz_oxide",
  "mockcoord",
  "rpassword",
  "serde",
@@ -1104,6 +1107,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "getrandom 0.3.4",
+ "libc",
  "minisign",
  "minisign-verify",
  "scrypt",
@@ -1118,8 +1122,9 @@ dependencies = [
 
 [[package]]
 name = "zerofarm-launcher"
-version = "0.2.11"
+version = "0.3.0"
 dependencies = [
+ "libc",
  "miniz_oxide",
  "mockcoord",
  "serde_json",

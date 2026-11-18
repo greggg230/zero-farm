@@ -1,17 +1,34 @@
 //! DPAPI, CurrentUser scope: data protected here can only be read back by the same Windows user
 //! (on the same machine unless roaming credentials are set up). Used for the machine token
 //! (agent) and the release secret key (desktop tool).
+//!
+//! Windows only: elsewhere `protect` and `unprotect` fail (the release tool runs on the Windows
+//! desktop; the macOS agent keeps its token in a mode-0600 file, PROTOCOL 11.5).
 
 use std::io;
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::LocalFree;
+#[cfg(windows)]
 use windows_sys::Win32::Security::Cryptography::{
     CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
 };
 
+#[cfg(not(windows))]
+pub fn protect(_data: &[u8], _purpose: &str) -> io::Result<Vec<u8>> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "DPAPI is Windows-only"))
+}
+
+#[cfg(not(windows))]
+pub fn unprotect(_data: &[u8], _purpose: &str) -> io::Result<Vec<u8>> {
+    Err(io::Error::new(io::ErrorKind::Unsupported, "DPAPI is Windows-only"))
+}
+
+#[cfg(windows)]
 fn blob(data: &[u8]) -> CRYPT_INTEGER_BLOB {
     CRYPT_INTEGER_BLOB { cbData: data.len() as u32, pbData: data.as_ptr() as *mut u8 }
 }
 
+#[cfg(windows)]
 /// Encrypts `data` for the current user. `purpose` is mixed in as DPAPI's optional entropy, so a
 /// blob made for one purpose cannot be decrypted as another.
 pub fn protect(data: &[u8], purpose: &str) -> io::Result<Vec<u8>> {
@@ -32,6 +49,7 @@ pub fn protect(data: &[u8], purpose: &str) -> io::Result<Vec<u8>> {
     take(ok, out)
 }
 
+#[cfg(windows)]
 pub fn unprotect(data: &[u8], purpose: &str) -> io::Result<Vec<u8>> {
     let input = blob(data);
     let entropy = blob(purpose.as_bytes());
@@ -50,6 +68,7 @@ pub fn unprotect(data: &[u8], purpose: &str) -> io::Result<Vec<u8>> {
     take(ok, out)
 }
 
+#[cfg(windows)]
 fn take(ok: i32, out: CRYPT_INTEGER_BLOB) -> io::Result<Vec<u8>> {
     if ok == 0 {
         return Err(io::Error::last_os_error());
@@ -59,7 +78,7 @@ fn take(ok: i32, out: CRYPT_INTEGER_BLOB) -> io::Result<Vec<u8>> {
     Ok(v)
 }
 
-#[cfg(test)]
+#[cfg(all(test, windows))]
 mod tests {
     use super::*;
     #[test]

@@ -2,6 +2,7 @@
 //!
 //! The wire contract lives in `PROTOCOL.md` at the repository root; the types here follow it.
 
+pub mod binver;
 pub mod definition;
 pub mod fsutil;
 pub mod hash;
@@ -38,6 +39,16 @@ pub const EXIT_RESTART_LAUNCHER: i32 = 76;
 /// [`EXIT_RESTART_LAUNCHER`]. Launchers before 0.2.0 set nothing.
 pub const LAUNCHER_ENV: &str = "ZEROFARM_LAUNCHER";
 pub const LAUNCHER_LEVEL: u32 = 2;
+
+/// The platform this build runs on (PROTOCOL 11): the agent's `x-farm-platform` and profile `platform`, and the only
+/// platform whose builds it runs.
+pub const PLATFORM: &str = if cfg!(windows) {
+    manifest::PLATFORM_WINDOWS_X64
+} else if cfg!(all(target_os = "macos", target_arch = "aarch64")) {
+    manifest::PLATFORM_MACOS_ARM64
+} else {
+    "unsupported"
+};
 
 /// Seconds since the Unix epoch.
 pub fn now_unix() -> i64 {

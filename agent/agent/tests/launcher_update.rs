@@ -60,7 +60,7 @@ fn install(layout: &Layout, key: &TestKey, agent_exe: &Path, package_launcher: &
     std::fs::create_dir_all(&layout.root).unwrap();
     let old_sha = launcher_copy(&bin("ZeroFarm"), &layout.launcher_exe(), (0, 0, 1));
     let launcher = std::fs::read(package_launcher).unwrap();
-    make_agent_version(layout, "0.1.0", agent_exe, &[("ZeroFarm.exe", &launcher)], &key.key);
+    make_agent_version(layout, "0.1.0", agent_exe, &[(zerofarm_common::layout::LAUNCHER_EXE, &launcher)], &key.key);
     layout.set_current("0.1.0").unwrap();
     layout.mark_healthy("0.1.0").unwrap();
     old_sha
@@ -84,7 +84,7 @@ fn engine_swaps_in_a_newer_launcher_and_asks_for_a_handover() {
     assert_eq!(sha256_of(&h.layout.launcher_exe()), sha256_of(&bin("fakelauncher")), "the new launcher is ZeroFarm.exe");
     let old = files_named(&root, "ZeroFarm.old-");
     assert_eq!(old.len(), 1, "{old:?}");
-    assert_eq!(zerofarm_common::winres::fixed_file_version(&std::fs::read(root.join(&old[0])).unwrap()), Some((0, 0, 1, 0)));
+    assert_eq!(zerofarm_common::binver::exe_version(&std::fs::read(root.join(&old[0])).unwrap()), Some((0, 0, 1, 0)));
     assert!(!root.join(STAGED_EXE).exists());
     let swap = h.layout.launcher_swap().expect("state\\launcher-swap");
     assert_eq!((swap.old.as_str(), swap.from.as_str(), swap.to.as_str()), (old[0].as_str(), "0.0.1", "0.1.0"));
@@ -136,7 +136,7 @@ fn plan_only_for_a_newer_launcher_from_the_current_healthy_version() {
     let layout = Layout::new(d.path().join("ZeroFarm"));
     let key = test_key();
     let keys = TrustedKeys::parse(&[key.pubkey.clone()]).unwrap();
-    let new = d.path().join("ZeroFarm-new.exe");
+    let new = d.path().join(format!("ZeroFarm-new{}", std::env::consts::EXE_SUFFIX));
     std::fs::copy(bin("ZeroFarm"), &new).unwrap();
     install(&layout, &key, &bin("fakeagent"), &new);
     let p = plan(&layout, "0.1.0", &keys).expect("the built launcher replaces 0.0.1");
@@ -206,7 +206,7 @@ impl E {
 
     fn launch(&self, handover_s: u64) -> KillOnDrop {
         KillOnDrop(
-            Command::new(self.root.join("ZeroFarm.exe"))
+            Command::new(self.root.join(zerofarm_common::layout::LAUNCHER_EXE))
                 .env(TEST_KEYS_ENV, &self.key.pubkey)
                 .env("ZEROFARM_TEST_HEADLESS", "1")
                 .env("ZEROFARM_TEST_TAKEOVER_CONFIRM_S", "1")

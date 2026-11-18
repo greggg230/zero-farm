@@ -81,6 +81,52 @@ fn rename_write_through(from: &Path, to: &Path) -> io::Result<()> {
     Ok(())
 }
 
+/// Like [`atomic_write`] for a secret (the macOS agent's `state/machine.json` with its token, PROTOCOL 11.5): on Unix
+/// the temporary file is created with mode 0600, so the bytes are never readable by others, even for an instant.
+/// On Windows exactly [`atomic_write`] (the token there is DPAPI-encrypted and the profile folder is private).
+pub fn atomic_write_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let tmp = path.with_file_name(format!(
+            ".{}.{}.tmp",
+            path.file_name().and_then(|s| s.to_str()).unwrap_or("f"),
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&tmp);
+        {
+            let mut f = fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&tmp)?;
+            f.write_all(bytes)?;
+        }
+        retry(|| fs::rename(&tmp, path)).inspect_err(|_| {
+            let _ = fs::remove_file(&tmp);
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        atomic_write(path, bytes)
+    }
+}
+
+/// Unix: sets `path`'s permission bits (0755 on a verified executable, 0700 on `state/`, PROTOCOL 11.3 and 11.5);
+/// true when done. Windows: nothing (true).
+pub fn set_mode(path: &Path, mode: u32) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(mode)).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+        true
+    }
+}
+
 /// Reads a small text file and trims it; `None` if missing or empty.
 pub fn read_trimmed(path: &Path) -> Option<String> {
     let s = fs::read_to_string(path).ok()?;
@@ -164,5 +210,21 @@ mod tests {
         assert_eq!(fs::read(&p).unwrap(), b"two");
         let left: Vec<_> = fs::read_dir(p.parent().unwrap()).unwrap().flatten().map(|e| e.file_name()).collect();
         assert_eq!(left.len(), 1, "no temp file left: {left:?}");
+    }
+
+    #[test]
+    fn private_write_is_owner_only() {
+        let d = tempfile::tempdir().unwrap();
+        let p = d.path().join("state").join("machine.json");
+        atomic_write_private(&p, b"{\"token\":\"x\"}").unwrap();
+        atomic_write_private(&p, b"{\"token\":\"y\"}").unwrap();
+        assert_eq!(fs::read(&p).unwrap(), b"{\"token\":\"y\"}");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&p).unwrap().permissions().mode() & 0o777, 0o600);
+            assert!(set_mode(p.parent().unwrap(), 0o700));
+            assert_eq!(fs::metadata(p.parent().unwrap()).unwrap().permissions().mode() & 0o777, 0o700);
+        }
     }
 }

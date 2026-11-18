@@ -197,10 +197,12 @@ fn a_changed_template_finishes_the_lease() {
     assert!(h.agent_log().contains("rolling job ended (finish)"), "{}", h.agent_log());
     assert_eq!(h.mock.count("GET", &format!("/v1/artifact/ckpt/{RUN}/2/")), 0, "the new network is never fetched");
     assert_eq!(definition_crashes(&h), 0, "a new template is no fault");
-    // "auto" on the CPU: 32 in flight in 4 groups, never more than fits the memory cap (rolling.rs)
+    // "auto" on the CPU: 32 in flight in 4 groups (macOS: per core, rev 17), never more than fits the memory cap
+    // (rolling.rs)
     let j = h.job_line();
     let (conc, groups) = (j["conc"].as_u64().unwrap(), j["groups"].as_u64().unwrap());
-    assert!((1..=32).contains(&conc) && groups == conc.min(4), "{j}");
+    let (auto_n, auto_g) = farm_agent::rolling::cpu_auto();
+    assert!((1..=auto_n).contains(&conc) && groups == conc.min(auto_g), "{j}");
     h.stop();
 }
 
@@ -250,7 +252,7 @@ fn a_worker_without_the_feature_runs_the_lease_as_a_classic_one() {
 fn publish(h: &H, v: &str) {
     let dir = h.dir.path().join(format!("pkg-{v}"));
     let launcher = std::fs::read(bin("ZeroFarm")).unwrap();
-    let id = make_agent_package(&dir, v, &bin("fakeagent"), &[("ZeroFarm.exe", &launcher)], &h.key.key);
+    let id = make_agent_package(&dir, v, &bin("fakeagent"), &[(zerofarm_common::layout::LAUNCHER_EXE, &launcher)], &h.key.key);
     h.mock.add_build_dir(&dir);
     h.mock.with(|s| s.latest = Some(json!({"version": v, "build_id": id, "manifest": format!("builds/{id}/manifest.json"), "min_agent": "0.1.0"})));
 }
@@ -349,6 +351,18 @@ fn out_of_memory_lease(oom_abort: bool) {
     let done = h.wait_done("l_RM");
     assert_eq!(done["given_back"], false, "the lease went on and ended as any: {done}");
     let (j0, j1) = (h.job_line(), h.job_line_n(1).expect("a second worker"));
+    if cfg!(not(windows)) {
+        // macOS (PROTOCOL 11.5): no job object fails the worker's allocations; the agent watches its physical footprint
+        // and either finishes its games near the cap (92 %) or kills it past the cap - either way the lease goes on
+        // with fewer games in flight, nothing credited twice, the cost per game remembered
+        assert_eq!((j0["conc"].clone(), j0["out_dir"].clone()), (json!(16), json!("out")), "{j0}");
+        assert!(j1["conc"].as_u64().unwrap() < 16 && j1["out_dir"] == "out-r1", "{j1}");
+        accounted_once(&h, "l_RM", &done, 80);
+        assert!(learned(&h)["roll-run/cpu"].as_u64().is_some(), "{}", learned(&h));
+        assert!(h.crashes().len() <= 1, "{:?}", h.crashes());
+        h.stop();
+        return;
+    }
     assert_eq!((j0["conc"].clone(), j0["gid_base"].clone(), j0["games"].clone(), j0["out_dir"].clone()), (json!(16), json!(0), json!(32), json!("out")), "{j0}");
     // measured (1,600 - 600) / 16 = 63 MB per game: (1,600 x 0.85 - 600) / 63 = 12 (= 3/4 of 16); the first worker's
     // ids were all lost: the second's start after them
@@ -404,7 +418,10 @@ fn a_worker_near_its_memory_limit_finishes_its_games_and_goes_on_with_fewer() {
     assert!(unfinished_n(&done) < 8, "only ids never started go back: {done}");
     assert!(first_played >= base1);
     let per = learned(&h)["roll-run/cpu"].as_u64().expect("measured");
-    assert!(per >= 100, "(~1,500 - 600) / 8: {per}");
+    // (macOS plans with a larger base in physical footprint, rolling.rs `MACOS_CPU_COST`)
+    let base = farm_agent::rolling::cpu_cost().base_mb;
+    let least = if cfg!(windows) { 100 } else { (1472 - base) / 8 };
+    assert!(per >= least, "(~1,500 - {base}) / 8: {per}");
     assert!(h.crashes().is_empty(), "coming near the limit is no crash: {:?}", h.crashes());
     h.stop();
 }

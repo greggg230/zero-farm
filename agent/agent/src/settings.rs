@@ -4,6 +4,7 @@
 use crate::util::local_now;
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
+#[cfg(windows)]
 use zerofarm_common::fsutil::atomic_write;
 use zerofarm_common::layout::Layout;
 
@@ -59,6 +60,22 @@ pub struct Settings {
     pub disk_cap_mb: u64,
     /// Never work while a fullscreen app / game / presentation runs (also in Always mode).
     pub respect_fullscreen: bool,
+    /// rev 17: work on battery power and with battery saver / Low Power Mode on too (default off: never). For an
+    /// owner's own laptop (macOS: `ZeroFarm set on_battery true`); written to `machine.json` only when on.
+    #[serde(skip_serializing_if = "is_false")]
+    pub on_battery: bool,
+    /// rev 17 (PROTOCOL 11.5, macOS): while working on AC power, keep the Mac from idle-sleeping (default on);
+    /// written to `machine.json` only when off.
+    #[serde(skip_serializing_if = "is_true")]
+    pub keep_awake: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 impl Default for Settings {
@@ -73,6 +90,8 @@ impl Default for Settings {
             max_ram_mb: None,
             disk_cap_mb: 3072,
             respect_fullscreen: true,
+            on_battery: false,
+            keep_awake: true,
         }
     }
 }
@@ -93,6 +112,78 @@ impl Settings {
 
     pub fn ram_cap_mb(&self, total_mb: u64) -> u64 {
         self.max_ram_mb.unwrap_or(total_mb / 2)
+    }
+
+    /// The keys `ZeroFarm set <key> <value>` takes (macOS, PROTOCOL 11.5; the tray's settings on Windows).
+    pub const KEYS: &'static [&'static str] =
+        &["cpu_threads", "work_when", "mode", "idle_minutes", "on_battery", "keep_awake", "hours", "max_ram_mb", "disk_cap_mb", "gpu"];
+
+    /// `set <key> <value>`: changes one setting, or says why not. Returns how it reads now.
+    pub fn set_by_name(&mut self, key: &str, value: &str) -> Result<String, String> {
+        let v = value.trim().to_ascii_lowercase();
+        let flag = |v: &str| match v {
+            "true" | "on" | "yes" | "1" => Ok(true),
+            "false" | "off" | "no" | "0" => Ok(false),
+            _ => Err(format!("{key}: true or false")),
+        };
+        let number = |v: &str, lo: u64, hi: u64| -> Result<u64, String> {
+            v.parse::<u64>().ok().filter(|n| (lo..=hi).contains(n)).ok_or_else(|| format!("{key}: a number from {lo} to {hi}"))
+        };
+        let auto = |v: &str| matches!(v, "auto" | "automatic" | "default");
+        match key {
+            "cpu_threads" | "threads" => self.cpu_threads = if auto(&v) { None } else { Some(number(&v, 1, 1024)? as u32) },
+            "work_when" | "mode" => {
+                self.mode = match v.as_str() {
+                    "idle" | "idle_only" | "away" => Mode::IdleOnly,
+                    "active" | "always" => Mode::Always,
+                    _ => return Err(format!("{key}: idle (only while the computer is not in use) or active (also while it is)")),
+                }
+            }
+            "idle_minutes" => self.idle_minutes = number(&v, 1, 240)? as u32,
+            "on_battery" => self.on_battery = flag(&v)?,
+            "keep_awake" => self.keep_awake = flag(&v)?,
+            "gpu" => self.gpu = flag(&v)?,
+            "max_ram_mb" => self.max_ram_mb = if auto(&v) { None } else { Some(number(&v, 1024, 1 << 22)?) },
+            "disk_cap_mb" => self.disk_cap_mb = number(&v, 1024, 1 << 24)?,
+            "hours" => {
+                self.hours = if matches!(v.as_str(), "off" | "any" | "always" | "none") {
+                    None
+                } else {
+                    let hm = |s: &str| -> Option<u32> {
+                        let (h, m) = s.split_once(':').unwrap_or((s, "0"));
+                        let (h, m) = (h.parse::<u32>().ok()?, m.parse::<u32>().ok()?);
+                        (h <= 24 && m < 60 && h * 60 + m <= 1440).then_some((h * 60 + m) % 1440)
+                    };
+                    let parsed = v.split_once('-').and_then(|(a, b)| Some(Hours { start_min: hm(a.trim())?, end_min: hm(b.trim())? }));
+                    Some(parsed.filter(|h| h.start_min != h.end_min).ok_or("hours: HH:MM-HH:MM (local time, may wrap midnight) or off")?)
+                }
+            }
+            _ => return Err(format!("unknown setting {key:?}; one of {}", Self::KEYS.join(", "))),
+        }
+        Ok(self.describe_key(key))
+    }
+
+    /// One setting as `set` takes it back: `cpu_threads auto`, `work_when idle`, ...
+    pub fn describe_key(&self, key: &str) -> String {
+        let yes = |b: bool| if b { "true" } else { "false" };
+        let val = match key {
+            "cpu_threads" | "threads" => self.cpu_threads.map_or("auto".to_string(), |n| n.to_string()),
+            "work_when" | "mode" => (if self.mode == Mode::Always { "active" } else { "idle" }).to_string(),
+            "idle_minutes" => self.idle_minutes.to_string(),
+            "on_battery" => yes(self.on_battery).to_string(),
+            "keep_awake" => yes(self.keep_awake).to_string(),
+            "gpu" => yes(self.gpu).to_string(),
+            "max_ram_mb" => self.max_ram_mb.map_or("auto".to_string(), |n| n.to_string()),
+            "disk_cap_mb" => self.disk_cap_mb.to_string(),
+            "hours" => self.hours.map_or("off".to_string(), |h| format!("{:02}:{:02}-{:02}:{:02}", h.start_min / 60, h.start_min % 60, h.end_min / 60, h.end_min % 60)),
+            _ => "?".to_string(),
+        };
+        let key = match key {
+            "threads" => "cpu_threads",
+            "mode" => "work_when",
+            k => k,
+        };
+        format!("{key} {val}")
     }
 }
 
@@ -115,6 +206,10 @@ pub struct Machine {
     pub settings: Settings,
     pub first_work_toast_shown: bool,
     pub games_today: GamesToday,
+    /// rev 17 (PROTOCOL 11.5, macOS): the machine token in the clear; the file is mode 0600 in a 0700 `state/` (the
+    /// Keychain would prompt after every self-update, whose code identity changes). Never set on Windows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 impl Default for Machine {
@@ -128,6 +223,7 @@ impl Default for Machine {
             settings: Settings::default(),
             first_work_toast_shown: false,
             games_today: GamesToday::default(),
+            token: None,
         }
     }
 }
@@ -150,14 +246,41 @@ impl Machine {
         }
     }
 
+    #[cfg(windows)]
     pub fn save(&self, layout: &Layout) -> std::io::Result<()> {
         atomic_write(&layout.machine_json(), &serde_json::to_vec_pretty(self).expect("json"))
     }
 
+    /// macOS: written with mode 0600 (it holds the token), `state/` made 0700.
+    #[cfg(not(windows))]
+    pub fn save(&self, layout: &Layout) -> std::io::Result<()> {
+        std::fs::create_dir_all(layout.state())?;
+        zerofarm_common::fsutil::set_mode(&layout.state(), 0o700);
+        zerofarm_common::fsutil::atomic_write_private(&layout.machine_json(), &serde_json::to_vec_pretty(self).expect("json"))
+    }
+
+    #[cfg(windows)]
     pub fn enrolled(&self) -> bool {
         self.machine_id.is_some() && self.token_dpapi.is_some()
     }
 
+    #[cfg(not(windows))]
+    pub fn enrolled(&self) -> bool {
+        self.machine_id.is_some() && self.token.is_some()
+    }
+
+    #[cfg(not(windows))]
+    pub fn token(&self) -> Option<String> {
+        self.token.clone().filter(|t| !t.is_empty())
+    }
+
+    #[cfg(not(windows))]
+    pub fn set_token(&mut self, token: &str) -> std::io::Result<()> {
+        self.token = Some(token.to_string());
+        Ok(())
+    }
+
+    #[cfg(windows)]
     pub fn token(&self) -> Option<String> {
         use base64::Engine as _;
         let blob = base64::engine::general_purpose::STANDARD.decode(self.token_dpapi.as_ref()?).ok()?;
@@ -165,6 +288,7 @@ impl Machine {
         String::from_utf8(raw).ok()
     }
 
+    #[cfg(windows)]
     pub fn set_token(&mut self, token: &str) -> std::io::Result<()> {
         use base64::Engine as _;
         let blob = zerofarm_common::dpapi::protect(token.as_bytes(), TOKEN_PURPOSE)?;
@@ -175,6 +299,7 @@ impl Machine {
     pub fn forget_enrollment(&mut self) {
         self.machine_id = None;
         self.token_dpapi = None;
+        self.token = None;
     }
 
     pub fn add_games(&mut self, n: u64) {
@@ -239,6 +364,35 @@ mod tests {
     }
 
     #[test]
+    fn set_by_name_for_the_headless_cli() {
+        let mut s = Settings::default();
+        assert_eq!(s.set_by_name("cpu_threads", "12").unwrap(), "cpu_threads 12");
+        assert_eq!(s.threads(16, 16), 12);
+        assert_eq!(s.set_by_name("cpu_threads", "auto").unwrap(), "cpu_threads auto");
+        assert_eq!(s.threads(16, 16), 16, "auto: every physical core (12 performance + 4 efficiency on an M4 Max)");
+        assert_eq!(s.set_by_name("work_when", "active").unwrap(), "work_when active");
+        assert_eq!(s.mode, Mode::Always);
+        assert_eq!(s.set_by_name("mode", "idle_only").unwrap(), "work_when idle");
+        assert_eq!(s.set_by_name("on_battery", "true").unwrap(), "on_battery true");
+        assert_eq!(s.set_by_name("keep_awake", "off").unwrap(), "keep_awake false");
+        assert_eq!(s.set_by_name("hours", "22:00-07:30").unwrap(), "hours 22:00-07:30");
+        assert_eq!(s.hours, Some(Hours { start_min: 1320, end_min: 450 }));
+        assert_eq!(s.set_by_name("hours", "off").unwrap(), "hours off");
+        assert_eq!(s.set_by_name("max_ram_mb", "48000").unwrap(), "max_ram_mb 48000");
+        for (k, v) in [("cpu_threads", "0"), ("work_when", "sometimes"), ("on_battery", "maybe"), ("hours", "9-9"), ("nope", "1"), ("max_ram_mb", "12")] {
+            assert!(s.set_by_name(k, v).is_err(), "{k} {v}");
+        }
+        // The new settings stay out of machine.json at their defaults (Windows files unchanged); a missing key reads as
+        // its default.
+        let d = serde_json::to_string(&Settings::default()).unwrap();
+        assert!(!d.contains("on_battery") && !d.contains("keep_awake"), "{d}");
+        let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
+        assert!(back.on_battery && !back.keep_awake && back == s);
+        let old: Settings = serde_json::from_str(r#"{"mode":"idle_only"}"#).unwrap();
+        assert!(!old.on_battery && old.keep_awake);
+    }
+
+    #[test]
     fn machine_json_roundtrip_with_token_and_corruption() {
         let d = tempfile::tempdir().unwrap();
         let l = Layout::new(d.path());
@@ -249,7 +403,16 @@ mod tests {
         m.settings.mode = Mode::Always;
         m.save(&l).unwrap();
         let text = std::fs::read_to_string(l.machine_json()).unwrap();
+        #[cfg(windows)]
         assert!(!text.contains("secret-token"), "token must be DPAPI-protected on disk");
+        // macOS (PROTOCOL 11.5): in the clear, in a file only this user can read, in a folder only this user can open
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert!(text.contains("\"token\": \"secret-token\"") && !text.contains("token_dpapi\": \""), "{text}");
+            assert_eq!(std::fs::metadata(l.machine_json()).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::metadata(l.state()).unwrap().permissions().mode() & 0o777, 0o700);
+        }
         let m2 = Machine::load(&l);
         assert_eq!(m2.token().as_deref(), Some("secret-token"));
         assert_eq!(m2.settings.mode, Mode::Always);

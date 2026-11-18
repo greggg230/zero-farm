@@ -26,11 +26,20 @@
 //! version (an agent runs it on a new launcher before putting it in place); exit 0 = good.
 //! `ZeroFarm.exe keys` prints the release keys it trusts (`release <key id> <public key>`).
 //! Its log lines are redacted (no Windows user name or profile path; security review M5).
+//!
+//! macOS (PROTOCOL 11.5): `<root>/ZeroFarm`, started at login by the LaunchAgent. POSIX process handling instead of
+//! job objects: the agent is its child (it quits when the launcher is gone), a new launcher taking over gets a session
+//! of its own, SIGTERM (launchd at logout, `ZeroFarm quit`) is "quit" and is passed on to the agent. No tray: the
+//! headless CLI `ZeroFarm status | pause [minutes] | resume | set <key> <value> | quit | uninstall` (forwarded to
+//! the current agent, `quit` done here) and `ZeroFarm setup [--invite CODE] [--name NAME]` from an unpacked download
+//! (it verifies the package it sits in, then runs that package's `farm-agent setup`).
 
 #![windows_subsystem = "windows"]
 
 use std::collections::VecDeque;
+#[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -43,9 +52,13 @@ use zerofarm_common::names::{single_instance, Handle, QuitEvent};
 use zerofarm_common::rotlog::{utc_timestamp, RotatingFile};
 use zerofarm_common::{now_unix, EXIT_RESTART_LAUNCHER, EXIT_UPDATE, LAUNCHER_ENV, LAUNCHER_LEVEL};
 
+#[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+#[cfg(windows)]
 const DETACHED_PROCESS: u32 = 0x0000_0008;
+#[cfg(windows)]
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+#[cfg(windows)]
 const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 const HEALTHY_TIMEOUT: Duration = Duration::from_secs(120);
 const CRASH_WINDOW: Duration = Duration::from_secs(600);
@@ -63,10 +76,22 @@ fn session_ending() -> bool {
     if std::env::var_os("ZEROFARM_TEST_SESSION_ENDING").is_some() {
         return true;
     }
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SHUTTINGDOWN};
-    // SAFETY: GetSystemMetrics has no preconditions.
-    unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) != 0 }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetSystemMetrics, SM_SHUTTINGDOWN};
+        // SAFETY: GetSystemMetrics has no preconditions.
+        unsafe { GetSystemMetrics(SM_SHUTTINGDOWN) != 0 }
+    }
+    // (macOS: launchd ends the session with SIGTERM, which is a quit)
+    #[cfg(not(windows))]
+    false
 }
+
+/// macOS: the version an agent reads from this file before replacing it (no VERSIONINFO there;
+/// `zerofarm_common::binver`).
+#[cfg(not(windows))]
+#[used]
+static VERSION_MARK: [u8; zerofarm_common::binver::MARK_LEN] = zerofarm_common::binver::mark(env!("CARGO_PKG_VERSION"));
 /// A launcher started with `--takeover` confirms once its first agent has run this long.
 const TAKEOVER_CONFIRM: Duration = Duration::from_secs(10);
 /// How long the launcher handing over waits for that confirmation.
@@ -77,6 +102,7 @@ const INSTANCE_WAIT: Duration = Duration::from_secs(30);
 /// confirmation) for this long.
 const LEFTOVER_RETRY: Duration = Duration::from_secs(120);
 
+#[cfg(windows)]
 mod job {
     use std::ffi::c_void;
     use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
@@ -137,6 +163,23 @@ fn verify_version(layout: &Layout, keys: &TrustedKeys, v: &str) -> Result<(), St
 
 /// Starts a process that must outlive this launcher: detached, no stdio, out of our job when the
 /// job we run in allows it.
+#[cfg(not(windows))]
+fn spawn_outliving(exe: &Path, args: &[&str], cwd: &Path) -> std::io::Result<Child> {
+    use std::os::unix::process::CommandExt;
+    let mut cmd = Command::new(exe);
+    cmd.args(args).current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    // A session of its own: launchd ends this launcher's process group (its job) when this one exits.
+    // SAFETY: setsid(2) is async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            libc::setsid();
+            Ok(())
+        });
+    }
+    cmd.spawn()
+}
+
+#[cfg(windows)]
 fn spawn_outliving(exe: &Path, args: &[&str], cwd: &Path) -> std::io::Result<Child> {
     let base = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
     let go = |flags: u32| {
@@ -171,6 +214,7 @@ struct Launcher {
     keys: TrustedKeys,
     log: RotatingFile,
     quit: Option<QuitEvent>,
+    #[cfg(windows)]
     job: Option<job::Job>,
     healthy_timeout: Duration,
     crashes: VecDeque<Instant>,
@@ -312,6 +356,7 @@ impl Launcher {
         true
     }
 
+    #[cfg(windows)]
     fn spawn(&self, v: &str) -> std::io::Result<Child> {
         let dir = self.layout.version_dir(v);
         let child = Command::new(dir.join(AGENT_EXE))
@@ -326,6 +371,20 @@ impl Launcher {
             j.assign(child.as_raw_handle() as _);
         }
         Ok(child)
+    }
+
+    /// macOS: the agent is our child, in our process group (launchd's job); it quits when we are gone.
+    #[cfg(not(windows))]
+    fn spawn(&self, v: &str) -> std::io::Result<Child> {
+        let dir = self.layout.version_dir(v);
+        Command::new(dir.join(AGENT_EXE))
+            .arg("run")
+            .arg("--root")
+            .arg(&self.layout.root)
+            .current_dir(&self.layout.root)
+            .env(LAUNCHER_ENV, LAUNCHER_LEVEL.to_string())
+            .stdin(Stdio::null())
+            .spawn()
     }
 
     fn supervise(&mut self, child: &mut Child, v: &str, mut probation: bool, started: Instant) -> Outcome {
@@ -353,7 +412,13 @@ impl Launcher {
                 }
             }
             if self.quit_requested() {
-                // The agent watches the same event; give it time to finish cleanly.
+                // The agent watches the same event; give it time to finish cleanly. (macOS: a SIGTERM may have
+                // reached only us - launchd's at logout -, so it is passed on.)
+                #[cfg(not(windows))]
+                // SAFETY: kill(2) of our own child, not reaped yet.
+                unsafe {
+                    libc::kill(child.id() as i32, libc::SIGTERM);
+                }
                 let deadline = Instant::now() + Duration::from_secs(15);
                 while Instant::now() < deadline {
                     if let Ok(Some(_)) = child.try_wait() {
@@ -458,7 +523,7 @@ impl Launcher {
         // Roll back: this launcher is ZeroFarm.exe again; the new one is set aside and marked bad.
         self.log(&format!("new launcher {}: {reason}; putting {} back", swap.to, swap.from));
         if new_exe.exists() {
-            let bad = root.join(format!("ZeroFarm.bad-{}.exe", now_unix()));
+            let bad = root.join(zerofarm_common::layout::launcher_leftover_name("bad", now_unix()));
             if let Err(e) = rename_retry(&new_exe, &bad) {
                 self.log(&format!("could not set the new launcher aside: {e}"));
             }
@@ -599,11 +664,84 @@ impl Launcher {
 }
 
 fn forward_uninstall(layout: &Layout, args: &[String]) -> i32 {
-    let Some(cur) = layout.current() else { return 2 };
+    forward(layout, "uninstall", args)
+}
+
+/// Runs `versions/<current>/farm-agent <cmd> --root <root> <args>` and returns its exit code.
+fn forward(layout: &Layout, cmd: &str, args: &[String]) -> i32 {
+    let Some(cur) = layout.current() else {
+        #[cfg(not(windows))]
+        eprintln!("Zero Farm is not installed in {} (no state/current)", layout.root.display());
+        return 2;
+    };
     let exe = layout.version_dir(&cur).join(AGENT_EXE);
-    match Command::new(exe).arg("uninstall").arg("--root").arg(&layout.root).args(args).creation_flags(CREATE_NO_WINDOW).status() {
+    let mut c = Command::new(exe);
+    c.arg(cmd).arg("--root").arg(&layout.root).args(args);
+    #[cfg(windows)]
+    c.creation_flags(CREATE_NO_WINDOW);
+    match c.status() {
         Ok(st) => st.code().unwrap_or(1),
         Err(_) => 1,
+    }
+}
+
+/// macOS `ZeroFarm quit`: asks this root's launcher and agent to quit (SIGTERM) and waits for them.
+#[cfg(not(windows))]
+fn quit(layout: &Layout) -> i32 {
+    use zerofarm_common::names::instance_running;
+    let running = || instance_running("launcher", &layout.root) || instance_running("agent", &layout.root);
+    if !running() {
+        println!("Zero Farm is not running.");
+        return 0;
+    }
+    if let Some(q) = QuitEvent::open(&layout.root) {
+        q.set();
+    }
+    let end = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < end {
+        if !running() {
+            println!("Zero Farm quit. It starts again at the next login.");
+            return 0;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    eprintln!("Zero Farm did not quit within 30 s");
+    1
+}
+
+/// macOS `ZeroFarm setup`: verifies the agent package this launcher sits in (an unpacked download, PROTOCOL 11.2; or
+/// an install root's current version) against the compiled-in release keys, then runs that package's
+/// `farm-agent setup --source <package>` with the same arguments.
+#[cfg(not(windows))]
+fn setup(here: &Path, args: &[String]) -> i32 {
+    let keys = TrustedKeys::compiled();
+    if keys.is_empty() {
+        eprintln!("this launcher build trusts no release key");
+        return 2;
+    }
+    let installed = Layout::new(here);
+    let source = match installed.current().filter(|_| here.join("state").is_dir()) {
+        Some(cur) => installed.version_dir(&cur),
+        None => here.to_path_buf(),
+    };
+    match verify_dir(&source, &keys, &Expect { build_id: None, kind: Some(Kind::Agent), version: None }) {
+        Ok(v) if v.manifest.entry.as_deref() == Some(AGENT_EXE) => {
+            match Command::new(source.join(AGENT_EXE)).arg("setup").arg("--source").arg(&source).args(args).status() {
+                Ok(st) => st.code().unwrap_or(1),
+                Err(e) => {
+                    eprintln!("could not run {AGENT_EXE}: {e}");
+                    1
+                }
+            }
+        }
+        Ok(v) => {
+            eprintln!("{}: the agent package's entry is {:?}", source.display(), v.manifest.entry);
+            2
+        }
+        Err(e) => {
+            eprintln!("{}: the files failed verification ({e}); download them again", source.display());
+            2
+        }
     }
 }
 
@@ -648,6 +786,19 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("uninstall") => std::process::exit(forward_uninstall(&layout, &args[1..])),
+        // macOS: the headless CLI (PROTOCOL 11.5)
+        #[cfg(not(windows))]
+        Some(c @ ("status" | "pause" | "resume" | "set")) => std::process::exit(forward(&layout, c, &args[1..])),
+        #[cfg(not(windows))]
+        Some("quit") => std::process::exit(quit(&layout)),
+        #[cfg(not(windows))]
+        Some("setup") => std::process::exit(setup(&root, &args[1..])),
+        #[cfg(not(windows))]
+        Some("version") => {
+            println!("{}", env!("CARGO_PKG_VERSION"));
+            std::process::exit(0)
+        }
+
         Some("selftest") => std::process::exit(selftest(&layout)),
         // The release keys this build trusts (`farm-release release-agent` checks them).
         Some("keys") => {
@@ -655,6 +806,11 @@ fn main() {
                 println!("release {} {}", k.key_id_hex(), k.b64);
             }
             std::process::exit(0)
+        }
+        #[cfg(not(windows))]
+        Some(a) if !a.starts_with("--") => {
+            eprintln!("usage: ZeroFarm [status | pause [minutes] | resume | set <key> <value> | quit | uninstall | setup [--invite CODE] [--name NAME] | selftest | keys | version]");
+            std::process::exit(2)
         }
         _ => {}
     }
@@ -664,6 +820,9 @@ fn main() {
         // Already running for this root.
         return;
     };
+    // macOS: SIGTERM / SIGINT / SIGHUP are "quit" (launchd at logout, `ZeroFarm quit`)
+    #[cfg(not(windows))]
+    zerofarm_common::names::install_quit_signals();
     let quit = QuitEvent::open(&root);
     if let Some(q) = &quit {
         if takeover.is_none() {
@@ -675,6 +834,7 @@ fn main() {
         layout,
         keys: TrustedKeys::compiled(),
         quit,
+        #[cfg(windows)]
         job: job::Job::new(),
         healthy_timeout: test_secs("ZEROFARM_TEST_HEALTHY_TIMEOUT_S", HEALTHY_TIMEOUT),
         crashes: VecDeque::new(),

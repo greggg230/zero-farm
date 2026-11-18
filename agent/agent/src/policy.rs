@@ -7,7 +7,7 @@
 //! |---|---|
 //! | pause (tray) | no work while paused |
 //! | optional hours | no work outside them |
-//! | power | never on battery or with battery saver on |
+//! | power | never on battery or with battery saver on (unless the owner's `on_battery` setting is on) |
 //! | fullscreen / D3D / presentation / busy | never work (also in "always" mode, unless disabled) |
 //! | memory | keep ≥ max(4 GB, 25 %) free; below that: no work, and pressure ends a paused lease |
 //! | input idle | "idle only" mode: work after `idle_minutes` without input; any input → yield |
@@ -173,9 +173,9 @@ pub fn decide(st: &mut PolicyState, s: &Signals, cfg: &Settings) -> Decision {
         Some(Block::Paused)
     } else if cfg.hours.is_some_and(|h| !h.contains(s.local_min)) {
         Some(Block::OutsideHours)
-    } else if s.on_ac == Some(false) {
+    } else if s.on_ac == Some(false) && !cfg.on_battery {
         Some(Block::OnBattery)
-    } else if s.battery_saver {
+    } else if s.battery_saver && !cfg.on_battery {
         Some(Block::BatterySaver)
     } else if cfg.respect_fullscreen && s.notification.is_fullscreen() {
         Some(Block::Fullscreen)
@@ -288,6 +288,14 @@ mod tests {
         assert!(d(&s, &Settings::default()).work, "unknown power = desktop");
         s.battery_saver = true;
         assert_eq!(d(&s, &Settings::default()).block, Some(Block::BatterySaver));
+        // rev 17: the owner's `on_battery` works on battery and in Low Power Mode too; nothing else changes.
+        let owner = Settings { on_battery: true, mode: Mode::Always, ..Settings::default() };
+        s.on_ac = Some(false);
+        assert!(d(&s, &owner).work);
+        s.idle_s = 0;
+        assert!(d(&s, &owner).work, "always + on_battery: works while the Mac is in use, on battery");
+        s.mem_avail_mb = 0;
+        assert_eq!(d(&s, &owner).block, Some(Block::LowMemory));
     }
 
     #[test]

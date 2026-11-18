@@ -4,18 +4,34 @@
 //! memory-capped, no crash dialogs), given IDLE_PRIORITY_CLASS and EcoQoS for CPU work, and only
 //! then allowed to run. Yield/resume use NtSuspendProcess/NtResumeProcess (the whole process,
 //! all threads). stdout carries JSON lines (bounded length); stderr goes to the worker log.
+//!
+//! macOS (PROTOCOL 11.5): `worker_unix.rs` - its own process group, nice 19 for CPU work, SIGSTOP/SIGCONT to the
+//! group, the memory cap enforced on the group's physical footprint.
 
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Read};
+#[cfg(windows)]
+use std::io::Write;
+#[cfg(windows)]
 use std::os::windows::io::AsRawHandle;
+#[cfg(windows)]
 use std::os::windows::process::CommandExt;
 use std::path::Path;
+#[cfg(windows)]
 use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::HANDLE;
+#[cfg(windows)]
 use zerofarm_common::names::Handle;
 use zerofarm_common::rotlog::RotatingFile;
+
+#[cfg(unix)]
+#[path = "worker_unix.rs"]
+mod unix;
+#[cfg(unix)]
+pub use unix::{kill_orphans, CpuMark, WorkerProc};
 
 /// Longest stdout line accepted from a worker.
 pub const MAX_LINE: usize = 1 << 20;
@@ -44,6 +60,7 @@ pub struct SpawnOpts<'a> {
     pub runtime_dir: Option<&'a Path>,
 }
 
+#[cfg(windows)]
 pub struct WorkerProc {
     child: Child,
     job: Handle,
@@ -55,8 +72,10 @@ pub struct WorkerProc {
     suspended: bool,
 }
 
+#[cfg(windows)]
 type NtProcFn = unsafe extern "system" fn(HANDLE) -> i32;
 
+#[cfg(windows)]
 fn ntdll_fn(name: &[u8]) -> Option<NtProcFn> {
     use windows_sys::Win32::System::LibraryLoader::{GetModuleHandleW, GetProcAddress};
     unsafe {
@@ -69,14 +88,17 @@ fn ntdll_fn(name: &[u8]) -> Option<NtProcFn> {
     }
 }
 
+#[cfg(windows)]
 fn nt_suspend(h: HANDLE) -> bool {
     ntdll_fn(b"NtSuspendProcess\0").map(|f| unsafe { f(h) } >= 0).unwrap_or(false)
 }
 
+#[cfg(windows)]
 fn nt_resume(h: HANDLE) -> bool {
     ntdll_fn(b"NtResumeProcess\0").map(|f| unsafe { f(h) } >= 0).unwrap_or(false)
 }
 
+#[cfg(windows)]
 fn make_job(mem_limit_mb: u64) -> std::io::Result<Handle> {
     use windows_sys::Win32::System::JobObjects::*;
     unsafe {
@@ -125,6 +147,7 @@ fn make_job(mem_limit_mb: u64) -> std::io::Result<Handle> {
     }
 }
 
+#[cfg(windows)]
 /// EcoQoS: ask the scheduler to prefer efficiency cores and low clocks for this process.
 fn set_eco_qos(h: HANDLE) -> bool {
     use windows_sys::Win32::System::Threading::{
@@ -146,6 +169,7 @@ fn set_eco_qos(h: HANDLE) -> bool {
     }
 }
 
+#[cfg(windows)]
 impl WorkerProc {
     /// Starts `<exe> <args>` (`serve`) in `cwd`. Every stdout line is delivered to `on_msg` from a reader
     /// thread (then `Eof` when the pipe closes).
@@ -191,28 +215,7 @@ impl WorkerProc {
         let pid = child.id();
         let stdout = child.stdout.take().expect("piped");
         let stderr = child.stderr.take().expect("piped");
-        let tail = Arc::new(Mutex::new(VecDeque::new()));
-        std::thread::Builder::new()
-            .name("worker-stdout".into())
-            .spawn(move || read_lines(stdout, on_msg))
-            .expect("thread");
-        let (tail2, log, tag) = (tail.clone(), opts.log.clone(), opts.tag.clone());
-        std::thread::Builder::new()
-            .name("worker-stderr".into())
-            .spawn(move || {
-                let r = BufReader::new(stderr);
-                for line in r.split(b'\n') {
-                    let Ok(line) = line else { break };
-                    let line = String::from_utf8_lossy(&line).trim_end().to_string();
-                    log.write_line(&format!("{} [{tag}] {line}", zerofarm_common::rotlog::utc_timestamp(zerofarm_common::now_unix())));
-                    let mut t = tail2.lock().unwrap();
-                    if t.len() >= STDERR_TAIL {
-                        t.pop_front();
-                    }
-                    t.push_back(line);
-                }
-            })
-            .expect("thread");
+        let tail = start_readers(stdout, stderr, on_msg, opts.log.clone(), opts.tag.clone());
         if !nt_resume(h) {
             let _ = child.kill();
             return Err(std::io::Error::other("could not start the worker's main thread"));
@@ -324,6 +327,7 @@ impl WorkerProc {
     }
 }
 
+#[cfg(windows)]
 impl Drop for WorkerProc {
     fn drop(&mut self) {
         if self.try_wait().is_none() {
@@ -332,10 +336,12 @@ impl Drop for WorkerProc {
     }
 }
 
+#[cfg(windows)]
 fn ft(t: &windows_sys::Win32::Foundation::FILETIME) -> u64 {
     ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64
 }
 
+#[cfg(windows)]
 /// A point in time for starvation checks: the worker's CPU time and the system's idle/total time.
 #[derive(Debug, Clone, Copy)]
 pub struct CpuMark {
@@ -344,6 +350,7 @@ pub struct CpuMark {
     sys_total: u64,
 }
 
+#[cfg(windows)]
 impl CpuMark {
     pub fn take(w: &WorkerProc) -> CpuMark {
         use windows_sys::Win32::Foundation::FILETIME;
@@ -364,6 +371,40 @@ impl CpuMark {
         let idle = now.sys_idle.saturating_sub(self.sys_idle);
         worker < 100 && (idle as f64 / total as f64) < 0.10
     }
+}
+
+/// Starts the threads reading the worker's stdout (JSON lines to `on_msg`, then `Eof`) and stderr (to the worker
+/// log, the last `STDERR_TAIL` lines kept): the tail.
+fn start_readers(
+    stdout: impl Read + Send + 'static,
+    stderr: impl Read + Send + 'static,
+    on_msg: impl Fn(WorkerMsg) + Send + 'static,
+    log: Arc<RotatingFile>,
+    tag: String,
+) -> Arc<Mutex<VecDeque<String>>> {
+    let tail = Arc::new(Mutex::new(VecDeque::new()));
+    std::thread::Builder::new()
+        .name("worker-stdout".into())
+        .spawn(move || read_lines(stdout, on_msg))
+        .expect("thread");
+    let tail2 = tail.clone();
+    std::thread::Builder::new()
+        .name("worker-stderr".into())
+        .spawn(move || {
+            let r = BufReader::new(stderr);
+            for line in r.split(b'\n') {
+                let Ok(line) = line else { break };
+                let line = String::from_utf8_lossy(&line).trim_end().to_string();
+                log.write_line(&format!("{} [{tag}] {line}", zerofarm_common::rotlog::utc_timestamp(zerofarm_common::now_unix())));
+                let mut t = tail2.lock().unwrap();
+                if t.len() >= STDERR_TAIL {
+                    t.pop_front();
+                }
+                t.push_back(line);
+            }
+        })
+        .expect("thread");
+    tail
 }
 
 fn read_lines(stdout: impl Read, on_msg: impl Fn(WorkerMsg)) {

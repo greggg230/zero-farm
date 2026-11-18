@@ -20,7 +20,7 @@ fn env() -> Env {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path().join("ZeroFarm");
     std::fs::create_dir_all(&root).unwrap();
-    std::fs::copy(env!("CARGO_BIN_EXE_ZeroFarm"), root.join("ZeroFarm.exe")).unwrap();
+    std::fs::copy(env!("CARGO_BIN_EXE_ZeroFarm"), root.join(zerofarm_common::layout::LAUNCHER_EXE)).unwrap();
     Env { layout: Layout::new(&root), root, _dir: dir, key: test_key() }
 }
 
@@ -30,7 +30,7 @@ impl Env {
     }
     fn launch(&self) -> KillOnDrop {
         KillOnDrop(
-            Command::new(self.root.join("ZeroFarm.exe"))
+            Command::new(self.root.join(zerofarm_common::layout::LAUNCHER_EXE))
                 .env(TEST_KEYS_ENV, &self.key.pubkey)
                 .env("ZEROFARM_TEST_HEALTHY_TIMEOUT_S", "3")
                 .spawn()
@@ -114,7 +114,7 @@ fn refuses_a_tampered_pending_version() {
     let e = env();
     e.version("1.0.0", "healthy\nonce: pending 2.0.0\nonce: exit 75\nwait-stop\n");
     e.version("2.0.0", "healthy\nwait-stop\n");
-    tamper(&e.layout.version_dir("2.0.0").join("farm-agent.exe"));
+    tamper(&e.layout.version_dir("2.0.0").join(zerofarm_common::layout::AGENT_EXE));
     e.layout.set_current("1.0.0").unwrap();
     let mut l = e.launch();
     assert!(wait_until(Duration::from_secs(10), || e.starts().len() == 2), "{:?}", e.starts());
@@ -210,7 +210,7 @@ fn refuses_to_run_an_unsigned_or_untrusted_current_version() {
     e.layout.set_current("1.0.0").unwrap();
     // Run with a different trusted key: the signature is by an unknown key.
     let other = test_key();
-    let mut l = KillOnDrop(Command::new(e.root.join("ZeroFarm.exe")).env(TEST_KEYS_ENV, &other.pubkey).spawn().unwrap());
+    let mut l = KillOnDrop(Command::new(e.root.join(zerofarm_common::layout::LAUNCHER_EXE)).env(TEST_KEYS_ENV, &other.pubkey).spawn().unwrap());
     assert_eq!(exits(&mut l, Duration::from_secs(10)), Some(2));
     assert!(e.starts().is_empty());
     assert!(e.launcher_log().contains("unknown key"), "{}", e.launcher_log());
@@ -223,13 +223,14 @@ fn deletes_leftover_launcher_files_at_start() {
 wait-stop
 ");
     e.layout.set_current("1.0.0").unwrap();
-    let leftovers = ["ZeroFarm.old-1794300000.exe", "ZeroFarm.bad-7.exe", "ZeroFarm.new.exe"];
-    for n in leftovers.iter().chain(&["ZeroFarmSetup.exe"]) {
+    let x = std::env::consts::EXE_SUFFIX;
+    let leftovers = [format!("ZeroFarm.old-1794300000{x}"), format!("ZeroFarm.bad-7{x}"), format!("ZeroFarm.new{x}")];
+    for n in leftovers.iter().chain(&["ZeroFarmSetup.exe".to_string()]) {
         std::fs::write(e.root.join(n), "x").unwrap();
     }
     let mut l = e.launch();
     assert!(wait_until(Duration::from_secs(10), || e.starts().len() == 1));
-    for n in leftovers {
+    for n in &leftovers {
         assert!(!e.root.join(n).exists(), "{n} should be gone");
     }
     assert!(e.root.join("ZeroFarmSetup.exe").exists(), "only leftovers are deleted");
@@ -244,7 +245,7 @@ fn selftest_checks_keys_and_the_current_version() {
 wait-stop
 ");
     e.layout.set_current("1.0.0").unwrap();
-    let run = |pubkey: &str| Command::new(e.root.join("ZeroFarm.exe")).arg("selftest").env(TEST_KEYS_ENV, pubkey).output().unwrap();
+    let run = |pubkey: &str| Command::new(e.root.join(zerofarm_common::layout::LAUNCHER_EXE)).arg("selftest").env(TEST_KEYS_ENV, pubkey).output().unwrap();
     let ok = run(&e.key.pubkey);
     assert_eq!(ok.status.code(), Some(0));
     assert_eq!(String::from_utf8_lossy(&ok.stdout).trim(), format!("ok {}", env!("CARGO_PKG_VERSION")));
@@ -258,6 +259,7 @@ wait-stop
 // ---- 0.2.11: the Windows session ending is not a crash ----
 
 #[test]
+#[cfg(windows)]
 fn session_end_exits_never_roll_back() {
     // STATUS_DLL_INIT_FAILED_LOGOFF three times within 10 minutes rolled a friend's 0.2.8 back to 0.2.5 (2026-11-13)
     let e = env();
@@ -283,7 +285,7 @@ fn no_new_start_while_the_session_is_ending() {
     e.version("1.0.0", "healthy\ncrash\n");
     e.layout.set_current("1.0.0").unwrap();
     let _l = KillOnDrop(
-        Command::new(e.root.join("ZeroFarm.exe"))
+        Command::new(e.root.join(zerofarm_common::layout::LAUNCHER_EXE))
             .env(TEST_KEYS_ENV, &e.key.pubkey)
             .env("ZEROFARM_TEST_SESSION_ENDING", "1")
             .spawn()

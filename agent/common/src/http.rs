@@ -1,5 +1,5 @@
 //! The coordinator HTTP client (ureq + rustls/ring, no OpenSSL) with PROTOCOL 1's rules:
-//! JSON bodies, bearer auth, `x-farm-agent` / `x-farm-aw` headers, error bodies
+//! JSON bodies, bearer auth, `x-farm-agent` / `x-farm-aw` / `x-farm-platform` headers, error bodies
 //! `{"error", "message"}`, and retries of 5xx / network errors / 429 with exponential backoff
 //! (1 s → 5 min, jitter) while 4xx are never retried.
 //!
@@ -189,6 +189,8 @@ impl Client {
     fn decorate<B>(&self, mut rb: ureq::RequestBuilder<B>) -> ureq::RequestBuilder<B> {
         if self.aw_header {
             rb = rb.header(headers::AGENT, &self.version).header(headers::AW, crate::AW_VERSION.to_string());
+            // rev 17 (PROTOCOL 11.1)
+            rb = rb.header(headers::PLATFORM, crate::PLATFORM);
         }
         if let Some(t) = &self.token {
             rb = rb.header("authorization", format!("Bearer {t}"));

@@ -1,22 +1,26 @@
-//! Small shared helpers: wide strings, local time, disk space, id ranges.
+//! Small shared helpers: wide strings (Windows), local time, disk space, id ranges.
 
 use serde_json::{json, Value};
 use std::path::Path;
 
+#[cfg(windows)]
 pub fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+#[cfg(windows)]
 pub fn wide_path(p: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
 }
 
+#[cfg(windows)]
 pub fn from_wide(buf: &[u16]) -> String {
     let end = buf.iter().position(|&c| c == 0).unwrap_or(buf.len());
     String::from_utf16_lossy(&buf[..end])
 }
 
+#[cfg(windows)]
 /// Local wall-clock time: (YYYY-MM-DD, seconds since local midnight).
 pub fn local_now() -> (String, u32) {
     use windows_sys::Win32::System::SystemInformation::GetLocalTime;
@@ -29,6 +33,7 @@ pub fn local_now() -> (String, u32) {
     )
 }
 
+#[cfg(windows)]
 /// Free bytes available to this user on the volume holding `path`.
 pub fn disk_free_bytes(path: &Path) -> Option<u64> {
     use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
@@ -40,6 +45,33 @@ pub fn disk_free_bytes(path: &Path) -> Option<u64> {
     let mut avail = 0u64;
     let ok = unsafe { GetDiskFreeSpaceExW(w.as_ptr(), &mut avail, std::ptr::null_mut(), std::ptr::null_mut()) };
     (ok != 0).then_some(avail)
+}
+
+/// Local wall-clock time: (YYYY-MM-DD, seconds since local midnight).
+#[cfg(unix)]
+pub fn local_now() -> (String, u32) {
+    // SAFETY: localtime_r fills the caller's struct.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    let t: libc::time_t = zerofarm_common::now_unix() as libc::time_t;
+    unsafe { libc::localtime_r(&t, &mut tm) };
+    (
+        format!("{:04}-{:02}-{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday),
+        tm.tm_hour as u32 * 3600 + tm.tm_min as u32 * 60 + tm.tm_sec as u32,
+    )
+}
+
+/// Free bytes available to this user on the volume holding `path`.
+#[cfg(unix)]
+pub fn disk_free_bytes(path: &Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut p = path.to_path_buf();
+    while !p.exists() {
+        p = p.parent()?.to_path_buf();
+    }
+    let c = std::ffi::CString::new(p.as_os_str().as_bytes()).ok()?;
+    // SAFETY: a NUL-terminated path and an out struct.
+    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+    (unsafe { libc::statvfs(c.as_ptr(), &mut st) } == 0).then(|| st.f_bavail as u64 * st.f_frsize as u64)
 }
 
 /// Half-open id ranges `[a, b)` as JSON pairs, the form used in `gids` and `unfinished`.

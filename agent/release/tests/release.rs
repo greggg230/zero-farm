@@ -1,6 +1,8 @@
 //! farm-release: keygen (DPAPI), sign (minisign-compatible), verify, publish to the mock
 //! coordinator, release-agent with prebuilt binaries (exact trusted-key sets), define (signed
 //! definitions, PROTOCOL 7). Temporary keys only.
+// The release tool runs on the Windows desktop, where the DPAPI-wrapped release key lives.
+#![cfg(windows)]
 
 use mockcoord::testkit::{bin, TEST_DATA_KEYS_ENV, TEST_KEYS_ENV};
 use mockcoord::MockCoord;

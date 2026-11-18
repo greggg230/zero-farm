@@ -24,7 +24,8 @@ fn invite_becomes_a_protected_token() {
     assert_eq!(saved.machine_id, m.machine_id);
     let token = saved.token().unwrap();
     assert!(mock.with(|s| s.machines.contains_key(&token)));
-    assert!(!std::fs::read_to_string(layout.machine_json()).unwrap().contains(&token));
+    // (Windows: DPAPI; macOS keeps it in the clear in its mode-0600 file, PROTOCOL 11.5)
+    assert_eq!(std::fs::read_to_string(layout.machine_json()).unwrap().contains(&token), cfg!(not(windows)));
     let req = mock.with(|s| s.enrolls[0].clone());
     assert_eq!(req["invite"], "ABCD-EFGH-JKM2");
     assert_eq!(req["name"], "Sam's desktop");
@@ -48,7 +49,8 @@ fn too_old_agent_gets_426_and_the_invite_survives() {
             let EnrollError::UpdateRequired { min_agent, download } = &e else { unreachable!() };
             assert_eq!(min_agent, "0.3.0");
             assert_eq!(download.as_deref(), Some(format!("{}/download", mock.url).as_str()));
-            assert!(e.to_string().contains(&format!("ZeroFarmSetup.exe from {}/download", mock.url)), "{e}");
+            let link = if cfg!(windows) { format!("ZeroFarmSetup.exe from {}/download", mock.url) } else { format!("latest one from {}/download", mock.url) };
+            assert!(e.to_string().contains(&link), "{e}");
         }
         other => panic!("{other:?}"),
     }

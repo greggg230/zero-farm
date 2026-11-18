@@ -7,11 +7,20 @@ pub mod availability;
 pub mod cache;
 pub mod engine;
 pub mod enroll;
+#[cfg(target_os = "macos")]
+pub mod headless;
+#[cfg(windows)]
+pub mod install;
+/// macOS (PROTOCOL 11.5): the LaunchAgent instead of the Run key, shortcut and Uninstall entry.
+#[cfg(target_os = "macos")]
+#[path = "install_macos.rs"]
 pub mod install;
 pub mod jobplan;
 pub mod launcher_update;
 pub mod lease;
 pub mod logging;
+#[cfg(target_os = "macos")]
+pub mod macos;
 pub mod policy;
 pub mod probe;
 pub mod profile;
@@ -21,6 +30,7 @@ pub mod settings;
 pub mod signals;
 pub mod startfail;
 pub mod status;
+#[cfg(windows)]
 pub mod tray;
 pub mod update;
 pub mod util;

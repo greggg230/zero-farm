@@ -39,6 +39,7 @@ fn send_diagnostics_uploads_the_logs_once_an_hour() {
 }
 
 /// True when `s` still carries this Windows user's profile path or user name.
+#[cfg(windows)]
 fn leaks(s: &str) -> bool {
     let low = s.to_lowercase();
     let profile = std::env::var("USERPROFILE").unwrap_or_default().to_lowercase();
@@ -46,7 +47,44 @@ fn leaks(s: &str) -> bool {
     (!profile.is_empty() && low.contains(&profile)) || (user.chars().count() >= 3 && low.contains(&user))
 }
 
+/// macOS: the home folder and `$USER` (PROTOCOL 11.5) leave no log line, upload or crash report either.
 #[test]
+#[cfg(unix)]
+fn logs_and_crash_reports_leave_without_the_home_folder_or_user_name() {
+    let home = std::env::var("HOME").expect("HOME");
+    let user = std::env::var("USER").unwrap_or_default();
+    let leaks = |s: &str| s.contains(&home) || (user.chars().count() >= 3 && s.contains(&user));
+    let root = format!("{home}/Library/Application Support/ZeroFarm");
+    let d = tempfile::tempdir().unwrap();
+    let layout = Layout::new(d.path());
+    std::fs::create_dir_all(layout.logs()).unwrap();
+    let log = zerofarm_common::rotlog::RotatingFile::new(layout.logs().join("agent.log"), 1 << 20, 1);
+    log.write_line(&format!("farm-agent 0.3.0 starting, root {root}, user {user}"));
+    let written = std::fs::read_to_string(layout.logs().join("agent.log")).unwrap();
+    assert!(written.contains("root %USERPROFILE%/Library/Application Support/ZeroFarm"), "{written}");
+    assert!(!leaks(&written), "{written}");
+    let body = String::from_utf8(logs_body(&layout, &format!("status: downloading to {root}"))).unwrap();
+    assert!(!leaks(&body), "{body}");
+    let mock = MockCoord::start();
+    let token = mock.add_machine("m_DIAG00000000000000000000003");
+    let client = Client::new(&mock.url, Some(token), "0.3.0").unwrap();
+    let crash = zerofarm_common::protocol::CrashReq {
+        kind: "crash".into(),
+        message: format!("worker fatal error: {root}/cache/ckpt/r/1/model.onnx has sha256 00"),
+        backtrace: Some(format!("fakeworker: job {{\"model\":{:?}}}", format!("{root}/cache/m.onnx"))),
+        ..Default::default()
+    };
+    farm_agent::engine::send_crash(&client, &crash).unwrap();
+    let sent = mock.with(|s| s.crashes[0].clone());
+    assert!(!leaks(&sent.to_string()), "{sent}");
+    let mut st = zerofarm_common::protocol::Stats::new();
+    st.insert("error".into(), serde_json::json!(format!("setup failed: {root}/work: denied ({user})")));
+    let st = serde_json::Value::Object(farm_agent::lease::redacted(st));
+    assert!(!leaks(&st.to_string()), "{st}");
+}
+
+#[test]
+#[cfg(windows)]
 fn logs_crash_reports_and_stats_leave_without_the_user_name_or_profile_path() {
     // Security review M5: the install path (and so the Windows user name) was in every upload.
     let profile = std::env::var("USERPROFILE").expect("USERPROFILE");

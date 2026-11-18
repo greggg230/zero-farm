@@ -26,9 +26,20 @@ pub fn target_dir() -> PathBuf {
     }
 }
 
+/// The fake worker's file name in a signed build (`fakeworker.exe`; on macOS `fakeworker`).
+pub const FAKEWORKER: &str = if cfg!(windows) { "fakeworker.exe" } else { "fakeworker" };
+
+/// What a test build's manifest says about its platform (PROTOCOL 11.3): nothing on Windows (= windows-x64, as
+/// before), else this platform (without `farm-release`'s `min_agent` rule, so test agents keep their versions).
+pub fn platform_fields(t: &mut zerofarm_common::manifest::Manifest) {
+    if !cfg!(windows) {
+        t.platform = Some(zerofarm_common::PLATFORM.into());
+    }
+}
+
 /// A binary built by this workspace (e.g. `fakeworker`). `cargo test --workspace` builds them all.
 pub fn bin(name: &str) -> PathBuf {
-    let p = target_dir().join(format!("{name}.exe"));
+    let p = target_dir().join(format!("{name}{}", std::env::consts::EXE_SUFFIX));
     assert!(
         p.exists(),
         "{} not found: run `cargo test --workspace` (or `cargo build --workspace`) so the test binaries exist",
@@ -51,7 +62,7 @@ pub fn test_key() -> TestKey {
 /// Copies `files` (destination name, source path) into `dir` and signs it as a worker build.
 pub fn make_worker_build(dir: &Path, key: &SigningKey, worker_exe: &Path, extra: &[(&str, &[u8])]) -> String {
     std::fs::create_dir_all(dir).unwrap();
-    std::fs::copy(worker_exe, dir.join("fakeworker.exe")).unwrap();
+    std::fs::copy(worker_exe, dir.join(FAKEWORKER)).unwrap();
     for (name, bytes) in extra {
         std::fs::write(dir.join(name), bytes).unwrap();
     }
@@ -60,11 +71,12 @@ pub fn make_worker_build(dir: &Path, key: &SigningKey, worker_exe: &Path, extra:
     t.aw = Some(1);
     t.zero_onnx = Some(vec![1]);
     t.profile = Some("release".into());
-    t.entry = Some("fakeworker.exe".into());
+    t.entry = Some(FAKEWORKER.into());
+    platform_fields(&mut t);
     sign_dir(dir, t, key).unwrap().0
 }
 
-/// Creates `versions\<v>\` in `layout` holding `farm-agent.exe` (a copy of `exe`) plus `extra`
+/// Creates `versions/<v>/` in `layout` holding `farm-agent` (a copy of `exe`) plus `extra`
 /// files, signed as an agent manifest for version `v`. Returns the build id.
 pub fn make_agent_version(layout: &Layout, v: &str, exe: &Path, extra: &[(&str, &[u8])], key: &SigningKey) -> String {
     let dir = layout.version_dir(v);
@@ -73,21 +85,29 @@ pub fn make_agent_version(layout: &Layout, v: &str, exe: &Path, extra: &[(&str, 
 
 pub fn make_agent_package(dir: &Path, v: &str, exe: &Path, extra: &[(&str, &[u8])], key: &SigningKey) -> String {
     std::fs::create_dir_all(dir).unwrap();
-    std::fs::copy(exe, dir.join("farm-agent.exe")).unwrap();
+    std::fs::copy(exe, dir.join(zerofarm_common::layout::AGENT_EXE)).unwrap();
     for (name, bytes) in extra {
         std::fs::write(dir.join(name), bytes).unwrap();
     }
     let mut t = template(Kind::Agent, v);
-    t.entry = Some("farm-agent.exe".into());
+    t.entry = Some(zerofarm_common::layout::AGENT_EXE.into());
+    platform_fields(&mut t);
     sign_dir(dir, t, key).unwrap().0
 }
 
-/// A copy of a built launcher whose VERSIONINFO says `version` (an "older" launcher for
+/// A copy of a built launcher whose VERSIONINFO (macOS: version marker) says `version` (an "older" launcher for
 /// launcher-update tests). Returns its sha256.
 pub fn launcher_copy(src: &Path, dest: &Path, version: (u16, u16, u16)) -> String {
     let mut b = std::fs::read(src).unwrap();
-    assert!(zerofarm_common::winres::patch_fixed_file_version(&mut b, version), "{} has no VERSIONINFO", src.display());
+    assert!(zerofarm_common::binver::patch_version(&mut b, version), "{} has no VERSIONINFO / version marker", src.display());
     std::fs::write(dest, &b).unwrap();
+    zerofarm_common::fsutil::set_mode(dest, 0o755);
+    // macOS on Apple silicon runs only validly signed code: the patched bytes need a new ad-hoc signature
+    if cfg!(target_os = "macos") {
+        let st = std::process::Command::new("/usr/bin/codesign").args(["--force", "--sign", "-"]).arg(dest).output().unwrap();
+        assert!(st.status.success(), "codesign: {}", String::from_utf8_lossy(&st.stderr));
+        return zerofarm_common::hash::sha256_hex(&std::fs::read(dest).unwrap());
+    }
     zerofarm_common::hash::sha256_hex(&b)
 }
 

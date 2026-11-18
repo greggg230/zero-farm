@@ -1,6 +1,8 @@
 //! 0.2.11 with the real engine and the mock coordinator: a probe the PC never finished (its marker found at start)
 //! is reported and holds its pack; the coordinator's evict list (rev 12) empties cache entries at start, before any
 //! probe; an AMD-only PC is a CPU-only PC to everyone.
+// GPU probes: Windows only (no GPU work on macOS in rev 17)
+#![cfg(windows)]
 
 mod harness;
 

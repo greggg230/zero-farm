@@ -65,7 +65,7 @@ fn eval_lease_with_two_networks_runs_and_uploads_every_game() {
         let m = &models[g];
         assert_eq!(m["sha256"], c["sha256"]);
         let model = std::path::Path::new(m["model"].as_str().unwrap());
-        assert!(model.is_absolute() && model.ends_with(format!("{RUN}\\{g}\\model.onnx")), "{m}");
+        assert!(model.is_absolute() && model.ends_with(std::path::Path::new(RUN).join(g).join("model.onnx")), "{m}");
         assert!(m["reference"].as_str().unwrap().ends_with("reference.npz"), "{m}");
     }
     assert_eq!(job["seats"], json!([{"net": 80}, {"net": 70}]));

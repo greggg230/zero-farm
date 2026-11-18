@@ -325,6 +325,9 @@ impl Engine {
     fn startup(&mut self) {
         log::info!("engine start: agent {} coordinator {}", self.cfg.version, self.cfg.coordinator);
         crate::update::cleanup_versions(&self.cfg.layout, &self.cfg.version);
+        // macOS (PROTOCOL 11.5): no job object ends a dead agent's worker group (a stopped one can't see its stdin close)
+        #[cfg(unix)]
+        crate::worker::kill_orphans(&self.cfg.layout.work());
         let _ = zerofarm_common::fsutil::remove_dir_all_retry(&self.cfg.layout.work(), Duration::from_secs(5));
         let _ = std::fs::create_dir_all(self.cfg.layout.work());
         self.note_unfinished_probe();

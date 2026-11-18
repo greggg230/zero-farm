@@ -13,10 +13,20 @@
 
 use crate::fsutil::{atomic_write, read_trimmed, remove_file_quiet};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
+/// Executables' file name extension: `.exe` on Windows, none on macOS (PROTOCOL 11.3).
+pub const EXE_SUFFIX: &str = std::env::consts::EXE_SUFFIX;
+#[cfg(windows)]
 pub const AGENT_EXE: &str = "farm-agent.exe";
+#[cfg(windows)]
 pub const LAUNCHER_EXE: &str = "ZeroFarm.exe";
+#[cfg(not(windows))]
+pub const AGENT_EXE: &str = "farm-agent";
+#[cfg(not(windows))]
+pub const LAUNCHER_EXE: &str = "ZeroFarm";
+/// rev 17 (PROTOCOL 11.5): the macOS LaunchAgent's label (`~/Library/LaunchAgents/<label>.plist`).
+pub const LAUNCH_AGENT_LABEL: &str = "com.zerofarm.agent";
 
 /// Version labels are used as directory and file names: `[0-9A-Za-z.+-]{1,64}`, no `..`.
 pub fn is_version_label(v: &str) -> bool {
@@ -51,12 +61,18 @@ pub struct LauncherSwap {
 /// Leftovers of a launcher replacement, deleted at the next launcher start:
 /// `ZeroFarm.old-<n>.exe` (the replaced launcher), `ZeroFarm.bad-<n>.exe` (a new launcher that
 /// was rolled back) and, with `staged`, `ZeroFarm.new.exe` (an agent's staging copy).
+/// (Without `.exe` on macOS.)
 pub fn is_launcher_leftover(name: &str, staged: bool) -> bool {
     let n = name.to_ascii_lowercase();
     let numbered = |prefix: &str| {
-        n.strip_prefix(prefix).and_then(|r| r.strip_suffix(".exe")).is_some_and(|k| !k.is_empty() && k.bytes().all(|c| c.is_ascii_digit()))
+        n.strip_prefix(prefix).and_then(|r| r.strip_suffix(EXE_SUFFIX)).is_some_and(|k| !k.is_empty() && k.bytes().all(|c| c.is_ascii_digit()))
     };
-    numbered("zerofarm.old-") || numbered("zerofarm.bad-") || (staged && n == "zerofarm.new.exe")
+    numbered("zerofarm.old-") || numbered("zerofarm.bad-") || (staged && n == format!("zerofarm.new{EXE_SUFFIX}"))
+}
+
+/// The name a replaced launcher gets (`ZeroFarm.old-<n>.exe`, `ZeroFarm.old-<n>` on macOS); `kind`: `old` or `bad`.
+pub fn launcher_leftover_name(kind: &str, n: i64) -> String {
+    format!("ZeroFarm.{kind}-{n}{EXE_SUFFIX}")
 }
 
 /// Something the launcher wants the next agent to report (`/v1/crash` kind `agent`).
@@ -219,12 +235,19 @@ impl Layout {
     }
 }
 
+#[cfg(windows)]
 /// The default install root: `%LOCALAPPDATA%\ZeroFarm`.
 pub fn default_root() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(|| {
-        std::env::var_os("USERPROFILE").map(|p| Path::new(&p).join("AppData").join("Local")).unwrap_or_default()
+        std::env::var_os("USERPROFILE").map(|p| std::path::Path::new(&p).join("AppData").join("Local")).unwrap_or_default()
     });
     base.join("ZeroFarm")
+}
+
+/// The default install root on macOS (PROTOCOL 11.5): `~/Library/Application Support/ZeroFarm`.
+#[cfg(not(windows))]
+pub fn default_root() -> PathBuf {
+    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default().join("Library").join("Application Support").join("ZeroFarm")
 }
 
 #[cfg(test)]
@@ -242,6 +265,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(windows)]
     fn launcher_leftovers() {
         assert!(is_launcher_leftover("ZeroFarm.old-1794300000.exe", false));
         assert!(is_launcher_leftover("zerofarm.BAD-7.exe", false));
@@ -251,6 +275,18 @@ mod tests {
         assert!(!is_launcher_leftover("ZeroFarm.old-.exe", true));
         assert!(!is_launcher_leftover("ZeroFarm.old-1x.exe", true));
         assert!(!is_launcher_leftover("ZeroFarmSetup.exe", true));
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn launcher_leftovers_without_exe() {
+        assert!(is_launcher_leftover("ZeroFarm.old-1794300000", false));
+        assert!(is_launcher_leftover(&launcher_leftover_name("bad", 7), false));
+        assert!(!is_launcher_leftover("ZeroFarm.new", false));
+        assert!(is_launcher_leftover("ZeroFarm.new", true));
+        assert!(!is_launcher_leftover("ZeroFarm", true));
+        assert!(!is_launcher_leftover("ZeroFarm.old-1794300000.exe", true));
+        assert_eq!((AGENT_EXE, LAUNCHER_EXE), ("farm-agent", "ZeroFarm"));
     }
 
     #[test]

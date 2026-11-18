@@ -47,8 +47,15 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
+/// macOS: no job objects.
+#[cfg(not(windows))]
+fn ui_limits() -> String {
+    "none".into()
+}
+
 /// The UI restrictions of the job this process runs in (`none` outside a job): tests check the
 /// agent's worker job.
+#[cfg(windows)]
 fn ui_limits() -> String {
     use windows_sys::Win32::System::JobObjects::{JobObjectBasicUIRestrictions, QueryInformationJobObject, JOBOBJECT_BASIC_UI_RESTRICTIONS};
     let mut info = JOBOBJECT_BASIC_UI_RESTRICTIONS { UIRestrictionsClass: 0 };
@@ -238,7 +245,21 @@ struct Mem {
 }
 
 impl Mem {
+    /// macOS: allocates `mb` more MB and writes every page (what the physical footprint counts, and so the agent's
+    /// memory cap). The agent kills a worker past its cap: nothing fails here.
+    #[cfg(not(windows))]
+    fn commit(&mut self, mb: u64, _out: &Out, _abort: bool) {
+        for _ in 0..mb {
+            let mut v = vec![0u8; 1 << 20];
+            for i in (0..v.len()).step_by(4096) {
+                v[i] = 1;
+            }
+            self.pieces.push(Box::leak(v.into_boxed_slice()).as_ptr() as usize);
+        }
+    }
+
     /// Commits `mb` more MB, or ends the worker the way a real one out of memory ends (`Cfg::oom_abort`).
+    #[cfg(windows)]
     fn commit(&mut self, mb: u64, out: &Out, abort: bool) {
         use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE};
         for _ in 0..mb {

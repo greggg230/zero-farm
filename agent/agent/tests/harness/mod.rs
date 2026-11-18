@@ -64,6 +64,7 @@ pub fn fake_profile() -> Profile {
         idle_h_day: None,
         on_h_day: None,
         gpus_off: vec![],
+        platform: Some(zerofarm_common::PLATFORM.into()),
     }
 }
 
@@ -263,7 +264,7 @@ pub fn wait(f: impl FnMut() -> bool) -> bool {
 
 /// Undoes the logs' `%USERPROFILE%` redaction in a JSON text (paths are JSON-escaped there).
 pub fn unredact(text: &str) -> String {
-    match std::env::var("USERPROFILE") {
+    match std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }) {
         Ok(p) => text.replace(zerofarm_common::redact::PROFILE, &p.replace('\\', "\\\\")),
         Err(_) => text.to_string(),
     }

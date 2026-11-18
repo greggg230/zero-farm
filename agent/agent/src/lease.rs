@@ -227,7 +227,10 @@ impl Engine {
             self.uploader.set_active(None);
             return LeaseEnd::Failed(e.to_string());
         }
+        // (macOS: a working Mac on AC power doesn't idle-sleep, `keep_awake`; nothing elsewhere)
+        self.signals.lease_active(true);
         let end = self.lease_inner(&lease);
+        self.signals.lease_active(false);
         if end == LeaseEnd::Cancelled {
             self.results.discard(&id);
         }

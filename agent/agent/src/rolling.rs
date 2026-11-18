@@ -47,6 +47,48 @@ pub struct MemCost {
 
 /// A CPU job's cost until this PC measured the run's own (`Learned`).
 pub const CPU_COST: MemCost = MemCost { base_mb: 600, per_game_mb: 45 };
+
+/// macOS (rev 17, PROTOCOL 11.5): "auto" on the CPU is this many games in flight per physical core (all of them,
+/// performance and efficiency: the threads are one per physical core, `settings.rs`) ...
+pub const MACOS_CPU_INFLIGHT_PER_CORE: u64 = 144;
+/// ... in groups (batches in turn) of this many games. From the Mac's own self-play over SSH on 2026-11-18 (the live
+/// run, the whole M4 Max: 3 processes of 768 games in flight in 4 groups of 192, ~3.9k games an hour): 16 cores give
+/// 2,304 games in flight in 12 groups of 192, the same games in flight and batch. Windows' 32 would leave most of a
+/// Mac's cores waiting for batches.
+pub const MACOS_CPU_BATCH: u64 = 192;
+/// macOS: a CPU job's cost until this Mac measured the run's own, in physical footprint (what the memory cap counts
+/// there, `worker_unix.rs`): the same self-play's processes used 2.03-2.08 GB each with 768 games in flight, about
+/// 2.7 MB per game with the process itself; planned with a 1 GB base and 4 MB per game. With the default memory cap
+/// of half the RAM (32 GB on a 64 GB Mac) that is room for 6,688 games in flight, more than a run may set (4,096).
+pub const MACOS_CPU_COST: MemCost = MemCost { base_mb: 1024, per_game_mb: 4 };
+
+/// "auto" on the CPU, (games in flight, groups): `CPU_INFLIGHT` in `CPU_GROUPS`; on macOS `MACOS_CPU_INFLIGHT_PER_CORE`
+/// per physical core (rounded as `round_games`) in groups of `MACOS_CPU_BATCH`.
+pub fn cpu_auto() -> (u64, u64) {
+    #[cfg(target_os = "macos")]
+    {
+        mac_cpu_auto(crate::profile::cores().0 as u64)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        (CPU_INFLIGHT, CPU_GROUPS)
+    }
+}
+
+/// macOS "auto" on the CPU for `cores` physical cores.
+pub fn mac_cpu_auto(cores: u64) -> (u64, u64) {
+    let conc = round_games(MACOS_CPU_INFLIGHT_PER_CORE * cores.max(1));
+    (conc, (conc / MACOS_CPU_BATCH).max(1))
+}
+
+/// A CPU job's cost until this PC measured the run's own: `CPU_COST`, on macOS `MACOS_CPU_COST`.
+pub fn cpu_cost() -> MemCost {
+    if cfg!(target_os = "macos") {
+        MACOS_CPU_COST
+    } else {
+        CPU_COST
+    }
+}
 /// A GPU job's cost until this PC measured the run's own: the GPU runtime commits more before any game.
 pub const GPU_COST: MemCost = MemCost { base_mb: 1800, per_game_mb: 45 };
 /// The games in flight are planned to commit at most this share of the memory cap (the job's limit): the rest is
@@ -187,7 +229,7 @@ impl Learned {
     /// What a job of `run` is planned with: the default's cost with the larger of its and the measured per-game
     /// cost, and whether there was a measurement.
     pub fn plan(layout: &Layout, run: &str, gpu: bool, ram_mb: u64) -> MemPlan {
-        let d = if gpu { GPU_COST } else { CPU_COST };
+        let d = if gpu { GPU_COST } else { cpu_cost() };
         let m = Self::get(layout, run, gpu);
         MemPlan { ram_mb, cost: MemCost { per_game_mb: d.per_game_mb.max(m.unwrap_or(0)), ..d }, measured: m.is_some() }
     }
@@ -239,7 +281,7 @@ pub fn gpu_groups(conc: u64) -> u64 {
 }
 
 /// A CPU job's (conc, groups): the run's number (in the template's groups, at most one per game), or "auto":
-/// `CPU_INFLIGHT` games in `CPU_GROUPS` groups; capped by memory (`MemPlan::cap`).
+/// `cpu_auto()` (`CPU_INFLIGHT` games in `CPU_GROUPS` groups; more on macOS); capped by memory (`MemPlan::cap`).
 pub fn cpu_shape(setting: Inflight, template_groups: u64, mem: MemPlan) -> (u64, u64) {
     match setting {
         Inflight::N(n) => {
@@ -247,8 +289,9 @@ pub fn cpu_shape(setting: Inflight, template_groups: u64, mem: MemPlan) -> (u64,
             (n, template_groups.clamp(1, n))
         }
         Inflight::Auto => {
-            let conc = mem.cap(CPU_INFLIGHT, true);
-            (conc, CPU_GROUPS.min(conc))
+            let (inflight, groups) = cpu_auto();
+            let conc = mem.cap(inflight, true);
+            (conc, groups.min(conc))
         }
     }
 }
@@ -302,7 +345,7 @@ mod tests {
     }
 
     fn auto_cpu(ram_mb: u64) -> MemPlan {
-        MemPlan { ram_mb, cost: CPU_COST, measured: false }
+        MemPlan { ram_mb, cost: cpu_cost(), measured: false }
     }
 
     fn auto_gpu(ram_mb: u64) -> MemPlan {
@@ -365,11 +408,31 @@ mod tests {
         assert_eq!((p.cost.per_game_mb, p.cost.base_mb, p.measured), (75, GPU_COST.base_mb, true));
         // measured below the default: the default is planned with (a run's number is capped by it, measured)
         let p = Learned::plan(&layout, "r", false, 10_000);
-        assert_eq!((p.cost.per_game_mb, p.measured), (CPU_COST.per_game_mb, true));
+        assert_eq!((p.cost.per_game_mb, p.measured), (cpu_cost().per_game_mb.max(20), true));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
+    fn mac_cpu_auto_fills_the_cores_and_fits_memory() {
+        assert_eq!(mac_cpu_auto(16), (2304, 12), "M4 Max: the SSH self-play's 3 x 768 in batches of 192");
+        assert_eq!(mac_cpu_auto(8), (1152, 6));
+        assert_eq!(mac_cpu_auto(10), (1440, 7));
+        assert_eq!(mac_cpu_auto(0), (128, 1));
+        let mac = |ram_mb| MemPlan { ram_mb, cost: MACOS_CPU_COST, measured: false };
+        // 64 GB Mac, default cap (half): room for more than any run's number
+        assert_eq!(ram_cap(32_768, MACOS_CPU_COST), 6688);
+        assert!(mac(32_768).cap(2304, true) == 2304 && mac(32_768).cap(4096, true) == 4096);
+        // 16 GB Mac: 8 GB cap
+        assert_eq!(mac(8192).cap(2304, true), 1472);
+        if cfg!(target_os = "macos") {
+            let (n, g) = cpu_auto();
+            assert_eq!(cpu_shape(Inflight::Auto, 1, auto_cpu(32_768)), (n, g));
+            assert_eq!(cpu_shape(Inflight::Auto, 1, auto_cpu(100)), (1, 1), "never 0");
+        }
+    }
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
     fn cpu_auto_is_32_in_four_groups_within_memory() {
         assert_eq!(cpu_shape(Inflight::Auto, 1, auto_cpu(16_000)), (32, 4));
         assert_eq!(cpu_shape(Inflight::Auto, 1, plan(2000, 0, 75, false)), (22, 4), "the memory cap: 1,700 / 75");

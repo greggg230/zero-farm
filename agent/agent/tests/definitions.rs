@@ -97,7 +97,7 @@ fn the_job_line_comes_from_the_signed_template_only() {
     // rev 7 (PROTOCOL 8): the agent's own providers (no probe here: the CPU), never the coordinator's
     assert_eq!((j["providers"].clone(), j["gpu"].clone()), (json!(["cpu"]), Value::Null), "{j}");
     let model = std::path::PathBuf::from(j["model"].as_str().unwrap());
-    assert!(model.is_absolute() && model.ends_with(format!("{RUN}\\1\\model.onnx")), "{j}");
+    assert!(model.is_absolute() && model.ends_with(std::path::Path::new(RUN).join("1").join("model.onnx")), "{j}");
 
     assert_eq!(h.mock.count("GET", &format!("/v1/artifact/ckpt/{RUN}/2/")), 0, "network 2 is not in the definition");
     assert_eq!(h.mock.count("GET", &format!("/v1/artifact/{}", dref["key"].as_str().unwrap())), 2, "the definition and its signature, once each");

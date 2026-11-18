@@ -98,7 +98,8 @@ pub const PLATFORM_WINDOWS_X64: &str = "windows-x64";
 pub const PLATFORM_MACOS_ARM64: &str = "macos-arm64";
 /// Every platform `farm-release sign --platform` takes.
 pub const PLATFORMS: [&str; 2] = [PLATFORM_WINDOWS_X64, PLATFORM_MACOS_ARM64];
-/// The first agent that knows platforms (PROTOCOL 11): a manifest that names one needs `min_agent` this or newer.
+/// The first agent that knows platforms (PROTOCOL 11): `farm-release sign` gives a manifest that names one a
+/// `min_agent` of this or newer.
 pub const PLATFORM_MIN_AGENT: &str = "0.3.0";
 
 /// A well-formed platform name (`[a-z0-9-]{1,32}`). An agent refuses a build of a platform it doesn't know as one of
@@ -317,12 +318,11 @@ impl Manifest {
                 return inv(&format!("a runtime manifest with gpu needs min_agent {ZST_MIN_AGENT} or newer"));
             }
         }
+        // (a platform's `min_agent` 0.3.0 rule is `farm-release sign`'s: it keeps such builds from older agents, which
+        // never run this check; an agent from 0.3.0 knows platforms whatever the build's `min_agent`)
         if let Some(p) = &self.platform {
             if !is_platform_name(p) {
                 return inv(&format!("platform {p:?} must be a platform name (e.g. {PLATFORM_MACOS_ARM64})"));
-            }
-            if !self.min_agent.as_deref().is_some_and(|m| semver_at_least(m, PLATFORM_MIN_AGENT)) {
-                return inv(&format!("a manifest with a platform needs min_agent {PLATFORM_MIN_AGENT} or newer"));
             }
         }
         match self.kind {
@@ -615,7 +615,7 @@ mod tests {
     }
 
     #[test]
-    fn platform_needs_agent_0_3_0() {
+    fn platform_names() {
         let f = FileEntry { path: "mtgz-worker".into(), sha256: "0".repeat(64), size: 1, zst: None };
         let mut m = Manifest {
             manifest: 1,
@@ -638,11 +638,7 @@ mod tests {
         assert!(m.validate().is_ok());
         assert_eq!(m.platform_name(), PLATFORM_WINDOWS_X64, "absent = windows-x64");
         m.platform = Some(PLATFORM_MACOS_ARM64.into());
-        assert!(m.validate().unwrap_err().to_string().contains("min_agent 0.3.0"));
-        m.min_agent = None;
-        assert!(m.validate().is_err());
-        m.min_agent = Some("0.3.0".into());
-        assert!(m.validate().is_ok());
+        assert!(m.validate().is_ok(), "the min_agent rule is farm-release's");
         assert_eq!(m.platform_name(), PLATFORM_MACOS_ARM64);
         // A platform this agent doesn't know is well formed (refused later as another platform's build) ...
         m.platform = Some("linux-x64".into());
