@@ -14,6 +14,9 @@ version is a GitHub Release tagged `agent-v<version>`.
   other work for the PC, when its instructions change, or when a Zero Farm update is ready, so updates still happen.
 - How many games run at once: 32 on the processor; on a graphics card, as many as still make it noticeably faster
   (measured on the card), never more than fit the memory Zero Farm may use.
+- **One job whose results the farm keeps refusing no longer holds up the others.** Before, Zero Farm sent results
+  one job at a time and stopped at the first that failed, so a single stuck job could keep every later job's
+  results from reaching the farm until they were too old to use. Each job now retries on its own schedule.
 
 ## 0.2.12 (2026-11-15, canary)
 
