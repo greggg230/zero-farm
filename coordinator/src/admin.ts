@@ -35,11 +35,14 @@ import {
   GPU_MODES,
   GPU_VENDORS_OFF,
   MAX_ALTERNATES,
+  MAX_EVAL_GAMES_PER_THREAD,
+  MAX_EVAL_HORIZON_S,
   MAX_EVICT,
   type Routing,
   VENDOR_RE,
   altPlatform,
   gpuNeedOf,
+  hwRoutingOf,
   requiresRuntimeOf,
   routingOf,
 } from "./routing";
@@ -919,6 +922,29 @@ export async function evict(c: Ctx): Promise<Response> {
 export async function getEvict(c: Ctx): Promise<Response> {
   await authAdmin(c);
   return json({ builds: await evictList(c.env.DB) });
+}
+
+// ---------- rev 18: hardware routing (PROTOCOL 12) ----------
+
+// The owner's switch and knobs. A POST names any of the fields; the others keep their stored (or default) values.
+export async function routing(c: Ctx): Promise<Response> {
+  await authAdmin(c);
+  const b = await readJson(c.req);
+  for (const k of Object.keys(b)) if (!["on", "eval_horizon_s", "eval_games_per_thread"].includes(k)) throw bad(`${k}: unknown field`);
+  const cur = hwRoutingOf((await c.env.DB.prepare(`SELECT value FROM settings WHERE key = 'hw_routing'`).first<{ value: string }>())?.value ?? null);
+  const next = {
+    on: bool(b.on, "on", { optional: true }) ?? cur.on,
+    eval_horizon_s: int(b.eval_horizon_s, "eval_horizon_s", { optional: true, min: 0, max: MAX_EVAL_HORIZON_S }) ?? cur.eval_horizon_s,
+    eval_games_per_thread: num(b.eval_games_per_thread, "eval_games_per_thread", { optional: true, min: 0, max: MAX_EVAL_GAMES_PER_THREAD }) ?? cur.eval_games_per_thread,
+  };
+  await c.env.DB.prepare(`INSERT OR REPLACE INTO settings (key, value) VALUES ('hw_routing', ?)`).bind(JSON.stringify(next)).run();
+  return json({ ok: true, ...next });
+}
+
+export async function getRouting(c: Ctx): Promise<Response> {
+  await authAdmin(c);
+  const row = await c.env.DB.prepare(`SELECT value FROM settings WHERE key = 'hw_routing'`).first<{ value: string }>();
+  return json({ ...hwRoutingOf(row?.value ?? null), stored: !!row });
 }
 
 // ---------- diagnostics ----------

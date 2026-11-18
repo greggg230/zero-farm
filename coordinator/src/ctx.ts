@@ -83,6 +83,7 @@ export interface MachineRow {
   paused: number;
   revoked_at: number | null;
   platform: string; // rev 17 (PROTOCOL 11.1): fixed at enrollment; migration 0013 (rows before it: windows-x64)
+  gpu_play?: number | null; // rev 18 (migration 0014): 1 while its last offer had self-play it plays on its GPU
 }
 
 function bearer(req: Request): string | null {

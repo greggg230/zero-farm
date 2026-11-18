@@ -53,6 +53,7 @@ CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET, an Access service token)
   diag (--machine <id> | --class <text>) <sweep|profile|stability|logs> [--params JSON]
   diag-list [--machine <id>]
   stats
+  routing [JSON|-]                                 hardware routing (rev 18): show, or set {on, eval_horizon_s, eval_games_per_thread}
   external <report.json|->                         a reporter's numbers for own machines (admin page only)
 `;
 
@@ -320,6 +321,11 @@ async function main(argv: string[]): Promise<void> {
       return print(await api("GET", `/v1/admin/diag${opt.machine ? `?machine_id=${encodeURIComponent(opt.machine)}` : ""}`));
     case "stats":
       return print(await api("GET", "/v1/admin/stats"));
+    case "routing":
+      // rev 18 (PROTOCOL 12): `routing` shows the hardware-routing setting; `routing '{"eval_horizon_s": 900}'` changes
+      // the fields it names (`routing -` reads the JSON from stdin)
+      if (!pos.length) return print(await api("GET", "/v1/admin/routing"));
+      return print(await api("POST", "/v1/admin/routing", pos[0] === "-" ? readConfig("-") : JSON.parse(pos[0])));
     case "external":
       need(pos, 1, "external <report.json|->");
       return print(await api("POST", "/v1/admin/external", readConfig(pos[0])));

@@ -278,6 +278,25 @@ describe("which build a machine gets (11.4)", () => {
   });
 });
 
+describe("hardware routing (rev 18) and macOS CPU alternates", () => {
+  it("a macOS CPU alternate is not a GPU version: CPU-only Windows PCs keep the self-play ahead of fuzz", async () => {
+    const p = await packs();
+    ok(await admin("PUT", "/v1/admin/run/maconly", { ...runBody(p.def, { games_per_lease: 8, quota: 100000 }), runtime: p.cpuRt, alternates: [macAlt(p)] }));
+    await publishCkpt("maconly", 1);
+    await define("run", "maconly", (d) => d.builds.push(p.mac));
+    await makeCampaign("fz");
+    const cpu = await enroll("cpu", { profile: CPU_ONLY });
+    expect((await lease(cpu)).kind).toBe("selfplay");
+  });
+
+  it("with the CUDA alternate as well, the run has a GPU version: a CPU-only Windows PC takes fuzz first", async () => {
+    await mixedRun("mixed");
+    await makeCampaign("fz");
+    const cpu = await enroll("cpu", { profile: CPU_ONLY });
+    expect((await lease(cpu)).kind).toBe("fuzz");
+  });
+});
+
 describe("run alternates per platform: PUT checks (11.4)", () => {
   it("a CPU alternate names its platform; builds and runtimes must be of it; no GPU alternates for macOS", async () => {
     const p = await packs();
