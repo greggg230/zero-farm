@@ -3,9 +3,9 @@
 //!
 //! ```text
 //! gh release view TAG --repo R --json tagName
-//! gh release create TAG FILE... --repo R --title T --notes-file F [--prerelease]
+//! gh release create TAG FILE... --repo R --title T --notes-file F [--prerelease] [--latest[=BOOL]]
 //! gh release upload TAG FILE... --repo R [--clobber]
-//! gh release edit TAG --repo R --title T --notes-file F --prerelease=BOOL
+//! gh release edit TAG --repo R --title T --notes-file F --prerelease=BOOL [--latest[=BOOL]]
 //! ```
 //!
 //! `FAKE_GH_DIR` (required): every call is appended to `calls.jsonl` (its argv), and release TAG
@@ -105,7 +105,8 @@ fn main() {
             }
             copy_assets(&dir, files, false);
             let meta = json!({"repo": repo, "title": p.value("--title"), "notes": notes(&p),
-                              "prerelease": p.get("--prerelease").is_some()});
+                              "prerelease": p.get("--prerelease").is_some(),
+                              "latest": p.get("--latest").map(|(_, v)| v.as_deref() != Some("false"))});
             std::fs::write(&meta_path, meta.to_string()).unwrap();
             println!("https://github.com/{repo}/releases/tag/{tag}");
         }
@@ -128,6 +129,9 @@ fn main() {
             }
             if let Some((_, v)) = p.get("--prerelease") {
                 meta["prerelease"] = json!(v.as_deref() != Some("false"));
+            }
+            if let Some((_, v)) = p.get("--latest") {
+                meta["latest"] = json!(v.as_deref() != Some("false"));
             }
             std::fs::write(&meta_path, meta.to_string()).unwrap();
         }

@@ -21,6 +21,8 @@ serde.workspace = true
 serde_json.workspace = true
 base64.workspace = true
 rpassword.workspace = true
+# (the macOS release tarball, PROTOCOL 11.2)
+miniz_oxide.workspace = true
 
 [dev-dependencies]
 mockcoord = { path = "../mockcoord" }

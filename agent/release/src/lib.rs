@@ -684,8 +684,24 @@ pub fn post_agent_release(
     min_agent: Option<&str>,
     github_url: Option<&str>,
 ) -> Result<(), String> {
-    let body = serde_json::json!({"version": version, "build_id": build_id, "channel": channel,
-                                  "min_agent": min_agent, "github_url": github_url});
+    post_agent_release_for(client, version, build_id, channel, min_agent, github_url, None)
+}
+
+/// [`post_agent_release`] with rev 17's `platform` (PROTOCOL 11.2; sent only when given: absent = windows-x64).
+pub fn post_agent_release_for(
+    client: &Client,
+    version: &str,
+    build_id: &str,
+    channel: &str,
+    min_agent: Option<&str>,
+    github_url: Option<&str>,
+    platform: Option<&str>,
+) -> Result<(), String> {
+    let mut body = serde_json::json!({"version": version, "build_id": build_id, "channel": channel,
+                                      "min_agent": min_agent, "github_url": github_url});
+    if let Some(p) = platform {
+        body["platform"] = serde_json::json!(p);
+    }
     with_retry(&mut Backoff::default(), Some(6), &|| false, || client.post_json::<_, serde_json::Value>("/v1/admin/agent/release", &body))
         .map_err(|e| format!("POST /v1/admin/agent/release: {e}"))?;
     Ok(())
@@ -1003,4 +1019,376 @@ pub fn build_setup(workspace: &Path, package: &Path, out: &Path) -> Result<PathB
     std::fs::copy(&built, &dest).map_err(|e| e.to_string())?;
     let _ = std::fs::remove_file(&ppath);
     Ok(dest)
+}
+
+// ---------- macOS agent releases (rev 17, PROTOCOL 11.2) ----------
+
+/// The macOS release's one download (PROTOCOL 11.2): the launcher and the signed agent package, flat.
+pub const MAC_TARBALL: &str = "ZeroFarm-macos-arm64.tar.gz";
+/// The macOS agent package's files.
+pub const MAC_AGENT: &str = "farm-agent";
+pub const MAC_LAUNCHER: &str = "ZeroFarm";
+
+/// `agent-macos-v<version>`: a macOS release's GitHub tag (`agent-v<version>` stays Windows').
+pub fn github_mac_tag(version: &str) -> String {
+    format!("agent-macos-v{version}")
+}
+
+/// What the coordinator's `github_url` of a macOS release must be exactly (PROTOCOL 11.2).
+pub fn github_mac_tarball_url(repo: &str, version: &str) -> String {
+    format!("https://github.com/{repo}/releases/download/{}/{MAC_TARBALL}", github_mac_tag(version))
+}
+
+#[derive(Debug, Clone)]
+pub struct MacReleaseOpts {
+    pub workspace: PathBuf,
+    /// The Mac-built release binaries (`farm-agent`, `ZeroFarm`; `tools/mac-agent-build.sh` copies them here).
+    pub prebuilt: PathBuf,
+    pub out: Option<PathBuf>,
+    pub channel: String,
+    /// The coordinator release's and the manifest's `min_agent` (0.3.0 or newer; default 0.3.0).
+    pub min_agent: Option<String>,
+    pub publish: Option<(String, String)>,
+    /// Tests only: accept debug binaries.
+    pub allow_test_binaries: bool,
+    pub github: Option<GithubOpts>,
+}
+
+pub struct MacReleased {
+    pub version: String,
+    pub build_id: String,
+    /// The signed package: `dist/agent-macos-<v>/`.
+    pub dir: PathBuf,
+    /// `dist/agent-macos-<v>-github/ZeroFarm-macos-arm64.tar.gz`.
+    pub tarball: PathBuf,
+    pub github: Option<GithubReleased>,
+}
+
+/// A 64-bit arm64 Mach-O executable (`MH_MAGIC_64`, `CPU_TYPE_ARM64`, `MH_EXECUTE`).
+pub fn is_macho_arm64_exe(b: &[u8]) -> bool {
+    b.len() >= 16 && b[0..4] == [0xcf, 0xfa, 0xed, 0xfe] && b[4..8] == [0x0c, 0x00, 0x00, 0x01] && b[12..16] == [0x02, 0x00, 0x00, 0x00]
+}
+
+/// The minisign public keys compiled into a binary: every `RW` + 54 base64 characters that decodes to `Ed` + key id
+/// + key (a release binary can't be run on this PC to print them, as `farm-agent keys` does on Windows).
+pub fn scan_keys(b: &[u8]) -> BTreeSet<String> {
+    use base64::Engine as _;
+    let b64 = |c: u8| c.is_ascii_alphanumeric() || c == b'+' || c == b'/';
+    let mut out = BTreeSet::new();
+    let mut i = 0;
+    while i + 56 <= b.len() {
+        if b[i] == b'R' && b[i + 1] == b'W' && b[i..i + 56].iter().all(|&c| b64(c)) {
+            if let Ok(raw) = base64::engine::general_purpose::STANDARD.decode(&b[i..i + 56]) {
+                if raw.len() == 42 && raw[0..2] == *b"Ed" {
+                    out.insert(String::from_utf8_lossy(&b[i..i + 56]).into_owned());
+                    i += 56;
+                    continue;
+                }
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn crc32(data: &[u8]) -> u32 {
+    let mut table = [0u32; 256];
+    for (n, t) in table.iter_mut().enumerate() {
+        let mut c = n as u32;
+        for _ in 0..8 {
+            c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+        }
+        *t = c;
+    }
+    let mut c = !0u32;
+    for &x in data {
+        c = table[((c ^ x as u32) & 0xff) as usize] ^ (c >> 8);
+    }
+    !c
+}
+
+/// A gzip-compressed ustar archive of flat `(name, bytes, mode)` entries, all with modification time `mtime`.
+pub fn tar_gz(entries: &[(String, Vec<u8>, u32)], mtime: i64) -> Result<Vec<u8>, String> {
+    let mut tar = Vec::new();
+    for (name, bytes, mode) in entries {
+        if name.is_empty() || name.len() > 99 || name.contains('/') || !name.is_ascii() {
+            return Err(format!("tar entry name {name:?}"));
+        }
+        let mut h = [0u8; 512];
+        h[..name.len()].copy_from_slice(name.as_bytes());
+        let mut put = |off: usize, len: usize, v: u64| {
+            let s = format!("{:0w$o}", v, w = len - 1);
+            h[off..off + len - 1].copy_from_slice(s.as_bytes());
+        };
+        put(100, 8, *mode as u64);
+        put(108, 8, 0);
+        put(116, 8, 0);
+        put(124, 12, bytes.len() as u64);
+        put(136, 12, mtime.max(0) as u64);
+        h[148..156].copy_from_slice(b"        ");
+        h[156] = b'0';
+        h[257..263].copy_from_slice(b"ustar\0");
+        h[263..265].copy_from_slice(b"00");
+        let sum: u32 = h.iter().map(|&c| c as u32).sum();
+        let s = format!("{sum:06o}\0 ");
+        h[148..156].copy_from_slice(s.as_bytes());
+        tar.extend_from_slice(&h);
+        tar.extend_from_slice(bytes);
+        tar.resize(tar.len().div_ceil(512) * 512, 0);
+    }
+    tar.resize(tar.len() + 1024, 0);
+    let mut gz = vec![0x1f, 0x8b, 8, 0];
+    gz.extend_from_slice(&(mtime.max(0) as u32).to_le_bytes());
+    gz.extend_from_slice(&[2, 3]);
+    gz.extend_from_slice(&miniz_oxide::deflate::compress_to_vec(&tar, 9));
+    gz.extend_from_slice(&crc32(&tar).to_le_bytes());
+    gz.extend_from_slice(&(tar.len() as u32).to_le_bytes());
+    Ok(gz)
+}
+
+/// The entries of a [`tar_gz`] archive: (name, bytes, mode).
+pub fn untar_gz(gz: &[u8]) -> Result<Vec<(String, Vec<u8>, u32)>, String> {
+    if gz.len() < 18 || gz[0..3] != [0x1f, 0x8b, 8] {
+        return Err("not gzip".into());
+    }
+    let tar = miniz_oxide::inflate::decompress_to_vec(&gz[10..gz.len() - 8]).map_err(|e| format!("inflate: {e:?}"))?;
+    if crc32(&tar).to_le_bytes() != gz[gz.len() - 8..gz.len() - 4] {
+        return Err("gzip crc".into());
+    }
+    let mut out = Vec::new();
+    let mut at = 0;
+    while at + 512 <= tar.len() && tar[at] != 0 {
+        let h = &tar[at..at + 512];
+        let name = String::from_utf8_lossy(&h[..100]).trim_end_matches('\0').to_string();
+        let oct = |r: std::ops::Range<usize>| u64::from_str_radix(String::from_utf8_lossy(&h[r]).trim_matches(|c: char| c == '\0' || c == ' '), 8).map_err(|e| e.to_string());
+        let (mode, size) = (oct(100..108)? as u32, oct(124..136)? as usize);
+        let data = tar.get(at + 512..at + 512 + size).ok_or("truncated tar")?.to_vec();
+        out.push((name, data, mode));
+        at += 512 + size.div_ceil(512) * 512;
+    }
+    Ok(out)
+}
+
+/// Signs prebuilt macOS binaries as an agent package for `macos-arm64` (PROTOCOL 11.2, 11.3), makes the tarball
+/// `ZeroFarm-macos-arm64.tar.gz` (the launcher and the package: `ZeroFarm`, `farm-agent`, `manifest.json` and its
+/// signature, nothing else), and optionally publishes the build, makes the GitHub Release `agent-macos-v<version>` and
+/// points the channel's macOS `latest` at it. The binaries can't run here, so what `release_agent` asks them is read
+/// from their bytes: arm64 Mach-O executables, no test-only names, the version markers (`zerofarm_common::binver`),
+/// and exactly the source tree's trusted keys.
+pub fn release_agent_macos(opts: &MacReleaseOpts, key: &SigningKey) -> Result<MacReleased, String> {
+    use zerofarm_common::manifest::{semver_at_least, PLATFORM_MACOS_ARM64};
+    check_channel(&opts.channel)?;
+    if let Some(g) = &opts.github {
+        g.check()?;
+    }
+    let min_agent = opts.min_agent.clone().unwrap_or_else(|| PLATFORM_MIN_AGENT.into());
+    if !semver_at_least(&min_agent, PLATFORM_MIN_AGENT) {
+        return Err(format!("--min-agent {min_agent}: a macOS release needs {PLATFORM_MIN_AGENT} or newer (the first Mac agent)"));
+    }
+    let read = |name: &str| -> Result<Vec<u8>, String> {
+        let p = opts.prebuilt.join(name);
+        let b = std::fs::read(&p).map_err(|e| format!("{}: {e}", p.display()))?;
+        if !is_macho_arm64_exe(&b) {
+            return Err(format!("{} is not an arm64 Mach-O executable (build it on the Mac: tools/mac-agent-build.sh)", p.display()));
+        }
+        if !opts.allow_test_binaries {
+            if let Some(m) = TEST_MARKERS.iter().find(|m| b.windows(m.len()).any(|w| w == m.as_bytes())) {
+                return Err(format!("{} is a debug build (contains {m}); release builds only", p.display()));
+            }
+        }
+        Ok(b)
+    };
+    let (agent, launcher) = (read(MAC_AGENT)?, read(MAC_LAUNCHER)?);
+    let ver = |b: &[u8], what: &str| -> Result<String, String> {
+        let v = zerofarm_common::binver::exe_version_marker(b).ok_or(format!("{what} carries no version marker"))?;
+        Ok(format!("{}.{}.{}", v.0, v.1, v.2))
+    };
+    let version = ver(&agent, MAC_AGENT)?;
+    let launcher_version = ver(&launcher, MAC_LAUNCHER)?;
+    let want = expected_keys(&opts.workspace, opts.allow_test_binaries)?;
+    if !want.release.contains(&key.public_b64()) {
+        return Err(format!("the signing key {} is not in common/trusted_keys.txt: these agents could never verify their own updates", key.key_id_hex()));
+    }
+    let union: BTreeSet<String> = want.release.union(&want.data).cloned().collect();
+    let found = scan_keys(&agent);
+    if found != union {
+        return Err(format!(
+            "{MAC_AGENT} does not trust exactly the keys in common/trusted_keys.txt and common/trusted_data_keys.txt (extra {:?}, missing {:?}); rebuild it without ZEROFARM_TRUSTED_KEYS / ZEROFARM_TRUSTED_DATA_KEYS set",
+            found.difference(&union).collect::<Vec<_>>(),
+            union.difference(&found).collect::<Vec<_>>()
+        ));
+    }
+    let lfound = scan_keys(&launcher);
+    if !want.release.is_subset(&lfound) || !lfound.is_subset(&union) {
+        return Err(format!("{MAC_LAUNCHER} does not trust exactly the release keys (found {lfound:?})"));
+    }
+    let out = opts.out.clone().unwrap_or_else(|| opts.workspace.join("dist").join(format!("agent-macos-{version}")));
+    if out.exists() {
+        std::fs::remove_dir_all(&out).map_err(|e| e.to_string())?;
+    }
+    std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+    std::fs::write(out.join(MAC_AGENT), &agent).map_err(|e| e.to_string())?;
+    std::fs::write(out.join(MAC_LAUNCHER), &launcher).map_err(|e| e.to_string())?;
+    let (build_id, m) = sign(
+        &out,
+        &SignOpts { kind: Some(Kind::Agent), version: Some(version.clone()), min_agent: Some(min_agent.clone()), platform: Some(PLATFORM_MACOS_ARM64.into()), ..Default::default() },
+        key,
+    )?;
+    let staging = github_staging_dir(&out);
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging).map_err(|e| format!("{}: {e}", staging.display()))?;
+    }
+    std::fs::create_dir_all(&staging).map_err(|e| e.to_string())?;
+    let file = |n: &str| std::fs::read(out.join(n)).map_err(|e| format!("{n}: {e}"));
+    let entries = vec![
+        (MAC_LAUNCHER.to_string(), file(MAC_LAUNCHER)?, 0o755),
+        (MAC_AGENT.to_string(), file(MAC_AGENT)?, 0o755),
+        (MANIFEST_FILE.to_string(), file(MANIFEST_FILE)?, 0o644),
+        (SIG_FILE.to_string(), file(SIG_FILE)?, 0o644),
+    ];
+    let tarball = staging.join(MAC_TARBALL);
+    std::fs::write(&tarball, tar_gz(&entries, m.created)?).map_err(|e| e.to_string())?;
+    eprintln!("macOS agent {version} (launcher {launcher_version}) build_id {build_id}: {}", tarball.display());
+    let client = match &opts.publish {
+        Some((url, token)) => {
+            let client = admin_client(url, token)?;
+            publish(&out, &TrustedKeys::parse(&[key.public_b64()])?, &client)?;
+            Some(client)
+        }
+        None => None,
+    };
+    let github = match &opts.github {
+        Some(g) => Some(github_release_macos(&out, &tarball, key, &opts.channel, g)?),
+        None => None,
+    };
+    if let Some(client) = &client {
+        post_agent_release_for(client, &version, &build_id, &opts.channel, Some(&min_agent), github.as_ref().map(|g| g.installer_url.as_str()), Some(PLATFORM_MACOS_ARM64))?;
+    }
+    Ok(MacReleased { version, build_id, dir: out, tarball, github })
+}
+
+/// The GitHub Release `agent-macos-v<version>` (PROTOCOL 11.2): the tarball, `SHA256SUMS` (its line) and
+/// `SHA256SUMS.minisig`; a prerelease for canary; never marked Latest (that stays the Windows release, where the
+/// farm page's installer link points). A re-run uploads with `--clobber` and refreshes the title, notes and flags.
+pub fn github_release_macos(package: &Path, tarball: &Path, key: &SigningKey, channel: &str, o: &GithubOpts) -> Result<GithubReleased, String> {
+    check_channel(channel)?;
+    o.check()?;
+    let v = verify(package, &TrustedKeys::parse(&[key.public_b64()])?)?;
+    if v.manifest.kind != Kind::Agent || v.manifest.platform.as_deref() != Some(zerofarm_common::manifest::PLATFORM_MACOS_ARM64) {
+        return Err(format!("{} is not a macOS agent package", package.display()));
+    }
+    let version = v.manifest.version.clone();
+    let tag = github_mac_tag(&version);
+    let staging = tarball.parent().unwrap_or(package).to_path_buf();
+    let sums = sha256sums(&[(MAC_TARBALL.to_string(), tarball.to_path_buf())])?;
+    let sums_path = staging.join(SUMS_FILE);
+    std::fs::write(&sums_path, &sums).map_err(|e| e.to_string())?;
+    let sig = key.sign(sums.as_bytes(), &format!("file={SUMS_FILE} version={version} build_id={}", v.build_id))?;
+    TrustedKeys::parse(&[key.public_b64()])?.verify(sums.as_bytes(), &sig).map_err(|e| format!("self-check of {SUMS_SIG_FILE} failed: {e}"))?;
+    let sums_sig_path = staging.join(SUMS_SIG_FILE);
+    std::fs::write(&sums_sig_path, sig).map_err(|e| e.to_string())?;
+    let notes = match &o.notes_file {
+        Some(f) => f.clone(),
+        None => {
+            let p = staging.join("notes.md");
+            std::fs::write(&p, default_mac_notes(&o.repo, &version, channel, &v.build_id, &key.public_b64())).map_err(|e| e.to_string())?;
+            p
+        }
+    };
+    let title = format!("Zero Farm agent {version} for macOS (Apple silicon)");
+    let prerelease = channel == "canary";
+    let files: Vec<String> = [tarball.to_path_buf(), sums_path, sums_sig_path].iter().map(|p| p.to_string_lossy().into_owned()).collect();
+    let notes_s = notes.to_string_lossy().into_owned();
+    let view = gh(&o.gh, &["release", "view", &tag, "--repo", &o.repo, "--json", "tagName"])?;
+    let updated = if view.status.success() {
+        let mut a = vec!["release", "upload", tag.as_str()];
+        a.extend(files.iter().map(String::as_str));
+        a.extend(["--repo", &o.repo, "--clobber"]);
+        gh_ok(&o.gh, &a)?;
+        let pre = format!("--prerelease={prerelease}");
+        gh_ok(&o.gh, &["release", "edit", tag.as_str(), "--repo", &o.repo, "--title", &title, "--notes-file", &notes_s, &pre, "--latest=false"])?;
+        true
+    } else if String::from_utf8_lossy(&view.stderr).to_ascii_lowercase().contains("not found") {
+        let mut a = vec!["release", "create", tag.as_str()];
+        a.extend(files.iter().map(String::as_str));
+        a.extend(["--repo", &o.repo, "--title", &title, "--notes-file", &notes_s, "--latest=false"]);
+        if prerelease {
+            a.push("--prerelease");
+        }
+        gh_ok(&o.gh, &a)?;
+        false
+    } else {
+        return Err(format!("gh release view {tag} failed: {}", String::from_utf8_lossy(&view.stderr).trim()));
+    };
+    Ok(GithubReleased { tag, installer_url: github_mac_tarball_url(&o.repo, &version), updated, staging })
+}
+
+fn default_mac_notes(repo: &str, version: &str, channel: &str, build_id: &str, pubkey: &str) -> String {
+    let which = if channel == "canary" {
+        "A **canary** (test) build: it goes to the owner's own test Macs first, and to everyone once it is promoted to stable."
+    } else {
+        "A **stable** build: every installed Zero Farm on a Mac updates to it by itself."
+    };
+    format!(
+        "Zero Farm agent {version} for macOS on Apple silicon (macOS 13 or newer). {which}\n\n\
+         **Install** (you need an invite code): `curl -fsSL https://farm.greggg230.com/install-macos.sh | sh -s -- --invite CODE`. \
+         Installed copies update themselves; you don't need to download this.\n\n\
+         **Verify** (with [minisign](https://jedisct1.github.io/minisign/)):\n\n\
+         ```\n\
+         minisign -Vm SHA256SUMS -P {pubkey}\n\
+         shasum -a 256 -c SHA256SUMS\n\
+         ```\n\n\
+         The tarball holds `ZeroFarm` (the launcher) and the signed agent package (`farm-agent`, `manifest.json`, \
+         `manifest.json.minisig`: `minisign -Vm manifest.json -P {pubkey}`). Agent package build id: `{build_id}`. \
+         See [CHANGELOG.md](https://github.com/{repo}/blob/main/CHANGELOG.md) for what changed.\n"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tar_gz_round_trips_and_the_system_tar_reads_it() {
+        let entries = vec![
+            (MAC_LAUNCHER.to_string(), b"launcher bytes".to_vec(), 0o755),
+            (MAC_AGENT.to_string(), vec![42u8; 70_000], 0o755),
+            (MANIFEST_FILE.to_string(), b"{}\n".to_vec(), 0o644),
+        ];
+        let gz = tar_gz(&entries, 1_794_300_000).unwrap();
+        assert_eq!(untar_gz(&gz).unwrap(), entries);
+        assert!(tar_gz(&[("a/b".into(), vec![], 0o644)], 0).is_err(), "flat names only");
+        // an independent reader: bsdtar (macOS /usr/bin/tar, Windows System32\tar.exe), with the modes as written
+        let tar = if cfg!(windows) { std::path::PathBuf::from(r"C:\Windows\System32\tar.exe") } else { std::path::PathBuf::from("/usr/bin/tar") };
+        if !tar.exists() {
+            return;
+        }
+        let d = tempfile::tempdir().unwrap();
+        let f = d.path().join(MAC_TARBALL);
+        std::fs::write(&f, &gz).unwrap();
+        let x = d.path().join("x");
+        std::fs::create_dir_all(&x).unwrap();
+        let st = Command::new(&tar).arg("-xzf").arg(&f).arg("-C").arg(&x).status().unwrap();
+        assert!(st.success());
+        for (n, b, _mode) in &entries {
+            assert_eq!(&std::fs::read(x.join(n)).unwrap(), b, "{n}");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(std::fs::metadata(x.join(n)).unwrap().permissions().mode() & 0o777, *_mode, "{n}");
+            }
+        }
+    }
+
+    #[test]
+    fn keys_and_mach_o_are_recognised_in_binary_bytes() {
+        let k = zerofarm_common::sign::SigningKey::generate().unwrap().public_b64();
+        let mut b = vec![0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0, 0, 1, 0, 0, 0, 0, 2, 0, 0, 0];
+        b.extend_from_slice(b"RWnotakeyRWxyz");
+        b.extend_from_slice(k.as_bytes());
+        b.extend_from_slice(b"RWRW");
+        assert!(is_macho_arm64_exe(&b));
+        assert_eq!(scan_keys(&b), BTreeSet::from([k]));
+        assert!(!is_macho_arm64_exe(b"MZ\x90\x00"));
+    }
 }

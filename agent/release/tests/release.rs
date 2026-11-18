@@ -797,3 +797,163 @@ fn define_refuses_bad_definitions_and_the_wrong_keys() {
     let o = cli(&["sign", d.to_str().unwrap(), "--kind", "worker", "--key", dk.to_str().unwrap(), "--game", "mtg", "--engine-commit", EC, "--core-commit", CC], &env_both);
     assert!(!o.status.success() && text(&o).contains("is a data key"), "{}", text(&o));
 }
+
+// ---------- rev 17 (PROTOCOL 11.2): a macOS agent release from Mac-built binaries ----------
+
+/// A stand-in for a Mac-built release binary: an arm64 Mach-O header, the version marker and the trusted keys as
+/// they sit in a compiled binary.
+fn fake_mac_binary(version: &str, keys: &[String]) -> Vec<u8> {
+    let mut b = vec![0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0, 0, 1, 0, 0, 0, 0, 2, 0, 0, 0];
+    b.extend_from_slice(&[0u8; 48]);
+    b.extend_from_slice(&zerofarm_common::binver::mark(version));
+    for k in keys {
+        b.extend_from_slice(k.as_bytes());
+        b.extend_from_slice(b"\0\x01");
+    }
+    b.extend_from_slice(&[7u8; 300]);
+    b
+}
+
+fn workspace_keys(test_key: &str) -> (Vec<String>, Vec<String>) {
+    let ws = Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("common");
+    let mut release: Vec<String> = farm_release::key_file_keys(&ws.join("trusted_keys.txt")).unwrap().into_iter().collect();
+    release.push(test_key.to_string());
+    let data: Vec<String> = farm_release::key_file_keys(&ws.join("trusted_data_keys.txt")).unwrap().into_iter().collect();
+    (release, data)
+}
+
+#[test]
+fn release_agent_macos_signs_the_prebuilt_package_makes_the_tarball_and_the_mac_release() {
+    let t = tempfile::tempdir().unwrap();
+    let k = t.path().join("release.key");
+    let key = farm_release::keygen(&k).unwrap();
+    let pubkey = key.public_b64();
+    let mock = MockCoord::start();
+    mock.trust(&pubkey);
+    let (release_keys, data_keys) = workspace_keys(&pubkey);
+    let all: Vec<String> = release_keys.iter().chain(&data_keys).cloned().collect();
+    let bins = t.path().join("prebuilt");
+    std::fs::create_dir_all(&bins).unwrap();
+    std::fs::write(bins.join("farm-agent"), fake_mac_binary("0.3.0", &all)).unwrap();
+    std::fs::write(bins.join("ZeroFarm"), fake_mac_binary("0.3.0", &release_keys)).unwrap();
+    let out = t.path().join("dist").join("agent-macos-0.3.0");
+    let gh_dir = t.path().join("gh");
+    let fakegh = bin("fakegh");
+    let (k_s, b_s, o_s, g_s) = (k.to_str().unwrap(), bins.to_str().unwrap(), out.to_str().unwrap(), fakegh.to_str().unwrap());
+    let run = |extra: &[&str]| {
+        let mut a = vec!["release-agent", "--platform", "macos-arm64", "--prebuilt", b_s, "--key", k_s, "--out", o_s, "--allow-test-binaries"];
+        a.extend_from_slice(extra);
+        cli(&a, &[(TEST_KEYS_ENV, pubkey.as_str()), ("FAKE_GH_DIR", gh_dir.to_str().unwrap())])
+    };
+    // refusals first: nothing is published or released
+    for (extra, why) in [
+        (&["--no-publish", "--min-agent", "0.2.14"][..], "0.3.0 or newer"),
+        (&["--url", &mock.url, "--token", "admin-secret"][..], "--min-agent is required"),
+    ] {
+        let o = run(extra);
+        assert!(!o.status.success() && text(&o).contains(why), "{extra:?}: {}", text(&o));
+    }
+    let o = cli(&["release-agent", "--platform", "macos-arm64", "--key", k_s, "--no-publish"], &[]);
+    assert!(!o.status.success() && text(&o).contains("--prebuilt"), "{}", text(&o));
+    let o = cli(&["release-agent", "--platform", "linux-x64", "--key", k_s, "--no-publish"], &[]);
+    assert!(!o.status.success() && text(&o).contains("macos-arm64"), "{}", text(&o));
+    assert!(mock.with(|s| s.agent_releases.is_empty()));
+
+    let o = run(&["--url", &mock.url, "--token", "admin-secret", "--channel", "canary", "--min-agent", "0.3.0", "--github", REPO, "--gh", g_s]);
+    assert!(o.status.success(), "{}", text(&o));
+    // the package: macos-arm64, entry farm-agent, the launcher in it
+    let v = farm_release::verify(&out, &TrustedKeys::parse(&[pubkey.clone()]).unwrap()).unwrap();
+    assert_eq!((v.manifest.kind, v.manifest.version.as_str()), (Kind::Agent, "0.3.0"));
+    assert_eq!((v.manifest.platform.as_deref(), v.manifest.entry.as_deref(), v.manifest.min_agent.as_deref()), (Some("macos-arm64"), Some("farm-agent"), Some("0.3.0")));
+    let mut names: Vec<&str> = v.manifest.files.iter().map(|f| f.path.as_str()).collect();
+    names.sort();
+    assert_eq!(names, ["ZeroFarm", "farm-agent"]);
+    // the tarball: the launcher and the package, flat, executables 0755, nothing else
+    let staging = t.path().join("dist").join("agent-macos-0.3.0-github");
+    let tgz = std::fs::read(staging.join("ZeroFarm-macos-arm64.tar.gz")).unwrap();
+    let entries = farm_release::untar_gz(&tgz).unwrap();
+    let got: Vec<(&str, u32)> = entries.iter().map(|(n, _, m)| (n.as_str(), *m)).collect();
+    assert_eq!(got, [("ZeroFarm", 0o755), ("farm-agent", 0o755), ("manifest.json", 0o644), ("manifest.json.minisig", 0o644)]);
+    for (n, bytes, _) in &entries {
+        assert_eq!(bytes, &std::fs::read(out.join(n)).unwrap(), "{n}");
+    }
+    // (an independent reader: Windows' own bsdtar, when there)
+    let tar = Path::new(r"C:\Windows\System32\tar.exe");
+    if tar.exists() {
+        let l = Command::new(tar).arg("-tzf").arg(staging.join("ZeroFarm-macos-arm64.tar.gz")).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&l.stdout).lines().collect::<Vec<_>>(), ["ZeroFarm", "farm-agent", "manifest.json", "manifest.json.minisig"], "{l:?}");
+    }
+    // GitHub: agent-macos-v0.3.0, a prerelease never marked Latest, the tarball + SHA256SUMS + its signature
+    let tag = "agent-macos-v0.3.0";
+    let calls = gh_calls(&gh_dir);
+    assert_eq!(calls.iter().map(|c| c[1].as_str()).collect::<Vec<_>>(), ["view", "create"], "{calls:?}");
+    assert!(calls[1].iter().any(|a| a == "--latest=false") && calls[1].iter().any(|a| a == "--prerelease"), "{calls:?}");
+    let rel = gh_release(&gh_dir, tag);
+    assert_eq!((rel["prerelease"].clone(), rel["latest"].clone()), (serde_json::json!(true), serde_json::json!(false)), "{rel}");
+    let assets = gh_assets(&gh_dir, tag);
+    assert_eq!(assets.keys().map(String::as_str).collect::<Vec<_>>(), ["SHA256SUMS", "SHA256SUMS.minisig", "ZeroFarm-macos-arm64.tar.gz"]);
+    let sums = String::from_utf8(assets["SHA256SUMS"].clone()).unwrap();
+    assert_eq!(sums, format!("{}  ZeroFarm-macos-arm64.tar.gz\n", zerofarm_common::hash::sha256_hex(&tgz)));
+    let pk = minisign_verify::PublicKey::decode(&std::fs::read_to_string(farm_release::pub_path(&k)).unwrap()).unwrap();
+    let sig = minisign_verify::Signature::decode(std::str::from_utf8(&assets["SHA256SUMS.minisig"]).unwrap()).unwrap();
+    pk.verify(sums.as_bytes(), &sig, false).unwrap();
+    assert!(sig.trusted_comment().starts_with(&format!("file=SHA256SUMS version=0.3.0 build_id={}", v.build_id)), "{}", sig.trusted_comment());
+    // the coordinator: the build, then the release with its platform and the tarball's exact GitHub URL
+    let url = format!("https://github.com/{REPO}/releases/download/{tag}/ZeroFarm-macos-arm64.tar.gz");
+    let r = mock.with(|s| s.agent_releases.clone());
+    assert_eq!(r.len(), 1);
+    assert_eq!((r[0]["platform"].as_str(), r[0]["github_url"].as_str(), r[0]["build_id"].as_str()), (Some("macos-arm64"), Some(url.as_str()), Some(v.build_id.as_str())));
+    assert_eq!((r[0]["min_agent"].as_str(), r[0]["channel"].as_str()), (Some("0.3.0"), Some("canary")));
+    assert!(mock.with(|s| s.builds_registered.contains(&v.build_id)));
+    // a re-run (stable): upload --clobber, edit, still never Latest
+    let o = run(&["--no-publish", "--channel", "stable", "--github", REPO, "--gh", g_s]);
+    assert!(o.status.success(), "{}", text(&o));
+    let calls = gh_calls(&gh_dir);
+    assert_eq!(calls.iter().skip(2).map(|c| c[1].as_str()).collect::<Vec<_>>(), ["view", "upload", "edit"], "{calls:?}");
+    let rel = gh_release(&gh_dir, tag);
+    assert_eq!((rel["prerelease"].clone(), rel["latest"].clone()), (serde_json::json!(false), serde_json::json!(false)), "{rel}");
+}
+
+#[test]
+fn release_agent_macos_refuses_what_a_mac_couldnt_or_shouldnt_run() {
+    let t = tempfile::tempdir().unwrap();
+    let k = t.path().join("release.key");
+    let key = farm_release::keygen(&k).unwrap();
+    let pubkey = key.public_b64();
+    let (release_keys, data_keys) = workspace_keys(&pubkey);
+    let all: Vec<String> = release_keys.iter().chain(&data_keys).cloned().collect();
+    let bins = t.path().join("prebuilt");
+    std::fs::create_dir_all(&bins).unwrap();
+    let out = t.path().join("out");
+    let try_with = |agent: Vec<u8>, launcher: Vec<u8>, allow_test: bool| {
+        std::fs::write(bins.join("farm-agent"), agent).unwrap();
+        std::fs::write(bins.join("ZeroFarm"), launcher).unwrap();
+        let mut a = vec!["release-agent", "--platform", "macos-arm64", "--prebuilt", bins.to_str().unwrap(), "--key", k.to_str().unwrap(), "--no-publish", "--out", out.to_str().unwrap()];
+        if allow_test {
+            a.push("--allow-test-binaries");
+        }
+        cli(&a, &[(TEST_KEYS_ENV, pubkey.as_str())])
+    };
+    let good = || fake_mac_binary("0.3.0", &all);
+    let launcher = || fake_mac_binary("0.3.0", &release_keys);
+    let mut windows = b"MZ".to_vec();
+    windows.extend(good());
+    let mut extra = all.clone();
+    extra.push(zerofarm_common::sign::SigningKey::generate().unwrap().public_b64());
+    let mut debug = good();
+    debug.extend_from_slice(b"ZEROFARM_TEST_HEADLESS");
+    let mut unmarked = vec![0xcf, 0xfa, 0xed, 0xfe, 0x0c, 0, 0, 1, 0, 0, 0, 0, 2, 0, 0, 0];
+    unmarked.extend(all.iter().flat_map(|k| k.bytes().chain([0u8])));
+    for (agent, why, allow) in [
+        (windows, "not an arm64 Mach-O", true),
+        (fake_mac_binary("0.3.0", &extra), "does not trust exactly", true),
+        (fake_mac_binary("0.3.0", &release_keys), "does not trust exactly", true),
+        (debug, "debug build", false),
+        (unmarked, "no version marker", true),
+    ] {
+        let o = try_with(agent, launcher(), allow);
+        assert!(!o.status.success() && text(&o).contains(why), "{why}: {}", text(&o));
+    }
+    let o = try_with(good(), launcher(), true);
+    assert!(o.status.success(), "{}", text(&o));
+}

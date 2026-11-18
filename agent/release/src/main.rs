@@ -20,6 +20,14 @@
 //! farm-release release-agent [--url URL] [--token T] [--key FILE] [--channel canary|stable]
 //!              [--min-agent V] [--workspace DIR] [--bin-dir DIR] [--out DIR] [--no-publish]
 //!              [--setup | --setup-exe FILE] [--github OWNER/REPO [--notes-file F] [--gh PATH]]
+//! farm-release release-agent --platform macos-arm64 --prebuilt DIR [--url URL] [--token T] [--key FILE]
+//!              [--channel canary|stable] [--min-agent V (0.3.0+, default 0.3.0)] [--out DIR] [--no-publish]
+//!              [--github OWNER/REPO [--notes-file F] [--gh PATH]]
+//!              rev 17 (PROTOCOL 11.2): the Mac-built farm-agent + ZeroFarm in DIR (tools/mac-agent-build.sh) signed
+//!              as a macos-arm64 agent package (dist/agent-macos-<v>/), the tarball ZeroFarm-macos-arm64.tar.gz
+//!              (dist/agent-macos-<v>-github/), the GitHub Release agent-macos-v<v> (tarball, SHA256SUMS + signature;
+//!              never Latest; prerelease for canary) and the coordinator release with "platform" and its github_url.
+//!              Without --platform (or with windows-x64) a release is Windows' as before (no manifest platform).
 //! farm-release github-release DIR --github OWNER/REPO [--channel canary|stable] [--key FILE]
 //!              [--setup-exe FILE] [--notes-file F] [--gh PATH]
 //!              [--url URL [--token T] [--min-agent V]]
@@ -226,7 +234,42 @@ fn run(a: &Args) -> Result<(), String> {
             println!("published build {id}");
             Ok(())
         }
+        Some("release-agent") if a.get("platform").as_deref() == Some(zerofarm_common::manifest::PLATFORM_MACOS_ARM64) => {
+            let key = load_key(&a.key_path())?;
+            let workspace = a.get("workspace").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".."));
+            let prebuilt = a.get("prebuilt").map(PathBuf::from).ok_or("--prebuilt DIR (the Mac-built farm-agent and ZeroFarm: tools/mac-agent-build.sh) is required for macos-arm64")?;
+            let publish = if a.has("no-publish") {
+                None
+            } else {
+                Some((a.get("url").ok_or("--url is required (or --no-publish)")?, a.token()?))
+            };
+            if publish.is_some() && a.get("min-agent").is_none() {
+                return Err("--min-agent is required when publishing an agent release (the oldest Mac agent that may keep taking work)".into());
+            }
+            let opts = MacReleaseOpts {
+                workspace,
+                prebuilt,
+                out: a.get("out").map(PathBuf::from),
+                channel: a.get("channel").unwrap_or_else(|| "canary".into()),
+                min_agent: a.get("min-agent"),
+                publish,
+                allow_test_binaries: a.has("allow-test-binaries"),
+                github: a.github()?,
+            };
+            let r = release_agent_macos(&opts, &key)?;
+            println!("macOS agent {} build_id {} in {}; tarball {}", r.version, r.build_id, r.dir.display(), r.tarball.display());
+            if let Some(g) = &r.github {
+                println!("GitHub release {} {}; tarball {}", g.tag, if g.updated { "updated" } else { "created" }, g.installer_url);
+            }
+            if opts.publish.is_some() {
+                println!("published and released on channel {} for macos-arm64", opts.channel);
+            }
+            Ok(())
+        }
         Some("release-agent") => {
+            if let Some(p) = a.get("platform").filter(|p| p != zerofarm_common::manifest::PLATFORM_WINDOWS_X64) {
+                return Err(format!("--platform {p}: release-agent takes macos-arm64 (with --prebuilt) or nothing (Windows)"));
+            }
             let key = load_key(&a.key_path())?;
             let workspace = a.get("workspace").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(".."));
             let publish = if a.has("no-publish") {
