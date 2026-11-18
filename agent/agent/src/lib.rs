@@ -79,6 +79,9 @@ pub struct Timings {
     pub start_backoff_max: Duration,
     /// How often crash reports saved under `state\crashes\` (e.g. a caught tray panic) are sent.
     pub crash_resend: Duration,
+    /// rev 16 (PROTOCOL 3, `POST /v1/presence`): while the idle policy blocks work, say why this
+    /// often (and at once when the reason changes).
+    pub presence: Duration,
     /// rev 15 (PROTOCOL 10.4): a rolling lease asks for more game ids at most this often (10 s).
     pub extend_every: Duration,
 }
@@ -105,6 +108,7 @@ impl Default for Timings {
             start_backoff: Duration::from_secs(60),
             start_backoff_max: Duration::from_secs(3600),
             crash_resend: Duration::from_secs(60),
+            presence: Duration::from_secs(300),
             extend_every: Duration::from_secs(10),
         }
     }

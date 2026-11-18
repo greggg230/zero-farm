@@ -2,7 +2,7 @@
 //! meanwhile report crashes and launcher events, check for agent updates, keep the tray status.
 
 use crate::cache::Cache;
-use crate::policy::{decide, mem_floor_mb, Decision, PolicyState};
+use crate::policy::{decide, mem_floor_mb, Block, Decision, PolicyState};
 use crate::results::{ResultStore, Uploader};
 use crate::settings::{Settings, SharedMachine};
 use crate::signals::SignalSource;
@@ -108,6 +108,9 @@ pub struct Engine {
     /// Saved crash reports (`state\crashes\`) are sent in the background every `crash_resend`.
     crash_sent_at: Instant,
     crash_sending: Arc<AtomicBool>,
+    /// rev 16: the last presence sent while blocked (when, why); None while working.
+    presence_sent: Option<(Instant, Block)>,
+    presence_sending: Arc<AtomicBool>,
 }
 
 impl Engine {
@@ -164,6 +167,8 @@ impl Engine {
             blocked_toast_shown: false,
             crash_sent_at: Instant::now(),
             crash_sending: Arc::new(AtomicBool::new(false)),
+            presence_sent: None,
+            presence_sending: Arc::new(AtomicBool::new(false)),
             cfg,
         })
     }
@@ -243,6 +248,31 @@ impl Engine {
         let (client, layout, busy) = (self.client.clone(), self.cfg.layout.clone(), self.crash_sending.clone());
         std::thread::spawn(move || {
             send_saved_crashes(&client, &layout);
+            busy.store(false, Ordering::SeqCst);
+        });
+    }
+
+    /// rev 16 (PROTOCOL 3, `POST /v1/presence`): while the idle policy blocks work, tell the
+    /// coordinator why - at once when the reason changes, then every `presence` - so a PC in use
+    /// doesn't look switched off. In the background: a slow or failing call never holds up the
+    /// loop, and any error (a coordinator before rev 16 answers 404) changes nothing.
+    pub(crate) fn maybe_send_presence(&mut self, block: Option<Block>) {
+        let Some(block) = block else { return };
+        if let Some((at, last)) = self.presence_sent {
+            if last == block && at.elapsed() < self.cfg.timings.presence {
+                return;
+            }
+        }
+        if self.presence_sending.swap(true, Ordering::SeqCst) {
+            return; // the previous one is still on its way: try again next poll
+        }
+        self.presence_sent = Some((Instant::now(), block));
+        let (client, busy) = (self.client.clone(), self.presence_sending.clone());
+        std::thread::spawn(move || {
+            let body = serde_json::json!({ "reason": block.slug() });
+            if let Err(e) = client.post_json::<_, serde_json::Value>("/v1/presence", &body) {
+                log::debug!("presence ({}) not sent: {e}", block.slug());
+            }
             busy.store(false, Ordering::SeqCst);
         });
     }
@@ -520,9 +550,11 @@ impl Engine {
             if !d.work {
                 let why = d.block.map(|b| b.describe()).unwrap_or("");
                 self.set_status(Phase::Idle, why, None);
+                self.maybe_send_presence(d.block);
                 self.control.sleep(self.cfg.timings.idle_poll);
                 continue;
             }
+            self.presence_sent = None;
             if self.maybe_probe(&d) {
                 continue;
             }

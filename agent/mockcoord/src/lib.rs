@@ -101,6 +101,8 @@ pub struct State {
     pub results: HashMap<(String, u64), StoredResult>,
     pub dones: Vec<(String, Value)>,
     pub crashes: Vec<Value>,
+    /// rev 16: `POST /v1/presence` bodies.
+    pub presences: Vec<Value>,
     pub diags: Vec<(String, usize)>,
     /// Bodies of user-initiated uploads (`x-farm-diag: user`).
     pub user_diags: Vec<Vec<u8>>,
@@ -797,6 +799,10 @@ fn handle(mut req: Request, st: &Arc<Mutex<State>>) {
         }
         ("POST", ["crash"]) => {
             s.crashes.push(json_body.clone());
+            done!(reply(req, 200, json!({"ok": true})))
+        }
+        ("POST", ["presence"]) => {
+            s.presences.push(json_body.clone());
             done!(reply(req, 200, json!({"ok": true})))
         }
         ("POST", ["diag", _]) if !s.diag_requested && extra_headers.get("x-farm-diag").map(String::as_str) == Some("user") => {
