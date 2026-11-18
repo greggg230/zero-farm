@@ -7,16 +7,19 @@ import { authMachine, type Ctx, type MachineRow } from "./ctx";
 import { currentDefs, DEF_KEY_RE, leaseProblem, type JobKind } from "./definitions";
 import { bookFor } from "./leasebook";
 import { minAgentOk } from "./manifest";
+import { DEFAULT_PLATFORM, type Platform, requestPlatform, storedPlatform } from "./platform";
 import { parseRanges, total } from "./ranges";
 import { ipKey, take } from "./ratelimit";
 import {
   type Alternate,
+  type CampaignAlternate,
   GPU_LEASE_MIN,
   LUID_RE,
   MAX_RUNTIME_PROVIDERS,
   MAX_RUNTIMES,
   type Provider,
   type Routing,
+  altPlatform,
   altProviders,
   gpuEligible,
   gpuNeedOf,
@@ -140,11 +143,21 @@ export function classOf(p: Profile | null): string | null {
   return `${p.cpu ?? "unknown cpu"} / ${gpu}`.slice(0, 200);
 }
 
-async function latestRelease(db: D1Database, channel: string) {
+// Rev 17 (PROTOCOL 11.2): the newest release of (channel, platform); `latest` and `min_agent` are per platform.
+async function latestRelease(db: D1Database, channel: string, platform: string) {
   return db
-    .prepare(`SELECT * FROM agent_releases WHERE channel = ? ORDER BY id DESC LIMIT 1`)
-    .bind(channel)
+    .prepare(`SELECT * FROM agent_releases WHERE channel = ? AND platform = ? ORDER BY id DESC LIMIT 1`)
+    .bind(channel, platform)
     .first<{ version: string; build_id: string; min_agent: string; channel: string }>();
+}
+
+// GET /download for a channel and platform (each named only when not the default: stable, windows-x64).
+export function downloadUrl(origin: string, channel: string, platform: string): string {
+  const q = new URLSearchParams();
+  if (platform !== DEFAULT_PLATFORM) q.set("platform", platform);
+  if (channel !== "stable") q.set("channel", channel);
+  const t = q.toString();
+  return `${origin}/download${t ? `?${t}` : ""}`;
 }
 
 // ---------- POST /v1/enroll ----------
@@ -160,6 +173,8 @@ export async function enroll(c: Ctx): Promise<Response> {
   if (!name) throw bad("name is required");
   const profile = cleanProfile(obj(b.profile, "profile"));
   const digest = str(b.profile_digest, "profile_digest", { optional: true, re: HEX64_RE }) ?? null;
+  // Rev 17 (PROTOCOL 11.1): the agent's platform (no header: windows-x64), fixed for the machine from now on.
+  const platform = requestPlatform(c.req);
   const used = () => new HttpError(403, "unauthorized", "unknown or already used invite code");
   if (!INVITE_RE.test(invite)) throw used();
   const inv = await c.env.DB.prepare(`SELECT * FROM invites WHERE code = ?`).bind(invite).first<{ used_at: number | null; channel: string }>();
@@ -167,10 +182,10 @@ export async function enroll(c: Ctx): Promise<Response> {
 
   const agent = c.req.headers.get("x-farm-agent");
   if (agent !== null && isSemver(agent)) {
-    const rel = await latestRelease(c.env.DB, inv.channel);
+    const rel = await latestRelease(c.env.DB, inv.channel, platform);
     if (rel && cmpSemver(agent, rel.min_agent) < 0) {
-      // An unenrolled agent can't update itself: the friend needs a newer installer.
-      const download = `${c.url.origin}/download${inv.channel === "stable" ? "" : `?channel=${inv.channel}`}`;
+      // An unenrolled agent can't update itself: the friend needs a newer installer (of its own platform).
+      const download = downloadUrl(c.url.origin, inv.channel, platform);
       throw new HttpError(426, "update_required", `agent ${agent} is older than ${rel.min_agent}`, { min_agent: rel.min_agent, download });
     }
   }
@@ -181,8 +196,8 @@ export async function enroll(c: Ctx): Promise<Response> {
     c.env.DB.prepare(`UPDATE invites SET used_at = ?, machine_id = ? WHERE code = ? AND used_at IS NULL`).bind(c.now, machineId, invite),
     // Inserted only if the UPDATE above won the invite (a concurrent enroll can't use it twice).
     c.env.DB.prepare(
-      `INSERT INTO machines (machine_id, token_hash, name, channel, invite, created_at, last_seen, agent_version, profile, profile_digest, class)
-       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM invites WHERE code = ? AND machine_id = ?)`,
+      `INSERT INTO machines (machine_id, token_hash, name, channel, invite, created_at, last_seen, agent_version, profile, profile_digest, class, platform)
+       SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ? WHERE EXISTS (SELECT 1 FROM invites WHERE code = ? AND machine_id = ?)`,
     ).bind(
       machineId,
       await sha256Hex(token),
@@ -195,6 +210,7 @@ export async function enroll(c: Ctx): Promise<Response> {
       JSON.stringify(profile),
       digest,
       classOf(profile),
+      platform,
       invite,
       machineId,
     ),
@@ -219,6 +235,7 @@ interface BuildInfo {
   aw: number | null;
   size: number;
   manifest: string;
+  platform: string; // rev 17
 }
 
 interface Candidate {
@@ -233,7 +250,8 @@ interface Candidate {
   gpu_configured?: "auto" | number; // rev 11: the job's gpu_games_per_lease (absent: none)
   max_stale?: number; // self-play: the run's staleness window in gens
   providers: Provider[] | null; // rev 7: the job's allowlist, sent with the lease
-  // Rev 11 (PROTOCOL 9.4): the worker build and runtime the lease carries (a run's default, or an alternate)
+  // Rev 11 (PROTOCOL 9.4): the worker build and runtime the lease carries (a run's default, or an alternate; rev 17: a
+  // campaign's build, or its alternate of the machine's platform)
   build_id: string;
   runtime: string | null;
   alt: boolean;
@@ -346,7 +364,15 @@ export async function lease(c: Ctx): Promise<Response> {
   if (kinds.has("diag") && !o.defAware) {
     for (const id of o.diag) {
       const l = unwrap(
-        await bookFor(c.env, book.DIAG_SCOPE).grant({ now: c.now, machine_id: m.machine_id, kind: "diag", want: 0, diag_id: id, def_aware: o.defAware }),
+        await bookFor(c.env, book.DIAG_SCOPE).grant({
+          now: c.now,
+          machine_id: m.machine_id,
+          kind: "diag",
+          want: 0,
+          diag_id: id,
+          def_aware: o.defAware,
+          platform: m.platform,
+        }),
       );
       if (l) return withDiag({ lease: { ...l, providers: null } });
     }
@@ -371,7 +397,8 @@ export async function lease(c: Ctx): Promise<Response> {
         run: cd.run,
         campaign: cd.campaign,
         def_aware: o.defAware,
-        ...(cd.alt ? { alt: { build_id: cd.build_id, runtime: cd.runtime! } } : {}),
+        platform: m.platform, // rev 17: checked again under the scope's lock
+        ...(cd.alt ? { alt: { build_id: cd.build_id, runtime: cd.runtime } } : {}),
         ...(rolling && cd.kind === "selfplay" ? { rolling: true } : {}),
       }),
     );
@@ -418,11 +445,13 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
   // verified a provider the job allows, with the job's runtime pack if the profile says.
   const placeFor = (kind: "selfplay" | "eval" | "fuzz", r: Routing, runtime: string | null) =>
     place(kind, r, gpuEligible(caps.gpu, verifiedProviders(machineProfile, runtime), r.providers), caps.gpu);
+  // Rev 17 (PROTOCOL 11): the machine's platform. Every build it is offered is of it; its channel's releases are too.
+  const platform: Platform = storedPlatform(m.platform);
 
   const [runsR, campsR, releaseR, pausedR, activeR, poolR, ratesR, classR, diagR, mineR] = await db.batch<any>([
     db.prepare(`SELECT * FROM runs WHERE state = 'active'`),
     db.prepare(`SELECT * FROM campaigns WHERE state = 'active'`),
-    db.prepare(`SELECT * FROM agent_releases WHERE channel = ? ORDER BY id DESC LIMIT 1`).bind(m.channel),
+    db.prepare(`SELECT * FROM agent_releases WHERE channel = ? AND platform = ? ORDER BY id DESC LIMIT 1`).bind(m.channel, platform),
     db.prepare(`SELECT value FROM settings WHERE key = 'paused'`),
     db.prepare(`SELECT scope, kind, COUNT(*) AS n FROM leases WHERE state = 'active' GROUP BY scope, kind`),
     db.prepare(`SELECT scope, pool, SUM(hi - lo) AS n FROM pool GROUP BY scope, pool`),
@@ -448,15 +477,19 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
   const release = (releaseR.results[0] ?? null) as { version: string; min_agent: string } | null;
 
   const altsOf = (r: book.RunRow) => parseJson<Alternate[] | null>(r.alternates ?? null, null) ?? [];
+  const campAltsOf = (x: book.CampaignRow) => parseJson<CampaignAlternate[] | null>(x.alternates ?? null, null) ?? [];
   const buildIds = [
     ...new Set(
-      [...runs.flatMap((r) => [r.build_id, r.runtime, ...altsOf(r).flatMap((a) => [a.build_id, a.runtime])]), ...camps.map((x) => x.build_id)].filter(Boolean),
+      [
+        ...runs.flatMap((r) => [r.build_id, r.runtime, ...altsOf(r).flatMap((a) => [a.build_id, a.runtime])]),
+        ...camps.flatMap((x) => [x.build_id, ...campAltsOf(x).map((a) => a.build_id)]),
+      ].filter(Boolean),
     ),
   ] as string[];
   const builds = new Map<string, BuildInfo>();
   if (buildIds.length) {
     const { results } = await db
-      .prepare(`SELECT build_id, kind, min_agent, aw, size, manifest FROM builds WHERE build_id IN (${buildIds.map(() => "?").join(",")})`)
+      .prepare(`SELECT build_id, kind, min_agent, aw, size, manifest, platform FROM builds WHERE build_id IN (${buildIds.map(() => "?").join(",")})`)
       .bind(...buildIds)
       .all<BuildInfo>();
     for (const x of results) builds.set(x.build_id, x);
@@ -479,38 +512,86 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
     const need = needOf(id);
     return !need || (altAware && hasAdapter(machineProfile, need.vendor, [need.min_driver]));
   };
-  // The build and runtime a run's job lease carries here (PROTOCOL 9.4): the first alternate this machine
-  // qualifies for, else the default (null: neither may go to this machine).
-  const variantFor = (r: book.RunRow, kind: "selfplay" | "eval", routing: Routing) => {
-    if (altAware && gpuAllowed) {
+  // Rev 17 (PROTOCOL 11.4): a build's platform (one not registered counts as windows-x64; such a candidate is dropped
+  // below anyway); no runtime fits every platform.
+  const platOf = (id: string | null) => (id ? storedPlatform(builds.get(id)?.platform) : platform);
+  // The build and runtime a run's job lease carries here (PROTOCOL 9.4, rev 17 11.4): the first alternate of this
+  // machine's platform it qualifies for, else the default when it is of this machine's platform (null: nothing from
+  // this run for this machine). A GPU alternate (a `vendor`) needs 9.4's conditions 1-7; a CPU alternate (no vendor)
+  // conditions 5-7 and the build's `aw`. One that only its `min_agent` keeps from this agent is held: when the default
+  // isn't of this platform it is the run's build here, so section 3's update rule asks for that agent (as it would for
+  // a default build) instead of the run giving this machine nothing without a word.
+  type Variant = { build_id: string; runtime: string | null; alt: boolean; eligible: boolean; gpuLease: boolean };
+  const variantFor = (r: book.RunRow, kind: "selfplay" | "eval", routing: Routing): Variant | null => {
+    let held: Variant | null = null;
+    if (altAware) {
       for (const a of altsOf(r)) {
+        if (altPlatform(a) !== platform) continue;
+        const vendor = a.when.vendor || null; // null: a CPU alternate
+        if (vendor && !gpuAllowed) continue; // 1
         const bi = builds.get(a.build_id);
         const ri = builds.get(a.runtime);
         if (!bi || !ri || bi.kind !== "worker" || ri.kind !== "runtime") continue; // 6: registered
+        if (platOf(a.build_id) !== platform || platOf(a.runtime) !== platform) continue;
         if (requiresRuntimeOf(bi.manifest) !== a.runtime) continue;
         const need = gpuNeedOf(ri.manifest);
-        if (need && need.vendor !== a.when.vendor) continue;
-        if (GPU_VENDORS_OFF.includes(a.when.vendor)) continue; // (an alternate stored before rev 12)
-        if (!hasAdapter(machineProfile, a.when.vendor, [a.when.min_driver, need?.min_driver])) continue; // 2
-        const allowed = altProviders(need, routing.providers); // 3
-        if (!allowed.length) continue;
-        const rp = runtimeProvidersOf(machineProfile, a.runtime); // 4: never probed here, or a provider passed
-        if (rp !== undefined && !rp.some((p) => (allowed as string[]).includes(p))) continue;
+        let eligible = true;
+        if (!vendor) {
+          if (need) continue; // a CPU alternate's pack has no GPU requirement (checked at PUT too)
+          eligible = gpuEligible(caps.gpu, verifiedProviders(machineProfile, a.runtime), routing.providers);
+        } else {
+          if (need && need.vendor !== vendor) continue;
+          if (GPU_VENDORS_OFF.includes(vendor)) continue; // (an alternate stored before rev 12)
+          if (!hasAdapter(machineProfile, vendor, [a.when.min_driver, need?.min_driver])) continue; // 2
+          const allowed = altProviders(need, routing.providers); // 3
+          if (!allowed.length) continue;
+          const rp = runtimeProvidersOf(machineProfile, a.runtime); // 4: never probed here, or a provider passed
+          if (rp !== undefined && !rp.some((p) => (allowed as string[]).includes(p))) continue;
+        }
         if (!diskOk([a.build_id, a.runtime])) continue; // 5
         if (blocked.has(a.build_id) || blocked.has(a.runtime)) continue; // 6
-        if ([bi.min_agent, ri.min_agent].some((v) => v && !minAgentOk(agent, v))) continue;
         if (bi.aw !== null && bi.aw !== aw) continue;
         const def = defs.get(`run:${r.run}`); // 7: the definition authorizes it
         if (!def || leaseProblem(def, kind, a.build_id, a.runtime, c.now, a.runtime)) continue;
-        return { build_id: a.build_id, runtime: a.runtime as string | null, alt: true, eligible: true, gpuLease: true };
+        const v: Variant = { build_id: a.build_id, runtime: a.runtime, alt: true, eligible, gpuLease: !!vendor };
+        if ([bi.min_agent, ri.min_agent].some((x) => x && !minAgentOk(agent, x))) {
+          held ??= v; // 6: min_agent
+          continue;
+        }
+        return v;
       }
     }
+    // Rev 17: the default only for a machine of its platform (a Mac never gets a Windows build, nor the reverse).
+    if (platOf(r.build_id) !== platform || platOf(r.runtime) !== platform) return held;
     if (!packFits(r.runtime)) return null;
     const eligible = gpuEligible(caps.gpu, verifiedProviders(machineProfile, r.runtime), routing.providers);
     // a GPU lease (its own size, 9.4) only when a GPU provider passed with this very pack here
     const withPack = r.runtime ? (runtimeProvidersOf(machineProfile, r.runtime) ?? []) : [];
     const gpuLease = eligible && withPack.some((p) => isGpuProvider(p) && (!routing.providers || (routing.providers as string[]).includes(p)));
     return { build_id: r.build_id, runtime: r.runtime, alt: false, eligible, gpuLease };
+  };
+  // Rev 17 (PROTOCOL 11.4): the worker build a campaign's lease carries here: its alternate of this machine's platform
+  // (registered, not blocked here, `aw` and `min_agent` met, in the campaign's current definition's `builds`), else its
+  // build when that is of this machine's platform (null: nothing from this campaign for this machine). An alternate
+  // that only its `min_agent` keeps from this agent is held, as for runs.
+  const campaignBuildFor = (x: book.CampaignRow): { build_id: string; alt: boolean } | null => {
+    let held: { build_id: string; alt: boolean } | null = null;
+    for (const a of campAltsOf(x)) {
+      if (storedPlatform(a.when?.platform) !== platform) continue;
+      const bi = builds.get(a.build_id);
+      if (!bi || bi.kind !== "worker" || platOf(a.build_id) !== platform) continue;
+      if (blocked.has(a.build_id)) continue;
+      if (bi.aw !== null && bi.aw !== aw) continue;
+      const def = defs.get(`campaign:${x.campaign}`);
+      if (!def || leaseProblem(def, "fuzz", a.build_id, null, c.now)) continue;
+      if (!minAgentOk(agent, bi.min_agent)) {
+        held ??= { build_id: a.build_id, alt: true };
+        continue;
+      }
+      return { build_id: a.build_id, alt: true };
+    }
+    if (platOf(x.build_id) === platform) return { build_id: x.build_id, alt: false };
+    return held;
   };
   for (const r of runs) {
     const scope = book.runScope(r.run);
@@ -584,7 +665,8 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
       // A campaign has no runtime pack: its machines' verified providers are their union.
       const routing = storedRouting(x.gpu, parseJson<unknown>(x.providers, null));
       const at = placeFor("fuzz", routing, null);
-      if (!at || !needsOk(needs) || !diskOk([x.build_id])) continue;
+      const v = campaignBuildFor(x); // rev 17
+      if (!v || !at || !needsOk(needs) || !diskOk([v.build_id])) continue;
       // Rev 14 (PROTOCOL 5.4): a campaign with a share competes with the runs' games (tier 1) within that share.
       const share = typeof x.share === "number" ? x.share : undefined;
       cands.push({
@@ -593,12 +675,12 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
         campaign: x.campaign,
         priority: x.priority,
         tier: share === undefined ? at.tier : 1,
-        fit: at.fit * (cachedBuilds.has(x.build_id) ? 1.2 : 1),
+        fit: at.fit * (cachedBuilds.has(v.build_id) ? 1.2 : 1),
         configured: x.chunk === "auto" ? "auto" : Number(x.chunk),
         providers: routing.providers,
-        build_id: x.build_id,
+        build_id: v.build_id,
         runtime: null,
-        alt: false,
+        alt: v.alt,
         gpu_lease: false,
         ...(share === undefined ? {} : { share }),
       });
@@ -614,11 +696,13 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
   const usable = cands.filter((cd) => {
     const r = cd.run ? runs.find((x) => x.run === cd.run) : null;
     const camp = r ? null : camps.find((x) => x.campaign === cd.campaign)!;
-    // Rev 11: the candidate's own build and runtime (a run's default, or the alternate variantFor chose).
-    const ids = r ? [cd.build_id, cd.runtime] : [camp!.build_id];
+    // Rev 11: the candidate's own build and runtime (a run's default, or the alternate variantFor chose; rev 17: a
+    // campaign's build or its alternate).
+    const ids = r ? [cd.build_id, cd.runtime] : [cd.build_id];
     if (ids.some((id) => id && blocked.has(id))) return false;
     const infos = ids.filter(Boolean).map((id) => builds.get(id!));
     if (infos.some((i) => !i)) return false; // build not registered
+    if (infos.some((i) => storedPlatform(i!.platform) !== platform)) return false; // rev 17: never another platform's build
     const def = defs.get(r ? `run:${r.run}` : `campaign:${camp!.campaign}`);
     if (!def && defAware) return false;
     if (def && defAware && leaseProblem(def, cd.kind as JobKind, ids[0]!, r ? cd.runtime : null, c.now, cd.alt ? cd.runtime : undefined)) return false;
@@ -949,8 +1033,9 @@ export async function agentLatest(c: Ctx): Promise<Response> {
   // left a machine moved to canary asking for stable forever while its leases demanded canary's
   // min_agent (found 2026-11-12). The query is still accepted, and ignored.
   const channel = m.channel;
-  const rel = await latestRelease(c.env.DB, channel);
-  if (!rel) throw notFound(`no agent release on ${channel}`);
+  // Rev 17 (PROTOCOL 11.2): the newest release of the machine's channel for its platform.
+  const rel = await latestRelease(c.env.DB, channel, m.platform);
+  if (!rel) throw notFound(`no agent release on ${channel} for ${m.platform}`);
   // Rev 12: the evict list rides along (only when there is one: the answer of before otherwise)
   const evict = await evictList(c.env.DB);
   return json({

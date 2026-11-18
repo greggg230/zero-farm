@@ -27,7 +27,22 @@ import { MAX_EXTERNAL_BODY, type Contributor, type ExternalRow, ownContributor, 
 import { CHANNELS, evictList, serveObject } from "./friend";
 import { bookFor } from "./leasebook";
 import { minisignKeyId, verifyBuild, verifyMinisign } from "./manifest";
-import { type Alternate, DRIVER_RE, GPU_MODES, GPU_VENDORS_OFF, MAX_ALTERNATES, MAX_EVICT, type Routing, VENDOR_RE, gpuNeedOf, requiresRuntimeOf, routingOf } from "./routing";
+import { DEFAULT_PLATFORM, PLATFORMS, type Platform, platformOf, storedPlatform } from "./platform";
+import {
+  type Alternate,
+  type CampaignAlternate,
+  DRIVER_RE,
+  GPU_MODES,
+  GPU_VENDORS_OFF,
+  MAX_ALTERNATES,
+  MAX_EVICT,
+  type Routing,
+  VENDOR_RE,
+  altPlatform,
+  gpuNeedOf,
+  requiresRuntimeOf,
+  routingOf,
+} from "./routing";
 import {
   BUILD_RE,
   HEX64_RE,
@@ -107,8 +122,10 @@ const spent = (key: string) => conflict(`${key} belongs to a registered definiti
 
 // An agent release's installer on GitHub Releases (rev 4), where GET /download redirects. Exactly
 // https://github.com/<GITHUB_REPO>/releases/download/agent-v<version>/ZeroFarmSetup.exe, the
-// release's own version (security review H4/L4: no other repository, tag or file).
-export function githubUrlFor(repo: string, version: string): string {
+// release's own version (security review H4/L4: no other repository, tag or file). Rev 17 (PROTOCOL 11.2): a macOS
+// release is the tarball of the GitHub Release agent-macos-v<version>.
+export function githubUrlFor(repo: string, version: string, platform: Platform = DEFAULT_PLATFORM): string {
+  if (platform === "macos-arm64") return `https://github.com/${repo}/releases/download/agent-macos-v${version}/ZeroFarm-macos-arm64.tar.gz`;
   return `https://github.com/${repo}/releases/download/agent-v${version}/ZeroFarmSetup.exe`;
 }
 
@@ -181,17 +198,27 @@ export async function registerBuild(c: Ctx): Promise<Response> {
   const id = str(b.build_id, "build_id", { re: BUILD_RE });
   const v = await verifyBuild(c.env.BUCKET, id, String(c.env.RELEASE_PUBKEYS ?? ""));
   const m = v.manifest;
+  // Rev 17 (PROTOCOL 11.3): a manifest that names a platform is for agents that know platforms (older ones refuse the
+  // field), so its min_agent is at least PLATFORM_AGENT.
+  const platformAgent = config(c.env).platformAgent;
+  if (m.platform !== undefined && (!m.min_agent || cmpSemver(m.min_agent, platformAgent) < 0)) {
+    throw bad(`build ${id} failed its checks`, { problems: [`a manifest that names a platform needs min_agent ${platformAgent} or newer`] });
+  }
+  const platform = m.platform ?? DEFAULT_PLATFORM;
   await c.env.DB.prepare(
-    `INSERT OR REPLACE INTO builds (build_id, kind, version, game, profile, min_agent, aw, size, manifest, sig_verified, created_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT OR REPLACE INTO builds (build_id, kind, version, game, profile, min_agent, aw, size, manifest, sig_verified, created_at, platform)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   )
-    .bind(id, m.kind, m.version, m.game ?? null, m.profile ?? null, m.min_agent ?? null, m.aw ?? null, v.size, v.text, v.sig_verified ? 1 : 0, c.now)
+    .bind(id, m.kind, m.version, m.game ?? null, m.profile ?? null, m.min_agent ?? null, m.aw ?? null, v.size, v.text, v.sig_verified ? 1 : 0, c.now, platform)
     .run();
-  return json({ ok: true, build_id: id, kind: m.kind, version: m.version, size: v.size, sig_verified: v.sig_verified });
+  return json({ ok: true, build_id: id, kind: m.kind, version: m.version, size: v.size, sig_verified: v.sig_verified, platform });
 }
 
 async function buildOfKind(db: D1Database, id: string, kind: string, what: string) {
-  const b = await db.prepare(`SELECT build_id, kind, version FROM builds WHERE build_id = ?`).bind(id).first<{ kind: string; version: string }>();
+  const b = await db
+    .prepare(`SELECT build_id, kind, version, game, profile, platform FROM builds WHERE build_id = ?`)
+    .bind(id)
+    .first<{ kind: string; version: string; game: string | null; profile: string | null; platform: string | null }>();
   if (!b) throw bad(`${what} ${id} is not a registered build (POST /v1/admin/build first)`);
   if (b.kind !== kind) throw bad(`${what} ${id} is a ${b.kind} build, not ${kind}`);
   return b;
@@ -207,21 +234,24 @@ export async function agentRelease(c: Ctx): Promise<Response> {
   const minAgent = str(b.min_agent, "min_agent", { max: 64 });
   if (!isSemver(minAgent)) throw bad("min_agent must be semver");
   if (cmpSemver(minAgent, version) > 0) throw bad("min_agent is newer than the release itself");
+  // Rev 17 (PROTOCOL 11.2): releases are per (channel, platform); the agent build's manifest names the same platform.
+  const platform = platformOf(b.platform, "platform");
   const build = await buildOfKind(c.env.DB, id, "agent", "build_id");
   if (build.version !== version) throw bad(`build ${id} is agent ${build.version}, not ${version}`);
+  if (storedPlatform(build.platform) !== platform) throw bad(`build ${id} is a ${storedPlatform(build.platform)} agent, not ${platform}`);
   // Rev 4: installers live on GitHub Releases, no longer in R2 (`setup`). Refused loudly rather
   // than ignored, so an old release tool can't think it attached one.
   if (b.setup !== undefined && b.setup !== null) throw bad("setup is no longer accepted: pass github_url (PROTOCOL rev 4)");
   let githubUrl: string | null = null;
   if (b.github_url !== undefined && b.github_url !== null) {
     githubUrl = str(b.github_url, "github_url", { max: 512 });
-    const want = githubUrlFor(config(c.env).githubRepo, version);
+    const want = githubUrlFor(config(c.env).githubRepo, version, platform);
     if (githubUrl !== want) throw bad(`github_url must be ${want}`);
   }
-  await c.env.DB.prepare(`INSERT INTO agent_releases (channel, version, build_id, min_agent, t, github_url) VALUES (?, ?, ?, ?, ?, ?)`)
-    .bind(channel, version, id, minAgent, c.now, githubUrl)
+  await c.env.DB.prepare(`INSERT INTO agent_releases (channel, version, build_id, min_agent, t, github_url, platform) VALUES (?, ?, ?, ?, ?, ?, ?)`)
+    .bind(channel, version, id, minAgent, c.now, githubUrl, platform)
     .run();
-  return json({ ok: true, channel, version, build_id: id, min_agent: minAgent, github_url: githubUrl });
+  return json({ ok: true, channel, platform, version, build_id: id, min_agent: minAgent, github_url: githubUrl });
 }
 
 // ---------- runs ----------
@@ -344,7 +374,8 @@ export function minAgentOf(v: unknown): string | null {
   return s;
 }
 
-// Rev 11 (PROTOCOL 9.4): a run's alternates as put (shape only; altCheck checks them against the builds).
+// Rev 11 (PROTOCOL 9.4): a run's alternates as put (shape only; altCheck checks them against the builds). Rev 17
+// (PROTOCOL 11.4): `when.platform` (kept only when given here; altCheck applies the default).
 export function alternatesOf(v: unknown): Alternate[] | null {
   if (v === undefined || v === null) return null;
   if (!Array.isArray(v) || v.length > MAX_ALTERNATES) throw bad(`alternates must be a list of at most ${MAX_ALTERNATES} or null`);
@@ -353,20 +384,25 @@ export function alternatesOf(v: unknown): Alternate[] | null {
     const o = obj(x, `alternates[${i}]`);
     for (const k of Object.keys(o)) if (!["build_id", "runtime", "when"].includes(k)) throw bad(`alternates[${i}].${k}: unknown field`);
     const w = obj(o.when, `alternates[${i}].when`, { optional: true }) ?? {};
-    for (const k of Object.keys(w)) if (!["vendor", "min_driver"].includes(k)) throw bad(`alternates[${i}].when.${k}: unknown field`);
+    for (const k of Object.keys(w)) if (!["platform", "vendor", "min_driver"].includes(k)) throw bad(`alternates[${i}].when.${k}: unknown field`);
+    const platform = w.platform === undefined || w.platform === null ? undefined : platformOf(w.platform, `alternates[${i}].when.platform`);
     const vendor = str(w.vendor, `alternates[${i}].when.vendor`, { optional: true, re: VENDOR_RE });
     const minDriver = str(w.min_driver, `alternates[${i}].when.min_driver`, { optional: true, re: DRIVER_RE });
     return {
       build_id: str(o.build_id, `alternates[${i}].build_id`, { re: BUILD_RE }),
       runtime: str(o.runtime, `alternates[${i}].runtime`, { re: BUILD_RE }),
-      when: { vendor: vendor ?? "", ...(minDriver ? { min_driver: minDriver } : {}) },
+      when: { ...(platform ? { platform } : {}), vendor: vendor ?? "", ...(minDriver ? { min_driver: minDriver } : {}) },
     };
   });
 }
 
-// Each alternate against the registered builds: a worker build requiring exactly its runtime, a runtime build, a
-// vendor (the pack's own `gpu.vendor` when it has one, which `when.vendor` defaults to); none twice, none the
-// default. Returns them with the vendor filled in.
+// Each alternate against the registered builds: a worker build requiring exactly its runtime, a runtime build, both
+// of `when.platform` (rev 17; default windows-x64); a vendor (the pack's own `gpu.vendor` when it has one, which
+// `when.vendor` defaults to), or (rev 17) none: a CPU alternate, whose pack has no `gpu` and whose `when` names its
+// platform (an alternate that names neither a vendor nor a platform, with a pack that names no GPU vendor, is refused
+// as before rev 17: a GPU pack such as Windows ML needs its vendor spelled out); GPU alternates only for windows-x64;
+// none twice, none the default. Returns them with the vendor filled in; a CPU alternate keeps its platform, a GPU
+// alternate (windows-x64) stores none, as before rev 17.
 async function altCheck(db: D1Database, cfg: book.RunCfg): Promise<Alternate[] | null> {
   if (!cfg.alternates) return null;
   const seen = new Set([`${cfg.build_id}|${cfg.runtime}`]);
@@ -375,20 +411,95 @@ async function altCheck(db: D1Database, cfg: book.RunCfg): Promise<Alternate[] |
     const at = `alternates[${i}]`;
     if (seen.has(`${a.build_id}|${a.runtime}`)) throw bad(`${at} is the run's default or another alternate`);
     seen.add(`${a.build_id}|${a.runtime}`);
-    await buildOfKind(db, a.build_id, "worker", `${at}.build_id`);
-    await buildOfKind(db, a.runtime, "runtime", `${at}.runtime`);
+    const wb = await buildOfKind(db, a.build_id, "worker", `${at}.build_id`);
+    const rb = await buildOfKind(db, a.runtime, "runtime", `${at}.runtime`);
     const rows = await db.prepare(`SELECT build_id, manifest FROM builds WHERE build_id IN (?, ?)`).bind(a.build_id, a.runtime).all<{ build_id: string; manifest: string }>();
     const text = (id: string) => rows.results.find((r) => r.build_id === id)?.manifest;
     const need = requiresRuntimeOf(text(a.build_id));
     if (need !== a.runtime) throw bad(`${at}: worker build ${a.build_id} requires runtime ${need ?? "none"}, not ${a.runtime} (sign its executable once per pack, PROTOCOL 9.1)`);
+    const platform = altPlatform(a);
+    for (const [what, id, b] of [["worker build", a.build_id, wb], ["runtime", a.runtime, rb]] as const) {
+      if (storedPlatform(b.platform) !== platform) throw bad(`${at}: ${what} ${id} is for ${storedPlatform(b.platform)}, not ${platform} (when.platform)`);
+    }
     const pack = gpuNeedOf(text(a.runtime));
     if (pack && a.when.vendor && a.when.vendor !== pack.vendor) throw bad(`${at}.when.vendor is ${a.when.vendor}, but runtime ${a.runtime} is for ${pack.vendor} GPUs`);
     const vendor = a.when.vendor || pack?.vendor;
-    if (!vendor) throw bad(`${at}.when.vendor is required: runtime ${a.runtime} names no GPU vendor of its own`);
+    if (!vendor) {
+      if (a.when.platform === undefined) {
+        throw bad(`${at}.when.vendor is required: runtime ${a.runtime} names no GPU vendor of its own (a CPU alternate names when.platform instead, PROTOCOL 11.4)`);
+      }
+      if (a.when.min_driver) throw bad(`${at}.when.min_driver needs a vendor: a CPU alternate has no GPU condition`);
+      out.push({ build_id: a.build_id, runtime: a.runtime, when: { platform } });
+      continue;
+    }
+    if (platform !== DEFAULT_PLATFORM) throw bad(`${at}: no GPU work on ${platform} yet (PROTOCOL 11.5); a CPU alternate names no vendor`);
     if (GPU_VENDORS_OFF.includes(vendor)) throw bad(`${at}: the farm runs no GPU work on ${vendor} GPUs (PROTOCOL 9.4)`);
     out.push({ build_id: a.build_id, runtime: a.runtime, when: { vendor, ...(a.when.min_driver ? { min_driver: a.when.min_driver } : {}) } });
   }
   return out;
+}
+
+// Rev 17 (PROTOCOL 11.4): a campaign's alternates as put, [{"build_id", "when": {"platform"}}] | null (shape only;
+// campaignAltCheck checks them against the builds).
+export function campaignAlternatesOf(v: unknown): CampaignAlternate[] | null {
+  if (v === undefined || v === null) return null;
+  if (!Array.isArray(v) || v.length > MAX_ALTERNATES) throw bad(`alternates must be a list of at most ${MAX_ALTERNATES} or null`);
+  if (!v.length) return null;
+  return v.map((x: unknown, i: number) => {
+    const o = obj(x, `alternates[${i}]`);
+    for (const k of Object.keys(o)) if (!["build_id", "when"].includes(k)) throw bad(`alternates[${i}].${k}: unknown field`);
+    const w = obj(o.when, `alternates[${i}].when`);
+    for (const k of Object.keys(w)) if (k !== "platform") throw bad(`alternates[${i}].when.${k}: unknown field`);
+    if (w.platform === undefined || w.platform === null) throw bad(`alternates[${i}].when.platform is required`);
+    return {
+      build_id: str(o.build_id, `alternates[${i}].build_id`, { re: BUILD_RE }),
+      when: { platform: platformOf(w.platform, `alternates[${i}].when.platform`) },
+    };
+  });
+}
+
+// Each campaign alternate: a registered worker build of when.platform with the campaign build's game and profile, not
+// the campaign's own build; at most one per platform.
+async function campaignAltCheck(
+  db: D1Database,
+  cfg: book.CampaignCfg,
+  main: { game: string | null; profile: string | null },
+): Promise<CampaignAlternate[] | null> {
+  if (!cfg.alternates) return null;
+  const seen = new Set<string>();
+  for (const [i, a] of cfg.alternates.entries()) {
+    const at = `alternates[${i}]`;
+    if (a.build_id === cfg.build_id) throw bad(`${at} is the campaign's own build`);
+    if (seen.has(a.when.platform)) throw bad(`${at}: a second alternate for ${a.when.platform} (at most one per platform)`);
+    seen.add(a.when.platform);
+    const b = await buildOfKind(db, a.build_id, "worker", `${at}.build_id`);
+    if (b.game !== main.game || b.profile !== main.profile) {
+      throw bad(`${at}: worker build ${a.build_id} is game ${b.game} profile ${b.profile}, the campaign's build game ${main.game} profile ${main.profile}`);
+    }
+    if (storedPlatform(b.platform) !== a.when.platform) throw bad(`${at}: worker build ${a.build_id} is for ${storedPlatform(b.platform)}, not ${a.when.platform}`);
+  }
+  return cfg.alternates;
+}
+
+// Rev 17 (PROTOCOL 11.4): the platform of each build among `ids` (one not registered: windows-x64).
+async function buildPlatforms(db: D1Database, ids: (string | null | undefined)[]): Promise<Map<string, Platform>> {
+  const list = [...new Set(ids.filter((x): x is string => !!x))];
+  const out = new Map<string, Platform>(list.map((id) => [id, DEFAULT_PLATFORM]));
+  if (!list.length) return out;
+  const { results } = await db
+    .prepare(`SELECT build_id, platform FROM builds WHERE build_id IN (${list.map(() => "?").join(",")})`)
+    .bind(...list)
+    .all<{ build_id: string; platform: string | null }>();
+  for (const r of results) out.set(r.build_id, storedPlatform(r.platform));
+  return out;
+}
+
+// Rev 17 (PROTOCOL 11.4): the platforms that can get a run's or campaign's jobs: its default build's, and each
+// alternate's that its current definition authorizes (no `problems`), in PLATFORMS order.
+async function platformsOf(db: D1Database, build: string, alts: { platform: Platform; problems: string[] }[]): Promise<Platform[]> {
+  const set = new Set<Platform>([(await buildPlatforms(db, [build])).get(build)!]);
+  for (const a of alts) if (!a.problems.length) set.add(a.platform);
+  return PLATFORMS.filter((p) => set.has(p));
 }
 
 export async function putRun(c: Ctx, run: string): Promise<Response> {
@@ -407,8 +518,14 @@ export async function putRun(c: Ctx, run: string): Promise<Response> {
     selfplay: selfplayOf(b.selfplay),
     eval: evalOf(b.eval),
   };
-  await buildOfKind(c.env.DB, cfg.build_id, "worker", "build_id");
-  if (cfg.runtime) await buildOfKind(c.env.DB, cfg.runtime, "runtime", "runtime");
+  const wb = await buildOfKind(c.env.DB, cfg.build_id, "worker", "build_id");
+  if (cfg.runtime) {
+    const rb = await buildOfKind(c.env.DB, cfg.runtime, "runtime", "runtime");
+    // Rev 17: the default build and runtime are of one platform (the machines of that platform get them).
+    if (storedPlatform(rb.platform) !== storedPlatform(wb.platform)) {
+      throw bad(`runtime ${cfg.runtime} is for ${storedPlatform(rb.platform)}, but build_id ${cfg.build_id} is for ${storedPlatform(wb.platform)}`);
+    }
+  }
   cfg.alternates = await altCheck(c.env.DB, cfg);
   return json(unwrap(await bookFor(c.env, book.runScope(run)).putRun(cfg, c.now)));
 }
@@ -422,6 +539,7 @@ export async function getRunRoute(c: Ctx, run: string): Promise<Response> {
   const ckpt = r.current_gen === null ? null : await c.env.DB.prepare(`SELECT * FROM checkpoints WHERE run = ? AND gen = ?`).bind(run, r.current_gen).first();
   const gens = (await c.env.DB.prepare(`SELECT gen FROM checkpoints WHERE run = ? ORDER BY gen`).bind(run).all<{ gen: number }>()).results;
   const batches = await evalBatches(c.env.DB, run, 50);
+  const alternates = await alternatesStatus(c, r);
   return json({
     run: r.run,
     game: r.game,
@@ -443,7 +561,9 @@ export async function getRunRoute(c: Ctx, run: string): Promise<Response> {
     pool: await book.poolSize(c.env.DB, scope),
     rolling_leases: await rollingLeases(c.env.DB, scope),
     definition: await definitionStatus(c, "run", r.run, r, null),
-    alternates: await alternatesStatus(c, r),
+    alternates,
+    // Rev 17 (PROTOCOL 11.4): the platforms that can get its jobs.
+    platforms: await platformsOf(c.env.DB, r.build_id, (alternates ?? []).map((a) => ({ platform: altPlatform(a), problems: a.problems }))),
   });
 }
 
@@ -473,10 +593,10 @@ export async function rollingLeases(db: D1Database, scope: string) {
 }
 
 // Rev 11: a run's alternates, each with why its current definition doesn't authorize it (`problems`).
-async function alternatesStatus(c: Ctx, r: book.RunRow): Promise<(Alternate & { problems: string[] })[] | null> {
+async function alternatesStatus(c: Ctx, r: book.RunRow, known?: Def | null): Promise<(Alternate & { problems: string[] })[] | null> {
   const alts = parseJson<Alternate[] | null>(r.alternates ?? null, null);
   if (!alts) return null;
-  const d = await currentDef(c.env.DB, "run", r.run);
+  const d = known === undefined ? await currentDef(c.env.DB, "run", r.run) : known;
   const out = [];
   for (const a of alts) {
     const b = await c.env.DB.prepare(`SELECT manifest FROM builds WHERE build_id = ?`).bind(a.build_id).first<{ manifest: string }>();
@@ -654,9 +774,24 @@ export async function putCampaign(c: Ctx, id: string): Promise<Response> {
     min_agent: minAgentOf(b.min_agent),
     // Rev 14 (PROTOCOL 5.4): a fuzz campaign's share of the farm beside the runs' games (null: the backfill).
     share: shareOf(b.share, "share").share ?? null,
+    // Rev 17 (PROTOCOL 11.4): its worker builds per platform; a PUT is the whole configuration, so one without them
+    // removes them.
+    alternates: campaignAlternatesOf(b.alternates),
   };
-  await buildOfKind(c.env.DB, cfg.build_id, "worker", "build_id");
+  const main = await buildOfKind(c.env.DB, cfg.build_id, "worker", "build_id");
+  cfg.alternates = await campaignAltCheck(c.env.DB, cfg, main);
   return json(unwrap(await bookFor(c.env, book.campaignScope(id)).putCampaign(cfg, c.now)));
+}
+
+// Rev 17 (PROTOCOL 11.4): a campaign's alternates, each with why its current definition doesn't authorize it.
+async function campaignAlternatesStatus(c: Ctx, x: book.CampaignRow, known?: Def | null): Promise<(CampaignAlternate & { problems: string[] })[] | null> {
+  const alts = parseJson<CampaignAlternate[] | null>(x.alternates ?? null, null);
+  if (!alts) return null;
+  const d = known === undefined ? await currentDef(c.env.DB, "campaign", x.campaign) : known;
+  return alts.map((a) => {
+    const p = d ? leaseProblem(d, "fuzz", a.build_id, null, c.now) : "the campaign has no definition";
+    return { ...a, problems: p ? [p] : [] };
+  });
 }
 
 export async function getCampaignRoute(c: Ctx, id: string): Promise<Response> {
@@ -664,6 +799,7 @@ export async function getCampaignRoute(c: Ctx, id: string): Promise<Response> {
   const x = await book.getCampaign(c.env.DB, slug(id, "campaign"));
   if (!x) throw notFound(`no campaign ${id}`);
   const scope = book.campaignScope(id);
+  const alternates = await campaignAlternatesStatus(c, x);
   const [claimed, leased, fails] = await c.env.DB.batch<any>([
     c.env.DB.prepare(`SELECT COALESCE(SUM(hi - lo), 0) AS n FROM claims WHERE scope = ?`).bind(scope),
     c.env.DB.prepare(`SELECT COUNT(*) AS n, COALESCE(SUM(hi - lo - claimed), 0) AS ids FROM leases WHERE scope = ? AND state = 'active'`).bind(scope),
@@ -681,6 +817,8 @@ export async function getCampaignRoute(c: Ctx, id: string): Promise<Response> {
     failures: fails.results[0].n,
     sites: fails.results[0].sites,
     definition: await definitionStatus(c, "campaign", x.campaign, null, x),
+    alternates,
+    platforms: await platformsOf(c.env.DB, x.build_id, (alternates ?? []).map((a) => ({ platform: a.when.platform, problems: a.problems }))),
   });
 }
 
@@ -790,19 +928,36 @@ export async function diag(c: Ctx): Promise<Response> {
   const b = await readJson(c.req);
   const kind = oneOf(b.kind, "kind", ["sweep", "profile", "stability", "logs"] as const);
   const params = b.params === undefined || b.params === null ? null : JSON.stringify(opaque(obj(b.params, "params"), "params", 16384));
-  let targets: string[];
+  let rows: { machine_id: string; platform: string | null }[];
   if (b.machine_id !== undefined && b.class !== undefined) throw bad("give machine_id or class, not both");
   if (b.machine_id !== undefined) {
     const id = str(b.machine_id, "machine_id", { re: MACHINE_RE });
-    const m = await c.env.DB.prepare(`SELECT machine_id FROM machines WHERE machine_id = ? AND revoked_at IS NULL`).bind(id).first();
+    const m = await c.env.DB.prepare(`SELECT machine_id, platform FROM machines WHERE machine_id = ? AND revoked_at IS NULL`)
+      .bind(id)
+      .first<{ machine_id: string; platform: string | null }>();
     if (!m) throw notFound(`no machine ${id}`);
-    targets = [id];
+    rows = [m];
   } else if (b.class !== undefined) {
     const cls = str(b.class, "class", { max: 200 });
-    const { results } = await c.env.DB.prepare(`SELECT machine_id FROM machines WHERE class = ? AND revoked_at IS NULL`).bind(cls).all<{ machine_id: string }>();
+    const { results } = await c.env.DB.prepare(`SELECT machine_id, platform FROM machines WHERE class = ? AND revoked_at IS NULL`)
+      .bind(cls)
+      .all<{ machine_id: string; platform: string | null }>();
     if (!results.length) throw notFound(`no machine of class ${cls}`);
-    targets = results.map((r) => r.machine_id);
+    rows = results;
   } else throw bad("machine_id or class is required");
+  // Rev 17 (PROTOCOL 11.4): the build a diag lease would run (params.build_id, else params.run's) is of every target
+  // machine's platform.
+  if (kind !== "logs" && params) {
+    const p = JSON.parse(params) as Record<string, Json>;
+    let buildId = typeof p.build_id === "string" ? p.build_id : null;
+    if (!buildId && typeof p.run === "string" && SLUG_RE.test(p.run)) buildId = (await book.getRun(c.env.DB, p.run))?.build_id ?? null;
+    if (buildId) {
+      const bp = (await buildPlatforms(c.env.DB, [buildId])).get(buildId)!;
+      const other = rows.find((r) => storedPlatform(r.platform) !== bp);
+      if (other) throw bad(`build ${buildId} is for ${bp}, but machine ${other.machine_id} is ${storedPlatform(other.platform)}`);
+    }
+  }
+  const targets = rows.map((r) => r.machine_id);
   const out: { id: number; machine_id: string }[] = [];
   for (const id of targets) {
     const r = await c.env.DB.prepare(`INSERT INTO diag_requests (machine_id, kind, params, created_at) VALUES (?, ?, ?, ?) RETURNING id`)
@@ -846,7 +1001,7 @@ export async function stats(c: Ctx): Promise<Response> {
   const cfg = config(c.env);
   const [machinesR, leasesR, crashesR, thrR, runsR, campsR, recentCrashR, fuzzR, classR, pausedR, failCountR, releasesR, diagR, blocksR, batchesR, perMachineR, perScopeR, externalR] = await db.batch<any>([
     db.prepare(
-      `SELECT machine_id, name, class, channel, agent_version, created_at, last_seen, revoked_at, paused, caps, presence, presence_t,
+      `SELECT machine_id, name, class, channel, platform, agent_version, created_at, last_seen, revoked_at, paused, caps, presence, presence_t,
          json_extract(profile, '$.idle_h_day') AS idle_h_day, json_extract(profile, '$.on_h_day') AS on_h_day,
          json_extract(profile, '$.providers') AS providers, json_extract(profile, '$.gpus') AS gpus
        FROM machines ORDER BY created_at`,
@@ -900,8 +1055,9 @@ export async function stats(c: Ctx): Promise<Response> {
       )
       .bind(day, day, day, day),
     db.prepare(
-      `SELECT r.channel, r.version, r.build_id, r.min_agent, r.t, r.github_url FROM agent_releases r
-       WHERE r.id = (SELECT MAX(id) FROM agent_releases x WHERE x.channel = r.channel) ORDER BY r.channel`,
+      `SELECT r.channel, r.platform, r.version, r.build_id, r.min_agent, r.t, r.github_url FROM agent_releases r
+       WHERE r.id = (SELECT MAX(id) FROM agent_releases x WHERE x.channel = r.channel AND x.platform = r.platform)
+       ORDER BY r.channel, r.platform`,
     ),
     db.prepare(
       `SELECT d.id, d.machine_id, m.name, d.name AS what, d.key, d.size, d.user, d.t FROM diag_uploads d
@@ -938,6 +1094,7 @@ export async function stats(c: Ctx): Promise<Response> {
       name: m.name,
       class: m.class,
       channel: m.channel,
+      platform: storedPlatform(m.platform), // rev 17
       agent_version: m.agent_version,
       last_seen: m.last_seen,
       revoked: m.revoked_at !== null,
@@ -986,6 +1143,7 @@ export async function stats(c: Ctx): Promise<Response> {
       .first<any>();
     const cur = r.eval_batch ? await book.getBatch(db, r.run, r.eval_batch) : null;
     const spCfg = parseJson<book.SelfplayCfg | null>(r.selfplay, null);
+    const alts = await alternatesStatus(c, r, defs.get(`run:${r.run}`) ?? null);
     runs.push({
       run: r.run,
       game: r.game,
@@ -1004,6 +1162,8 @@ export async function stats(c: Ctx): Promise<Response> {
       unacked_results: extra.unacked,
       pool: extra.pool,
       definition: await definitionStatus(c, "run", r.run, r, null, defs.get(`run:${r.run}`) ?? null),
+      // Rev 17 (PROTOCOL 11.4): the platforms that can get its jobs.
+      platforms: await platformsOf(db, r.build_id, (alts ?? []).map((a) => ({ platform: altPlatform(a), problems: a.problems }))),
     });
   }
   const campaigns = [];
@@ -1019,6 +1179,7 @@ export async function stats(c: Ctx): Promise<Response> {
       )
       .bind(scope, scope, scope, x.campaign, x.campaign)
       .first<any>();
+    const alts = await campaignAlternatesStatus(c, x, defs.get(`campaign:${x.campaign}`) ?? null);
     campaigns.push({
       campaign: x.campaign,
       mode: x.mode,
@@ -1035,6 +1196,9 @@ export async function stats(c: Ctx): Promise<Response> {
       failures: e.failures,
       sites: e.sites,
       definition: await definitionStatus(c, "campaign", x.campaign, null, x, defs.get(`campaign:${x.campaign}`) ?? null),
+      // Rev 17 (PROTOCOL 11.4): its worker builds per platform, and the platforms that can get its jobs.
+      alternates: alts,
+      platforms: await platformsOf(db, x.build_id, (alts ?? []).map((a) => ({ platform: a.when.platform, problems: a.problems }))),
     });
   }
 
@@ -1096,6 +1260,7 @@ export async function stats(c: Ctx): Promise<Response> {
     paused: pausedR.results[0]?.value === "1",
     limits: {
       definition_agent: cfg.definitionAgent,
+      platform_agent: cfg.platformAgent,
       data_keys: cfg.dataPubkeys.length,
       max_active_leases: cfg.maxActiveLeases,
       max_lease_chunks: cfg.maxLeaseChunks,

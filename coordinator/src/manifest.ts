@@ -2,6 +2,7 @@
 // registered. The coordinator never holds the secret key; with RELEASE_PUBKEYS set it also
 // verifies the minisign signature, which agents verify again on every PC.
 
+import { PLATFORMS, type Platform, isPlatform } from "./platform";
 import { BUILD_RE, bad, cmpSemver, hex, isSemver, sha256Hex } from "./util";
 
 export interface ManifestFile {
@@ -24,6 +25,7 @@ export interface Manifest {
   min_agent?: string;
   requires_runtime?: string;
   entry?: string;
+  platform?: Platform; // rev 17 (PROTOCOL 11.3): absent = windows-x64
   files: ManifestFile[];
 }
 
@@ -55,6 +57,8 @@ export function parseManifest(text: string, problems: string[]): Manifest | null
   if (typeof m.version !== "string" || !m.version || m.version.length > 64) problems.push("version must be a short string");
   if (m.kind === "agent" && typeof m.version === "string" && !isSemver(m.version)) problems.push("an agent's version must be semver");
   if (m.min_agent !== undefined && (typeof m.min_agent !== "string" || !isSemver(m.min_agent))) problems.push("min_agent must be semver");
+  // Rev 17: an optional platform (absent: windows-x64). The coordinator checks its min_agent against PLATFORM_AGENT.
+  if (m.platform !== undefined && !isPlatform(m.platform)) problems.push(`unknown platform ${JSON.stringify(m.platform)} (known: ${PLATFORMS.join(", ")})`);
   if (m.kind === "worker") {
     if (typeof m.game !== "string" || !m.game) problems.push("a worker needs game");
     if (!Number.isInteger(m.aw)) problems.push("a worker needs aw (the agent-worker protocol it speaks)");

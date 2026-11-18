@@ -2,6 +2,7 @@
 // go to, from the job's `gpu` setting and `providers` allowlist and each machine's verified
 // execution providers. Pure functions: friend.ts `lease()` asks them for each candidate.
 
+import { type Platform, storedPlatform } from "./platform";
 import { bad } from "./util";
 
 // Execution providers by their wire names, and the GPU vendor each serves (`dml`: any DirectX 12
@@ -134,11 +135,20 @@ export interface GpuNeed {
   providers: Provider[];
 }
 
-// A run alternate (PROTOCOL 9.4): a worker build, the runtime pack it requires and the vendor condition.
+// A run alternate (PROTOCOL 9.4): a worker build, the runtime pack it requires and the vendor condition. Rev 17
+// (PROTOCOL 11.4): the platform it is for (stored only when not windows-x64, so a run put before rev 17 reads the same),
+// and no vendor for a CPU alternate (offered to every machine of its platform, no GPU condition).
 export interface Alternate {
   build_id: string;
   runtime: string;
-  when: { vendor: string; min_driver?: string | null };
+  when: { platform?: Platform; vendor?: string; min_driver?: string | null };
+}
+export const altPlatform = (a: Alternate): Platform => storedPlatform(a.when.platform);
+
+// Rev 17 (PROTOCOL 11.4): a fuzz campaign's worker build for one platform (at most one per platform).
+export interface CampaignAlternate {
+  build_id: string;
+  when: { platform: Platform };
 }
 
 export const MAX_ALTERNATES = 4;

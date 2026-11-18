@@ -29,11 +29,14 @@ CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET, an Access service token)
   definition <definition.json>                     upload it and its .minisig (signed with a data key) to
                                                    defs/<kind>/<id>/<version>/ and register it (PROTOCOL 7)
   upload-build <dir>                               upload dir/manifest.json(.minisig) + its files, register
-  agent-release <version> <build_id> <channel> <min_agent> [--github-url URL]
-                                                   with --github-url: the installer on GitHub
-                                                   Releases, where GET /download redirects
+  agent-release <version> <build_id> <channel> <min_agent> [--github-url URL] [--platform P]
+                                                   with --github-url: the installer (macOS: the
+                                                   tarball) on GitHub Releases, where GET /download
+                                                   redirects; --platform windows-x64 (default) |
+                                                   macos-arm64: the agent build's platform
 
-  run <run> <config.json|->                        create/update a run (PUT /v1/admin/run/<run>)
+  run <run> <config.json|->                        create/update a run (PUT /v1/admin/run/<run>); alternates
+                                                   take when.platform (a CPU alternate: no vendor)
   run-get <run>
   checkpoint <run> <gen> <model.onnx> [reference.npz]   upload to ckpt/<run>/<gen>/ and publish
                                                    (older than current: registered, not current)
@@ -41,7 +44,7 @@ CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET, an Access service token)
   accept <run> <gen> <games>                       the trainer's total of accepted games for gen
   ack <run> <cursor>
 
-  campaign <id> <config.json|->
+  campaign <id> <config.json|->                    alternates: [{"build_id", "when": {"platform"}}] per platform
   campaign-get <id>
   campaign-results <id> [--after N] [--limit N]
   campaign-ack <id> <cursor>
@@ -247,7 +250,7 @@ async function main(argv: string[]): Promise<void> {
       return print(await api("POST", "/v1/admin/build", { build_id: id }));
     }
     case "agent-release":
-      need(pos, 4, "agent-release <version> <build_id> <channel> <min_agent> [--github-url URL]");
+      need(pos, 4, "agent-release <version> <build_id> <channel> <min_agent> [--github-url URL] [--platform P]");
       return print(
         await api("POST", "/v1/admin/agent/release", {
           version: pos[0],
@@ -255,6 +258,7 @@ async function main(argv: string[]): Promise<void> {
           channel: pos[2],
           min_agent: pos[3],
           github_url: opt["github-url"] ?? null,
+          ...(opt.platform ? { platform: opt.platform } : {}),
         }),
       );
 

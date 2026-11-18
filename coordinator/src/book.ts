@@ -32,7 +32,8 @@ import {
   leaseProblem,
 } from "./definitions";
 import { intersect, normalize, parseRanges, subtract, total, type Range } from "./ranges";
-import { type Alternate, type GpuMode, type Provider, requiresRuntimeOf } from "./routing";
+import { storedPlatform } from "./platform";
+import { type Alternate, type CampaignAlternate, type GpuMode, type Provider, requiresRuntimeOf } from "./routing";
 import {
   HttpError,
   type Json,
@@ -156,6 +157,7 @@ export interface CampaignRow {
   providers: string | null; // rev 7: JSON allowlist or NULL (any provider)
   min_agent: string | null; // rev 9: the oldest agent its leases go to (NULL: no such limit)
   share: number | null; // rev 14: competes with the runs' games within this share (NULL: the backfill)
+  alternates?: string | null; // rev 17: JSON list of its worker builds per platform (PROTOCOL 11.4; NULL or absent: none)
   created_at: number;
   updated_at: number;
 }
@@ -530,7 +532,10 @@ export interface GrantReq {
   def_aware: boolean;
   // Rev 11 (PROTOCOL 9.4): one of the run's alternates, chosen for this machine by friend.ts (absent:
   // the run's default build and runtime). Checked again here against the run's stored alternates.
-  alt?: { build_id: string; runtime: string };
+  // Rev 17 (PROTOCOL 11.4): or one of a campaign's alternates (runtime null), checked against the campaign's.
+  alt?: { build_id: string; runtime: string | null };
+  // Rev 17 (PROTOCOL 11): the machine's platform (absent: windows-x64). Every build the lease carries is of it.
+  platform?: string;
   // Rev 15 (PROTOCOL 10.2): the agent takes rolling leases (ROLLING_AGENT or newer, `features: ["rolling"]`): a
   // self-play lease of a run with `selfplay.rolling` set is then rolling. Ignored for every other lease.
   rolling?: boolean;
@@ -570,6 +575,19 @@ export interface Lease {
 }
 
 const buildRef = (id: string) => ({ build_id: id, manifest: `builds/${id}/manifest.json` });
+
+// Rev 17 (PROTOCOL 11.4): every build a lease would carry is of the machine's platform (a build not registered counts as
+// windows-x64, as everything did before rev 17). friend.ts chose them so; this is the check under the scope's lock.
+async function platformOk(db: D1Database, ids: (string | null | undefined)[], platform: string | undefined): Promise<boolean> {
+  const want = storedPlatform(platform);
+  const list = [...new Set(ids.filter((x): x is string => !!x))];
+  if (!list.length) return true;
+  const { results } = await db
+    .prepare(`SELECT build_id, platform FROM builds WHERE build_id IN (${list.map(() => "?").join(",")})`)
+    .bind(...list)
+    .all<{ build_id: string; platform: string | null }>();
+  return list.every((id) => storedPlatform(results.find((r) => r.build_id === id)?.platform) === want);
+}
 
 export async function grant(env: Env, req: GrantReq): Promise<Lease | null> {
   if (req.kind === "diag") return grantDiag(env, req);
@@ -657,6 +675,7 @@ async function grantRunGames(env: Env, req: GrantReq): Promise<Lease | null> {
     buildId = req.alt.build_id;
     runtime = req.alt.runtime;
   }
+  if (!(await platformOk(db, [buildId, runtime], req.platform))) return null; // rev 17
   const def = await grantDef(db, req, "run", run.run, req.kind as JobKind, buildId, runtime, buildRuntime);
   if (def === null) return null;
   const stmts: Stmt[] = [];
@@ -760,7 +779,15 @@ async function grantFuzz(env: Env, req: GrantReq): Promise<Lease | null> {
   await sweep(env, scope, req.now);
   const c = await getCampaign(db, req.campaign!);
   if (!c || c.state !== "active") return null;
-  const def = await grantDef(db, req, "campaign", c.campaign, "fuzz", c.build_id, null);
+  // Rev 17 (PROTOCOL 11.4): the campaign's alternate for the machine's platform, chosen by friend.ts (absent: its build).
+  let buildId = c.build_id;
+  if (req.alt) {
+    const alts = parseJson<CampaignAlternate[] | null>(c.alternates ?? null, null) ?? [];
+    if (req.alt.runtime !== null || !alts.some((a) => a.build_id === req.alt!.build_id)) return null;
+    buildId = req.alt.build_id;
+  }
+  if (!(await platformOk(db, [buildId], req.platform))) return null;
+  const def = await grantDef(db, req, "campaign", c.campaign, "fuzz", buildId, null);
   if (def === null) return null;
   const n = Math.max(1, Math.min(req.want, MAX_LEASE_IDS));
   const stmts: Stmt[] = [];
@@ -778,7 +805,7 @@ async function grantFuzz(env: Env, req: GrantReq): Promise<Lease | null> {
     ...baseLease(req.now, "fuzz"),
     run: null,
     campaign: c.campaign,
-    build: buildRef(c.build_id),
+    build: buildRef(buildId),
     runtime: null,
     checkpoint: null,
     checkpoints: null,
@@ -823,6 +850,8 @@ async function grantDiag(env: Env, req: GrantReq): Promise<Lease | null> {
     buildId = c?.build_id ?? null;
   }
   if (!buildId) return null;
+  // Rev 17: only a build of the machine's platform (diag leases go only to legacy agents, all windows-x64).
+  if (!(await platformOk(db, [buildId, run?.runtime], req.platform))) return null;
   const ckpt = run ? await getCheckpoint(db, run.run, run.current_gen) : null;
   const lease: Lease = {
     ...baseLease(req.now, "diag"),
@@ -1543,6 +1572,7 @@ export interface CampaignCfg {
   providers: Provider[] | null; // rev 7
   min_agent: string | null; // rev 9
   share: number | null; // rev 14 (PROTOCOL 5.4): null = the backfill
+  alternates: CampaignAlternate[] | null; // rev 17 (PROTOCOL 11.4): its worker builds for other platforms
 }
 
 export async function putCampaign(env: Env, cfg: CampaignCfg, now: number): Promise<{ ok: true; created: boolean; cursor: number }> {
@@ -1552,12 +1582,13 @@ export async function putCampaign(env: Env, cfg: CampaignCfg, now: number): Prom
   const cursor = old ? Math.max(old.cursor, cfg.seed_base) : cfg.seed_base;
   await db
     .prepare(
-      `INSERT INTO campaigns (campaign, build_id, mode, env, seed_base, cursor, chunk, priority, state, needs, gpu, providers, min_agent, share, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `INSERT INTO campaigns (campaign, build_id, mode, env, seed_base, cursor, chunk, priority, state, needs, gpu, providers, min_agent, share, alternates, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
        ON CONFLICT (campaign) DO UPDATE SET build_id = excluded.build_id, mode = excluded.mode, env = excluded.env,
          seed_base = excluded.seed_base, cursor = MAX(campaigns.cursor, excluded.cursor), chunk = excluded.chunk,
          priority = excluded.priority, state = excluded.state, needs = excluded.needs, gpu = excluded.gpu,
-         providers = excluded.providers, min_agent = excluded.min_agent, share = excluded.share, updated_at = excluded.updated_at`,
+         providers = excluded.providers, min_agent = excluded.min_agent, share = excluded.share, alternates = excluded.alternates,
+         updated_at = excluded.updated_at`,
     )
     .bind(
       cfg.campaign,
@@ -1574,6 +1605,7 @@ export async function putCampaign(env: Env, cfg: CampaignCfg, now: number): Prom
       cfg.providers ? JSON.stringify(cfg.providers) : null,
       cfg.min_agent,
       cfg.share,
+      cfg.alternates && cfg.alternates.length ? JSON.stringify(cfg.alternates) : null,
       now,
       now,
     )

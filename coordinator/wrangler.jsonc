@@ -48,6 +48,9 @@
     // Rev 15 (PROTOCOL 10): the first agent that takes rolling self-play leases (it also lists the feature
     // "rolling" in its lease request); older agents get classic self-play leases of every run.
     "ROLLING_AGENT": "0.2.13",
+    // Rev 17 (PROTOCOL 11): the first agent that knows platforms (header x-farm-platform; absent = windows-x64). A
+    // manifest that names a platform needs min_agent at least this.
+    "PLATFORM_AGENT": "0.3.0",
     // Installers (agent release github_url) must be this repository's agent-v<version> assets.
     "GITHUB_REPO": "greggg230/zero-farm",
     // Limits (security review M3, M4): active leases per machine; result chunks and bytes per

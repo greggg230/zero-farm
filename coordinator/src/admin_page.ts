@@ -168,7 +168,7 @@ function render(s) {
     // Rev 15 (PROTOCOL 10): rolling self-play leases (the run's setting and how many run now; each in its own table).
     ["rolling", (r) => (r.rolling ? (r.rolling_leases || []).length + ' leases<br><span class="muted">block ' + num(r.rolling.block) +
       ", " + Math.round(r.rolling.max_s / 60) + " min</span>" : (r.rolling_leases || []).length ? (r.rolling_leases || []).length + " leases (setting removed)" : "-")],
-    ["definition", (r) => defCell(r.definition)],
+    ["definition", (r) => defCell(r.definition)], ["platforms", (r) => esc((r.platforms || []).join(", "))],
     ["active leases", (r) => r.active_leases, "n"], ["pool", (r) => num(r.pool), "n"], ["next gid", (r) => num(r.next_gid), "n"],
   ], s.runs);
 
@@ -201,7 +201,7 @@ function render(s) {
     ["campaign", (x) => esc(x.campaign)], ["mode", (x) => esc(x.mode)], ["state", (x) => x.state], ["priority", (x) => x.priority, "n"],
     ["cursor", (x) => num(x.cursor), "n"], ["seeds done", (x) => num(x.seeds_done), "n"], ["pool", (x) => num(x.pool), "n"],
     ["active leases", (x) => x.active_leases, "n"], ["failures", (x) => '<span class="' + (x.failures ? "bad" : "") + '">' + x.failures + "</span>", "n"],
-    ["sites", (x) => x.sites, "n"], ["definition", (x) => defCell(x.definition)],
+    ["sites", (x) => x.sites, "n"], ["definition", (x) => defCell(x.definition)], ["platforms", (x) => esc((x.platforms || []).join(", "))],
   ], s.campaigns);
 
   // Signed definitions (PROTOCOL 7): what each run's and campaign's current definition allows.
@@ -218,7 +218,9 @@ function render(s) {
 
   h += "<h2>Machines</h2>" + table([
     ["name", (m) => esc(m.name) + '<br><code class="muted">' + esc(m.machine_id) + "</code>"],
-    ["class", (m) => esc(m.class)], ["agent", (m) => esc(m.agent_version) + ' <span class="muted">' + esc(m.channel) + "</span>" +
+    // Rev 17 (PROTOCOL 11): the machine's platform under its hardware class.
+    ["class", (m) => esc(m.class) + '<br><span class="muted">' + esc(m.platform || "windows-x64") + "</span>"],
+    ["agent", (m) => esc(m.agent_version) + ' <span class="muted">' + esc(m.channel) + "</span>" +
       (s.limits && m.agent_version && cmpVer(m.agent_version, s.limits.definition_agent) < 0 ? ' <span class="warn" title="older than the first agent that verifies definitions">legacy</span>' : "")],
     ["last seen", (m) => (m.revoked ? '<span class="bad">revoked</span>' : ago(m.last_seen, now)) + (m.paused ? ' <span class="warn">paused</span>' : "")],
     ["working on", (m) => esc(m.working_on || "")],
