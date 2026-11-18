@@ -9,7 +9,8 @@
 // Every /v1/* answer, errors included, carries `x-zerofarm-coordinator: 1`: agents (0.2.5+) treat
 // a 401/403 as "this PC was removed" only when the coordinator itself said so, never when a proxy,
 // a firewall rule or a misplaced Access policy answered.
-//   public:                   / (onboarding page), /download (302 to the newest installer on GitHub)
+//   public:                   / (onboarding page), /download (302 to the newest installer on GitHub),
+//                             /install-macos.sh (rev 17: the macOS installer script)
 
 import * as admin from "./admin";
 import { ADMIN_PAGE } from "./admin_page";
@@ -75,6 +76,7 @@ const routes: [string, RegExp, Handler][] = [
   ["GET", /^\/$/, onboard.home],
   ["GET", /^\/download$/, onboard.download],
   ["HEAD", /^\/download$/, onboard.download],
+  ["GET", /^\/install-macos\.sh$/, onboard.installMacos], // rev 17: the macOS installer script
 ];
 
 const COORDINATOR_HEADER = "x-zerofarm-coordinator";
