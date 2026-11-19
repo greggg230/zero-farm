@@ -7,8 +7,8 @@ A change to anything here is a protocol change: bump the version it belongs to a
 bottom.
 
 Versions: HTTP API `v1` (path prefix), agent↔worker protocol `aw/1`, network files `zero-onnx/1`,
-manifests `manifest/1`. Current revision: v1 rev 19 (section 13, layout tuning and several workers per lease; rev 18: section 12, hardware routing;
-rev 17: section 11, platforms: macOS on Apple silicon).
+manifests `manifest/1`. Current revision: v1 rev 20 (section 14, model variants per generation; rev 19: section 13, layout tuning and
+several workers per lease; rev 18: section 12, hardware routing; rev 17: section 11, platforms: macOS on Apple silicon).
 
 ## 1. Conventions
 
@@ -219,7 +219,8 @@ Lease = {
   "build":   {"build_id": "...", "manifest": "builds/<id>/manifest.json"},
   "runtime": {"build_id": "...", "manifest": "builds/<id>/manifest.json"} | null,
   "checkpoint": {"gen": 81, "model": "ckpt/eoe2/81/model.onnx", "sha256": "...",
-                 "reference": "ckpt/eoe2/81/reference.npz", "reference_sha256": "..."} | null,
+                 "reference": "ckpt/eoe2/81/reference.npz", "reference_sha256": "...",
+                 "variant": "gpu"?} | null,                // `variant`: rev 20, section 14.3 (agents from 0.3.5)
   "checkpoints": [Checkpoint, ...] | null,              // eval only (rev 5, section 5.2): every
                                                        // network the job's seats name, by gen
   "definition": {"key": "defs/<kind>/<id>/<version>/definition.json", "sha256": "..."},
@@ -403,9 +404,9 @@ tools also send an Access service token (`CF-Access-Client-Id`, `CF-Access-Clien
 | `POST /v1/admin/build` | `{"build_id"}` after its manifest, signature and files are uploaded; the coordinator checks presence + sizes + hashes, and the signature and its trusted comment (`build_id=`, `kind=`) when the Worker var `RELEASE_PUBKEYS` is set → `{"ok": true, "build_id", "kind", "version", "size", "sig_verified"}`; failures → 400 with `"problems": [...]` |
 | `POST /v1/admin/agent/release` | `{"version", "build_id", "channel": "canary" \| "stable", "min_agent", "github_url": "<url>" \| null}`: `build_id` must be a registered agent build of that version, `min_agent` ≤ `version`. `github_url` (rev 4): the installer asset of the release's GitHub Release, where `GET /download` redirects; create the GitHub Release first. Rev 6: exactly `https://github.com/<GITHUB_REPO>/releases/download/agent-v<version>/ZeroFarmSetup.exe` (the var defaults to `greggg230/zero-farm`), else 400. `setup` (rev 3) → 400 → `{"ok": true, "channel", "version", "build_id", "min_agent", "github_url"}` |
 | `PUT /v1/admin/definition` | rev 6, section 7: `{"kind": "run" \| "campaign", "id", "version", "key", "sha256"}` after `definition.json` and `.minisig` are uploaded to `key` = `defs/<kind>/<id>/<version>/definition.json` → `{"ok": true, "kind", "id", "version", "key", "sha256", "unchanged", "current": true}`; failures → 400 with `"problems"`, a version not above the current one (or the same with other bytes) → 409 |
-| `PUT /v1/admin/run/{run}` | `{"game", "build_id", "runtime", "priority": 1.0, "min_agent": "0.2.8" \| null, "alternates": [{"build_id", "runtime", "when": {"vendor", "min_driver"?}}] \| null (rev 11, section 9.4), "selfplay": {"quota": 600, "slack": 0.1, "max_stale": 1, "games_per_lease": "auto", "gpu_games_per_lease": 24 | "auto" (rev 11, optional, section 9.4), "gpu": "any" \| "preferred" \| "required", "providers": ["dml", "cpu"] \| null, "needs": {"threads", "ram_mb"}, "job": {...}, "share": 0.25 \| null (rev 13, section 5.3), "rolling": {...} \| null (rev 15, section 10.1)} \| null, "eval": {"batch": "it81", "games": 110, "checkpoints": [81, 70], "games_per_lease": "auto", "gpu", "providers", "needs", "job": {"settings", "seats", "paired"}, "share" (rev 13)} \| null, "state": "active" \| "paused"}` → `{"ok": true, "created"}`. `build_id` must be a registered worker build, `runtime` a runtime build. A new eval `batch` reserves `games` fresh game ids (the old batch's unissued ones are dropped); its rules and checks are in section 5.2 (rev 5: `checkpoints` replaces `gen`, which is now refused). Pausing a run, or dropping its `selfplay`/`eval`, cancels those leases at their next beat. Rev 9: `min_agent` (semver, optional; absent or null: none) - the run's leases (self-play and eval) go only to agents at or above it (section 3's update rule); a PUT is the whole configuration, so a PUT without it removes the limit; leases already issued run on (migration 0007) |
+| `PUT /v1/admin/run/{run}` | `{"game", "build_id", "runtime", "priority": 1.0, "min_agent": "0.2.8" \| null, "alternates": [{"build_id", "runtime", "when": {"vendor", "min_driver"?}, "model"?}] \| null (rev 11, section 9.4; `model`: rev 20, section 14.3), "selfplay": {"quota": 600, "slack": 0.1, "max_stale": 1, "games_per_lease": "auto", "gpu_games_per_lease": 24 | "auto" (rev 11, optional, section 9.4), "gpu": "any" \| "preferred" \| "required", "providers": ["dml", "cpu"] \| null, "needs": {"threads", "ram_mb"}, "job": {...}, "share": 0.25 \| null (rev 13, section 5.3), "rolling": {...} \| null (rev 15, section 10.1)} \| null, "eval": {"batch": "it81", "games": 110, "checkpoints": [81, 70], "games_per_lease": "auto", "gpu", "providers", "needs", "job": {"settings", "seats", "paired"}, "share" (rev 13)} \| null, "state": "active" \| "paused"}` → `{"ok": true, "created"}`. `build_id` must be a registered worker build, `runtime` a runtime build. A new eval `batch` reserves `games` fresh game ids (the old batch's unissued ones are dropped); its rules and checks are in section 5.2 (rev 5: `checkpoints` replaces `gen`, which is now refused). Pausing a run, or dropping its `selfplay`/`eval`, cancels those leases at their next beat. Rev 9: `min_agent` (semver, optional; absent or null: none) - the run's leases (self-play and eval) go only to agents at or above it (section 3's update rule); a PUT is the whole configuration, so a PUT without it removes the limit; leases already issued run on (migration 0007) |
 | `GET /v1/admin/run/{run}` | config (rev 9: with `min_agent`) + state: `current_gen`, `next_gid`, `pool`, `selfplay_state` (`cap`, `accepted`, `leased`, `pending`, `in_flight`, `headroom`), `checkpoints` (registered gens, rev 5), `eval_state` (the current batch's progress, section 5.2) and `eval_batches` (every batch of the run, newest first, same fields); rev 6 `definition` (as in stats; `GET /v1/admin/campaign/{id}` too) |
-| `PUT /v1/admin/run/{run}/checkpoint/{gen}` | `{"model", "sha256", "reference", "reference_sha256"}` (files under `ckpt/<run>/`, uploaded first); makes `gen` current for self-play and resets that generation's quota counter → `{"ok": true, "unchanged", "current"}`. Rev 5: a `gen` older than the current one is registered without becoming current (`"current": false`: an eval opponent or a head-to-head label); the same `gen` with other files → 409. Rev 6: a gen the current definition already signs must be exactly those files (else 400); self-play with a definition plays the new current gen once a definition signs it |
+| `PUT /v1/admin/run/{run}/checkpoint/{gen}` | `{"model", "sha256", "reference", "reference_sha256"}` (files under `ckpt/<run>/`, uploaded first); makes `gen` current for self-play and resets that generation's quota counter → `{"ok": true, "unchanged", "current"}`. Rev 5: a `gen` older than the current one is registered without becoming current (`"current": false`: an eval opponent or a head-to-head label); the same `gen` with other files → 409. Rev 6: a gen the current definition already signs must be exactly those files (else 400); self-play with a definition plays the new current gen once a definition signs it. Rev 20: optional `"variants": {"<name>": {"model", "sha256"}}`, which a registered gen may add to (section 14.2; the answer adds `variants`) |
 | `GET /v1/admin/run/{run}/results?after={cursor}&limit=500` | → `{"results": [{"id", "key", "lease_id", "seq", "machine_id", "kind", "gen", "games", "ids", "dup_ids", "sha256", "size", "t"}], "cursor"}`. `ids`/`games`: the game ids credited to this chunk; `dup_ids`: ids in it that an earlier chunk was credited with (skip those games). Eval chunks (rev 5) also carry `batch`, `held` and `also`, and their `games` counts `also` too (section 5.2). `limit` ≤ 1000 |
 | `POST /v1/admin/run/{run}/accept` | `{"gen", "games": n}`: the trainer's total of games accepted for `gen` (a total, not an increment; include games held over for the next generation). Self-play stops when accepted + in flight (unclaimed ids in active self-play leases + credited self-play games not yet acked) reaches `quota × (1 + slack)`. Call it before `ack` |
 | `POST /v1/admin/run/{run}/ack` | `{"cursor"}`: results up to it are ingested (R2 objects deleted after 7 days) → `{"ok": true, "acked"}` |
@@ -744,7 +745,8 @@ its own list. The first data key is `RWTImfGffZDbH0xWVxO/H563BYqds0G+D+hJLn79XEo
   "builds": ["<worker build_id>", ...],             // workers allowed to run it
   "runtime": "<runtime build_id>" | null,           // the runtime pack those builds load
   "checkpoints": {"<gen>": {"model_sha256": "...", "model_size": 13421772,
-                            "reference_sha256": "...", "reference_size": 412000}},
+                            "reference_sha256": "...", "reference_size": 412000,
+                            "variants": {"<name>": {"model_sha256", "model_size"}}?}},   // rev 20, section 14.1
   "jobs": {                           // exact job templates; only per-lease fields are added
     "selfplay": {"settings": {...}} | null,
     "eval": {"settings": {...}, "seats": [Seat, ...], "paired": true} | null,
@@ -1027,7 +1029,8 @@ and the pack's applies); no alternate equal to the default (`build_id`, `runtime
 `when.vendor` not a vendor the farm never uses (`GPU_VENDORS_OFF`: `amd`, section 9.8), and an alternate of such a
 vendor stored before rev 12 is never offered. `GET
 /v1/admin/run/{run}` and the stats show them, with `problems` per alternate when the current definition doesn't
-authorize it.
+authorize it. Rev 20: an alternate may name a model variant (`"model": "<name>"`, section 14.3) that its machines play
+instead of each gen's default model.
 
 For a run's self-play or eval job and an agent of at least `ALT_RUNTIME_AGENT`, the coordinator puts the **first
 alternate the machine qualifies for** in the lease (its `build` and `runtime`) instead of the run's default. A
@@ -1907,7 +1910,144 @@ extra lease: the coordinator sees one lease, its released ids, its extensions an
   layout), then it finishes its games beside its successor. A worker op handing a running worker a new range would let
   every member run as long as the lease (an aw/1 change); not needed for the measured gain.
 
+## 14. Model variants per generation (rev 20; coordinator migration 0016, agents from 0.3.5)
+
+**Why.** A run's GPU machines may play a generation with a graph made for them - a fixed-shape graph for CUDA graphs,
+a reduced-precision one - that CPU PCs and Macs can't load or would play worse with. A **variant** is another model
+file of the same generation and the same network (the same trained weights, exported another way), signed in the
+definition beside the gen's default model and named by a run alternate (9.4, 11.4): a machine that gets that alternate
+gets the variant, every other machine the default. Everything below is additive: a run without variants, a coordinator
+before rev 20 and every agent before 0.3.5 are unchanged. `VARIANT_AGENT` (coordinator var, default `0.3.5`) is the
+first agent that knows variants.
+
+Variant names: `[a-z0-9][a-z0-9-]{0,31}` (a name ends up in a file name), at most 8 per gen. The first one: `gpu`, a
+fixed-shape `zero-onnx/2` sibling of the gen's graph for the run's CUDA alternate (zero-core's export and worker; the
+worker tells the graphs apart from their metadata, so neither the agent nor aw/1 changes).
+
+### 14.1 In the definition (`definition/1`, an optional key)
+
+```json
+"checkpoints": {"81": {"model_sha256": "<hex>", "model_size": 13421772,
+                       "reference_sha256": "<hex>", "reference_size": 412000,
+                       "variants": {"gpu": {"model_sha256": "<hex>", "model_size": 14680064}}}}
+```
+
+- `variants`: optional; when present, an object of 1 to 8 variants (an empty object is refused: leave the key out for
+  a gen without variants). Each name as above; each variant exactly `model_sha256` (64 lowercase hex) and `model_size`
+  (1 byte to 1 GiB), no other key. The key order is free (the signed bytes are what count).
+- A variant has no reference set of its own: the gen's `reference_sha256` / `reference_size` serve every variant (the
+  reference rows and torch's answers don't depend on how the graph was exported). The per-machine self-test runs the
+  variant graph against them (the worker's tolerance for a reduced-precision graph is the worker's: section 8).
+- **Older agents.** `definition/1` refuses unknown fields in agents before 0.3.5, so they can't read a definition in
+  which any gen has `variants`: they would refuse every lease of it (`refused: "definition"`). Therefore:
+  - the coordinator counts a run's current definition with any `variants` as `min_agent` 0.3.5 (`VARIANT_AGENT`) for
+    every lease of the run - self-play and eval, default build or alternate - with section 3's update rule (`{"update"}`
+    when the machine's channel offers 0.3.5, else nothing from that run: the machine gets other work);
+  - the desktop sets the run's own `min_agent` to at least 0.3.5 (`PUT /v1/admin/run`) before it registers the run's
+    first definition with variants (zero-core's `zero.farm_def` and pool remote do), so the run's configuration says so
+    too;
+  - a lease granted to an older agent before keeps running: a classic one never reads a newer definition; a rolling one
+    gets the new definition with its next generation (10.6), can't read it and finishes gracefully (its games in flight
+    complete, one crash report `definition` for the lease), and its next `/v1/lease` gets `{"update"}` or other work.
+  - Rollout: agent 0.3.5 on canary, validated, then stable (the owner's OK), before any live run registers variants.
+- `farm-release define` checks the same (`common/src/definition.rs`).
+
+### 14.2 Registering a variant (desktop)
+
+`PUT /v1/admin/run/{run}/checkpoint/{gen}` takes an optional `"variants": {"<name>": {"model": "ckpt/<run>/<gen>/model-<name>.onnx",
+"sha256": "<hex>"}}` beside `model`, `sha256`, `reference`, `reference_sha256`:
+
+- Each `model` is a key under `ckpt/<run>/` (by convention `ckpt/<run>/<gen>/model-<name>.onnx`), uploaded first like the
+  model (`PUT /v1/admin/artifact`), its sha256 checked the same way (R2's checksum when the upload carried one); its size
+  is R2's. At most 8 names; a key used twice, or the gen's own model, → 400.
+- A variant the current definition already signs for that gen must be exactly those files (sha256 and size), else 400 -
+  as for the model (rev 6).
+- **Adding to a registered gen.** The same gen again with the same default files may add variant names (a run that
+  switches variants on can add one to its current gen); a name registered before with other files → 409 (files never
+  change); a PUT that leaves out a registered name keeps it (variants are never removed). Adding variants doesn't make the
+  gen current or reset its quota. `unchanged` is true when nothing was added.
+- The answer adds `"variants": ["gpu", ...]` (every name the gen has now). `GET /v1/admin/run/{run}`: `checkpoint` (the
+  current gen) adds `variants` (`{"<name>": {"model", "sha256", "size"}}`, `{}` without), and `variants` lists every gen
+  that has any (`{"<gen>": ["gpu"]}`).
+- Migration 0016: `checkpoints.variants` (JSON `{"<name>": {"model", "sha256", "size"}}`, NULL: none) and `leases.variant`
+  (the variant the lease was granted for, 14.3; NULL: the default).
+
+**Registering a definition** (`PUT /v1/admin/definition`, rev 6) adds: every variant the definition signs for a gen the
+run registered, under a name the run registered for that gen, has the registered sha256 and size (else 400, as for the
+model). A variant signed but not registered (yet), or registered but not signed, is no error: until both agree for a
+gen, machines get that gen's default model (14.3).
+
+### 14.3 Which machines get a variant
+
+- **The alternate.** `PUT /v1/admin/run/{run}` `alternates[]` takes an optional `"model": "<variant name>"` (9.4, 11.4; a
+  GPU or a CPU alternate). Only the name's syntax is checked there (400): variants arrive per gen, so whether a gen has
+  one is decided per lease. The run's default build never names one: machines that get the default get each gen's default
+  model. `GET /v1/admin/run/{run}` and the stats show it in `alternates`.
+- **The lease.** A self-play or eval lease that carries an alternate with `model` (section 9.4's choice, unchanged: the
+  variant plays no part in which alternate a machine gets), to an agent of at least `VARIANT_AGENT`, carries for each
+  gen it names the variant instead of the default model when all hold:
+  1. the gen has the variant registered (14.2);
+  2. the lease's definition signs that variant for the gen with the registered sha256 and size.
+
+  The checkpoint is then `{"gen", "model": <the variant's key>, "sha256": <the variant's>, "variant": "<name>",
+  "reference", "reference_sha256"}` (the reference is the gen's); otherwise the gen's default, exactly as before (no
+  `variant` key). Where a checkpoint reaches an agent:
+  - a self-play lease's `checkpoint`;
+  - each of an eval lease's `checkpoints[]`, on its own (a batch's gens may differ);
+  - a beat answer's `checkpoint` - a classic self-play lease's newer gen that its own definition signs (section 3), a
+    rolling lease's in-place switch under the current definition (10.6) - with the lease's variant: `leases.variant`, the
+    alternate's `model` when the lease was granted, as long as the run's alternate of the lease's build and runtime still
+    names it (an owner who drops `model` turns it off for the next generation of running leases too); else the default.
+    A lease granted without a variant never gets one later.
+  Fuzz and diag leases carry no checkpoint variant.
+- **A gen without the variant** (not registered, not signed, or registered other than signed): the machine plays that
+  gen's default model - it is the same network, and a GPU alternate's pack runs the default graph as it did before rev
+  20 -, and the admin stats say so: per alternate `variant_notes`, one per gen concerned (the run's current gen and the
+  current eval batch's gens), e.g. `"gen 82: no variant gpu registered: its default model is leased"`. A note, not one of
+  the alternate's `problems` (which mean it can't be leased at all).
+- **Cached checkpoints.** Agents from 0.3.5 list `"<run>/<gen>/<name>"` in `cached.ckpts` (section 3) for each variant
+  model in their cache, beside `"<run>/<gen>"` for the default model. For a lease that would carry a variant, the
+  coordinator's cache bonus and disk check use that entry and the variant's size.
+
+### 14.4 The agent (0.3.5)
+
+- Parses `variants` (14.1) and verifies the definition as before.
+- A checkpoint with `variant` - in a lease's `checkpoint`, an eval lease's `checkpoints[]` or a beat answer - must name a
+  variant the lease's definition signs for that gen (a rolling switch: the current definition, 10.6): `sha256` = its
+  `model_sha256`, the file checked against its `model_size`; the reference is the gen's own, checked as before. The name
+  must have the syntax above. Anything else refuses the lease (`refused: "definition"`, section 7), or, for a beat's
+  checkpoint, the generation isn't taken (a rolling lease finishes, 10.6). A legacy lease (no definition) with a variant is
+  refused.
+- **Cache.** A variant's model is `cache\ckpt\<run>\<gen>\model-<name>.onnx`, next to the gen's `reference.npz` and
+  default `model.onnx` (when this PC has them too); the gen's directory stays one LRU entry. Files are verified (size and
+  sha256) when downloaded and again before every worker start, as the default model is.
+- **The worker** gets the variant's file wherever it would get the model: the job line's `model` (and `sha256`), an eval
+  job line's `models["<gen>"].model`, the aw/1 `checkpoint` op's `model` and `sha256` (a rolling lease may switch between
+  a variant and a default graph from one generation to the next: the worker must take either). `reference` is unchanged.
+  The bench of the job's network (9.6) benches the lease's graph, so a variant's (`probe-providers --model`).
+- Tuning (13): a variant's layouts are remembered apart from the default graph's (the variant's name is part of the
+  network's fingerprint).
+- Stats: no change (the worker's `selftest` per gen as before).
+
+### 14.5 What the trainer writes (zero-core `zero.farm_def`, the pool remote)
+
+For each gen with variants: upload `ckpt/<run>/<gen>/model.onnx`, `reference.npz` and every
+`ckpt/<run>/<gen>/model-<name>.onnx`; `PUT /v1/admin/run/{run}/checkpoint/{gen}` with `variants` (14.2); sign the next
+definition version with `checkpoints["<gen>"].variants` (14.1, sha256 and size of each variant file exactly as uploaded);
+set the run's alternate's `model` (the CUDA alternate: `"model": "gpu"`) and the run's `min_agent` (at least 0.3.5) with
+`PUT /v1/admin/run/{run}` before the first definition with variants. A gen whose variant isn't ready is registered without
+it: GPU machines play its default model.
+
 ## Changes
+- v1 rev 20, agent 0.3.5 (2026-11-19; coordinator migration 0016): **model variants per generation** (section 14). A
+  definition's `checkpoints[gen]` may sign `variants` (`{"<name>": {"model_sha256", "model_size"}}`, sharing the gen's
+  reference set); `PUT /v1/admin/run/{run}/checkpoint/{gen}` registers them (`variants`: `{"<name>": {"model", "sha256"}}`,
+  additive on a registered gen); a run alternate's `model` names the variant its machines get - in self-play leases, eval
+  leases' `checkpoints[]` and beat answers' generation switches (a checkpoint's new `variant` key) -, a gen without it
+  gives them its default model (an admin `variant_notes` entry); a run whose current definition has variants counts as
+  `min_agent` 0.3.5 (`VARIANT_AGENT`: older agents can't read such a definition); agents from 0.3.5 verify a variant
+  against the definition, cache it per (run, gen, variant) and hand it to the worker as the model, and list cached variants
+  in `cached.ckpts` as `<run>/<gen>/<name>`.
 - v1 rev 19, agent 0.3.4 (2026-11-19; no wire change): **rolling GPU jobs use the GPU properly**, from a measurement on
   the owner's 4070 Ti PC (agent 0.3.3's job: one worker of 128 games in flight, 5,030 leaves/s, the GPU 37 % busy; three
   workers of 384: 14,154, 82 %). GPU "auto" targets two full batches of the bench's batch (10.6: 1,024 games in flight
