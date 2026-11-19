@@ -54,6 +54,12 @@ fn entry(h: &H) -> Value {
     tuning_json(h)["entries"].as_array().and_then(|a| a.first().cloned()).unwrap_or(Value::Null)
 }
 
+/// The agent's tuning lines in the worker log (trials, handoffs, discards), for failure messages.
+fn tuning_log(h: &H) -> String {
+    h.agent_log().lines().filter(|l| l.contains("tuning [") || l.contains("leaves/s at this layout")).collect::<Vec<_>>().join("
+")
+}
+
 /// Every job line the fakeworkers logged.
 fn job_lines(h: &H) -> Vec<Value> {
     (0..).map_while(|n| h.job_line_n(n)).collect()
@@ -78,9 +84,16 @@ fn ids_accounted(h: &H, id: &str, done: &Value) {
     assert_eq!(credited + unfinished, released, "{done}");
 }
 
+/// The harness, its fake worker never counted as starved by the test machine's own load (it sleeps).
+fn harness() -> H {
+    let mut h = H::new();
+    h.signals.real_starvation = false;
+    h
+}
+
 #[test]
 fn tunes_inside_a_rolling_lease_remembers_it_and_reports_it() {
-    let mut h = H::new();
+    let mut h = harness();
     h.push(tuning_lease(&h, "l_T1", fake(peaked()), json!(16), None));
     h.start();
     assert!(
@@ -95,7 +108,8 @@ fn tunes_inside_a_rolling_lease_remembers_it_and_reports_it() {
         ms.iter().sum::<f64>() / ms.len().max(1) as f64
     };
     let (start, best) = (e["start"].clone(), e["incumbent"].clone());
-    assert_ne!(start, best, "the fake's peak is elsewhere: {e}");
+    assert_ne!(start, best, "the fake's peak is elsewhere: {e}
+{}", tuning_log(&h));
     assert!(rate(&best) >= rate(&start) * 1.03, "{e}");
     if cfg!(windows) {
         // (macOS keeps batches of 192-384 rows: 16 games in flight are one group there)
@@ -139,7 +153,7 @@ fn tunes_inside_a_rolling_lease_remembers_it_and_reports_it() {
 
 #[test]
 fn a_trial_is_discarded_when_the_computer_is_used_and_retried_later() {
-    let mut h = H::new();
+    let mut h = harness();
     // the owner's computer: work goes on while it is used, trials don't
     h.machine.lock().unwrap().settings.mode = farm_agent::settings::Mode::Always;
     let mut fk = fake(peaked());
@@ -178,7 +192,7 @@ fn a_trial_is_discarded_when_the_computer_is_used_and_retried_later() {
 
 #[test]
 fn no_trial_while_other_programs_load_the_cpu() {
-    let mut h = H::new();
+    let mut h = harness();
     h.signals.set_other_load(Some(0.5));
     h.push(tuning_lease(&h, "l_TL", fake(peaked()), json!(16), None));
     h.start();
@@ -197,7 +211,7 @@ fn no_trial_while_other_programs_load_the_cpu() {
 
 #[test]
 fn the_coordinators_hint_is_the_starting_point() {
-    let mut h = H::new();
+    let mut h = harness();
     let hint = json!({"layout": {"threads": 3, "infer_workers": 1, "infer_threads": 5, "groups": 2, "conc": 16}, "leaves_s": 900, "machines": 2});
     h.push(tuning_lease(&h, "l_TH", fake(peaked()), json!(16), Some(hint)));
     h.start();
@@ -209,7 +223,7 @@ fn the_coordinators_hint_is_the_starting_point() {
     assert_eq!(layout_json(&entry(&h)["start"]), want);
     h.stop();
     // a hint out of bounds is ignored (the platform's start instead)
-    let mut h = H::new();
+    let mut h = harness();
     let bad = json!({"layout": {"threads": 0, "infer_workers": 1, "infer_threads": 5, "groups": 2, "conc": 16}});
     h.push(tuning_lease(&h, "l_TB", fake(peaked()), json!(16), Some(bad)));
     h.start();
@@ -221,7 +235,7 @@ fn the_coordinators_hint_is_the_starting_point() {
 
 #[test]
 fn autotune_off_keeps_the_fixed_rules() {
-    let mut h = H::new();
+    let mut h = harness();
     h.machine.lock().unwrap().settings.autotune = false;
     h.push(tuning_lease(&h, "l_TO", fake(peaked()), json!(16), None));
     h.start();

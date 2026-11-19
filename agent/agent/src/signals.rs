@@ -546,11 +546,20 @@ pub struct SharedSignals {
     pub starved: Arc<AtomicBool>,
     /// Tests: other programs' share of the CPUs (None: as measured).
     pub other_load: Arc<Mutex<Option<f64>>>,
+    /// Tests: false - the worker counts as starved only when `starved` says so, not when the test machine itself is
+    /// busy (a fake worker sleeps, so on a saturated machine it always looks starved).
+    pub real_starvation: bool,
 }
 
 impl SharedSignals {
     pub fn new(s: Signals) -> Self {
-        SharedSignals { inner: Arc::new(Mutex::new(s)), frozen_now: false, starved: Arc::new(AtomicBool::new(false)), other_load: Arc::new(Mutex::new(Some(0.0))) }
+        SharedSignals {
+            inner: Arc::new(Mutex::new(s)),
+            frozen_now: false,
+            starved: Arc::new(AtomicBool::new(false)),
+            other_load: Arc::new(Mutex::new(Some(0.0))),
+            real_starvation: true,
+        }
     }
     pub fn set_other_load(&self, share: Option<f64>) {
         *self.other_load.lock().unwrap() = share;
@@ -576,7 +585,7 @@ impl SignalSource for SharedSignals {
         (s.mem_avail_mb, s.mem_total_mb)
     }
     fn worker_starved(&self, mark: &CpuMark, worker: &WorkerProc) -> bool {
-        self.starved.load(Ordering::SeqCst) || mark.starved_since(worker)
+        self.starved.load(Ordering::SeqCst) || (self.real_starvation && mark.starved_since(worker))
     }
     fn other_load(&self, measured: f64) -> f64 {
         self.other_load.lock().unwrap().unwrap_or(measured)

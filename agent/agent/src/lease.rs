@@ -2408,7 +2408,8 @@ impl Run {
             return;
         }
         self.sample_load(eng, t);
-        let rolling_ok = self.roll.as_ref().is_some_and(|r| r.active && !r.finishing && r.restart.is_none());
+        // (the lease's first worker is rolling once its `hello` says so)
+        let rolling_ok = self.roll.as_ref().is_some_and(|r| (r.active || !self.job_sent) && !r.finishing && r.restart.is_none());
         let other = self.tuning.as_ref().map_or(0.0, |x| x.other_load);
         let quiet = other <= tune::OTHER_LOAD_MAX && self.stall_since.is_none();
         let strict = eng.tune_ok && quiet && !must_pause;
