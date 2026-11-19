@@ -807,7 +807,7 @@ impl Engine {
         let mut tuning = None;
         let mut measure0 = false;
         if let (Some((setup, _)), false, true, "selfplay") = (roll.as_ref(), gpu_choice, self.settings().autotune, lease.kind.as_str()) {
-            let (t, m) = self.tuning_for(lease, &plan, &prep, setup, &choice, mem.0);
+            let (t, m) = self.tuning_for(lease, &plan, &prep, setup, &choice);
             log::info!(
                 "lease {id}: CPU layout {}{} ({})",
                 t.current.describe(),
@@ -924,22 +924,23 @@ impl Engine {
     }
 
     /// rev 19 (PROTOCOL 13): a rolling CPU job's tuning: its key (worker build, runtime pack, network, hardware, OS,
-    /// tuner), what may vary (the thread budget - the platform's, or the owner's `cpu_threads` -, sessions, games in
-    /// flight within memory, or the run's number), and the remembered search or a new one (from the coordinator's hint
-    /// for this hardware class, else the platform's starting point). The lease's first worker runs the next layout to
+    /// tuner), what may vary (search and inference threads within the platform's caps or the owner's `cpu_threads`,
+    /// sessions, batches within the platform's rows, games in flight from half 10.6's choice to it, or the run's
+    /// number), and the remembered search or a new one (from the coordinator's hint for this hardware class, else the
+    /// platform's starting point with 10.6's games in flight and groups). The lease's first worker runs the next layout to
     /// measure when a trial may run now (a fresh start is a free trial), else the incumbent. -> (tuning, measured).
-    fn tuning_for(&self, lease: &Lease, plan: &Plan, prep: &Prepared, setup: &Setup, choice: &crate::probe::Choice, mem: MemPlan) -> (Tuning, bool) {
+    fn tuning_for(&self, lease: &Lease, plan: &Plan, prep: &Prepared, setup: &Setup, choice: &crate::probe::Choice) -> (Tuning, bool) {
         let p = &self.profile;
         let hw = tune::Hw { cores: p.cores, logical: p.threads, perf: p.perf_cores, eff: p.eff_cores };
         let d = tune::defaults(tune::Platform::current(), &hw);
         let settings = self.settings();
-        let budget = settings.cpu_threads.map_or(d.budget, |n| n.max(2));
+        // (10.6's choice already fits the memory plan; the search only lowers it)
         let conc = choice.conc.unwrap_or(crate::rolling::CPU_INFLIGHT).max(1);
         let (conc_min, conc_max) = match setup.cpu {
             crate::rolling::Inflight::N(_) => (conc, conc),
-            crate::rolling::Inflight::Auto => ((conc / 4).max(tune::MIN_BATCH).min(conc), mem.cap(crate::rolling::MAX_INFLIGHT, true).min(conc * 2).max(conc)),
+            crate::rolling::Inflight::Auto => ((conc / 2).max(1), conc),
         };
-        let space = tune::Space { budget, sessions: d.sessions_always, conc_min, conc_max };
+        let space = tune::Space::new(&d, settings.cpu_threads, conc_min, conc_max);
         let run = lease.run.clone().unwrap_or_default();
         let key = tune::Key {
             build: lease.build.build_id.clone(),
@@ -953,8 +954,7 @@ impl Engine {
         let mut entry = match tune::Cache::load(&self.cfg.layout).get(&key) {
             Some(e) => e.clone(),
             None => {
-                let groups = d.batch.map_or(choice.groups.unwrap_or(1), |b| (conc / b.max(1)).max(1));
-                let start = space.fit(Layout { threads: d.threads, infer_workers: d.infer_workers, infer_threads: d.infer_threads, groups, conc });
+                let start = space.fit(Layout { threads: d.threads, infer_workers: d.infer_workers, infer_threads: d.infer_threads, groups: choice.groups.unwrap_or(1), conc });
                 match tune::hint_layout(lease.tuning_hint.as_ref(), &space) {
                     Some(h) => {
                         log::info!("lease {}: starting the tuning from the coordinator's hint: {}", lease.lease_id, h.describe());

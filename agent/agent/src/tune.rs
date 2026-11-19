@@ -16,12 +16,13 @@
 //! `[p0, p1]`.
 //!
 //! **The search.** From the starting point (a coordinator hint for this hardware class, else the platform's default)
-//! a coordinate search: for each coordinate in turn (batch size, the split of the thread budget between search and
-//! inference, sessions, games in flight) the incumbent's two neighbours, moving to one that is at least `GAIN` faster
-//! (and so on from there), at most `MAX_TRIALS` trials; then the incumbent is measured once more and kept only if its
-//! mean is still `GAIN` over the start's (a lucky single measurement doesn't stick). Search threads plus inference
-//! threads never exceed the thread budget (the M4 Max, 2026-11-18: 24 + 16 threads ran at 0.7x of 16 + 15, 36 + 36 at
-//! 0.3x: oversubscribing collapses the native worker), so the budget is a constraint, never a dimension.
+//! a coordinate search: for each coordinate in turn (batch size, search threads, threads per inference session,
+//! sessions, games in flight) the incumbent's two neighbours, moving to one that is at least `GAIN` faster (and on from
+//! there), at most `MAX_TRIALS` trials; then the incumbent is measured once more and kept only if its mean is still
+//! `GAIN` over the start's (a lucky single measurement doesn't stick). Search threads and inference threads each stay
+//! within a cap, never searched upward (the M4 Max, 2026-11-18: every layout with more threads than its 16 + 5 x 3 ran
+//! slower, 36 + 12 x 3 at 0.3x: oversubscribing collapses the native worker), and the batches within the platform's
+//! rows (`defaults`).
 //!
 //! **Remembered** per (worker build, runtime pack, network fingerprint, hardware, OS, tuner version); a key not seen
 //! is searched again; a tuned key is re-checked weekly (the runner-up against the incumbent, both measured afresh).
@@ -150,44 +151,62 @@ impl Platform {
     }
 }
 
-/// The starting point per platform (the only per-platform part of tuning).
+/// The starting point and the bounds per platform (the only per-platform part of tuning).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Defaults {
-    /// Search threads + inference threads at most (the owner's `cpu_threads` replaces it).
-    pub budget: u32,
     /// The start's search threads, sessions and threads per session.
     pub threads: u32,
     pub infer_workers: u32,
     pub infer_threads: u32,
-    /// The start's rows per batch: `groups` = conc / batch (None: the groups of rolling.rs's "auto" as they are).
-    pub batch: Option<u64>,
+    /// Search threads at most, and inference threads (sessions x threads per session) at most: never searched upward
+    /// (the owner's `cpu_threads` replaces both).
+    pub max_search: u32,
+    pub max_infer: u32,
+    /// Rows per batch within these bounds (`groups` = games in flight / rows; the start's groups are 10.6's "auto").
+    pub batch_min: u64,
+    pub batch_max: u64,
     /// Every worker build of the platform honours `infer_workers` (else only one whose `hello` lists the feature).
     pub sessions_always: bool,
 }
 
-/// The starting point for `hw` on `p`. Windows: today's layout (one search thread per physical core, one session with
-/// the rest of the logical threads - the worker's own default, `infer_threads` = `threads`, on an SMT CPU), budget the
-/// logical threads. macOS (Apple silicon, no SMT): budget the cores, split between search and inference (the shipped
-/// 16 + 5 x 3 threads ran at 61-69 % machine load and was inference-bound on the M4 Max, 2026-11-18).
+/// The starting point for `hw` on `p`.
+///
+/// Windows: today's layout - one search thread per physical core, one inference session with as many threads (the
+/// worker's own default) -, which is also each one's cap (never more threads than before); batches of at least
+/// `MIN_BATCH` rows.
+///
+/// macOS (Apple silicon), from the M4 Max's clean windows of 2026-11-18 (legacy-meta3-r1's gen-398 network, leaves/s;
+/// the owner's 3-process setup 19,035-20,034, 19,504 in a later control): the layout agent 0.3.0 ships - one search
+/// thread per core, inference in sessions of 3 threads (16 cores: 16 + 5 x 3), 2,304 games in flight in 12 groups of
+/// 192 rows - is the best measured region: 10,977-11,086 (fused-attention export 12,292); 6 groups (384-450 rows)
+/// 11,155 (12,560); 4 groups (~675 rows) 8,970 (load 46 %: too few groups starve the search); 4 x 4 inference threads
+/// 6,596; 24 + 8 x 2 7,707; 36 + 12 x 3 3,475 - more threads in any form hurt, and inference cost per row is about flat
+/// in the batch size. So the search stays narrow around it: search and inference threads each at most the cores,
+/// batches of 192-384 rows.
 pub fn defaults(p: Platform, hw: &Hw) -> Defaults {
     let cores = hw.cores.max(1);
-    let logical = hw.logical.max(cores);
     match p {
-        Platform::Windows => {
-            let (threads, infer) = if logical > cores { (cores, logical - cores) } else { (cores - cores / 2, (cores / 2).max(1)) };
-            Defaults { budget: logical.max(2), threads: threads.max(1), infer_workers: 1, infer_threads: infer.max(1), batch: None, sessions_always: false }
-        }
+        Platform::Windows => Defaults {
+            threads: cores,
+            infer_workers: 1,
+            infer_threads: cores,
+            max_search: cores,
+            max_infer: cores,
+            batch_min: MIN_BATCH,
+            batch_max: crate::rolling::MAX_INFLIGHT,
+            sessions_always: false,
+        },
         Platform::MacOs => {
-            // half the cores search, the other half answers batches in sessions of 2 threads
-            let budget = cores.max(2);
-            let infer = (budget / 2).max(1);
-            let workers = (infer / 2).max(1);
+            // (the worker's own split, docs/az.md 62.1: sessions of 3 threads; under 6 cores one session)
+            let (workers, per) = if cores >= 6 { (cores / 3, 3) } else { (1, cores) };
             Defaults {
-                budget,
-                threads: (budget - workers * (infer / workers)).max(1),
+                threads: cores,
                 infer_workers: workers,
-                infer_threads: infer / workers,
-                batch: Some(crate::rolling::MACOS_CPU_BATCH * 2),
+                infer_threads: per,
+                max_search: cores,
+                max_infer: cores,
+                batch_min: crate::rolling::MACOS_CPU_BATCH,
+                batch_max: 2 * crate::rolling::MACOS_CPU_BATCH,
                 sessions_always: true,
             }
         }
@@ -197,42 +216,58 @@ pub fn defaults(p: Platform, hw: &Hw) -> Defaults {
 /// What a search may vary for one job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Space {
-    /// Search + inference threads at most.
-    pub budget: u32,
+    /// Search threads at most, inference threads at most.
+    pub max_search: u32,
+    pub max_infer: u32,
     /// The worker honours `infer_workers` (else one session).
     pub sessions: bool,
     /// Games in flight within these bounds (equal: the run's number, fixed).
     pub conc_min: u64,
     pub conc_max: u64,
+    /// Rows per batch within these bounds where the games in flight allow.
+    pub batch_min: u64,
+    pub batch_max: u64,
 }
 
 impl Space {
-    /// A layout made valid: at least 1 of everything, one session without the feature, the threads within the budget
-    /// (a thread at a time from the larger of search and inference; inference gives threads per session before
-    /// sessions), the games in flight within bounds, at least `MIN_BATCH` rows per batch where the games in flight
-    /// allow.
+    /// The space of a job on a platform: its bounds (the owner's `cpu_threads` caps search and inference threads each,
+    /// as the worker's default `infer_threads` = `threads` always did), whether sessions vary, the games in flight.
+    pub fn new(d: &Defaults, cpu_threads: Option<u32>, conc_min: u64, conc_max: u64) -> Space {
+        let (max_search, max_infer) = match cpu_threads {
+            Some(n) => (n.max(1), n.max(1)),
+            None => (d.max_search.max(1), d.max_infer.max(1)),
+        };
+        Space { max_search, max_infer, sessions: d.sessions_always, conc_min, conc_max, batch_min: d.batch_min.max(1), batch_max: d.batch_max.max(d.batch_min).max(1) }
+    }
+
+    /// The groups the games in flight allow: batches within the bounds where possible, at least one, at most one per
+    /// game.
+    fn groups_range(&self, conc: u64) -> (u64, u64) {
+        let lo = conc.div_ceil(self.batch_max).max(1);
+        let hi = (conc / self.batch_min).max(1).max(lo).min(conc.max(1));
+        (lo.min(hi), hi)
+    }
+
+    /// A layout made valid: at least 1 of everything, one session without the feature, search threads and inference
+    /// threads within their caps (inference gives threads per session before sessions), the games in flight within
+    /// bounds, the batches within bounds where the games in flight allow.
     pub fn fit(&self, l: Layout) -> Layout {
-        let budget = self.budget.max(2);
         let mut l = Layout {
-            threads: l.threads.clamp(1, MAX_THREADS),
+            threads: l.threads.clamp(1, self.max_search.clamp(1, MAX_THREADS)),
             infer_workers: if self.sessions { l.infer_workers.clamp(1, MAX_SESSIONS) } else { 1 },
             infer_threads: l.infer_threads.clamp(1, MAX_THREADS),
             groups: l.groups.max(1),
             conc: l.conc.clamp(self.conc_min.max(1), self.conc_max.max(self.conc_min).max(1)),
         };
-        while l.total_threads() > budget {
-            if l.threads > 1 && l.threads >= l.infer_total() {
-                l.threads -= 1;
-            } else if l.infer_threads > 1 {
+        while l.infer_total() > self.max_infer.max(1) {
+            if l.infer_threads > 1 {
                 l.infer_threads -= 1;
-            } else if l.infer_workers > 1 {
-                l.infer_workers -= 1;
             } else {
-                l.threads = l.threads.saturating_sub(1).max(1);
-                break;
+                l.infer_workers -= 1;
             }
         }
-        l.groups = l.groups.min((l.conc / MIN_BATCH).max(1)).min(l.conc);
+        let (lo, hi) = self.groups_range(l.conc);
+        l.groups = l.groups.clamp(lo, hi);
         l
     }
 }
@@ -240,66 +275,53 @@ impl Space {
 /// The coordinates of the search, in the order they are tried.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Coord {
-    /// Rows per batch (groups halved or doubled).
+    /// Rows per batch (`up`: bigger: two thirds of the groups; else half again as many).
     Batch,
-    /// Threads moved between search and inference (the total kept).
-    Split,
-    /// Sessions doubled or halved (their threads kept).
+    /// Search threads (an eighth of their cap, at least 1).
+    Search,
+    /// Threads per inference session (one).
+    InferThreads,
+    /// Inference sessions (one; their threads kept). Only for a worker that honours `infer_workers`.
     Sessions,
-    /// Games in flight doubled or halved (rows per batch kept).
+    /// Games in flight doubled / halved (rows per batch kept); "auto" only.
     Conc,
 }
 
-pub const COORDS: [Coord; 4] = [Coord::Batch, Coord::Split, Coord::Sessions, Coord::Conc];
+pub const COORDS: [Coord; 5] = [Coord::Batch, Coord::Search, Coord::InferThreads, Coord::Sessions, Coord::Conc];
 
-/// `l`'s neighbour along `c` (`up`: bigger batches, more inference threads, more sessions, more games in flight), made
-/// valid; None when there is none (a bound, or the same layout).
+/// `l`'s neighbour along `c`, valid in `s`; None when there is none (a bound, or the same layout). Thread moves past a
+/// cap are no neighbours (never cut back into another shape); batch and games-in-flight moves are kept within bounds.
 pub fn neighbour(l: &Layout, c: Coord, up: bool, s: &Space) -> Option<Layout> {
-    let mut n = *l;
+    let l = s.fit(*l);
+    let mut n = l;
     match c {
-        Coord::Batch => n.groups = if up { (l.groups / 2).max(1) } else { l.groups * 2 },
-        Coord::Split => {
-            // about an eighth of the budget, in whole threads per session
-            let total = l.total_threads().min(s.budget.max(2));
-            let per = ((s.budget / 8).max(1) / l.infer_workers.max(1)).max(1);
-            let t = if up { l.infer_threads + per } else { l.infer_threads.checked_sub(per).filter(|&t| t >= 1)? };
-            let infer = t * l.infer_workers;
-            if infer >= total {
-                return None;
-            }
-            n.infer_threads = t;
-            n.threads = total - infer;
+        Coord::Batch => n.groups = if up { (l.groups * 2 / 3).max(1) } else { (l.groups * 3).div_ceil(2) },
+        Coord::Search => {
+            let step = (s.max_search / 8).max(1);
+            n.threads = if up { l.threads + step } else { l.threads.checked_sub(step).filter(|&t| t >= 1)? };
         }
+        Coord::InferThreads => n.infer_threads = if up { l.infer_threads + 1 } else { l.infer_threads.checked_sub(1).filter(|&t| t >= 1)? },
         Coord::Sessions => {
             if !s.sessions {
                 return None;
             }
-            if up {
-                if l.infer_threads < 2 {
-                    return None;
-                }
-                n.infer_workers = l.infer_workers * 2;
-                n.infer_threads = l.infer_threads / 2;
-            } else {
-                if l.infer_workers < 2 {
-                    return None;
-                }
-                n.infer_workers = l.infer_workers / 2;
-                n.infer_threads = l.infer_threads * 2;
-            }
+            n.infer_workers = if up { l.infer_workers + 1 } else { l.infer_workers.checked_sub(1).filter(|&w| w >= 1)? };
         }
         Coord::Conc => {
             if s.conc_min >= s.conc_max {
                 return None;
             }
             let batch = l.batch();
-            n.conc = if up { l.conc * 2 } else { l.conc / 2 };
-            n.conc = n.conc.clamp(s.conc_min.max(1), s.conc_max);
+            n.conc = (if up { l.conc * 2 } else { l.conc / 2 }).clamp(s.conc_min.max(1), s.conc_max);
             n.groups = n.conc.div_ceil(batch.max(1)).max(1);
         }
     }
-    let n = s.fit(n);
-    (n != s.fit(*l)).then_some(n)
+    let f = s.fit(n);
+    let thread_move = matches!(c, Coord::Search | Coord::InferThreads | Coord::Sessions);
+    if (thread_move && f != n) || f == l {
+        return None;
+    }
+    Some(f)
 }
 
 /// The window trials are compared over: leaves per game in flight, from `p0` to `p1` (the search's first measurement).
@@ -805,60 +827,75 @@ impl Probe {
 mod tests {
     use super::*;
 
-    fn space(budget: u32) -> Space {
-        Space { budget, sessions: true, conc_min: 64, conc_max: 4096 }
+    /// The M4 Max's space: search and inference threads at most 16, sessions, 1,152-2,304 games in flight, 192-384 rows.
+    fn space() -> Space {
+        Space { max_search: 16, max_infer: 16, sessions: true, conc_min: 1152, conc_max: 2304, batch_min: 192, batch_max: 384 }
     }
 
     fn lay(threads: u32, w: u32, t: u32, groups: u64, conc: u64) -> Layout {
         Layout { threads, infer_workers: w, infer_threads: t, groups, conc }
     }
 
+    /// The shipped macOS layout on the M4 Max: the measured best region.
+    fn shipped() -> Layout {
+        lay(16, 5, 3, 12, 2304)
+    }
+
     #[test]
-    fn layouts_fit_the_thread_budget() {
-        let s = space(16);
-        // the shipped macOS layout (16 + 5 x 3 = 31 threads) is cut to 16: threads per session first, then sessions
-        let f = s.fit(lay(16, 5, 3, 12, 2304));
-        assert!(f.total_threads() <= 16, "{f:?}");
-        assert_eq!(f.groups, 12);
+    fn layouts_fit_their_caps() {
+        let s = space();
+        assert_eq!(s.fit(shipped()), shipped(), "the start is valid as it is");
+        // over a cap: search threads cut, inference threads per session before sessions
+        assert_eq!(s.fit(lay(36, 12, 3, 12, 2304)), lay(16, 12, 1, 12, 2304));
+        assert_eq!(s.fit(lay(16, 4, 5, 12, 2304)), lay(16, 4, 4, 12, 2304));
         // without the sessions feature: one session
         let one = Space { sessions: false, ..s };
-        assert_eq!(one.fit(lay(8, 4, 2, 4, 32)).infer_workers, 1);
-        // games in flight within bounds, at least MIN_BATCH rows per batch
-        assert_eq!(s.fit(lay(8, 2, 4, 64, 8192)).conc, 4096);
-        assert_eq!(s.fit(lay(8, 2, 4, 64, 64)).groups, 8, "64 games: at most 8 groups of 8 rows");
-        // never 0 of anything, budget at least 2
-        let tiny = Space { budget: 1, ..s };
-        assert_eq!(tiny.fit(lay(0, 0, 0, 0, 0)), lay(1, 1, 1, 1, 64));
+        assert_eq!(one.fit(lay(8, 4, 2, 12, 2304)).infer_workers, 1);
+        // games in flight and batches within bounds
+        assert_eq!(s.fit(lay(8, 2, 4, 12, 8192)).conc, 2304);
+        assert_eq!(s.fit(lay(8, 2, 4, 2, 2304)).groups, 6, "at most 384 rows");
+        assert_eq!(s.fit(lay(8, 2, 4, 40, 2304)).groups, 12, "at least 192 rows");
+        let small = Space { conc_min: 64, conc_max: 64, ..s };
+        assert_eq!(small.fit(lay(8, 2, 4, 12, 64)).groups, 1, "fewer games than a batch: one group");
+        // never 0 of anything
+        assert_eq!(Space { max_search: 0, max_infer: 0, ..s }.fit(lay(0, 0, 0, 0, 0)), lay(1, 1, 1, 3, 1152), "1,152 games: 3 groups of 384 rows at least");
+        // Windows: batches from MIN_BATCH rows to all games in flight
+        let win = Space::new(&defaults(Platform::Windows, &Hw { cores: 8, logical: 16, perf: 8, eff: 0 }), None, 16, 32);
+        assert_eq!(win.fit(lay(8, 1, 8, 4, 32)), lay(8, 1, 8, 4, 32));
+        assert_eq!(win.fit(lay(8, 1, 8, 9, 32)).groups, 4, "at least 8 rows");
+        assert_eq!(win.fit(lay(9, 1, 17, 4, 32)), lay(8, 1, 8, 4, 32), "search and inference threads each at most the cores");
+        // the owner's cpu_threads caps search and inference threads each
+        let owner = Space::new(&defaults(Platform::MacOs, &Hw { cores: 16, logical: 16, perf: 12, eff: 4 }), Some(8), 2304, 2304);
+        assert_eq!(owner.fit(shipped()), lay(8, 5, 1, 12, 2304));
     }
 
     #[test]
-    fn neighbours_move_one_coordinate() {
-        let s = space(16);
-        let l = lay(8, 4, 2, 6, 2304);
-        assert_eq!(neighbour(&l, Coord::Batch, true, &s), Some(lay(8, 4, 2, 3, 2304)), "bigger batches: half the groups");
-        assert_eq!(neighbour(&l, Coord::Batch, false, &s), Some(lay(8, 4, 2, 12, 2304)));
-        // split: about 2 threads (16 / 8) between search and inference, in whole threads per session, the total kept
-        assert_eq!(neighbour(&l, Coord::Split, true, &s), Some(lay(4, 4, 3, 6, 2304)), "4 sessions: one more thread each");
-        assert_eq!(neighbour(&l, Coord::Split, false, &s), Some(lay(12, 4, 1, 6, 2304)));
-        assert_eq!(neighbour(&lay(8, 8, 1, 6, 2304), Coord::Split, false, &s), None, "no thread per session to give");
-        let l2 = lay(8, 2, 4, 6, 2304);
-        assert_eq!(neighbour(&l2, Coord::Split, true, &s), Some(lay(6, 2, 5, 6, 2304)));
-        assert_eq!(neighbour(&l2, Coord::Split, false, &s), Some(lay(10, 2, 3, 6, 2304)));
-        assert_eq!(neighbour(&l, Coord::Sessions, true, &s), Some(lay(8, 8, 1, 6, 2304)));
-        assert_eq!(neighbour(&l, Coord::Sessions, false, &s), Some(lay(8, 2, 4, 6, 2304)));
-        // games in flight: rows per batch kept
-        assert_eq!(neighbour(&l, Coord::Conc, false, &s), Some(lay(8, 4, 2, 3, 1152)));
-        assert_eq!(neighbour(&l, Coord::Conc, true, &s), Some(lay(8, 4, 2, 11, 4096)), "capped at 4,096");
-        // the run's number: fixed
-        let fixed = Space { conc_min: 2304, conc_max: 2304, ..s };
-        assert_eq!(neighbour(&l, Coord::Conc, true, &fixed), None);
+    fn neighbours_move_one_coordinate_and_never_past_a_cap() {
+        let s = space();
+        let l = shipped();
+        assert_eq!(neighbour(&l, Coord::Batch, true, &s), Some(lay(16, 5, 3, 8, 2304)), "bigger batches: two thirds of the groups");
+        assert_eq!(neighbour(&lay(16, 5, 3, 8, 2304), Coord::Batch, true, &s), Some(lay(16, 5, 3, 6, 2304)), "384 rows at most");
+        assert_eq!(neighbour(&lay(16, 5, 3, 6, 2304), Coord::Batch, true, &s), None);
+        assert_eq!(neighbour(&l, Coord::Batch, false, &s), None, "192 rows at least");
+        assert_eq!(neighbour(&lay(16, 5, 3, 6, 2304), Coord::Batch, false, &s), Some(lay(16, 5, 3, 9, 2304)));
+        // threads: never up past a cap, never cut back into another shape
+        assert_eq!(neighbour(&l, Coord::Search, true, &s), None);
+        assert_eq!(neighbour(&l, Coord::Search, false, &s), Some(lay(14, 5, 3, 12, 2304)), "an eighth of the cap");
+        assert_eq!(neighbour(&l, Coord::InferThreads, true, &s), None, "5 x 4 = 20 > 16");
+        assert_eq!(neighbour(&l, Coord::InferThreads, false, &s), Some(lay(16, 5, 2, 12, 2304)));
+        assert_eq!(neighbour(&l, Coord::Sessions, true, &s), None, "6 x 3 = 18 > 16");
+        assert_eq!(neighbour(&l, Coord::Sessions, false, &s), Some(lay(16, 4, 3, 12, 2304)));
+        assert_eq!(neighbour(&lay(16, 1, 3, 12, 2304), Coord::Sessions, false, &s), None);
         let no_sessions = Space { sessions: false, ..s };
-        assert_eq!(neighbour(&lay(8, 1, 8, 4, 32), Coord::Sessions, true, &no_sessions), None);
-        assert_eq!(neighbour(&lay(8, 1, 8, 1, 2304), Coord::Batch, true, &s), None, "one group already");
+        assert_eq!(neighbour(&lay(16, 1, 3, 12, 2304), Coord::Sessions, true, &no_sessions), None);
+        // games in flight: rows per batch kept, within bounds; the run's number fixed
+        assert_eq!(neighbour(&l, Coord::Conc, false, &s), Some(lay(16, 5, 3, 6, 1152)));
+        assert_eq!(neighbour(&l, Coord::Conc, true, &s), None, "not above 10.6's auto");
+        assert_eq!(neighbour(&l, Coord::Conc, false, &Space { conc_min: 2304, ..s }), None);
     }
 
-    /// A rate source: a peak at `best`, 15 % less per doubling away on each coordinate, oversubscription free (the
-    /// budget is a constraint), and `noise` (a fixed pseudo-random sequence of +- that share).
+    /// A rate source: a peak at `best`, 15 % less per doubling away on each coordinate, and `noise` (a fixed
+    /// pseudo-random sequence of +- that share).
     struct Fake {
         best: Layout,
         noise: f64,
@@ -901,18 +938,18 @@ mod tests {
 
     #[test]
     fn the_search_climbs_to_a_better_layout_within_its_budget() {
-        let s = space(16);
-        let best = lay(4, 4, 3, 4, 2304);
+        let s = space();
+        let best = lay(12, 4, 3, 8, 2304);
         let mut fake = Fake { best, noise: 0.0, n: 1 };
-        let start = lay(8, 4, 2, 12, 2304);
+        let start = shipped();
         let start_rate = fake.rate(&start);
         let (e, seen) = search(start, &s, &mut fake);
         assert_eq!(e.state, State::Tuned);
         assert!(e.trials <= MAX_TRIALS, "{}", e.trials);
         assert!(seen.len() as u32 <= MAX_TRIALS + 2, "start + trials + the final re-measure: {seen:?}");
-        let got = fake.rate(&e.incumbent);
-        assert!(got > start_rate * 1.2, "{:?} {got} vs start {start_rate}", e.incumbent);
-        assert!(seen.iter().all(|l| l.total_threads() <= 16), "never over the budget: {seen:?}");
+        assert_eq!(e.incumbent, best, "{seen:?}");
+        assert!(fake.rate(&e.incumbent) > start_rate * 1.2);
+        assert!(seen.iter().all(|l| l.threads <= 16 && l.infer_total() <= 16 && (192..=384).contains(&l.batch())), "never past a cap: {seen:?}");
         // the winner was measured twice (the final re-measure)
         assert_eq!(e.measured.iter().filter(|m| m.layout == e.incumbent).count(), 2);
         assert!(e.check_after == Some(100 + RECHECK_S));
@@ -921,22 +958,22 @@ mod tests {
 
     #[test]
     fn a_move_that_paid_is_tried_again_first() {
-        let s = space(16);
-        let start = lay(12, 2, 2, 6, 2304);
+        let s = space();
+        let start = shipped();
         let mut e = Entry::new(key(), "r", start, false, 0);
         e.record(start, 10_000.0, None, &s, 0);
-        // more inference threads pays: the next candidate goes on that way, before the other coordinates
-        let more_infer = neighbour(&start, Coord::Split, true, &s).unwrap();
-        e.record(more_infer, 11_000.0, None, &s, 0);
-        assert_eq!(e.incumbent, more_infer);
-        assert_eq!(e.momentum, Some((1, true)));
-        assert_eq!(e.plan(&s), neighbour(&more_infer, Coord::Split, true, &s));
+        // fewer search threads pays: the next candidate goes on that way, before the other coordinates
+        let fewer = neighbour(&start, Coord::Search, false, &s).unwrap();
+        e.record(fewer, 11_000.0, None, &s, 0);
+        assert_eq!(e.incumbent, fewer);
+        assert_eq!(e.momentum, Some((1, false)));
+        assert_eq!(e.plan(&s), neighbour(&fewer, Coord::Search, false, &s));
     }
 
     #[test]
     fn the_start_stays_when_nothing_is_clearly_faster() {
-        let s = space(16);
-        let start = lay(8, 4, 2, 6, 2304);
+        let s = space();
+        let start = shipped();
         // the start is the peak: every neighbour is slower
         let mut fake = Fake { best: start, noise: 0.0, n: 1 };
         let (e, seen) = search(start, &s, &mut fake);
@@ -947,8 +984,8 @@ mod tests {
 
     #[test]
     fn noise_below_the_gain_never_moves_the_incumbent() {
-        let s = space(16);
-        let start = lay(8, 4, 2, 6, 2304);
+        let s = space();
+        let start = shipped();
         // a flat landscape (every layout the same) with +-1 % noise
         for seed in 1..50u64 {
             let mut e = Entry::new(key(), "r", start, false, 0);
@@ -964,8 +1001,8 @@ mod tests {
 
     #[test]
     fn a_lucky_measurement_is_undone_by_the_final_re_measure() {
-        let s = space(16);
-        let start = lay(8, 4, 2, 6, 2304);
+        let s = space();
+        let start = shipped();
         let mut e = Entry::new(key(), "r", start, false, 0);
         e.record(start, 10_000.0, None, &s, 0);
         // the first candidate measures 5 % faster once (luck), every other one 10 % slower
@@ -982,8 +1019,8 @@ mod tests {
 
     #[test]
     fn discarded_trials_are_retried_then_skipped() {
-        let s = space(16);
-        let start = lay(8, 4, 2, 6, 2304);
+        let s = space();
+        let start = shipped();
         let mut e = Entry::new(key(), "r", start, false, 0);
         e.record(start, 10_000.0, None, &s, 0);
         let c = e.plan(&s).unwrap();
@@ -997,8 +1034,8 @@ mod tests {
 
     #[test]
     fn the_weekly_check_compares_runner_up_and_incumbent_afresh() {
-        let s = space(16);
-        let start = lay(8, 4, 2, 6, 2304);
+        let s = space();
+        let start = shipped();
         let mut fake = Fake { best: start, noise: 0.0, n: 1 };
         let (mut e, _) = search(start, &s, &mut fake);
         assert!(!e.maybe_check(100 + RECHECK_S - 1), "not due yet");
@@ -1020,11 +1057,11 @@ mod tests {
         let paths = Paths::new(d.path());
         let mut c = Cache::load(&paths);
         assert!(c.entries.is_empty());
-        let s = space(16);
+        let s = space();
         for i in 0..(MAX_ENTRIES as i64 + 3) {
             let mut k = key();
             k.net = format!("n{i}");
-            let mut e = Entry::new(k, "r", lay(8, 4, 2, 6, 2304), false, i);
+            let mut e = Entry::new(k, "r", shipped(), false, i);
             if i % 2 == 0 {
                 e.record(e.start, 1000.0 + i as f64, None, &s, i);
             }
@@ -1037,17 +1074,17 @@ mod tests {
         let r = c.reports();
         assert_eq!(r.len(), MAX_REPORTS);
         assert_eq!(r[0]["net"], "n18", "newest first: {r:?}");
-        assert_eq!(r[0]["layout"]["infer_workers"], 4);
+        assert_eq!(r[0]["layout"]["infer_workers"], 5);
         assert!(r.iter().all(|x| x["leaves_s"].as_f64().unwrap() > 0.0));
     }
 
     #[test]
     fn hints_are_checked_and_fitted() {
-        let s = space(16);
+        let s = space();
         let ok = json!({"layout": {"threads": 6, "infer_workers": 5, "infer_threads": 2, "groups": 6, "conc": 2304}, "leaves_s": 15000});
         assert_eq!(hint_layout(Some(&ok), &s), Some(lay(6, 5, 2, 6, 2304)));
-        let over = json!({"layout": {"threads": 30, "infer_workers": 5, "infer_threads": 3, "groups": 6, "conc": 2304}});
-        assert!(hint_layout(Some(&over), &s).unwrap().total_threads() <= 16, "fitted to this machine's budget");
+        let over = json!({"layout": {"threads": 30, "infer_workers": 5, "infer_threads": 4, "groups": 6, "conc": 2304}});
+        assert_eq!(hint_layout(Some(&over), &s), Some(lay(16, 5, 3, 6, 2304)), "fitted to this machine's caps");
         for bad in [
             json!({"layout": {"threads": 0, "infer_workers": 1, "infer_threads": 1, "groups": 1, "conc": 32}}),
             json!({"layout": {"threads": 4, "infer_workers": 1, "infer_threads": 1, "groups": 64, "conc": 32}}),
@@ -1063,21 +1100,27 @@ mod tests {
 
     #[test]
     fn defaults_per_platform() {
+        // macOS: the shipped layout (the M4 Max's measured best region), search and inference threads each at most
+        // the cores, 192-384 rows per batch, sessions always
         let m4max = Hw { cores: 16, logical: 16, perf: 12, eff: 4 };
         let d = defaults(Platform::MacOs, &m4max);
-        assert_eq!(d.budget, 16);
-        assert!(d.threads + d.infer_workers * d.infer_threads <= 16, "{d:?}");
-        assert!(d.sessions_always && d.batch.is_some());
-        let air = Hw { cores: 8, logical: 8, perf: 4, eff: 4 };
-        let d = defaults(Platform::MacOs, &air);
-        assert!(d.threads + d.infer_workers * d.infer_threads <= 8 && d.threads >= 1, "{d:?}");
-        // Windows: today's layout on an SMT CPU (one search thread per core, one session of the other threads)
-        let i9 = Hw { cores: 8, logical: 16, perf: 8, eff: 0 };
-        let d = defaults(Platform::Windows, &i9);
-        assert_eq!((d.budget, d.threads, d.infer_workers, d.infer_threads, d.sessions_always), (16, 8, 1, 8, false));
-        let no_smt = Hw { cores: 6, logical: 6, perf: 6, eff: 0 };
-        let d = defaults(Platform::Windows, &no_smt);
-        assert_eq!((d.budget, d.threads, d.infer_threads), (6, 3, 3), "no SMT: the cores split");
+        assert_eq!((d.threads, d.infer_workers, d.infer_threads, d.max_search, d.max_infer, d.batch_min, d.batch_max), (16, 5, 3, 16, 16, 192, 384));
+        assert!(d.sessions_always);
+        let air = defaults(Platform::MacOs, &Hw { cores: 8, logical: 8, perf: 4, eff: 4 });
+        assert_eq!((air.threads, air.infer_workers, air.infer_threads), (8, 2, 3));
+        let tiny = defaults(Platform::MacOs, &Hw { cores: 4, logical: 4, perf: 4, eff: 0 });
+        assert_eq!((tiny.infer_workers, tiny.infer_threads), (1, 4), "under 6 cores one session");
+        // Windows: today's layout (one search thread per core, one session of as many threads)
+        let i9 = defaults(Platform::Windows, &Hw { cores: 8, logical: 16, perf: 8, eff: 0 });
+        assert_eq!((i9.threads, i9.infer_workers, i9.infer_threads, i9.max_search, i9.max_infer, i9.sessions_always), (8, 1, 8, 8, 8, false));
+        assert_eq!((i9.batch_min, i9.batch_max), (MIN_BATCH, crate::rolling::MAX_INFLIGHT));
+        // either way the start is valid in its own space
+        for (p, hw) in [(Platform::MacOs, m4max), (Platform::Windows, Hw { cores: 6, logical: 6, perf: 6, eff: 0 })] {
+            let d = defaults(p, &hw);
+            let s = Space::new(&d, None, 32, 2304);
+            let start = Layout { threads: d.threads, infer_workers: d.infer_workers, infer_threads: d.infer_threads, groups: 12, conc: 2304 };
+            assert_eq!(s.fit(start), start, "{p:?}");
+        }
     }
 
     #[test]
