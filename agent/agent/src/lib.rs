@@ -104,6 +104,8 @@ pub struct Timings {
     pub tune_ping: Duration,
     /// rev 19: a layout handoff waits this long after `finish` before reading where the old worker's ids stop.
     pub tune_settle: Duration,
+    /// agent 0.3.3: at most `tune::MAX_HANDOFFS` layout handoffs start per this long (an hour; a safety net).
+    pub tune_handoff_window: Duration,
 }
 
 impl Default for Timings {
@@ -134,6 +136,7 @@ impl Default for Timings {
             tune_window: Duration::from_secs(75),
             tune_ping: Duration::from_secs(2),
             tune_settle: Duration::from_secs(1),
+            tune_handoff_window: Duration::from_secs(3600),
         }
     }
 }

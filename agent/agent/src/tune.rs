@@ -72,8 +72,26 @@ pub const RECHECK_S: i64 = 7 * 86_400;
 pub const MAX_ENTRIES: usize = 16;
 /// Layouts reported to the coordinator per lease request at most.
 pub const MAX_REPORTS: usize = 4;
-/// Other programs may use at most this share of the CPUs while a trial starts and runs.
+/// Other programs may use at most this share of the CPUs, on average, before a trial (`LOAD_BASELINE_TRIALS`) and over
+/// it (agent 0.3.3: a mean over the window, not every sample - a Mac's background daemons burst, a sync daemon to ~55 %
+/// of a core, syncthing to ~90 %, and 0.3.2 discarded every trial within seconds of such a burst).
 pub const OTHER_LOAD_MAX: f64 = 0.10;
+/// ... and a trial's mean may exceed the mean before it by at most this much (interference that came with the trial
+/// would bias its comparison).
+pub const OTHER_LOAD_RISE: f64 = 0.05;
+/// A trial is discarded at once when other programs used more than this share over the last `LOAD_SUSTAINED_SHARE` of
+/// a trial's window (sustained, not a burst): it couldn't end valid.
+pub const OTHER_LOAD_SUSTAINED: f64 = 0.25;
+/// The load before a trial is averaged over this many trial lengths (`tune_warm` + `tune_window`: 95 s).
+pub const LOAD_BASELINE_TRIALS: f64 = 1.0;
+/// "Sustained" is this share of a trial's window (`tune_window`: 30 s of the real 75).
+pub const LOAD_SUSTAINED_SHARE: f64 = 0.4;
+/// A candidate measured with this much less load from other programs than the incumbent (the CPU it didn't have to
+/// share) doesn't replace it: the comparison is between similar conditions.
+pub const LOAD_SIMILAR: f64 = 0.05;
+/// agent 0.3.3: at most this many layout handoffs start per `Timings::tune_handoff_window` (an hour): a safety net under
+/// the one-drain-at-a-time rule (lease.rs) - 0.3.2 handed a job over to the same layout 3 times in 7 minutes.
+pub const MAX_HANDOFFS: usize = 6;
 /// A batch has at least this many rows (fewer groups than that would make).
 pub const MIN_BATCH: u64 = 8;
 /// A trial's games in flight count as refilled at this share of its `conc`.
@@ -249,14 +267,14 @@ impl Defaults {
     }
 
     /// The start's layout for `n` workers serving `conc` games in flight in `groups` groups in all (10.6's choice): each
-    /// worker the platform's threads for `n`, `conc` / `n` games in flight (a multiple of 32 from 32) in groups of the
-    /// same rows per batch.
+    /// worker the platform's threads for `n`, `conc` / `n` games in flight (a multiple of 32 from 32) in its share of
+    /// the groups (agent 0.3.3: the group count is kept, not the rows per batch - 12 groups on 16 cores are 6 a worker for
+    /// two, whatever memory leaves of the games in flight; `Space::fit` keeps the batches within bounds).
     pub fn layout_for(&self, n: u32, conc: u64, groups: u64) -> Layout {
         let n = n.max(1);
         let (threads, infer_workers, infer_threads) = self.threads_for(n);
-        let batch = conc.div_ceil(groups.max(1)).max(1);
         let per = if n > 1 { crate::rolling::round_games(conc / n as u64) } else { conc.max(1) };
-        Layout { workers: n, threads, infer_workers, infer_threads, groups: per.div_ceil(batch).max(1), conc: per }
+        Layout { workers: n, threads, infer_workers, infer_threads, groups: groups.max(1).div_ceil(n as u64).min(per).max(1), conc: per }
     }
 }
 
@@ -302,7 +320,7 @@ pub fn defaults(p: Platform, hw: &Hw) -> Defaults {
             infer_threads: cores,
             max_search: cores,
             max_infer: cores,
-            batch_min: crate::rolling::MACOS_CPU_BATCH,
+            batch_min: crate::rolling::MACOS_CPU_MIN_BATCH,
             batch_max: 2 * crate::rolling::MACOS_CPU_BATCH,
             sessions_always: true,
             // (the worker's own split, docs/az.md 62.1: sessions of 3 threads; under 6 threads one session)
@@ -315,7 +333,7 @@ pub fn defaults(p: Platform, hw: &Hw) -> Defaults {
 }
 
 /// What a search may vary for one job.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Space {
     /// One worker's search threads at most, inference threads at most (N > 1 workers: `budget` of them).
     pub max_search: u32,
@@ -539,6 +557,9 @@ pub struct Measured {
     /// The weekly check it belongs to (0: the search).
     #[serde(default)]
     pub epoch: u32,
+    /// agent 0.3.3: other programs' mean share of the CPUs over its trial (None: not recorded, agents 0.3.1-0.3.2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load: Option<f64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
@@ -581,6 +602,14 @@ pub struct Entry {
     pub momentum: Option<(usize, bool)>,
     /// Last change (least recently used keys are forgotten first).
     pub t: i64,
+    /// agent 0.3.3: the bounds of the lease that used it last (its memory plan, the owner's settings, the worker's
+    /// features). Its layouts are compared as `Space::fit` makes them there - what the workers run: a remembered layout
+    /// the memory plan no longer holds is its fitted one (0.3.2 kept an incumbent of 2 x 958 games in flight from a
+    /// lease planned at 13 MB a game while the next lease's plan, at 16 MB, held 2 x 778; the fitted incumbent's
+    /// measurements and discards were never the incumbent's, so it was "unmeasured" for ever and handed over to again
+    /// and again).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<Space>,
 }
 
 impl Entry {
@@ -601,41 +630,90 @@ impl Entry {
             hint,
             momentum: None,
             t: now,
+            space: None,
         }
     }
 
-    fn rates(&self, l: &Layout, epoch: Option<u32>) -> Vec<f64> {
-        self.measured.iter().filter(|m| m.layout == *l && epoch.is_none_or(|e| m.epoch == e)).map(|m| m.rate).collect()
+    /// The bounds the entry's layouts are compared in from now on (the lease's space).
+    pub fn bind(&mut self, s: &Space) {
+        self.space = Some(*s);
     }
 
-    /// The mean rate of `l` (this check's measurements only during a check).
+    /// `l` as it runs in `s` (else in the bound space; as it is without one).
+    fn fitted(&self, l: &Layout, s: Option<&Space>) -> Layout {
+        match s.or(self.space.as_ref()) {
+            Some(s) => s.fit(*l),
+            None => *l,
+        }
+    }
+
+    /// `a` and `b` are the same layout where they run.
+    fn same(&self, a: &Layout, b: &Layout, s: Option<&Space>) -> bool {
+        self.fitted(a, s) == self.fitted(b, s)
+    }
+
+    /// The measurements of `l` (of one epoch, or all), compared where they run.
+    fn of(&self, l: &Layout, epoch: Option<u32>, s: Option<&Space>) -> Vec<&Measured> {
+        let k = self.fitted(l, s);
+        self.measured.iter().filter(|m| self.fitted(&m.layout, s) == k && epoch.is_none_or(|e| m.epoch == e)).collect()
+    }
+
+    fn rates(&self, l: &Layout, epoch: Option<u32>, s: Option<&Space>) -> Vec<f64> {
+        self.of(l, epoch, s).iter().map(|m| m.rate).collect()
+    }
+
+    /// Other programs' mean load over `l`'s measurements that recorded it (this check's during a check).
+    fn load_of(&self, l: &Layout, s: Option<&Space>) -> Option<f64> {
+        let epoch = (self.state == State::Checking).then_some(self.epoch);
+        let v: Vec<f64> = self.of(l, epoch, s).iter().filter_map(|m| m.load).collect();
+        (!v.is_empty()).then(|| v.iter().sum::<f64>() / v.len() as f64)
+    }
+
+    /// `a` was measured with clearly less load from other programs than `b` (`LOAD_SIMILAR`): faster numbers of `a` may
+    /// be the CPU it didn't share, not its layout.
+    fn quieter(&self, a: &Layout, b: &Layout, s: Option<&Space>) -> bool {
+        matches!((self.load_of(a, s), self.load_of(b, s)), (Some(x), Some(y)) if x + LOAD_SIMILAR < y)
+    }
+
+    fn mean_in(&self, l: &Layout, s: Option<&Space>) -> Option<f64> {
+        let r = self.rates(l, (self.state == State::Checking).then_some(self.epoch), s);
+        (!r.is_empty()).then(|| r.iter().sum::<f64>() / r.len() as f64)
+    }
+
+    /// The mean rate of `l` (this check's measurements only during a check), where the entry's layouts run.
     pub fn mean(&self, l: &Layout) -> Option<f64> {
-        let r = self.rates(l, (self.state == State::Checking).then_some(self.epoch));
+        self.mean_in(l, None)
+    }
+
+    fn mean_all(&self, l: &Layout, s: Option<&Space>) -> Option<f64> {
+        let r = self.rates(l, None, s);
         (!r.is_empty()).then(|| r.iter().sum::<f64>() / r.len() as f64)
     }
 
-    fn mean_all(&self, l: &Layout) -> Option<f64> {
-        let r = self.rates(l, None);
-        (!r.is_empty()).then(|| r.iter().sum::<f64>() / r.len() as f64)
+    fn discarded(&self, l: &Layout, s: Option<&Space>) -> u32 {
+        let k = self.fitted(l, s);
+        self.discards.iter().filter(|(x, _)| self.fitted(x, s) == k).map(|(_, n)| *n).sum()
     }
 
-    fn discarded(&self, l: &Layout) -> u32 {
-        self.discards.iter().find(|(x, _)| x == l).map_or(0, |(_, n)| *n)
+    fn runner_up_in(&self, s: Option<&Space>) -> Option<Layout> {
+        let inc = self.fitted(&self.incumbent, s);
+        let mut best: Option<(Layout, f64)> = None;
+        for m in &self.measured {
+            let l = self.fitted(&m.layout, s);
+            if l == inc || best.is_some_and(|(b, _)| b == l) {
+                continue;
+            }
+            let r = self.mean_all(&l, s).unwrap_or(0.0);
+            if best.is_none_or(|(_, b)| r > b) {
+                best = Some((l, r));
+            }
+        }
+        best.map(|(l, _)| l)
     }
 
     /// The best layout measured other than the incumbent (all measurements).
     pub fn runner_up(&self) -> Option<Layout> {
-        let mut best: Option<(Layout, f64)> = None;
-        for m in &self.measured {
-            if m.layout == self.incumbent || best.is_some_and(|(l, _)| l == m.layout) {
-                continue;
-            }
-            let r = self.mean_all(&m.layout).unwrap_or(0.0);
-            if best.is_none_or(|(_, b)| r > b) {
-                best = Some((m.layout, r));
-            }
-        }
-        best.map(|(l, _)| l)
+        self.runner_up_in(None)
     }
 
     /// The next candidate of the search: the first unmeasured neighbour of the incumbent - the move that made it
@@ -649,7 +727,7 @@ impl Entry {
         for (ci, up) in order {
             let Some(&c) = COORDS.get(ci) else { continue };
             let Some(n) = neighbour(&inc, c, up, s) else { continue };
-            if self.rates(&n, Some(0)).is_empty() && self.discarded(&n) < MAX_DISCARDS {
+            if self.rates(&n, Some(0), Some(s)).is_empty() && self.discarded(&n, Some(s)) < MAX_DISCARDS {
                 return Some(n);
             }
         }
@@ -658,9 +736,10 @@ impl Entry {
 
     /// The layout to measure next (None: nothing to measure now - tuned, or a check not due).
     pub fn plan(&self, s: &Space) -> Option<Layout> {
+        let sp = Some(s);
         match self.state {
             State::Searching => {
-                if self.rates(&self.incumbent, Some(0)).is_empty() && self.discarded(&self.incumbent) < MAX_DISCARDS * 2 {
+                if self.rates(&self.incumbent, Some(0), sp).is_empty() && self.discarded(&self.incumbent, sp) < MAX_DISCARDS * 2 {
                     return Some(s.fit(self.incumbent));
                 }
                 self.next_candidate(s)
@@ -668,9 +747,9 @@ impl Entry {
             State::Final => Some(s.fit(self.incumbent)),
             State::Tuned => None,
             State::Checking => {
-                let fresh = |l: &Layout| !self.rates(l, Some(self.epoch)).is_empty();
-                match self.runner_up() {
-                    Some(r) if !fresh(&r) && self.discarded(&r) < MAX_DISCARDS => Some(s.fit(r)),
+                let fresh = |l: &Layout| !self.rates(l, Some(self.epoch), sp).is_empty();
+                match self.runner_up_in(sp) {
+                    Some(r) if !fresh(&r) && self.discarded(&r, sp) < MAX_DISCARDS => Some(s.fit(r)),
                     _ if !fresh(&self.incumbent) => Some(s.fit(self.incumbent)),
                     _ => None,
                 }
@@ -683,18 +762,29 @@ impl Entry {
         s.fit(self.incumbent)
     }
 
-    /// A valid measurement of `l`.
-    pub fn record(&mut self, l: Layout, rate: f64, phase: Option<Phase>, s: &Space, now: i64) {
+    /// A valid measurement of `l` (`load`: other programs' mean share of the CPUs over its trial).
+    pub fn record(&mut self, l: Layout, rate: f64, load: Option<f64>, phase: Option<Phase>, s: &Space, now: i64) {
+        self.bind(s);
+        let sp = Some(s);
         if self.phase.is_none() {
             self.phase = phase;
         }
         let epoch = if self.state == State::Checking { self.epoch } else { 0 };
-        self.measured.push(Measured { layout: l, rate, t: now, epoch });
+        self.measured.push(Measured { layout: l, rate, t: now, epoch, load });
         self.t = now;
-        if self.state == State::Searching && l != self.incumbent {
+        if self.state == State::Searching && !self.same(&l, &self.incumbent, sp) {
             self.trials += 1;
-            if let (Some(c), Some(i)) = (self.mean(&l), self.mean(&self.incumbent)) {
-                if c >= GAIN * i {
+            if let (Some(c), Some(i)) = (self.mean_in(&l, sp), self.mean_in(&self.incumbent, sp)) {
+                if c >= GAIN * i && self.quieter(&l, &self.incumbent, sp) {
+                    log::info!(
+                        "tuning: {} measured {:.1} % faster than {}, but with less load from other programs ({:.0} % vs {:.0} %): not comparable, the incumbent stays",
+                        l.describe(),
+                        (c / i - 1.0) * 100.0,
+                        self.incumbent.describe(),
+                        self.load_of(&l, sp).unwrap_or(0.0) * 100.0,
+                        self.load_of(&self.incumbent, sp).unwrap_or(0.0) * 100.0
+                    );
+                } else if c >= GAIN * i {
                     log::info!("tuning: {} is {:.1} % faster than {}: the new incumbent", l.describe(), (c / i - 1.0) * 100.0, self.incumbent.describe());
                     let old = s.fit(self.incumbent);
                     self.momentum = COORDS.iter().enumerate().flat_map(|(ci, &cd)| [(ci, cd, true), (ci, cd, false)]).find(|&(_, cd, up)| neighbour(&old, cd, up, s) == Some(l)).map(|(ci, _, up)| (ci, up));
@@ -707,6 +797,7 @@ impl Entry {
 
     /// A trial that didn't count (it is tried again later, at most `MAX_DISCARDS` times).
     pub fn discard(&mut self, l: Layout, s: &Space, now: i64) {
+        self.bind(s);
         match self.discards.iter_mut().find(|(x, _)| *x == l) {
             Some((_, n)) => *n += 1,
             None => self.discards.push((l, 1)),
@@ -717,23 +808,24 @@ impl Entry {
 
     /// State changes once the current step has nothing left to measure.
     pub fn advance(&mut self, s: &Space, now: i64) {
+        let sp = Some(s);
         loop {
             match self.state {
                 State::Searching if self.plan(s).is_none() => {
-                    self.state = if self.incumbent != self.start && self.rates(&self.incumbent, Some(0)).len() < 2 { State::Final } else { State::Tuned };
+                    self.state = if !self.same(&self.incumbent, &self.start, sp) && self.rates(&self.incumbent, Some(0), sp).len() < 2 { State::Final } else { State::Tuned };
                     if self.state == State::Tuned {
-                        self.conclude(now);
+                        self.conclude(s, now);
                     }
                 }
-                State::Final if self.rates(&self.incumbent, Some(0)).len() >= 2 || self.discarded(&self.incumbent) >= MAX_DISCARDS => {
+                State::Final if self.rates(&self.incumbent, Some(0), sp).len() >= 2 || self.discarded(&self.incumbent, sp) >= MAX_DISCARDS => {
                     self.state = State::Tuned;
-                    self.conclude(now);
+                    self.conclude(s, now);
                 }
                 State::Checking if self.plan(s).is_none() => {
-                    if let Some(r) = self.runner_up() {
-                        let (a, b) = (self.rates(&r, Some(self.epoch)), self.rates(&self.incumbent, Some(self.epoch)));
+                    if let Some(r) = self.runner_up_in(sp) {
+                        let (a, b) = (self.rates(&r, Some(self.epoch), sp), self.rates(&self.incumbent, Some(self.epoch), sp));
                         if let (Some(&a), Some(&b)) = (a.last(), b.last()) {
-                            if a >= GAIN * b {
+                            if a >= GAIN * b && !self.quieter(&r, &self.incumbent, sp) {
                                 log::info!("tuning: the weekly check found {} {:.1} % faster than {}", r.describe(), (a / b - 1.0) * 100.0, self.incumbent.describe());
                                 self.incumbent = r;
                             }
@@ -748,11 +840,13 @@ impl Entry {
         }
     }
 
-    /// The search's end: the incumbent stays only if its mean is still `GAIN` over the start's.
-    fn conclude(&mut self, now: i64) {
-        if self.incumbent != self.start {
-            if let (Some(i), Some(st)) = (self.mean_all(&self.incumbent), self.mean_all(&self.start)) {
-                if i < GAIN * st {
+    /// The search's end: the incumbent stays only if its mean is still `GAIN` over the start's (with load no lighter
+    /// than the start's, `LOAD_SIMILAR`).
+    fn conclude(&mut self, s: &Space, now: i64) {
+        let sp = Some(s);
+        if !self.same(&self.incumbent, &self.start, sp) {
+            if let (Some(i), Some(st)) = (self.mean_all(&self.incumbent, sp), self.mean_all(&self.start, sp)) {
+                if i < GAIN * st || self.quieter(&self.incumbent, &self.start, sp) {
                     log::info!("tuning: {} re-measured at only {:.1} % over the start: keeping the start", self.incumbent.describe(), (i / st - 1.0) * 100.0);
                     self.incumbent = self.start;
                 }
@@ -777,27 +871,34 @@ impl Entry {
         true
     }
 
+    /// The incumbent as the workers run it (in the bound space).
+    pub fn incumbent_run(&self) -> Layout {
+        self.fitted(&self.incumbent, None)
+    }
+
     /// The incumbent's mean rate (all measurements).
     pub fn rate(&self) -> Option<f64> {
-        self.mean_all(&self.incumbent)
+        self.mean_all(&self.incumbent, None)
     }
 
     /// What `ZeroFarm status` / the tray say about it.
     pub fn describe(&self) -> String {
         let rate = self.rate().map(|r| format!(", {} leaves/s", thousands(r.round() as u64))).unwrap_or_default();
+        let inc = self.incumbent_run().describe();
         match self.state {
-            State::Tuned => format!("tuned: {}{rate}", self.incumbent.describe()),
-            State::Checking => format!("weekly check of the tuned layout: {}{rate}", self.incumbent.describe()),
-            _ => format!("tuning ({} of at most {} trials): {}{rate}", self.trials, MAX_TRIALS, self.incumbent.describe()),
+            State::Tuned => format!("tuned: {inc}{rate}"),
+            State::Checking => format!("weekly check of the tuned layout: {inc}{rate}"),
+            _ => format!("tuning ({} of at most {} trials): {inc}{rate}", self.trials, MAX_TRIALS),
         }
     }
 
-    /// The coordinator's report of it (PROTOCOL 13): None before the incumbent was measured.
+    /// The coordinator's report of it (PROTOCOL 13): None before the incumbent was measured. The layout is the
+    /// incumbent as it ran (fitted where it was measured).
     pub fn report(&self) -> Option<Value> {
         let rate = self.rate()?;
         Some(json!({
             "run": self.run, "build": self.key.build, "runtime": self.key.runtime, "net": self.key.net,
-            "layout": self.incumbent.to_json(), "leaves_s": rate.round(), "trials": self.measured.len(),
+            "layout": self.incumbent_run().to_json(), "leaves_s": rate.round(), "trials": self.measured.len(),
             "state": if self.state == State::Tuned { "tuned" } else { "searching" }, "t": self.t,
         }))
     }
@@ -867,6 +968,78 @@ impl LoadMark {
         let ours = now.ours_ms.saturating_sub(self.ours_ms);
         (busy.saturating_sub(ours) as f64 / total as f64).clamp(0.0, 1.0)
     }
+}
+
+/// agent 0.3.3: other programs' load over time - each sample their share of the CPUs since the one before
+/// (`LoadMark::other_since`) - judged over windows, not sample by sample: a trial may start when the mean over the last
+/// trial length is at most `OTHER_LOAD_MAX`; it is discarded at once when the mean over the last `LOAD_SUSTAINED_SHARE`
+/// of a window passes `OTHER_LOAD_SUSTAINED` (it couldn't end valid); and it counts when its own mean is at most
+/// `OTHER_LOAD_MAX` and at most `OTHER_LOAD_RISE` over the mean before it (`judge_trial`). A burst of a background
+/// daemon passes; interference that lasts, or that came with the trial, doesn't. The user's own rule - trials only while
+/// the computer isn't used (input, battery, fullscreen, blocks) - is the policy's and stays strict (`policy.rs`).
+#[derive(Clone, Debug, Default)]
+pub struct LoadTrack {
+    /// (end of the sample in seconds on the track's clock, other programs' share over it, its length in seconds)
+    samples: std::collections::VecDeque<(f64, f64, f64)>,
+}
+
+impl LoadTrack {
+    /// Samples older than this are dropped (seconds).
+    pub const KEEP_S: f64 = 3600.0;
+
+    /// A sample: other programs used `share` of the CPUs over the `dt` seconds up to `t`.
+    pub fn push(&mut self, t: f64, dt: f64, share: f64) {
+        if dt <= 0.0 || !share.is_finite() {
+            return;
+        }
+        self.samples.push_back((t, share.clamp(0.0, 1.0), dt));
+        while self.samples.front().is_some_and(|s| s.0 < t - Self::KEEP_S) {
+            self.samples.pop_front();
+        }
+    }
+
+    /// The time-weighted mean share over `(a, b]` and the seconds of it the samples cover (None: none).
+    pub fn mean(&self, a: f64, b: f64) -> Option<(f64, f64)> {
+        let (mut w, mut sum) = (0.0, 0.0);
+        for &(t, share, dt) in &self.samples {
+            let ov = (t.min(b) - (t - dt).max(a)).max(0.0);
+            if ov > 0.0 {
+                w += ov;
+                sum += share * ov;
+            }
+        }
+        (w > 0.0).then(|| (sum / w, w))
+    }
+
+    /// The last sample's share.
+    pub fn last(&self) -> Option<f64> {
+        self.samples.back().map(|s| s.1)
+    }
+
+    /// A trial may start at `now`: the mean over the last `baseline_s` is at most `OTHER_LOAD_MAX` (nothing measured
+    /// yet: yes - the trial's own window is judged).
+    pub fn quiet(&self, now: f64, baseline_s: f64) -> bool {
+        self.mean(now - baseline_s, now).is_none_or(|(m, _)| m <= OTHER_LOAD_MAX)
+    }
+
+    /// The load is sustained at `now`: the mean over the last `window_s` (covered at least 90 %) passes
+    /// `OTHER_LOAD_SUSTAINED` -> that mean.
+    pub fn sustained(&self, now: f64, window_s: f64) -> Option<f64> {
+        self.mean(now - window_s, now).filter(|&(m, w)| w >= 0.9 * window_s && m > OTHER_LOAD_SUSTAINED).map(|(m, _)| m)
+    }
+}
+
+/// agent 0.3.3: a trial's load verdict: its mean `trial` over its window and the mean `before` it -> the mean to record
+/// with the measurement, or why it doesn't count.
+pub fn judge_trial(trial: Option<f64>, before: Option<f64>) -> Result<Option<f64>, String> {
+    let Some(m) = trial else { return Ok(None) };
+    if m > OTHER_LOAD_MAX {
+        return Err(format!("other programs used {:.0} % of the CPUs during the trial", m * 100.0));
+    }
+    if let Some(b) = before.filter(|&b| m > b + OTHER_LOAD_RISE) {
+        return Err(format!("other programs used {:.0} % of the CPUs during the trial, {:.0} % before it", m * 100.0, b * 100.0));
+    }
+    Ok(Some(m))
 }
 
 /// The coordinator's `tuning_hint` (PROTOCOL 13), checked: its layout within bounds, made valid for `s`. Unsigned and
@@ -1101,7 +1274,7 @@ mod tests {
         while let Some(l) = e.plan(s) {
             seen.push(l);
             let r = fake.rate(&l);
-            e.record(l, r, Some(Phase { p0: 1.0, p1: 2.0, conc: 64 }), s, 100);
+            e.record(l, r, None, Some(Phase { p0: 1.0, p1: 2.0, conc: 64 }), s, 100);
             guard += 1;
             assert!(guard < 40, "the search doesn't end: {seen:?}");
         }
@@ -1133,10 +1306,10 @@ mod tests {
         let s = space();
         let start = shipped();
         let mut e = Entry::new(key(), "r", start, false, 0);
-        e.record(start, 10_000.0, None, &s, 0);
+        e.record(start, 10_000.0, None, None, &s, 0);
         // fewer search threads pays: the next candidate goes on that way, before the other coordinates
         let fewer = neighbour(&start, Coord::Search, false, &s).unwrap();
-        e.record(fewer, 11_000.0, None, &s, 0);
+        e.record(fewer, 11_000.0, None, None, &s, 0);
         assert_eq!(e.incumbent, fewer);
         assert_eq!(e.momentum, Some((2, false)), "Search is the third coordinate");
         assert_eq!(e.plan(&s), neighbour(&fewer, Coord::Search, false, &s));
@@ -1165,7 +1338,7 @@ mod tests {
             while let Some(l) = e.plan(&s) {
                 n = n.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
                 let u = ((n >> 33) as f64 / (1u64 << 31) as f64) * 2.0 - 1.0;
-                e.record(l, 10_000.0 * (1.0 + 0.01 * u), None, &s, 0);
+                e.record(l, 10_000.0 * (1.0 + 0.01 * u), None, None, &s, 0);
             }
             assert_eq!(e.incumbent, start, "seed {seed}");
         }
@@ -1176,14 +1349,14 @@ mod tests {
         let s = space();
         let start = shipped();
         let mut e = Entry::new(key(), "r", start, false, 0);
-        e.record(start, 10_000.0, None, &s, 0);
+        e.record(start, 10_000.0, None, None, &s, 0);
         // the first candidate measures 5 % faster once (luck), every other one 10 % slower
         let first = e.plan(&s).unwrap();
-        e.record(first, 10_500.0, None, &s, 0);
+        e.record(first, 10_500.0, None, None, &s, 0);
         assert_eq!(e.incumbent, first);
         while let Some(l) = e.plan(&s) {
             let r = if l == first { 10_050.0 } else { 9_000.0 };
-            e.record(l, r, None, &s, 0);
+            e.record(l, r, None, None, &s, 0);
         }
         assert_eq!(e.state, State::Tuned);
         assert_eq!(e.incumbent, start, "mean 10,275 is under 3 % over the start");
@@ -1194,7 +1367,7 @@ mod tests {
         let s = space();
         let start = shipped();
         let mut e = Entry::new(key(), "r", start, false, 0);
-        e.record(start, 10_000.0, None, &s, 0);
+        e.record(start, 10_000.0, None, None, &s, 0);
         let c = e.plan(&s).unwrap();
         e.discard(c, &s, 0);
         assert_eq!(e.plan(&s), Some(c), "a discarded trial is tried again");
@@ -1215,9 +1388,9 @@ mod tests {
         assert_eq!(e.state, State::Checking);
         let r = e.runner_up().unwrap();
         assert_eq!(e.plan(&s), Some(r), "the runner-up first");
-        e.record(r, 12_000.0, None, &s, 200 + RECHECK_S);
+        e.record(r, 12_000.0, None, None, &s, 200 + RECHECK_S);
         assert_eq!(e.plan(&s), Some(start), "then the incumbent");
-        e.record(start, 10_000.0, None, &s, 200 + RECHECK_S);
+        e.record(start, 10_000.0, None, None, &s, 200 + RECHECK_S);
         assert_eq!(e.state, State::Tuned);
         assert_eq!(e.incumbent, r, "the runner-up is now 20 % faster");
         assert_eq!(e.check_after, Some(200 + 2 * RECHECK_S));
@@ -1235,7 +1408,7 @@ mod tests {
             k.net = format!("n{i}");
             let mut e = Entry::new(k, "r", shipped(), false, i);
             if i % 2 == 0 {
-                e.record(e.start, 1000.0 + i as f64, None, &s, i);
+                e.record(e.start, 1000.0 + i as f64, None, None, &s, i);
             }
             c.put(e);
         }
@@ -1276,7 +1449,7 @@ mod tests {
         // the cores, 192-384 rows per batch, sessions always
         let m4max = Hw { cores: 16, logical: 16, perf: 12, eff: 4, ram_mb: 16384 };
         let d = defaults(Platform::MacOs, &m4max);
-        assert_eq!((d.threads, d.infer_workers, d.infer_threads, d.max_search, d.max_infer, d.batch_min, d.batch_max), (16, 5, 3, 16, 16, 192, 384));
+        assert_eq!((d.threads, d.infer_workers, d.infer_threads, d.max_search, d.max_infer, d.batch_min, d.batch_max), (16, 5, 3, 16, 16, 96, 384));
         assert!(d.sessions_always);
         let air = defaults(Platform::MacOs, &Hw { cores: 8, logical: 8, perf: 4, eff: 4, ram_mb: 16384 });
         assert_eq!((air.threads, air.infer_workers, air.infer_threads), (8, 2, 3));
@@ -1321,44 +1494,167 @@ mod tests {
 
     #[test]
     fn a_macs_crew_starts_within_the_default_memory_cap() {
-        // agent 0.3.2: a Mac's games in flight cost ~13 MB each at steady state (rolling::MACOS_CPU_COST), so the start's
-        // two workers of 1,152 (13 GB + ~15 GB each in 16 GB) no longer fit; the plan bounds each worker's games in flight
-        // (each its own base) and the tuner keeps its games-in-flight range
+        // agent 0.3.3: a Mac's games in flight cost ~16 MB each and more (rolling::MACOS_CPU_COST plans 18), so the start's
+        // two workers hold 716 each; the plan bounds each worker's games in flight (each its own base), the tuner keeps
+        // its games-in-flight range, and the groups stay where memory cuts the games (6 a worker, batches shrink)
         let cost = crate::rolling::MACOS_CPU_COST;
         let start_of = |hw: &Hw, cap: u64| {
             let d = defaults(Platform::MacOs, hw);
-            let one = crate::rolling::ram_cap(cap, cost).min(crate::rolling::mac_cpu_auto(hw.cores as u64).0);
+            let (auto, groups) = crate::rolling::mac_cpu_auto(hw.cores as u64);
+            let one = crate::rolling::ram_cap(cap, cost).min(auto);
             let s = Space::new(&d, None, None, (one / 2).max(1), one, Some((cap, cost)));
-            (s, s.fit(d.layout_for(d.workers, one, crate::rolling::mac_groups(one))), one)
+            (s, s.fit(d.layout_for(d.workers, one, crate::rolling::mac_capped_groups(one, groups))), one)
         };
-        // 64 GB, cap 32,768 MB: one worker would get 1,888; two get (0.85 x 16,384 - 1,024) / 14 = 921 each
+        // 64 GB, cap 32,768 MB: one worker would get 1,472 in 12 groups; two get (0.85 x 16,384 - 1,024) / 18 = 716 each,
+        // in 6 groups (of 120 rows)
         let (s, l, one) = start_of(&m4max(), 32_768);
-        assert_eq!(one, 1888);
-        assert_eq!(s.mem_room(2), Some(921));
-        assert_eq!(l, Layout { workers: 2, threads: 12, infer_workers: 4, infer_threads: 3, groups: 4, conc: 921 }, "batches of ~230 rows");
-        assert_eq!((s.conc_min, s.conc_max, s.workers_max), (944, 1888, 3), "the tuner's games in flight and workers kept");
-        // every worker's base and games in flight within 85 % of its part, and at the measured steady state (~13.2 MB a
-        // game) under the 92 % where a worker gives way
-        for (cap, l) in [(32_768u64, l), (31_671, start_of(&m4max(), 31_671).1)] {
+        assert_eq!(one, 1472);
+        assert_eq!(s.mem_room(2), Some(716));
+        assert_eq!(l, Layout { workers: 2, threads: 12, infer_workers: 4, infer_threads: 3, groups: 6, conc: 716 }, "the groups kept, batches of 120 rows");
+        assert_eq!((s.conc_min, s.conc_max, s.workers_max), (736, 1472, 3), "the tuner's games in flight and workers kept");
+        // every worker's base and games in flight within 85 % of its part, and at the crew's measured 16 MB a game under
+        // the 92 % where a worker gives way
+        for (cap, l) in [(32_768u64, l), (31_671, start_of(&m4max(), 31_671).1), (31_717, start_of(&m4max(), 31_717).1)] {
             let part = cap as f64 / l.workers as f64;
             assert!((cost.base_mb + l.conc * cost.per_game_mb) as f64 <= part * crate::rolling::PLAN_SHARE, "{cap}: {l:?}");
-            assert!(1024.0 + l.conc as f64 * 13.2 < part * crate::rolling::HIGH_SHARE, "{cap}: {l:?}");
+            assert!(1024.0 + l.conc as f64 * 16.0 < part * crate::rolling::HIGH_SHARE * 0.9, "{cap}: {l:?}");
+            assert_eq!((l.workers, l.groups), (2, 6), "{cap}: {l:?}");
         }
+        // the second validation lease's limit (31,717 MB): 2 x 691 in 6 groups (0.3.2: 2 x 778 in 4 groups of 195)
+        assert_eq!(start_of(&m4max(), 31_717).1.conc, 691);
         // the owner's fixed 2 workers (autotune off): the same start
         let d = defaults(Platform::MacOs, &m4max());
-        let fixed = Space::new(&d, None, Some(2), 944, 1888, Some((32_768, cost)));
-        assert_eq!(fixed.fit(d.layout_for(2, 1888, crate::rolling::mac_groups(1888))), l);
-        // 0.3.1's plan (4 MB a game) let both run 1,152
+        let fixed = Space::new(&d, None, Some(2), 736, 1472, Some((32_768, cost)));
+        assert_eq!(fixed.fit(d.layout_for(2, 1472, crate::rolling::mac_capped_groups(1472, 12))), l);
+        // 0.3.1's plan (4 MB a game) let both run 1,152; 0.3.2's (14 MB) 921 in 4 groups
         let old = Space { conc_min: 1152, conc_max: 2304, mem: Some((32_768, crate::rolling::MemCost { base_mb: 1024, per_game_mb: 4 })), ..fixed };
         assert_eq!(old.fit(d.layout_for(2, 2304, 12)).conc, 1152);
-        // a 32 GB Mac with 12 cores (cap 16,384 MB): two workers of 424 in 2 groups
-        let (_, l, one) = start_of(&Hw { cores: 12, logical: 12, perf: 8, eff: 4, ram_mb: 32_768 }, 16_384);
-        assert_eq!(one, 896);
-        assert_eq!((l.workers, l.conc, l.groups), (2, 424, 2));
-        // a 16 GB Mac with 8 cores (cap 8,192 MB): one worker of 416 in 2 groups
+        // a 32 GB Mac with 12 cores (cap 16,384 MB): two workers of 329 in 3 groups (110 rows)
+        let (s, l, one) = start_of(&Hw { cores: 12, logical: 12, perf: 8, eff: 4, ram_mb: 32_768 }, 16_384);
+        assert_eq!(one, 704);
+        assert_eq!((s.workers_max, l.workers, l.conc, l.groups), (2, 2, 329, 3));
+        // a 16 GB Mac with 8 cores (cap 8,192 MB): one worker of 320 in 3 groups (107 rows; 0.3.2: 416 in 2)
         let (s, l, one) = start_of(&Hw { cores: 8, logical: 8, perf: 4, eff: 4, ram_mb: 16_384 }, 8192);
-        assert_eq!(one, 416);
-        assert_eq!((s.workers_max, l.workers, l.conc, l.groups), (1, 1, 416, 2));
+        assert_eq!(one, 320);
+        assert_eq!((s.workers_max, l.workers, l.conc, l.groups), (1, 1, 320, 3));
+    }
+
+    #[test]
+    fn a_remembered_incumbent_the_memory_no_longer_holds_is_its_fitted_layout() {
+        // agent 0.3.2 on the M4 Max (2026-11-19): the entry kept 2 x 958 games in flight from a lease planned at 13 MB a
+        // game (its trial discarded); the next lease, planned at 16 MB, held 2 x 778. The first worker's trial of 778 was
+        // discarded (load) and its discards and measurements were never the incumbent's: `plan` returned the fitted
+        // incumbent for ever and the agent handed the job over to the same layout 3 times in 7 minutes
+        let d = defaults(Platform::MacOs, &m4max());
+        let cost = |per| Some((31_742, crate::rolling::MemCost { base_mb: 1024, per_game_mb: per }));
+        let old = Space::new(&d, None, None, 992, 1984, cost(13));
+        let new = Space::new(&d, None, None, 800, 1600, Some((31_717, crate::rolling::MemCost { base_mb: 1024, per_game_mb: 16 })));
+        let inc = Layout { workers: 2, threads: 12, infer_workers: 4, infer_threads: 3, groups: 4, conc: 958 };
+        assert_eq!(old.fit(inc), inc);
+        let l = new.fit(inc);
+        assert_eq!(l, Layout { conc: 778, ..inc });
+        let mut e = Entry::new(key(), "r", inc, false, 0);
+        e.discard(inc, &old, 0);
+        // the next lease binds its bounds (lease.rs `tuning_for`): the incumbent is what runs there
+        e.bind(&new);
+        assert_eq!((e.wanted(&new), e.plan(&new), e.incumbent_run()), (l, Some(l), l));
+        e.discard(l, &new, 1);
+        assert_eq!(e.discarded(&inc, Some(&new)), 2, "the discards of 958 and 778 are the incumbent's");
+        assert_eq!(e.plan(&new), Some(l), "measured afresh (a fresh worker)");
+        // measured: the incumbent's measurement, not a trial - the search goes on to a neighbour
+        e.record(l, 15_000.0, Some(0.03), Some(Phase { p0: 1.0, p1: 2.0, conc: 1556 }), &new, 2);
+        assert_eq!((e.trials, e.rate()), (0, Some(15_000.0)));
+        let next = e.plan(&new).unwrap();
+        assert_ne!(next, l, "no second trial of the same layout");
+        assert_eq!(e.report().unwrap()["layout"], l.to_json(), "the incumbent as it ran");
+        assert!(e.describe().contains("778 games in flight"), "{}", e.describe());
+        // discarded at most 6 times (twice MAX_DISCARDS) where it runs, then the search goes on without it
+        let mut e = Entry::new(key(), "r", inc, false, 0);
+        e.bind(&new);
+        for k in 0..2 * MAX_DISCARDS {
+            assert_eq!(e.plan(&new), Some(l), "{k}");
+            e.discard(if k % 2 == 0 { inc } else { l }, &new, k as i64);
+        }
+        assert_ne!(e.plan(&new), Some(l));
+        // the stored layouts are kept as they were (a lease with more memory runs 958 again)
+        assert_eq!(e.incumbent, inc);
+        assert_eq!(old.fit(e.incumbent), inc);
+        // an entry of 0.3.1-0.3.2 (no bounds, no loads) still loads
+        let v = serde_json::to_value(Entry::new(key(), "r", inc, false, 0)).unwrap();
+        assert!(v.get("space").is_none());
+        let mut legacy = v.clone();
+        legacy["measured"] = json!([{"layout": inc.to_json(), "rate": 9000.0, "t": 1}]);
+        let back: Entry = serde_json::from_value(legacy).unwrap();
+        assert_eq!((back.space, back.measured[0].load), (None, None));
+        let mut bound = Entry::new(key(), "r", inc, false, 0);
+        bound.record(l, 1.0, Some(0.02), None, &new, 0);
+        let back: Entry = serde_json::from_value(serde_json::to_value(&bound).unwrap()).unwrap();
+        assert_eq!(back, bound, "bounds and loads are remembered");
+    }
+
+    #[test]
+    fn bursts_of_other_programs_pass_and_sustained_load_doesnt() {
+        // the owner's Mac (2026-11-19): a sync daemon ~55 % of a core in bursts, syncthing to ~90 %, kernel_task ~19 % -
+        // on 16 cores bursts of 10-18 % of the CPUs; 0.3.2 discarded a trial on any 2-s sample over 10 % (the first
+        // trial of the crew within 9 s). Here: samples every 2 s, a 4-s burst of 18 % every 30 s over 3 % otherwise
+        let mut tr = LoadTrack::default();
+        let mut t = 0.0;
+        for i in 0..200 {
+            t += 2.0;
+            tr.push(t, 2.0, if i % 15 < 2 { 0.18 } else { 0.03 });
+        }
+        assert!(tr.quiet(t, 95.0), "a trial may start: {:?}", tr.mean(t - 95.0, t));
+        assert_eq!(tr.sustained(t, 30.0), None, "a burst isn't sustained");
+        let (before, w) = tr.mean(t - 95.0, t).unwrap();
+        assert!(before < 0.07 && (w - 95.0).abs() < 1e-9, "{before} {w}");
+        // a trial in the same conditions counts, and records its load
+        let t0 = t;
+        for i in 0..60 {
+            t += 2.0;
+            tr.push(t, 2.0, if i % 15 < 2 { 0.18 } else { 0.03 });
+            assert_eq!(tr.sustained(t, 30.0), None);
+        }
+        let during = tr.mean(t0, t).map(|(m, _)| m);
+        assert_eq!(judge_trial(during, Some(before)), Ok(during));
+        // sustained: another program takes 30 % of the CPUs from now on - the trial ends at once, none starts
+        for _ in 0..15 {
+            t += 2.0;
+            tr.push(t, 2.0, 0.30);
+        }
+        assert!(tr.sustained(t, 30.0).is_some_and(|m| (m - 0.30).abs() < 1e-9));
+        assert!(!tr.quiet(t, 95.0));
+        // a trial's mean over 10 %, or 5 points over the load before it, doesn't count
+        assert!(judge_trial(Some(0.12), Some(0.11)).unwrap_err().starts_with("other programs used 12 % of the CPUs"));
+        assert!(judge_trial(Some(0.09), Some(0.02)).is_err(), "rose 7 points");
+        assert_eq!(judge_trial(Some(0.06), Some(0.03)), Ok(Some(0.06)));
+        assert_eq!(judge_trial(Some(0.06), None), Ok(Some(0.06)), "nothing measured before it (a lease's first worker)");
+        assert_eq!(judge_trial(None, None), Ok(None));
+        // means weigh partial samples by time; nothing measured yet is quiet; sustained needs the window covered
+        let mut tr = LoadTrack::default();
+        assert!(tr.quiet(0.0, 1.0));
+        tr.push(10.0, 10.0, 0.5);
+        tr.push(20.0, 10.0, 0.0);
+        assert_eq!(tr.mean(5.0, 15.0), Some((0.25, 10.0)));
+        assert_eq!(tr.sustained(10.0, 30.0), None, "only 10 of 30 s covered");
+        assert_eq!(tr.last(), Some(0.0));
+    }
+
+    #[test]
+    fn a_candidate_measured_on_a_quieter_machine_doesnt_replace_the_incumbent() {
+        let s = space();
+        let start = shipped();
+        let run = |inc_load: f64, cand_load: f64| {
+            let mut e = Entry::new(key(), "r", start, false, 0);
+            e.record(start, 10_000.0, Some(inc_load), None, &s, 0);
+            let c = e.plan(&s).unwrap();
+            e.record(c, 10_500.0, Some(cand_load), None, &s, 0);
+            (e.incumbent == c, e)
+        };
+        assert!(!run(0.08, 0.01).0, "5 % faster with 7 points less load: not comparable");
+        assert!(run(0.04, 0.02).0, "similar load: 5 % faster wins");
+        assert!(run(0.01, 0.09).0, "faster under more load wins");
+        let (_, e) = run(0.08, 0.01);
+        assert_eq!(e.measured[1].load, Some(0.01), "the load is recorded with the measurement");
     }
 
     #[test]
@@ -1433,7 +1729,7 @@ mod tests {
         let mut seen = vec![];
         while let Some(l) = e.plan(&s) {
             seen.push(l);
-            e.record(l, rate(&l), None, &s, 0);
+            e.record(l, rate(&l), None, None, &s, 0);
             assert!(seen.len() < 30);
         }
         assert_eq!(seen[1].workers, 2, "the worker count is the first coordinate: {seen:?}");

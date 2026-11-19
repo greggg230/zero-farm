@@ -359,3 +359,158 @@ fn the_tuner_chooses_the_worker_count_and_reports_it() {
     assert_eq!(req["tuning"][0]["layout"]["workers"], 2, "{req}");
     h.stop();
 }
+
+/// What the lease's fakeworkers held at once, from their `holds` / `exits` lines in the worker log (in the order
+/// written): (the most MB at once, the most workers at once).
+fn held_at_once(h: &H) -> (u64, usize) {
+    let mut held: std::collections::BTreeMap<u64, u64> = Default::default();
+    let (mut most, mut alive) = (0, 0);
+    for l in h.agent_log().lines() {
+        let Some(i) = l.find("fakeworker: pid ") else { continue };
+        let rest: Vec<&str> = l[i + 16..].split_whitespace().collect();
+        let Some(pid) = rest.first().and_then(|p| p.parse::<u64>().ok()) else { continue };
+        match rest.get(1).copied() {
+            Some("holds") => {
+                held.insert(pid, rest.get(2).and_then(|n| n.parse().ok()).unwrap_or(0));
+            }
+            Some("exits") => {
+                held.remove(&pid);
+            }
+            _ => continue,
+        }
+        most = most.max(held.values().sum::<u64>());
+        alive = alive.max(held.len());
+    }
+    (most, alive)
+}
+
+/// Agent 0.3.3, the M4 Max's crew of 2026-11-19: every handoff left the old workers finishing their games, and with new
+/// workers admitted on what they committed at their start (little) 4 drainers and the crew held ~4,700 games in flight,
+/// 38.9 GB against a 31.7 GB cap. Now a new worker counts at its plan until it commits more, a drainer at what it
+/// commits, a worker starts only when its plan fits beside them, one drain at a time: the lease's workers never hold
+/// more than the cap, and never more than a crew and the crew it replaced.
+#[test]
+fn handoffs_and_drains_never_hold_more_than_the_memory_cap() {
+    let mut h = harness(Some(2), true);
+    // the run's cost remembered here: 300 MB a game over the platform's base; each worker of 2 games in flight is planned
+    // at base + 600 MB, and its fakeworker grows to exactly that (its base at the start, 300 MB a finished game, twice)
+    let base = farm_agent::rolling::cpu_cost().base_mb;
+    let plan = base + 2 * 300;
+    std::fs::create_dir_all(h.layout.state()).unwrap();
+    std::fs::write(h.layout.state().join("rolling_memory.json"), json!({format!("{RUN}/cpu"): 300}).to_string()).unwrap();
+    // a cap whose 85 % holds three workers' plans, not four: a crew of two and one more beside it
+    let limit = (3.2 * plan as f64 / farm_agent::rolling::PLAN_SHARE).ceil() as u64;
+    h.machine.lock().unwrap().settings.max_ram_mb = Some(limit);
+    let mut fk = fake(150, json!([1.0, 1.3]));
+    fk["rate"]["best"] = json!({"threads": 2});
+    fk["rate"]["penalty"] = json!(0.25);
+    (fk["mem_base_mb"], fk["mem_grow_mb"], fk["mem_grow_until"]) = (json!(base), json!(300), json!(2));
+    h.push(crew_lease(&h, "l_CMD", &fk, json!(4), 1_000_000));
+    h.start();
+    let handoffs = |h: &H| h.agent_log().matches("tuning [l_CMD]: handing the job over to").count();
+    // (polled: `workers_uploading` reads the mock's state, which `mock.wait` holds while it asks)
+    assert!(mockcoord::testkit::wait_until(Duration::from_secs(150), || handoffs(&h) >= 3 && workers_uploading(&h, "l_CMD") >= 3), "{}", crew_log(&h));
+    h.stop();
+    let done = h.wait_done("l_CMD");
+    ids_accounted(&h, "l_CMD", &done);
+    let (most, alive) = held_at_once(&h);
+    eprintln!("held at once: {most} MB, {alive} workers; cap {limit} MB, plan {plan} MB, {} handoffs", handoffs(&h));
+    assert!(most >= 2 * plan, "the crew ran at its plan: {most} MB");
+    assert!(most <= limit, "{most} MB at once against the {limit} MB cap
+{}", crew_log(&h));
+    assert!(alive <= 4, "{alive} workers at once: a crew and the one it replaced at most
+{}", crew_log(&h));
+    assert!(h.crashes().is_empty(), "{:?}", h.crashes());
+}
+
+/// Agent 0.3.3, the same crew, the handoff no trial measures (the revert to the incumbent after a discarded trial; 0.3.2
+/// also handed over unmeasured whenever a trial couldn't start at spawn time): the next crew's first worker starts
+/// beside the old crew - finishing its games for a long while, at its full memory - and its second only once its plan
+/// fits beside them. 0.3.2 admitted the second on what the first committed right after its start (its games not grown
+/// yet) and the lease ended up holding four workers' memory against a cap that holds three.
+#[test]
+fn an_unmeasured_handoff_starts_the_next_crew_only_as_memory_allows() {
+    let mut h = harness(Some(2), true);
+    // the owner's computer: work goes on while it is used, trials don't; trials last long enough to be interrupted
+    h.machine.lock().unwrap().settings.mode = farm_agent::settings::Mode::Always;
+    h.timings.tune_window = Duration::from_secs(8);
+    // the run's cost remembered here, each worker of 2 games in flight planned at base + 2 x that: on Windows the games
+    // weigh twice the base (as a real worker's grown games do), so that 0.3.2's rule - the old crew's commit, the first
+    // new worker's (its base so far) and a plan within 85 % - admits a fourth worker while 4 plans pass the cap (3.95);
+    // a Mac's fakeworkers touch every page they hold: lighter there
+    let base = farm_agent::rolling::cpu_cost().base_mb;
+    let per = if cfg!(windows) { base } else { 300 };
+    let plan = base + 2 * per;
+    std::fs::create_dir_all(h.layout.state()).unwrap();
+    std::fs::write(h.layout.state().join("rolling_memory.json"), json!({format!("{RUN}/cpu"): per}).to_string()).unwrap();
+    let limit = (3.95 * plan as f64) as u64;
+    h.machine.lock().unwrap().settings.max_ram_mb = Some(limit);
+    // games of 4 s (a drain of its 2 games in flight takes up to 8 s); a worker commits its base at once and its games'
+    // memory over 1.5 s
+    let mut fk = fake(4000, json!([1.0, 1.3]));
+    fk["rate"]["best"] = json!({"threads": 2});
+    fk["rate"]["penalty"] = json!(0.25);
+    (fk["mem_base_mb"], fk["mem_per_game_mb"], fk["mem_ramp_ms"]) = (json!(base), json!(per), json!(1500));
+    h.push(crew_lease(&h, "l_CMU", &fk, json!(4), 1_000_000));
+    h.start();
+    // a candidate's trial with its whole crew, its memory grown: then the owner uses the computer
+    let trial_crew = |h: &H| {
+        h.agent_log().contains("tuning [l_CMU]: handing the job over to")
+            && h.status.lock().unwrap().tuning.as_deref().is_some_and(|t| t.starts_with("measuring") && !t.contains("workers running"))
+    };
+    assert!(mockcoord::testkit::wait_until(Duration::from_secs(90), || trial_crew(&h)), "{}", crew_log(&h));
+    std::thread::sleep(Duration::from_millis(1800));
+    h.user_active(true);
+    let revert = |h: &H| h.agent_log().contains("(the incumbent, not measured)");
+    assert!(wait(|| revert(&h)), "the incumbent back, unmeasured: {}", crew_log(&h));
+    // the old crew's drain (up to 8 s) and the new crew complete
+    let since = job_lines(&h).len();
+    assert!(mockcoord::testkit::wait_until(Duration::from_secs(40), || job_lines(&h).len() >= since + 2), "{}", crew_log(&h));
+    std::thread::sleep(Duration::from_secs(3));
+    h.stop();
+    let done = h.wait_done("l_CMU");
+    ids_accounted(&h, "l_CMU", &done);
+    let (most, alive) = held_at_once(&h);
+    eprintln!("held at once: {most} MB, {alive} workers; cap {limit} MB, plan {plan} MB");
+    assert!(most <= limit, "{most} MB at once against the {limit} MB cap
+{}", crew_log(&h));
+    assert!(alive <= 3, "{alive} workers at once: the old crew and one new worker beside it at most
+{}", crew_log(&h));
+    assert!(h.crashes().is_empty(), "{:?}", h.crashes());
+}
+
+/// Agent 0.3.3, the same crew: its memory plan cut each worker to 882 games in flight, and macOS's 192-row floor then
+/// left 4 groups (and 3 after a memory restart) - the slow region (PROTOCOL 13: 4 groups starve the search; the measured
+/// best was 6 a worker). Now the groups stay where memory cuts the games and the batches shrink (down to 96 rows on
+/// macOS): on a 16-core Mac at the validation's 31,717 MB cap, 2 x 691 games in flight in 6 groups of 116 rows.
+#[test]
+fn a_memory_capped_crew_keeps_its_groups_and_batches_shrink() {
+    let limit = 31_717u64;
+    let mut h = harness(Some(2), false);
+    h.machine.lock().unwrap().settings.max_ram_mb = Some(limit);
+    // (a 64 GB machine with most of it free: the cap is the setting's, not the free memory's)
+    h.signals.set(|s| (s.mem_avail_mb, s.mem_total_mb) = (60_000, 65_536));
+    h.push(crew_lease(&h, "l_CGR", &fake(40, json!([1.0, 1.3])), json!("auto"), 1_000_000));
+    h.start();
+    assert!(wait(|| job_lines(&h).len() >= 2), "{}", crew_log(&h));
+    // what the agent works out (rolling::cpu_shape, tune::Defaults::layout_for, tune::Space::fit), computed here
+    let cost = farm_agent::rolling::cpu_cost();
+    let (auto_n, auto_g) = farm_agent::rolling::cpu_auto();
+    let one = farm_agent::rolling::ram_cap(limit, cost).min(auto_n);
+    let groups = if cfg!(target_os = "macos") { farm_agent::rolling::mac_capped_groups(one, auto_g) } else { auto_g };
+    let p = harness::fake_profile();
+    let d = farm_agent::tune::defaults(
+        farm_agent::tune::Platform::current(),
+        &farm_agent::tune::Hw { cores: p.cores, logical: p.threads, perf: p.perf_cores, eff: p.eff_cores, ram_mb: p.ram_mb },
+    );
+    let want = farm_agent::tune::Space::new(&d, None, Some(2), (one / 2).max(1), one, Some((limit, cost))).fit(d.layout_for(2, one, groups));
+    for j in &job_lines(&h)[..2] {
+        assert_eq!((j["conc"].as_u64(), j["groups"].as_u64()), (Some(want.conc), Some(want.groups)), "{j}");
+    }
+    assert_eq!(want.groups, groups.div_ceil(2).min(want.conc / d.batch_min).max(1), "the job's groups shared, not its rows");
+    if cfg!(target_os = "macos") && auto_n == 2304 {
+        assert_eq!((want.conc, want.groups), (691, 6), "16 cores: 2 x 691 in 6 groups (0.3.2: 2 x 778 in 4)");
+        assert!(want.batch() < farm_agent::rolling::MACOS_CPU_BATCH, "batches shrink below 192 rows: {want:?}");
+    }
+    h.stop();
+}

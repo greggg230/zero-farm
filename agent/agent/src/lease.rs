@@ -13,7 +13,7 @@ use crate::jobplan::{Plan, PlanError, Recheck};
 use crate::results::{compute_unfinished, ResultMeta, Source};
 use crate::rolling::{Learned, MemPlan, Setup};
 use crate::status::Phase;
-use crate::tune::{self, Layout, LoadMark, Probe, Verdict};
+use crate::tune::{self, Layout, LoadMark, LoadTrack, Probe, Verdict};
 use crate::worker::{CpuMark, SpawnOpts, WorkerMsg, WorkerProc};
 use serde_json::{json, Map, Value};
 use std::path::PathBuf;
@@ -94,6 +94,9 @@ struct Roll {
     /// rev 19 (PROTOCOL 13.5): the most any worker of the lease committed per game in flight over the cost's base (MB),
     /// remembered at the end when more than planned.
     per_game_max: u64,
+    /// agent 0.3.3: the most a worker committed per game once it had run `rolling::STEADY_S` (0: none ran that long);
+    /// such a lease may lower a higher remembered cost (`Learned::settle`).
+    steady_per_game: u64,
     /// The current worker's ids start at `lo + offset` (0 until a restart; a restart's worker gets the ids after
     /// the ones its predecessor started).
     offset: u64,
@@ -191,9 +194,15 @@ struct Tuning {
     /// The main worker started fresh with `current` and is being measured.
     probe: Option<(Probe, Instant)>,
     handoff: Option<Handoff>,
-    /// The other programs' load: the last CPU mark and their share of the CPUs since the one before.
+    /// The other programs' load: the last CPU mark, and their share of the CPUs over time since the lease started
+    /// (agent 0.3.3: judged over windows, `tune::LoadTrack`; the track's clock starts at `origin`).
     load: Option<(Instant, LoadMark)>,
-    other_load: f64,
+    loads: LoadTrack,
+    origin: Instant,
+    /// The running measurement's load window: where it started on the track's clock, and the mean load before it.
+    probe_load: Option<(f64, Option<f64>)>,
+    /// agent 0.3.3: when the last layout handoffs started (at most `tune::MAX_HANDOFFS` per `tune_handoff_window`).
+    handoffs: Vec<Instant>,
     last_ping: Instant,
     /// A trial was discarded: back to the incumbent first, and no trial before this.
     revert_due: bool,
@@ -222,8 +231,32 @@ struct Handoff {
     last_ping: Option<Instant>,
 }
 
-/// At most this many workers (per worker of the crew) finish their games beside the current ones before a new handoff.
-const MAX_DRAINERS: usize = 2;
+impl Tuning {
+    /// Now on the load track's clock (seconds).
+    fn now_s(&self) -> f64 {
+        self.origin.elapsed().as_secs_f64()
+    }
+
+    /// A measurement of the main worker (and its crew, summed) starts now - `conc` games in flight in all: the window's
+    /// load is judged against the mean load before it (agent 0.3.3, `tune::judge_trial`).
+    fn start_probe(&mut self, conc: u64, t: &crate::Timings) {
+        let now = self.now_s();
+        let before = self.loads.mean(now - baseline_s(t), now).map(|(m, _)| m);
+        self.probe = Some((Probe::new(conc, self.entry.phase, t.tune_warm.as_secs_f64(), t.tune_window.as_secs_f64()), Instant::now()));
+        self.probe_members.clear();
+        self.probe_load = Some((now, before));
+    }
+}
+
+/// agent 0.3.3: the load before a trial is the mean over this long (one trial length).
+fn baseline_s(t: &crate::Timings) -> f64 {
+    (t.tune_warm + t.tune_window).as_secs_f64() * tune::LOAD_BASELINE_TRIALS
+}
+
+/// agent 0.3.3: load that lasts this long during a trial is sustained (30 s of the real 75-s window).
+fn sustained_s(t: &crate::Timings) -> f64 {
+    t.tune_window.as_secs_f64() * tune::LOAD_SUSTAINED_SHARE
+}
 
 /// What a worker is started with (kept: a rolling lease's restart starts another).
 struct SpawnSpec {
@@ -974,6 +1007,7 @@ impl Engine {
                 gpu: gpu_choice,
                 peak_mb: 0,
                 per_game_max: 0,
+                steady_per_game: 0,
                 offset: 0,
                 restarts: 0,
                 restart: None,
@@ -982,8 +1016,7 @@ impl Engine {
             mates: Vec::new(),
             tuning: tuning.map(|mut t| {
                 if measure0 {
-                    t.probe = Some((Probe::new(t.current.total_conc(), t.entry.phase, self.cfg.timings.tune_warm.as_secs_f64(), self.cfg.timings.tune_window.as_secs_f64()), Instant::now()));
-                    t.probe_members.clear();
+                    t.start_probe(t.current.total_conc(), &self.cfg.timings);
                 }
                 t
             }),
@@ -1050,6 +1083,9 @@ impl Engine {
             },
         };
         entry.run = run;
+        // (agent 0.3.3: its layouts are compared as they run in this lease's bounds - a remembered incumbent the memory
+        // plan no longer holds is its fitted layout)
+        entry.bind(&space);
         if !fixed && entry.maybe_check(now) {
             log::info!("lease {}: the weekly check of the tuned layout is due", lease.lease_id);
         }
@@ -1062,7 +1098,10 @@ impl Engine {
             probe: None,
             handoff: None,
             load: None,
-            other_load: 0.0,
+            loads: LoadTrack::default(),
+            origin: Instant::now(),
+            probe_load: None,
+            handoffs: Vec::new(),
             last_ping: Instant::now(),
             revert_due: false,
             no_trial_before: Instant::now(),
@@ -1367,6 +1406,11 @@ impl Run {
             // rev 19 (PROTOCOL 13): the main worker is gone; workers handed off from (and a crew's members, 13.5) finish
             // their games first
             if let Some(code) = self.main_exit {
+                // (agent 0.3.3: a restart that waited for memory starts once the drain made room)
+                if self.restart_pending() && self.restart_room() && self.restart_worker(eng) {
+                    self.main_exit = None;
+                    continue;
+                }
                 if self.mates.is_empty() {
                     break code;
                 }
@@ -1392,6 +1436,13 @@ impl Run {
                 }
                 // rev 19: a handoff whose old worker finished its games before the next one could start beside it
                 self.handoff_after_exit();
+                // agent 0.3.3: the next worker starts only when its plan fits beside the workers still finishing their
+                // games; until then the lease winds down with them
+                if self.restart_pending() && !self.restart_room() {
+                    log::info!("lease {}: the next worker waits for memory: the workers finishing their games beside it hold too much", self.id());
+                    self.main_exit = Some(code);
+                    continue;
+                }
                 if self.restart_worker(eng) {
                     continue;
                 }
@@ -1526,10 +1577,15 @@ impl Run {
             return;
         }
         let conc = self.conc.unwrap_or(1);
+        let steady = self.started.elapsed().as_secs() >= crate::rolling::STEADY_S;
         let Some(r) = self.roll.as_mut().filter(|r| r.active) else { return };
         let Some(now) = self.worker.commit_mb() else { return };
         r.peak_mb = r.peak_mb.max(now);
-        r.per_game_max = r.per_game_max.max(crate::rolling::measured_per_game(now, conc, r.mem.cost));
+        let per = crate::rolling::measured_per_game(now, conc, r.mem.cost);
+        r.per_game_max = r.per_game_max.max(per);
+        if steady {
+            r.steady_per_game = r.steady_per_game.max(per);
+        }
         if !live || r.finishing || r.restart.is_some() || limit == 0 || (now as f64) < limit as f64 * crate::rolling::HIGH_SHARE {
             return;
         }
@@ -1541,14 +1597,12 @@ impl Run {
     /// finishes the lease.
     fn primary_memory_high(&mut self, eng: &Engine, now: u64) {
         let limit = self.worker.mem_limit_mb;
-        let Some(r) = self.roll.as_mut() else { return };
+        let Some(base) = self.roll.as_ref().map(|r| r.mem.cost) else { return };
         let id = self.lease.lease_id.clone();
         let conc = self.conc.unwrap_or(1);
-        let per = crate::rolling::measured_per_game(now, conc, r.mem.cost);
-        if Learned::raise(&eng.cfg.layout, self.lease.run.as_deref().unwrap_or(""), r.gpu, per) {
-            log::info!("lease {id}: remembering {per} MB per game in flight for this run");
-        }
-        let cost = crate::rolling::MemCost { per_game_mb: r.mem.cost.per_game_mb.max(per), ..r.mem.cost };
+        let per = crate::rolling::measured_per_game(now, conc, base);
+        let cost = self.learn_cost(eng, per);
+        let Some(r) = self.roll.as_mut() else { return };
         match crate::rolling::restart_games(conc, limit, cost).filter(|_| r.restarts < crate::rolling::MAX_RESTARTS) {
             Some(n) => {
                 log::warn!("lease {id}: the worker commits {now} MB of its {limit} MB limit with {conc} games in flight; finishing them, then going on with {n}");
@@ -1569,13 +1623,11 @@ impl Run {
         let hit = (limit > 0 && peak as f64 >= limit as f64 * crate::rolling::HIT_SHARE) || alloc_failure(why) || alloc_failure(&self.worker.stderr_tail());
         let stopping = matches!(self.state, WState::Stopping(_)) || self.after.is_some() || eng.quitting();
         let conc = self.conc.unwrap_or(1);
-        let Some(r) = self.roll.as_mut().filter(|r| r.active && !r.finishing && !stopping && hit) else { return false };
+        let Some((base, peak_mb)) = self.roll.as_ref().filter(|r| r.active && !r.finishing && !stopping && hit).map(|r| (r.mem.cost, r.peak_mb)) else { return false };
         let id = self.lease.lease_id.clone();
-        let per = crate::rolling::measured_per_game(peak.max(r.peak_mb).max(limit), conc, r.mem.cost);
-        if Learned::raise(&eng.cfg.layout, self.lease.run.as_deref().unwrap_or(""), r.gpu, per) {
-            log::info!("lease {id}: remembering {per} MB per game in flight for this run");
-        }
-        let cost = crate::rolling::MemCost { per_game_mb: r.mem.cost.per_game_mb.max(per), ..r.mem.cost };
+        let per = crate::rolling::measured_per_game(peak.max(peak_mb).max(limit), conc, base);
+        let cost = self.learn_cost(eng, per);
+        let Some(r) = self.roll.as_mut() else { return false };
         let Some(n) = crate::rolling::restart_games(conc, limit, cost).filter(|_| r.restarts < crate::rolling::MAX_RESTARTS) else {
             log::error!("lease {id}: the worker ran into its {limit} MB memory limit with {conc} games in flight ({why}); no restart left");
             return false;
@@ -1643,23 +1695,37 @@ impl Run {
         self.spawns += 1;
         // (a memory restart's results directory is named by its restart, a handoff's by its worker)
         self.out_dir = if rs.count { format!("out-r{restarts}") } else { format!("out-w{}", self.spawns) };
-        let (warm, window) = (eng.cfg.timings.tune_warm.as_secs_f64(), eng.cfg.timings.tune_window.as_secs_f64());
+        let timings = eng.cfg.timings.clone();
         let (conc, groups, threads, infer) = (self.conc.unwrap_or(1), self.groups.unwrap_or(1), self.threads, self.infer);
+        let mut refit = None;
         if let (Some(t), Some((w, it))) = (self.tuning.as_mut(), infer) {
             let workers = rs.layout.map_or(t.current.workers, |l| l.workers);
             t.current = Layout { workers, threads, infer_workers: w, infer_threads: it, groups, conc };
             if rs.layout.is_none() {
                 // (a memory restart: the layouts of this lease keep within the games in flight that fit - else the
-                // incumbent would be handed back to at once, PROTOCOL 13.5)
+                // incumbent would be handed back to at once, PROTOCOL 13.5 - and its batches within bounds, the groups
+                // kept where the fewer games allow: what the crew's next members run, and the incumbent at this size)
                 t.space.conc_max = t.space.conc_max.min(t.current.total_conc());
                 t.space.conc_min = t.space.conc_min.min(t.space.conc_max);
+                t.current = t.space.fit(t.current);
+                refit = Some(t.current);
             }
             t.handoff = None;
-            t.probe = rs.measure.then(|| (Probe::new(t.current.total_conc(), t.entry.phase, warm, window), Instant::now()));
+            t.probe = None;
+            t.probe_load = None;
             t.probe_members.clear();
+            if rs.measure {
+                t.start_probe(t.current.total_conc(), &timings);
+            }
             if rs.layout.is_some() {
                 t.revert_due = false;
             }
+        }
+        if let Some(l) = refit {
+            self.conc = Some(l.conc);
+            self.groups = Some(l.groups);
+            self.threads = l.threads;
+            self.infer = Some((l.infer_workers, l.infer_threads));
         }
         let limit = self.worker_limit();
         self.wgen = self.next_gen();
@@ -1684,7 +1750,7 @@ impl Run {
                 self.crew_changed = Instant::now();
                 match rs.layout {
                     Some(l) => log::info!("lease {id}: worker pid {} started with layout {} (ids from {}, memory limit {limit} MB)", w.pid, l.per_worker().describe(), lo + offset),
-                    None => log::info!("lease {id}: worker pid {} started again ({} games in flight, ids from {}, restart {restarts})", w.pid, rs.conc, lo + offset),
+                    None => log::info!("lease {id}: worker pid {} started again ({} games in flight, ids from {}, restart {restarts})", w.pid, self.conc.unwrap_or(rs.conc), lo + offset),
                 }
                 self.worker = w;
                 self.mark = CpuMark::take(&self.worker);
@@ -2453,6 +2519,13 @@ impl Run {
             if per > r.mem.cost.per_game_mb && Learned::raise(&eng.cfg.layout, self.lease.run.as_deref().unwrap_or(""), r.gpu, per) {
                 log::info!("lease {id}: the worker committed up to {} MB with {conc} games in flight: remembering {per} MB per game for this run", r.peak_mb);
             }
+            // agent 0.3.3: a lease whose workers ran to their steady state under the remembered cost lowers it a little
+            // (never below what any of them committed per game)
+            if r.steady_per_game > 0 {
+                if let Some(v) = Learned::settle(&eng.cfg.layout, self.lease.run.as_deref().unwrap_or(""), r.gpu, per.max(r.steady_per_game)) {
+                    log::info!("lease {id}: its workers committed at most {} MB per game at their steady state: remembering {v} MB for this run", per.max(r.steady_per_game));
+                }
+            }
         }
         let given_back = !(end.is_some() && matches!(reason.as_str(), "done" | "finish") && self.after.is_none());
         let done = DoneReq {
@@ -2615,7 +2688,8 @@ impl Run {
         }
     }
 
-    /// A measurement's end: recorded or discarded, remembered, the drainers going on.
+    /// A measurement's end: recorded or discarded, remembered, the drainers going on. A rate counts only when the
+    /// other programs' load over the trial passes `tune::judge_trial` (agent 0.3.3); it is recorded with that load.
     fn end_probe(&mut self, eng: &mut Engine, r: Result<(f64, tune::Phase), String>) {
         let id = self.lease.lease_id.clone();
         let retry = 2 * (eng.cfg.timings.tune_warm + eng.cfg.timings.tune_window);
@@ -2626,11 +2700,18 @@ impl Run {
         t.probe_members.clear();
         let now = zerofarm_common::now_unix();
         let l = t.current;
+        let load = t.probe_load.take().map(|(t0, before)| (t.loads.mean(t0, t.now_s()).map(|(m, _)| m), before));
+        let r = match (r, load) {
+            (Ok(x), Some((during, before))) => tune::judge_trial(during, before).map(|m| (x, m)),
+            (Ok(x), None) => Ok((x, None)),
+            (Err(e), _) => Err(e),
+        };
         match r {
-            Ok((rate, ph)) => {
-                log::info!("lease {id}: {} measured {} leaves/s", l.describe(), rate.round());
-                eng.worker_log.write_line(&format!("tuning [{id}]: {} measured {} leaves/s", l.describe(), rate.round()));
-                t.entry.record(l, rate, Some(ph), &t.space, now);
+            Ok(((rate, ph), load)) => {
+                let other = load.map(|m| format!(" (other programs {:.0} % of the CPUs)", m * 100.0)).unwrap_or_default();
+                log::info!("lease {id}: {} measured {} leaves/s{other}", l.describe(), rate.round());
+                eng.worker_log.write_line(&format!("tuning [{id}]: {} measured {} leaves/s{other}", l.describe(), rate.round()));
+                t.entry.record(l, rate, load, Some(ph), &t.space, now);
             }
             Err(why) => {
                 // (PROTOCOL 13: a trial is never paused and resumed; it is tried again later, from the incumbent)
@@ -2648,24 +2729,90 @@ impl Run {
         self.show_tuning(eng);
     }
 
-    /// The other programs' share of the CPUs, sampled every `tune_ping` (at least every 0.5 s).
+    /// The other programs' share of the CPUs, sampled every `tune_ping` (at least every 0.1 s) into the load track.
     fn sample_load(&mut self, eng: &Engine, t: &crate::Timings) {
-        if self.tuning.as_ref().is_none_or(|x| x.load.is_some_and(|(at, _)| at.elapsed() < t.tune_ping.max(Duration::from_millis(500)))) {
+        if self.tuning.as_ref().is_none_or(|x| x.load.is_some_and(|(at, _)| at.elapsed() < t.tune_ping.max(Duration::from_millis(100)))) {
             return;
         }
         let (idle_ms, total_ms) = crate::worker::sys_cpu_ms();
         let ours_ms = self.worker.cpu_ms() + self.mates.iter().map(|d| d.worker.cpu_ms()).sum::<u64>();
         let now = LoadMark { idle_ms, total_ms, ours_ms };
         let tu = self.tuning.as_mut().expect("checked");
-        if let Some((_, prev)) = tu.load {
-            tu.other_load = eng.signals.other_load(prev.other_since(&now));
+        if let Some((at, prev)) = tu.load {
+            let share = eng.signals.other_load(prev.other_since(&now));
+            let ts = tu.now_s();
+            tu.loads.push(ts, at.elapsed().as_secs_f64(), share);
         }
         tu.load = Some((Instant::now(), now));
     }
 
+    /// agent 0.3.3: a worker finishes its games beside the ones playing new games (a handoff's old crew, a member that
+    /// played its range or gave way to memory), or the main worker is finishing for a handoff or a restart: a drain is
+    /// in progress, and no handoff starts until it is over (one drain at a time per lease, PROTOCOL 13.2).
+    fn draining(&self) -> bool {
+        self.mates.iter().any(|m| m.finishing)
+            || self.tuning.as_ref().is_some_and(|t| t.handoff.is_some())
+            || self.roll.as_ref().is_some_and(|r| r.restart.is_some())
+    }
+
+    /// What a worker of `conc` games in flight is planned to commit (PROTOCOL 10.6: the base + the cost per game).
+    fn plan_mb(&self, conc: u64) -> u64 {
+        self.roll.as_ref().map_or(0, |r| r.mem.cost.base_mb + conc * r.mem.cost.per_game_mb)
+    }
+
+    /// agent 0.3.3: the memory the lease's workers hold or will hold (MB) - every worker playing new games at the more of
+    /// its commit and its plan (a fresh worker commits little at first and grows to its plan), every worker finishing
+    /// its games (a drainer) at its commit - which a new worker's plan must fit beside within `PLAN_SHARE` of the job's
+    /// limit. 0.3.2 counted commits only: a crew that had just started looked small, and two handoffs later 4 drainers
+    /// and the crew committed 38.9 GB of a 31.7 GB cap.
+    /// (`with_main`: the main worker counts too - not once it exited.)
+    fn reserved_mb(&mut self, with_main: bool) -> u64 {
+        let with_main = with_main && self.main_exit.is_none();
+        let main_on = with_main
+            && self.tuning.as_ref().is_none_or(|t| t.handoff.is_none())
+            && self.roll.as_ref().is_none_or(|r| !r.finishing && r.restart.is_none());
+        let main_plan = if main_on { self.plan_mb(self.conc.unwrap_or(1)) } else { 0 };
+        let mut held = if with_main { self.worker.commit_mb().unwrap_or(0).max(main_plan) } else { 0 };
+        let plans: Vec<u64> = self.mates.iter().map(|m| if m.active() { self.plan_mb(m.layout.conc) } else { 0 }).collect();
+        for (m, p) in self.mates.iter_mut().zip(plans) {
+            held += m.worker.commit_mb().unwrap_or(0).max(p);
+        }
+        held
+    }
+
+    /// A new worker of `conc` games in flight (`n` of them) fits beside the lease's workers: their reservation
+    /// (`reserved_mb`) plus its plan within `PLAN_SHARE` of the job's limit (no limit: always).
+    fn room_for(&mut self, n: u64, conc: u64) -> bool {
+        let limit = self.lease_limit_mb;
+        let need = n * self.plan_mb(conc);
+        limit == 0 || (self.reserved_mb(true) + need) as f64 <= limit as f64 * crate::rolling::PLAN_SHARE
+    }
+
+    /// A restart of the main worker is due (memory, a handoff that had to wait, a crashed tail).
+    fn restart_pending(&self) -> bool {
+        self.roll.as_ref().is_some_and(|r| r.restart.is_some())
+    }
+
+    /// agent 0.3.3: the restart due may start now that the main worker is gone: no worker beside it is finishing its
+    /// games (nothing to wait for: members playing their ranges are watched by the crew's memory check), or the next
+    /// worker's plan fits beside them (drainers at their commit, members at least at their plan) within `PLAN_SHARE` of
+    /// the job's limit. Else it waits for the drain (`go`).
+    fn restart_room(&mut self) -> bool {
+        let Some(rs) = self.roll.as_ref().and_then(|r| r.restart.clone()) else { return true };
+        let limit = self.lease_limit_mb;
+        if limit == 0 || !self.mates.iter().any(|m| m.finishing) {
+            return true;
+        }
+        let need = self.plan_mb(rs.layout.map_or(rs.conc, |l| l.conc));
+        (self.reserved_mb(false) + need) as f64 <= limit as f64 * crate::rolling::PLAN_SHARE
+    }
+
     /// Each tick: a measurement holds only while a trial may run (else it is discarded); a handoff goes on; else the
     /// next layout to measure (when a trial may run) or the incumbent (when the main worker runs another) is handed
-    /// over to. A fixed layout (`autotune` off) runs no trial.
+    /// over to. A fixed layout (`autotune` off) runs no trial. agent 0.3.3: other programs' load is judged over windows
+    /// (`tune::LoadTrack`: a burst passes, sustained load discards), a handoff starts only when no drain is in progress
+    /// and at most `tune::MAX_HANDOFFS` per `tune_handoff_window`, and never to the layout the main worker runs unless to
+    /// measure it.
     fn tune_tick(&mut self, eng: &mut Engine, t: &crate::Timings, must_pause: bool) {
         if self.tuning.is_none() {
             return;
@@ -2673,8 +2820,11 @@ impl Run {
         self.sample_load(eng, t);
         // (the lease's first worker is rolling once its `hello` says so)
         let rolling_ok = self.roll.as_ref().is_some_and(|r| (r.active || !self.job_sent) && !r.finishing && r.restart.is_none());
-        let other = self.tuning.as_ref().map_or(0.0, |x| x.other_load);
-        let quiet = other <= tune::OTHER_LOAD_MAX && self.stall_since.is_none();
+        let (quiet_load, sustained) = self.tuning.as_ref().map_or((true, None), |x| {
+            let now = x.now_s();
+            (x.loads.quiet(now, baseline_s(t)), x.loads.sustained(now, sustained_s(t)))
+        });
+        let quiet = quiet_load && self.stall_since.is_none();
         let strict = eng.tune_ok && quiet && !must_pause;
         if self.tuning.as_ref().is_some_and(|x| x.probe.is_some()) {
             let why = if !eng.tune_ok {
@@ -2683,8 +2833,8 @@ impl Run {
                 Some("work was paused".to_string())
             } else if self.stall_since.is_some() {
                 Some("the worker got no CPU".to_string())
-            } else if other > tune::OTHER_LOAD_MAX {
-                Some(format!("other programs used {:.0} % of the CPUs", other * 100.0))
+            } else if let Some(m) = sustained {
+                Some(format!("other programs used {:.0} % of the CPUs for {:.0} s", m * 100.0, sustained_s(t)))
             } else if !rolling_ok || self.after.is_some() || eng.quitting() {
                 Some("the lease is ending".to_string())
             } else {
@@ -2725,15 +2875,18 @@ impl Run {
             return;
         }
         let running = matches!(self.state, WState::Running) && self.job_sent && self.after.is_none() && !eng.quitting();
-        // (a worker runs a while before it is replaced; at most MAX_DRAINERS per worker finish their games beside the
-        // crew; a crew is handed over only once it is complete and settled)
-        let finishing = self.mates.iter().filter(|m| m.finishing).count();
-        let target = self.crew_target() as usize;
+        // (a worker runs a while before it is replaced; one drain at a time - no handoff while any worker finishes its
+        // games; a crew is handed over only once it is complete and settled)
         let settled = self.crew_complete() && self.crew_changed.elapsed() >= t.tune_warm;
-        if !running || !rolling_ok || finishing >= MAX_DRAINERS * target || self.started.elapsed() < t.tune_warm || !settled {
+        if !running || !rolling_ok || self.draining() || self.started.elapsed() < t.tune_warm || !settled {
             return;
         }
-        let tu = self.tuning.as_ref().expect("checked");
+        let tu = self.tuning.as_mut().expect("checked");
+        tu.handoffs.retain(|at| at.elapsed() < t.tune_handoff_window);
+        if tu.handoffs.len() >= tune::MAX_HANDOFFS {
+            // (the safety net: the next handoff waits until the oldest of these leaves the window)
+            return;
+        }
         let wanted = tu.entry.wanted(&tu.space);
         let next = if strict && !tu.revert_due && Instant::now() >= tu.no_trial_before { tu.entry.plan(&tu.space) } else { None };
         let (target, measure) = match next {
@@ -2741,6 +2894,10 @@ impl Run {
             None if tu.current != wanted => (wanted, strict),
             None => return,
         };
+        // (never to the layout the main worker runs, unless to measure it: a measurement needs a fresh worker)
+        if target == tu.current && !measure {
+            return;
+        }
         self.start_handoff(eng, target, measure);
     }
 
@@ -2770,21 +2927,37 @@ impl Run {
         self.spare.extend(spare);
         self.crew_changed = Instant::now();
         let tu = self.tuning.as_mut().expect("tuning");
+        tu.handoffs.push(Instant::now());
         tu.handoff = Some(Handoff { next, measure, since: Instant::now(), reads: Vec::new(), last_ping: None });
     }
 
     /// A handoff waits for the old worker's id count (two equal reads after `finish`, else after `10 x tune_settle` the
-    /// next worker takes fresh ids), then for room: every worker's memory plus the next worker's plan (a measured
-    /// crew's: every one of its workers') within `PLAN_SHARE` of the job's limit.
+    /// next worker takes fresh ids), then for room: the lease's workers' reservation (`reserved_mb`: the old crew, now
+    /// finishing, at its commit) plus the next worker's plan (a measured crew's: every one of its workers') within
+    /// `PLAN_SHARE` of the job's limit. A trial that can't be measured any more by then: a candidate gives way to the
+    /// incumbent; the layout wanted anyway (the incumbent measured afresh) starts unmeasured and the trial counts as
+    /// discarded (agent 0.3.3: 0.3.2 started it unmeasured and handed over to it again at once).
     fn handoff_tick(&mut self, eng: &mut Engine, t: &crate::Timings, strict: bool) {
+        let id = self.lease.lease_id.clone();
+        let retry = 2 * (t.tune_warm + t.tune_window);
         let tu = self.tuning.as_mut().expect("tuning");
         let wanted = tu.entry.wanted(&tu.space);
         let h = tu.handoff.as_mut().expect("handoff");
         // (a trial that can't be measured now: the incumbent instead)
         if h.measure && !strict {
             h.measure = false;
-            h.next = wanted;
+            let l = std::mem::replace(&mut h.next, wanted);
+            if l == wanted {
+                let line = format!("the trial of {} can't run now (the computer is busy or not idle): counted as discarded", l.describe());
+                log::info!("lease {id}: {line}");
+                eng.worker_log.write_line(&format!("tuning [{id}]: {line}"));
+                tu.entry.discard(l, &tu.space, zerofarm_common::now_unix());
+                tu.no_trial_before = Instant::now() + retry;
+                self.save_tuning(eng);
+            }
         }
+        let tu = self.tuning.as_mut().expect("tuning");
+        let h = tu.handoff.as_mut().expect("handoff");
         if h.since.elapsed() < t.tune_settle {
             return;
         }
@@ -2801,17 +2974,11 @@ impl Run {
         } else {
             return;
         };
-        let limit = self.lease_limit_mb;
-        let Some(cost) = self.roll.as_ref().map(|r| r.mem.cost) else { return };
-        let mut held = self.worker.commit_mb().unwrap_or(0);
-        for d in &mut self.mates {
-            held += d.worker.commit_mb().unwrap_or(0);
-        }
         // (a measured crew starts together: room for all of it; otherwise its workers join as memory allows)
         let workers = if h.measure { h.next.workers.max(1) as u64 } else { 1 };
-        let plan_mb = workers * (cost.base_mb + h.next.conc * cost.per_game_mb);
-        if limit > 0 && (held + plan_mb) as f64 > limit as f64 * crate::rolling::PLAN_SHARE {
-            // (no room yet: the old worker finishes its games, and the next one starts after it)
+        if !self.room_for(workers, h.next.conc) {
+            // (no room yet: the old workers finish their games, and the next one starts once they freed enough - at the
+            // latest after the main worker ended, `handoff_after_exit`)
             return;
         }
         self.spawn_beside(eng, h.next, h.measure, tail);
@@ -2906,7 +3073,6 @@ impl Run {
         self.crew_changed = Instant::now();
         self.mark = CpuMark::take(&self.worker);
         self.sample = (self.mark, Instant::now());
-        let (warm, window) = (eng.cfg.timings.tune_warm.as_secs_f64(), eng.cfg.timings.tune_window.as_secs_f64());
         if let Some(t) = self.tuning.as_mut() {
             t.current = next;
             t.handoff = None;
@@ -2914,8 +3080,12 @@ impl Run {
             if next == t.entry.wanted(&t.space) {
                 t.revert_due = false;
             }
-            t.probe = measure.then(|| (Probe::new(next.total_conc(), t.entry.phase, warm, window), Instant::now()));
+            t.probe = None;
+            t.probe_load = None;
             t.probe_members.clear();
+            if measure {
+                t.start_probe(next.total_conc(), &eng.cfg.timings);
+            }
         }
         self.show_tuning(eng);
     }
@@ -3107,15 +3277,16 @@ impl Run {
         if self.tuning.as_ref().is_some_and(|t| t.probe.is_some()) {
             self.end_probe(eng, Err("a worker of the crew failed during the trial".into()));
         }
-        let Some(r) = self.roll.as_mut().filter(|r| !r.finishing && !stopping) else { return };
+        let Some(base) = self.roll.as_ref().filter(|r| !r.finishing && !stopping).map(|r| r.mem.cost) else { return };
         let others = self.mates.iter().filter(|m| m.active()).count() + 1;
+        if hit {
+            let per = crate::rolling::measured_per_game(peak.max(limit), d.layout.conc, base);
+            self.learn_cost(eng, per);
+        }
+        let Some(r) = self.roll.as_mut() else { return };
         let restart_left = r.restarts < crate::rolling::MAX_RESTARTS && !self.selftest_failed;
         if hit {
-            let per = crate::rolling::measured_per_game(peak.max(limit), d.layout.conc, r.mem.cost);
-            if Learned::raise(&eng.cfg.layout, self.lease.run.as_deref().unwrap_or(""), r.gpu, per) {
-                log::info!("lease {id}: remembering {per} MB per game in flight for this run");
-            }
-            let cost = crate::rolling::MemCost { per_game_mb: r.mem.cost.per_game_mb.max(per), ..r.mem.cost };
+            let cost = r.mem.cost;
             match crate::rolling::restart_games(d.layout.conc, limit, cost).filter(|_| restart_left) {
                 Some(n) => {
                     r.restarts += 1;
@@ -3162,8 +3333,31 @@ impl Run {
             t.current.conc = t.current.conc.min(n).max(1);
             t.space.conc_max = t.space.conc_max.min(t.current.total_conc());
             t.space.conc_min = t.space.conc_min.min(t.space.conc_max);
-            log::info!("lease {}: the crew's next workers run {} games in flight each", self.lease.lease_id, t.current.conc);
+            // (agent 0.3.3: the batches within bounds, the groups kept where the fewer games allow)
+            t.current = t.space.fit(t.current);
+            log::info!("lease {}: the crew's next workers run {} games in flight each in {} groups", self.lease.lease_id, t.current.conc, t.current.groups);
         }
+    }
+
+    /// agent 0.3.3: a measured cost per game (MB over the base) - remembered for the run when higher (`Learned`) and
+    /// planned with for the rest of the lease: the crew's next members, handoffs and restarts, and the tuner's memory
+    /// bounds (0.3.2 remembered it for the next lease only). -> the cost planned with from now on.
+    fn learn_cost(&mut self, eng: &Engine, per: u64) -> crate::rolling::MemCost {
+        let id = self.lease.lease_id.clone();
+        let run = self.lease.run.clone().unwrap_or_default();
+        let Some(r) = self.roll.as_mut() else { return crate::rolling::cpu_cost() };
+        if Learned::raise(&eng.cfg.layout, &run, r.gpu, per) {
+            log::info!("lease {id}: remembering {per} MB per game in flight for this run");
+        }
+        r.mem.cost.per_game_mb = r.mem.cost.per_game_mb.max(per);
+        r.mem.measured = true;
+        let cost = r.mem.cost;
+        if let Some(t) = self.tuning.as_mut() {
+            if let Some((limit, _)) = t.space.mem {
+                t.space.mem = Some((limit, cost));
+            }
+        }
+        cost
     }
 
     /// The crew runs at most `n` workers for the rest of the lease (a member failed with no restart left).
@@ -3348,18 +3542,23 @@ impl Run {
     }
 
     /// The crew's memory (PROTOCOL 13.5): each member within its part of the job's limit (`HIGH_SHARE` of it: it
-    /// finishes its games, the next members run fewer), and all of them within the job's limit (at `HIGH_SHARE`, with
-    /// nothing finishing to free memory, the biggest gives way the same way).
+    /// finishes its games, the next members run fewer), and every worker of the lease - those finishing their games too
+    /// (agent 0.3.3; 0.3.2 looked away while any finished) - within the job's limit: at `HIGH_SHARE` of it in all, the
+    /// biggest worker playing new games gives way - a memory restart's way when it commits more per game than planned
+    /// (the cost remembered, the next members smaller), else it just starts no new game and the crew refills as the
+    /// drain makes room (`add_member`, `restart_room`; no restart counted, nothing shrunk). Once nothing plays new games,
+    /// new games have stopped until memory frees.
     fn crew_mem_check(&mut self, eng: &Engine) {
         if self.tuning.as_ref().is_some_and(|t| t.handoff.is_some()) || self.after.is_some() {
             return;
         }
         let Some(cost) = self.roll.as_ref().filter(|r| r.active && !r.finishing && r.restart.is_none()).map(|r| r.mem.cost) else { return };
-        let main_mb = self.worker.commit_mb().unwrap_or(0);
+        let main_on = matches!(self.state, WState::Running | WState::Resuming(_)) && self.main_exit.is_none();
+        let main_mb = if self.main_exit.is_none() { self.worker.commit_mb().unwrap_or(0) } else { 0 };
         let mut sum = main_mb;
         let mut high = None;
         let mut biggest: Option<(usize, u64)> = None;
-        let mut per_max = 0;
+        let (mut per_max, mut steady) = (0, 0);
         for (i, m) in self.mates.iter_mut().enumerate() {
             let Some(c) = m.worker.commit_mb() else { continue };
             m.peak_mb = m.peak_mb.max(c);
@@ -3367,7 +3566,11 @@ impl Run {
             if !m.active() || !m.job_sent {
                 continue;
             }
-            per_max = per_max.max(crate::rolling::measured_per_game(c, m.layout.conc, cost));
+            let per = crate::rolling::measured_per_game(c, m.layout.conc, cost);
+            per_max = per_max.max(per);
+            if m.spawned.elapsed().as_secs() >= crate::rolling::STEADY_S {
+                steady = steady.max(per);
+            }
             let lim = m.worker.mem_limit_mb;
             if high.is_none() && lim > 0 && c as f64 >= lim as f64 * crate::rolling::HIGH_SHARE {
                 high = Some((i, c));
@@ -3378,20 +3581,67 @@ impl Run {
         }
         if let Some(r) = self.roll.as_mut() {
             r.per_game_max = r.per_game_max.max(per_max);
+            r.steady_per_game = r.steady_per_game.max(steady);
         }
         if let Some((i, c)) = high {
             return self.mate_memory_high(eng, i, c);
         }
         let limit = self.lease_limit_mb;
-        if biggest.is_none() || limit == 0 || self.mates.iter().any(|m| m.finishing) || (sum as f64) < limit as f64 * crate::rolling::HIGH_SHARE {
+        if limit == 0 || (sum as f64) < limit as f64 * crate::rolling::HIGH_SHARE {
             return;
         }
-        log::warn!("lease {}: the crew commits {sum} MB of the job's {limit} MB limit", self.lease.lease_id);
+        let finishing = self.mates.iter().filter(|m| m.finishing).count();
+        let over = |c: u64, conc: u64| crate::rolling::measured_per_game(c, conc, cost) > cost.per_game_mb;
+        let main_conc = self.conc.unwrap_or(1);
         match biggest {
-            Some((i, c)) if c >= main_mb => self.mate_memory_high(eng, i, c),
-            _ if matches!(self.state, WState::Running | WState::Resuming(_)) => self.primary_memory_high(eng, main_mb),
+            Some((i, c)) if !main_on || c >= main_mb => {
+                log::warn!("lease {}: its workers commit {sum} MB of the job's {limit} MB limit ({finishing} finishing their games)", self.lease.lease_id);
+                if over(c, self.mates[i].layout.conc) {
+                    self.mate_memory_high(eng, i, c);
+                } else {
+                    self.mate_give_way(eng, i, c);
+                }
+            }
+            _ if main_on => {
+                log::warn!("lease {}: its workers commit {sum} MB of the job's {limit} MB limit ({finishing} finishing their games)", self.lease.lease_id);
+                if over(main_mb, main_conc) {
+                    self.primary_memory_high(eng, main_mb);
+                } else {
+                    self.primary_give_way(eng, main_mb);
+                }
+            }
             _ => {}
         }
+    }
+
+    /// agent 0.3.3: a crew member within its plan gives way to the memory the workers finishing their games still hold:
+    /// it starts no new game (its unstarted ids become spare) and a new member joins once the drain made room.
+    fn mate_give_way(&mut self, eng: &Engine, i: usize, now: u64) {
+        let id = self.lease.lease_id.clone();
+        let m = &mut self.mates[i];
+        let line = format!("worker pid {} ({now} MB) starts no new game until the workers finishing theirs made room", m.worker.pid);
+        log::warn!("lease {id}: {line}");
+        eng.worker_log.write_line(&format!("crew [{id}]: {line}"));
+        let _ = m.worker.send(&json!({"op": "finish"}));
+        m.finishing = true;
+        m.reclaim = Some(Reclaim { since: Instant::now(), reads: Vec::new(), last_ping: None });
+        self.crew_changed = Instant::now();
+    }
+
+    /// agent 0.3.3: the main worker within its plan gives way the same way: it finishes its games and the next one, with
+    /// the same games in flight and the released ids it never started, starts once the drain made room (`restart_room`;
+    /// no restart counted).
+    fn primary_give_way(&mut self, eng: &Engine, now: u64) {
+        let id = self.lease.lease_id.clone();
+        let conc = self.conc.unwrap_or(1);
+        let Some(r) = self.roll.as_mut().filter(|r| r.restart.is_none() && !r.finishing) else { return };
+        r.restart = Some(Restart { conc, burn: false, layout: None, count: false, measure: false });
+        r.want_more = false;
+        let line = format!("the main worker ({now} MB) starts no new game until the workers finishing theirs made room");
+        log::warn!("lease {id}: {line}");
+        eng.worker_log.write_line(&format!("crew [{id}]: {line}"));
+        self.send(json!({"op": "finish"}));
+        self.crew_changed = Instant::now();
     }
 
     /// A crew member near its memory limit (`now` MB): it finishes its games (the ids it never started become spare),
@@ -3399,14 +3649,12 @@ impl Run {
     /// runs without it).
     fn mate_memory_high(&mut self, eng: &Engine, i: usize, now: u64) {
         let id = self.lease.lease_id.clone();
+        let Some(base) = self.roll.as_ref().map(|r| r.mem.cost) else { return };
+        let (conc, limit) = (self.mates[i].layout.conc, self.mates[i].worker.mem_limit_mb);
+        let per = crate::rolling::measured_per_game(now, conc, base);
+        let cost = self.learn_cost(eng, per);
         let Some(r) = self.roll.as_mut() else { return };
         let m = &mut self.mates[i];
-        let (conc, limit) = (m.layout.conc, m.worker.mem_limit_mb);
-        let per = crate::rolling::measured_per_game(now, conc, r.mem.cost);
-        if Learned::raise(&eng.cfg.layout, self.lease.run.as_deref().unwrap_or(""), r.gpu, per) {
-            log::info!("lease {id}: remembering {per} MB per game in flight for this run");
-        }
-        let cost = crate::rolling::MemCost { per_game_mb: r.mem.cost.per_game_mb.max(per), ..r.mem.cost };
         log::warn!("lease {id}: worker pid {} commits {now} MB of its {limit} MB limit with {conc} games in flight; it finishes them", m.worker.pid);
         let _ = m.worker.send(&json!({"op": "finish"}));
         m.finishing = true;
@@ -3423,8 +3671,9 @@ impl Run {
     }
 
     /// A new member when the crew is short of the layout's workers (at the lease's start, after a retirement or a
-    /// failure), one at a time, while work runs and memory allows (every worker's commit plus its plan within
-    /// `PLAN_SHARE` of the job's limit): it plays a spare range that fills its games in flight, else it takes the tail's
+    /// failure), one at a time, while work runs and memory allows (`room_for`: what every worker holds or will hold -
+    /// workers playing new games at least their plan, drainers their commit - plus its plan within `PLAN_SHARE` of the
+    /// job's limit; agent 0.3.3): it plays a spare range that fills its games in flight, else it takes the tail's
     /// place - the main worker keeps its range (at least `RUNWAY_INFLIGHTS` x its games in flight unstarted; else more
     /// ids are asked for first) and the new worker gets the ids released from then on.
     fn add_member(&mut self, eng: &mut Engine, t: &crate::Timings, must_pause: bool) {
@@ -3440,14 +3689,10 @@ impl Run {
             return;
         }
         let per = tu.current.per_worker();
-        let (cost, released, offset) = (r.mem.cost, r.released, r.offset);
+        let (released, offset) = (r.released, r.offset);
         let limit = self.worker_limit();
-        let mut held = self.worker.commit_mb().unwrap_or(0);
-        for m in &mut self.mates {
-            held += m.worker.commit_mb().unwrap_or(0);
-        }
-        let plan = cost.base_mb + per.conc * cost.per_game_mb;
-        if self.lease_limit_mb > 0 && (held + plan) as f64 > self.lease_limit_mb as f64 * crate::rolling::PLAN_SHARE {
+        // (agent 0.3.3: beside what every worker holds or will hold - a fresh one at its plan, a drainer at its commit)
+        if !self.room_for(1, per.conc) {
             return;
         }
         // a spare range that holds RUNWAY_INFLIGHTS x its games in flight (a shorter one goes back with the lease)

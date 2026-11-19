@@ -12,7 +12,9 @@
 //!  "fail_seeds": [10450007],   // fuzz: seeds that "fail"
 //!  "chunk": 1000,              // fuzz: seeds per step
 //!  "selftest_fail_gen": null,  // eval: this network fails its self-test (then a fatal error)
-//!  "mem_per_game_mb": 0,       // rolling: memory committed per game in flight (the job's conc), at the start
+//!  "mem_base_mb": 0,           // rolling: memory committed at the start, before any game (a real worker's runtime)
+//!  "mem_per_game_mb": 0,       // rolling: memory committed per game in flight (the job's conc), at the start ...
+//!  "mem_ramp_ms": 0,           // ... or, when > 0, in ten steps over this long (a real worker's games grow)
 //!  "mem_grow_mb": 0,           // rolling: memory committed per finished game on top (a creep)
 //!  "mem_grow_until": null,     // rolling: ... until this many games are finished (then it stays)
 //!  "oom_abort": false,         // a failed commit: abort on stderr (Rust's message) instead of a fatal error
@@ -31,12 +33,15 @@
 //! flight) (a fresh worker's games grow); time suspended doesn't count. Workers of one lease share the machine (the
 //! agent's crews, PROTOCOL 13.5): each one with a rate model beats a file in `.crew/` of its working directory (the
 //! lease's) every 100 ms, and plays `crew[N - 1] / N` of its rate while N of them beat (`"crew": [1.0, 1.3, 1.25]`: two
-//! workers 30 % more in all; default 1.0 for any N - the machine's rate shared, nothing gained). With `rate` a rolling job keeps `conc` games in
+//! workers 30 % more in all; default 1.0 for any N - the machine's rate shared, nothing gained); a worker told `finish`
+//! removes its beat file (a drainer, which the agent stops while a crew is measured). With `rate` a rolling job keeps `conc` games in
 //! flight (`games_started` = finished + in flight; still played one at a time), `finish` plays the games in flight to
 //! the end first, and `status` carries `leaves`, `games_started`, `concurrency` and `wall_s`.
 //!
 //! Memory (rolling jobs) is committed in 1 MB pieces (`VirtualAlloc`), so it counts against the job's memory limit
-//! as a real worker's does and the job's peak ends within 1 MB of the limit when a commit fails. A failed commit ends
+//! as a real worker's does and the job's peak ends within 1 MB of the limit when a commit fails. Each change is logged
+//! on stderr (`fakeworker: pid P holds N MB`, and `fakeworker: pid P exits` at the end), so a test can add up what a
+//! lease's workers held at once. A failed commit ends
 //! the worker like a real one out of memory: ONNX Runtime's fatal error (`... bad allocation`, exit 2), or with
 //! `oom_abort` Rust's abort (`memory allocation of N bytes failed` on stderr, exit 0xC0000409).
 //!
@@ -205,7 +210,9 @@ struct Cfg {
     selftest_fail_gen: Option<u64>,
     /// Rolling jobs: overrides the job's `flush_s`.
     flush_ms: Option<u64>,
+    mem_base_mb: u64,
     mem_per_game_mb: u64,
+    mem_ramp_ms: u64,
     mem_grow_mb: u64,
     mem_grow_until: Option<u64>,
     oom_abort: bool,
@@ -245,7 +252,9 @@ impl Cfg {
             chunk: u("chunk", 1000).max(1),
             selftest_fail_gen: o("selftest_fail_gen"),
             flush_ms: o("flush_ms"),
+            mem_base_mb: u("mem_base_mb", 0),
             mem_per_game_mb: u("mem_per_game_mb", 0),
+            mem_ramp_ms: u("mem_ramp_ms", 0),
             mem_grow_mb: u("mem_grow_mb", 0),
             mem_grow_until: o("mem_grow_until"),
             oom_abort: f.get("oom_abort").and_then(Value::as_bool).unwrap_or(false),
@@ -335,6 +344,8 @@ struct W {
     crew_n: usize,
     /// Its sessions are being built (`build_ms`): no provider yet.
     building: bool,
+    /// `mem_ramp_ms`: (the job's start, the games' MB to commit, committed so far).
+    ramp: Option<(Instant, u64, u64)>,
 }
 
 impl W {
@@ -399,7 +410,14 @@ impl W {
                 self.games = self.games.max(g);
             }
             "extend" => self.out.send(json!({"ev": "error", "message": "unknown op extend", "fatal": false})),
-            "finish" => self.stop = Stop::Finish,
+            "finish" => {
+                self.stop = Stop::Finish;
+                // (a worker finishing its games no longer counts in the crew: the agent stops such a drainer while
+                // the crew is measured, and its beat file would stay fresh for up to 400 ms after - agent 0.3.3)
+                if let Some((path, _)) = self.beat.take() {
+                    let _ = std::fs::remove_file(path);
+                }
+            }
             "quit" => self.stop = Stop::Quit,
             "yield" => self.do_yield(),
             "resume" => {} // not yielded: nothing to do
@@ -471,6 +489,7 @@ impl W {
                 return;
             }
             self.accrue();
+            self.ramp_mem();
             if self.last_status.elapsed() >= Duration::from_millis(self.cfg.status_ms) {
                 self.status();
             }
@@ -564,6 +583,25 @@ fake crash at game {gid:?}");
         self.out.send(json!({"ev": "end", "reason": reason, "stats": self.stats(), "unfinished": unfinished}));
     }
 
+    /// `mem_ramp_ms`: the games in flight's memory committed in ten steps over that long from the job's start.
+    fn ramp_mem(&mut self) {
+        let Some((t0, total, done)) = self.ramp else { return };
+        let steps = ((t0.elapsed().as_millis() as u64 * 10) / self.cfg.mem_ramp_ms.max(1)).min(10);
+        let want = total * steps / 10;
+        if want > done {
+            self.mem.commit(want - done, &self.out, self.cfg.oom_abort);
+            self.ramp = (want < total).then_some((t0, total, want));
+            self.note_mem();
+        }
+    }
+
+    /// What this worker holds now, on stderr (a test adds up a lease's workers).
+    fn note_mem(&self) {
+        if !self.mem.pieces.is_empty() {
+            eprintln!("fakeworker: pid {} holds {} MB", std::process::id(), self.mem.pieces.len());
+        }
+    }
+
     /// A rolling self-play job (PROTOCOL 10.5).
     fn run_rolling(&mut self, job: &Value) {
         let base = job.get("gid_base").and_then(Value::as_u64).unwrap_or(0);
@@ -571,8 +609,15 @@ fake crash at game {gid:?}");
         let flush = Duration::from_millis(self.cfg.flush_ms.unwrap_or(job.get("flush_s").and_then(Value::as_u64).unwrap_or(120) * 1000));
         self.games = job.get("games").and_then(Value::as_u64).unwrap_or(4);
         eprintln!("fakeworker: rolling job, {} ids released, {conc} in flight, flush {flush:?}", self.games);
-        // the games in flight's memory
-        self.mem.commit(conc * self.cfg.mem_per_game_mb, &self.out, self.cfg.oom_abort);
+        // the runtime's and the games in flight's memory (or the latter in steps, `ramp_mem`)
+        let games_mb = conc * self.cfg.mem_per_game_mb;
+        if self.cfg.mem_ramp_ms > 0 && games_mb > 0 {
+            self.mem.commit(self.cfg.mem_base_mb, &self.out, self.cfg.oom_abort);
+            self.ramp = Some((Instant::now(), games_mb, 0));
+        } else {
+            self.mem.commit(self.cfg.mem_base_mb + games_mb, &self.out, self.cfg.oom_abort);
+        }
+        self.note_mem();
         let mut unflushed = Vec::new();
         let mut first_fin: Option<Instant> = None;
         let mut next = 0u64;
@@ -603,8 +648,9 @@ fake crash at game {gid:?}");
                 self.done += 1;
                 self.out.send(json!({"ev": "fin", "n": 1}));
                 self.after_game_hooks_gid(Some(base + next - 1));
-                if self.cfg.mem_grow_until.is_none_or(|u| self.done <= u) {
+                if self.cfg.mem_grow_until.is_none_or(|u| self.done <= u) && self.cfg.mem_grow_mb > 0 {
                     self.mem.commit(self.cfg.mem_grow_mb, &self.out, self.cfg.oom_abort);
+                    self.note_mem();
                 }
             } else {
                 // every released id is played: wait for more (still answering ops, sending status)
@@ -829,6 +875,7 @@ fn main() {
         beat: None,
         crew_n: 1,
         building: false,
+        ramp: None,
     };
     if let Some(r) = w.cfg.rate.clone() {
         w.leaves_s = Some(layout_rate(&r, &job));
@@ -859,7 +906,10 @@ fn main() {
     match job.get("kind").and_then(Value::as_str) {
         Some("fuzz") => w.run_fuzz(&job),
         Some("eval") => w.run_eval(&job),
-        _ if w.rolling => w.run_rolling(&job),
+        _ if w.rolling => {
+            w.run_rolling(&job);
+            eprintln!("fakeworker: pid {} exits", std::process::id());
+        }
         _ => w.run_games(&job),
     }
 }

@@ -56,19 +56,28 @@ pub const MACOS_CPU_INFLIGHT_PER_CORE: u64 = 144;
 /// 2,304 games in flight in 12 groups of 192, the same games in flight and batch. Windows' 32 would leave most of a
 /// Mac's cores waiting for batches.
 pub const MACOS_CPU_BATCH: u64 = 192;
+/// macOS (agent 0.3.3): when memory caps the games in flight, the groups stay (the cores' 12 on 16 cores, `cpu_shape`;
+/// 6 a worker in a crew of two, `tune::Defaults::layout_for`) and the batches shrink - down to this many rows. The
+/// group count is what keeps the search threads fed: on the M4 Max 4 groups played 8,970 leaves/s against 11,155 with 6
+/// (one worker, PROTOCOL 13), and a crew of two held to 2 x 882 in 4 groups of 221 rows by 0.3.2's 192-row floor played
+/// ~14.8k (each worker using ~4 of its cores) against ~18k with 6 groups a worker; inference costs about the same per row
+/// whatever the batch (192-675 rows measured), so smaller batches cost little. 96 rows keep 6 groups down to 576 games
+/// in flight a worker (2 x 691 on a 64 GB Mac: 6 groups of 116 rows).
+pub const MACOS_CPU_MIN_BATCH: u64 = 96;
 /// macOS: a CPU job's cost until this Mac measured the run's own, in physical footprint (what the memory cap counts
 /// there, `worker_unix.rs`). 0.3.0 planned 4 MB per game from the SSH self-play above (2.03-2.08 GB a process with 768
 /// games in flight, 2.7 MB a game with the process, read early). A real rolling lease on the M4 Max (2026-11-19:
 /// legacy-meta3-r1's network, fast export, one worker of 2,304 games in flight, about 235 games finished a minute, so a
 /// game lasts about 10 minutes) grew all the way: 12.8 GB at 3 minutes, 19.0 at 5, 22.2 at 7, 25.2 at 9, 27.0 at 11,
-/// 28.1 at 13, 29.1 at 15 - about 12.2 MB a game over the base, still climbing about 0.5 GB a minute and slowing, heading
-/// for ~31 GB (~13 MB a game) at steady state - where the agent's memory check restarted it at 1,728 (PROTOCOL 10.6) and
-/// remembered 13 MB a game for the run; a two-worker trial's ~9 MB a game (PROTOCOL 13.5) was read early too. Planned
-/// with a 1 GB base (what this Mac's measurements, `Learned`, are counted over) and 14 MB a game: with the default memory
-/// cap of half the RAM a 64 GB Mac (32,768 MB) holds 1,888 games in flight in one worker, two workers 921 each (each its
-/// own base, `tune::Space`), a 16 GB Mac (8,192 MB) 416 - each about 80 % of its cap at the measured steady state,
-/// under the 92 % where a worker gives way.
-pub const MACOS_CPU_COST: MemCost = MemCost { base_mb: 1024, per_game_mb: 14 };
+/// 28.1 at 13, 29.1 at 15 - about 12.2 MB a game over the base, still climbing about 0.5 GB a minute and slowing - where
+/// the agent's memory check restarted it at 1,728 (PROTOCOL 10.6) and remembered 13 MB a game for the run; 0.3.2 planned
+/// 14 MB. The crew of the same day (two workers of 882 games in flight, 0.3.2) went further: the main worker reached
+/// 14,487 MB of its 15,746 MB part after ~27 minutes - 16 MB a game over the base, still rising slowly - and hit the 92 %
+/// trigger. Planned with a 1 GB base (what this Mac's measurements, `Learned`, are counted over) and 18 MB a game (agent
+/// 0.3.3): with the default memory cap of half the RAM a 64 GB Mac (32,768 MB) holds 1,472 games in flight in one worker,
+/// two workers 716 each (each its own base, `tune::Space`), a 16 GB Mac (8,192 MB) 320 - each about 76 % of its cap at
+/// 16 MB a game and 85 % at 18, under the 92 % where a worker gives way.
+pub const MACOS_CPU_COST: MemCost = MemCost { base_mb: 1024, per_game_mb: 18 };
 
 /// "auto" on the CPU, (games in flight, groups): `CPU_INFLIGHT` in `CPU_GROUPS`; on macOS `MACOS_CPU_INFLIGHT_PER_CORE`
 /// per physical core (rounded as `round_games`) in groups of `MACOS_CPU_BATCH`.
@@ -92,6 +101,12 @@ pub fn mac_cpu_auto(cores: u64) -> (u64, u64) {
 /// macOS: the groups of `conc` games in flight - batches of at least `MACOS_CPU_BATCH` rows (one group under it).
 pub fn mac_groups(conc: u64) -> u64 {
     (conc / MACOS_CPU_BATCH).max(1)
+}
+
+/// macOS (0.3.3): the groups of `conc` games in flight when memory capped them below the cores' choice: `groups` kept,
+/// the batches shrinking to at least `MACOS_CPU_MIN_BATCH` rows (fewer groups only below that; at least one).
+pub fn mac_capped_groups(conc: u64, groups: u64) -> u64 {
+    groups.min(conc / MACOS_CPU_MIN_BATCH).max(1)
 }
 
 /// A CPU job's cost until this PC measured the run's own: `CPU_COST`, on macOS `MACOS_CPU_COST`.
@@ -118,6 +133,13 @@ pub const RESTART_SHARE: f64 = 0.75;
 pub const MAX_RESTARTS: u32 = 4;
 /// A memory cap of at least this many games in flight is rounded down to a multiple of it.
 pub const RAM_CAP_STEP: u64 = 32;
+/// agent 0.3.3: a worker's commit counts as its steady state once it has run this long (a few game lengths: a game lasts
+/// ~10 minutes on the M4 Max, ~19 on a Windows CPU at 32 in flight); only such readings may lower the remembered cost.
+pub const STEADY_S: u64 = 45 * 60;
+/// ... and a lease whose steady readings stayed under the remembered cost lowers it by at most this share (rounded up,
+/// at least 1 MB): a cost goes up at once (memory first) and comes down slowly (a run's games change, a worker build
+/// with less memory per game arrives).
+pub const LEARN_DECAY: f64 = 0.125;
 
 /// The run's setting for a CPU or GPU job (`rolling.inflight.cpu` / `.gpu`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,7 +240,8 @@ pub fn measured_per_game(commit_mb: u64, conc: u64, cost: MemCost) -> u64 {
 
 /// The memory a game in flight was measured to take on this PC, per run and provider class (`state\rolling_memory.json`,
 /// keys `<run>/cpu` and `<run>/gpu`, MB per game over the base): "auto" and a run's number are planned with it from
-/// then on (PROTOCOL 10.6). It only goes up.
+/// then on (PROTOCOL 10.6), and so are the rest of the lease that measured it (lease.rs). It goes up at once (`raise`)
+/// and down only slowly, from steady-state readings (`settle`, agent 0.3.3).
 pub struct Learned;
 
 impl Learned {
@@ -255,11 +278,32 @@ impl Learned {
             return false;
         }
         m.insert(k, per_game_mb);
+        Self::save(layout, &m);
+        true
+    }
+
+    /// agent 0.3.3: a lease whose workers, at their steady state (`STEADY_S`), committed at most `steady_mb` per game
+    /// lowers a higher remembered cost toward it, by at most `LEARN_DECAY` of it (at least 1 MB, never below
+    /// `steady_mb` or 1) -> the new value when it was lowered.
+    pub fn settle(layout: &Layout, run: &str, gpu: bool, steady_mb: u64) -> Option<u64> {
+        let mut m = Self::load(layout);
+        let k = Self::key(run, gpu);
+        let old = *m.get(&k)?;
+        if steady_mb == 0 || steady_mb >= old {
+            return None;
+        }
+        let step = ((old as f64 * LEARN_DECAY).ceil() as u64).max(1);
+        let new = old.saturating_sub(step).max(steady_mb).max(1);
+        m.insert(k, new);
+        Self::save(layout, &m);
+        Some(new)
+    }
+
+    fn save(layout: &Layout, m: &BTreeMap<String, u64>) {
         let _ = std::fs::create_dir_all(layout.state());
-        if let Err(e) = zerofarm_common::fsutil::atomic_write(&Self::path(layout), &serde_json::to_vec(&m).expect("json")) {
+        if let Err(e) = zerofarm_common::fsutil::atomic_write(&Self::path(layout), &serde_json::to_vec(m).expect("json")) {
             log::warn!("could not record a rolling job's memory per game: {e}");
         }
-        true
     }
 }
 
@@ -295,7 +339,7 @@ pub fn gpu_groups(conc: u64) -> u64 {
 
 /// A CPU job's (conc, groups): the run's number (in the template's groups, at most one per game), or "auto":
 /// `cpu_auto()` (`CPU_INFLIGHT` games in `CPU_GROUPS` groups; more on macOS); capped by memory (`MemPlan::cap`; on
-/// macOS the groups of what is left still batches of `MACOS_CPU_BATCH` rows, `mac_groups`).
+/// macOS the cores' groups kept, the batches shrinking to `MACOS_CPU_MIN_BATCH` rows, `mac_capped_groups`, 0.3.3).
 pub fn cpu_shape(setting: Inflight, template_groups: u64, mem: MemPlan) -> (u64, u64) {
     match setting {
         Inflight::N(n) => {
@@ -305,7 +349,7 @@ pub fn cpu_shape(setting: Inflight, template_groups: u64, mem: MemPlan) -> (u64,
         Inflight::Auto => {
             let (inflight, groups) = cpu_auto();
             let conc = mem.cap(inflight, true);
-            let groups = if cfg!(target_os = "macos") { groups.min(mac_groups(conc)) } else { groups };
+            let groups = if cfg!(target_os = "macos") { mac_capped_groups(conc, groups) } else { groups };
             (conc, groups.min(conc))
         }
     }
@@ -434,35 +478,63 @@ mod tests {
         assert_eq!(mac_cpu_auto(10), (1440, 7));
         assert_eq!(mac_cpu_auto(0), (128, 1));
         assert_eq!((mac_groups(1888), mac_groups(416), mac_groups(100)), (9, 2, 1), "batches of 192 rows at least");
+        // 0.3.3: capped by memory, the groups stay and the batches shrink to 96 rows
+        assert_eq!((mac_capped_groups(1472, 12), mac_capped_groups(691, 6), mac_capped_groups(320, 6), mac_capped_groups(50, 6)), (12, 6, 3, 1));
         let mac = |ram_mb| MemPlan { ram_mb, cost: MACOS_CPU_COST, measured: false };
-        // 64 GB Mac, default cap (half the RAM): (27,852 - 1,024) / 14 = 1,916 -> 1,888 of the 16 cores' 2,304
-        assert_eq!(ram_cap(32_768, MACOS_CPU_COST), 1888);
-        assert_eq!(mac(32_768).cap(2304, true), 1888);
+        // 64 GB Mac, default cap (half the RAM): (27,852 - 1,024) / 18 = 1,490 -> 1,472 of the 16 cores' 2,304
+        assert_eq!(ram_cap(32_768, MACOS_CPU_COST), 1472);
+        assert_eq!(mac(32_768).cap(2304, true), 1472);
         assert_eq!(mac(32_768).cap(1024, false), 1024, "a run's number as it is until this Mac measured it");
-        // the validation lease's limit (half the RAM, less with little memory free): 1,824
-        assert_eq!(mac(31_671).cap(2304, true), 1824);
-        // 16 GB Mac (8 cores: 1,152 in 6 groups), 8 GB cap: (6,963 - 1,024) / 14 = 424 -> 416
-        assert_eq!(mac(8192).cap(mac_cpu_auto(8).0, true), 416);
-        // the plan fits what the validation lease measured: at its steady state (~13.2 MB a game over the base) a planned
-        // job commits about 80 % of its cap, under the 92 % where it would give way (HIGH_SHARE) ...
+        // the first validation lease's limit (half the RAM, less with little memory free): 1,408
+        assert_eq!(mac(31_671).cap(2304, true), 1408);
+        // 16 GB Mac (8 cores: 1,152 in 6 groups), 8 GB cap: (6,963 - 1,024) / 18 = 329 -> 320
+        assert_eq!(mac(8192).cap(mac_cpu_auto(8).0, true), 320);
+        // the plan fits what the crew measured on 2026-11-19 (16 MB a game over the base after 27 minutes, still rising
+        // slowly): about 76 % of the cap there, 85 % at the planned 18 MB, under the 92 % where a worker gives way
         for ram in [8192u64, 16_384, 31_671, 32_768] {
             let n = mac(ram).cap(4096, true) as f64;
-            assert!(1024.0 + n * 13.2 < ram as f64 * HIGH_SHARE, "{ram}: {n}");
-            assert!(1024.0 + n * 13.2 > ram as f64 * 0.7, "{ram}: {n} (not far below)");
+            assert!(1024.0 + n * 16.0 < ram as f64 * 0.8, "{ram}: {n}");
+            assert!(1024.0 + n * 18.0 < ram as f64 * HIGH_SHARE, "{ram}: {n}");
+            assert!(1024.0 + n * 16.0 > ram as f64 * 0.7, "{ram}: {n} (not far below)");
         }
         // ... while 0.3.1's 4 MB let 2,304 in, which committed 29,140 MB of its 31,671 MB limit at 15 minutes (92 %: the
-        // memory check's restart)
+        // memory check's restart), and 0.3.2's 14 MB let a crew of two run 882 each, whose main worker committed 14,487
+        // MB of its 15,746 MB part (92 %) after 27 minutes
         assert_eq!(ram_cap(31_671, MemCost { base_mb: 1024, per_game_mb: 4 }).min(2304), 2304);
-        assert!(29_140.0 > 31_671.0 * HIGH_SHARE);
+        const { assert!(29_140.0 > 31_671.0 * HIGH_SHARE) };
         assert_eq!(measured_per_game(29_140, 2304, MACOS_CPU_COST), 13, "what the agent remembered for the run");
+        const { assert!(14_487.0 > 15_746.0 * HIGH_SHARE) };
+        assert_eq!(measured_per_game(14_487, 882, MACOS_CPU_COST), 16, "what the crew remembered");
         if cfg!(target_os = "macos") {
             let (n, g) = cpu_auto();
             assert_eq!(cpu_shape(Inflight::Auto, 1, auto_cpu(1 << 20)), (n, g), "room for all: the cores' choice");
-            // memory-capped: batches of 192 rows still (a 16-core Mac's 2,304 in 12 groups -> 1,888 in 9 groups of 210)
-            let c = n.min(1888);
-            assert_eq!(cpu_shape(Inflight::Auto, 1, auto_cpu(32_768)), (c, g.min(mac_groups(c))));
+            // memory-capped: the cores' groups kept (a 16-core Mac's 2,304 in 12 groups -> 1,472 in 12 groups of 123)
+            let c = n.min(1472);
+            assert_eq!(cpu_shape(Inflight::Auto, 1, auto_cpu(32_768)), (c, mac_capped_groups(c, g)));
             assert_eq!(cpu_shape(Inflight::Auto, 1, auto_cpu(100)), (1, 1), "never 0");
         }
+    }
+
+    #[test]
+    fn the_remembered_cost_goes_up_at_once_and_down_slowly() {
+        let dir = std::env::temp_dir().join(format!("zf-rolling-settle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let layout = Layout::new(&dir);
+        assert_eq!(Learned::settle(&layout, "r", false, 5), None, "nothing remembered: nothing to lower");
+        assert!(Learned::raise(&layout, "r", false, 20));
+        // steady readings under it: an eighth (rounded up) a lease at most, never below the reading
+        assert_eq!(Learned::settle(&layout, "r", false, 16), Some(17));
+        assert_eq!(Learned::settle(&layout, "r", false, 16), Some(16));
+        assert_eq!(Learned::settle(&layout, "r", false, 16), None, "at the reading");
+        assert_eq!(Learned::settle(&layout, "r", false, 0), None, "no steady reading");
+        assert_eq!(Learned::get(&layout, "r", false), Some(16));
+        // a higher reading raises it at once
+        assert!(Learned::raise(&layout, "r", false, 19));
+        assert_eq!(Learned::get(&layout, "r", false), Some(19));
+        // the plan uses it (with the platform's default as the floor)
+        assert_eq!(Learned::plan(&layout, "r", false, 10_000).cost.per_game_mb, cpu_cost().per_game_mb.max(19));
+        assert_eq!(Learned::settle(&layout, "r", false, 1), Some(16), "19 - 3");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

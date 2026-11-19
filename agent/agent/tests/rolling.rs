@@ -198,11 +198,11 @@ fn a_changed_template_finishes_the_lease() {
     assert_eq!(h.mock.count("GET", &format!("/v1/artifact/ckpt/{RUN}/2/")), 0, "the new network is never fetched");
     assert_eq!(definition_crashes(&h), 0, "a new template is no fault");
     // "auto" on the CPU: 32 in flight in 4 groups (macOS: per core, rev 17), never more than fits the memory cap
-    // (rolling.rs; macOS: what the cap leaves still in batches of 192 rows or more, 0.3.2)
+    // (rolling.rs; macOS: what the cap leaves in the cores' groups, batches down to 96 rows, 0.3.3)
     let j = h.job_line();
     let (conc, groups) = (j["conc"].as_u64().unwrap(), j["groups"].as_u64().unwrap());
     let (auto_n, auto_g) = farm_agent::rolling::cpu_auto();
-    let want_g = if cfg!(target_os = "macos") { auto_g.min(farm_agent::rolling::mac_groups(conc)) } else { auto_g };
+    let want_g = if cfg!(target_os = "macos") { farm_agent::rolling::mac_capped_groups(conc, auto_g) } else { auto_g };
     assert!((1..=auto_n).contains(&conc) && groups == conc.min(want_g), "{j}");
     h.stop();
 }
@@ -425,4 +425,34 @@ fn a_worker_near_its_memory_limit_finishes_its_games_and_goes_on_with_fewer() {
     assert!(per >= least, "(~1,500 - {base}) / 8: {per}");
     assert!(h.crashes().is_empty(), "coming near the limit is no crash: {:?}", h.crashes());
     h.stop();
+}
+
+/// Agent 0.3.3 (finding of 2026-11-19: the plan must follow the evidence): the cost per game this PC remembered for the
+/// run plans "auto" - here 120 MB a game against the platform's 45 (Windows) / 18 (macOS) - and so does the default
+/// when nothing is remembered.
+#[test]
+fn the_remembered_cost_per_game_plans_the_games_in_flight() {
+    let limit = 3000;
+    let (auto_n, _) = farm_agent::rolling::cpu_auto();
+    let default = farm_agent::rolling::cpu_cost();
+    for (name, remembered) in [("remembered", Some(120u64)), ("default", None)] {
+        let mut h = H::new();
+        h.machine.lock().unwrap().settings.max_ram_mb = Some(limit);
+        if let Some(per) = remembered {
+            std::fs::create_dir_all(h.layout.state()).unwrap();
+            std::fs::write(h.layout.state().join("rolling_memory.json"), json!({format!("{RUN}/cpu"): per}).to_string()).unwrap();
+        }
+        let g1 = generation_1(&h, 100);
+        h.push(rolling_lease(&h, "l_RM", &g1, 0, 8, 1000, json!("auto")));
+        h.start();
+        assert!(wait(|| h.job_line_n(0).is_some()), "{name}: {}", h.agent_log());
+        let j = h.job_line();
+        let cost = farm_agent::rolling::MemCost { per_game_mb: default.per_game_mb.max(remembered.unwrap_or(0)), ..default };
+        let want = farm_agent::rolling::ram_cap(limit, cost).min(auto_n);
+        assert_eq!(j["conc"].as_u64(), Some(want), "{name}: (0.85 x {limit} - {}) / {} MB a game: {j}", cost.base_mb, cost.per_game_mb);
+        if remembered.is_some() {
+            assert!(want < farm_agent::rolling::ram_cap(limit, default).min(auto_n), "the remembered cost is the one that counts");
+        }
+        h.stop();
+    }
 }

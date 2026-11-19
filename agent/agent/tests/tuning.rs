@@ -114,7 +114,7 @@ fn tunes_inside_a_rolling_lease_remembers_it_and_reports_it() {
 {}", tuning_log(&h));
     assert!(rate(&best) >= rate(&start) * 1.03, "{e}");
     if cfg!(windows) {
-        // (macOS keeps batches of 192-384 rows: 16 games in flight are one group there)
+        // (macOS keeps batches of 96-384 rows: 16 games in flight are one group there)
         assert_eq!(best["groups"], 2, "batches of 8 rows (16 in flight, the run's number, in 2 groups): {e}");
     }
     assert!(best["threads"].as_u64().unwrap() < start["threads"].as_u64().unwrap(), "fewer search threads: {e}");
@@ -218,7 +218,7 @@ fn the_coordinators_hint_is_the_starting_point() {
     h.push(tuning_lease(&h, "l_TH", fake(peaked()), json!(16), Some(hint)));
     h.start();
     assert!(wait(|| !job_lines(&h).is_empty()));
-    // (fitted to this machine: macOS keeps batches of 192-384 rows, so 16 games in flight are one group)
+    // (fitted to this machine: macOS keeps batches of 96-384 rows, so 16 games in flight are one group)
     let want = (3, 1, 5, if cfg!(windows) { 2 } else { 1 }, 16);
     assert_eq!(layout_of(&job_lines(&h)[0]), want, "the hint's layout first");
     assert!(wait(|| entry(&h)["hint"] == true), "{}", tuning_json(&h));
@@ -278,4 +278,115 @@ fn a_trial_is_discarded_when_work_pauses_and_the_incumbent_comes_back_after() {
     h.stop();
     let done = h.wait_done("l_TP");
     ids_accounted(&h, "l_TP", &done);
+}
+
+/// The layouts (threads, sessions, threads per session, groups, games in flight) of every job line from the `n`th on.
+fn layouts_from(h: &H, n: usize) -> Vec<(u64, u64, u64, u64, u64)> {
+    job_lines(h)[n..].iter().map(layout_of).collect()
+}
+
+/// Agent 0.3.3, the M4 Max's crew of 2026-11-19: the remembered entry held a layout from a lease planned with less memory
+/// per game (2 x 958 games in flight, its trial discarded) while the next lease's memory plan held only 2 x 778. 0.3.2
+/// recorded the fitted layout's measurements and discards as another layout's, so the incumbent stayed "unmeasured" and
+/// the job was handed over to the same layout again and again (3 times in 7 minutes, nothing measured). Now the
+/// remembered layout is compared as it runs: the lease's first worker measures it, and the search goes on from there.
+#[test]
+fn a_remembered_layout_the_memory_no_longer_holds_is_measured_once_not_handed_over_to_again() {
+    let mut h = harness();
+    // a first lease with room for the run's 16 games in flight leaves the key's entry
+    h.machine.lock().unwrap().settings.max_ram_mb = Some(8000);
+    h.push(tuning_lease(&h, "l_TS1", fake(peaked()), json!(16), None));
+    h.start();
+    assert!(h.mock.wait(Duration::from_secs(60), |_| entry(&h)["measured"].as_array().is_some_and(|m| !m.is_empty())), "{}", tuning_json(&h));
+    h.stop();
+    let start = entry(&h)["start"].clone();
+    assert_eq!(start["conc"], 16);
+    // as 0.3.2 left it: the incumbent never measured, discarded once, still searching
+    let mut t = tuning_json(&h);
+    let e = &mut t["entries"][0];
+    e["incumbent"] = start.clone();
+    e["measured"] = json!([]);
+    e["discards"] = json!([[start.clone(), 1]]);
+    (e["trials"], e["state"], e["phase"], e["momentum"]) = (json!(0), json!("searching"), Value::Null, Value::Null);
+    e.as_object_mut().unwrap().remove("space");
+    std::fs::write(h.layout.state().join("tuning.json"), serde_json::to_vec_pretty(&t).unwrap()).unwrap();
+    // the next lease's memory holds fewer games in flight: (0.85 x 1,400 - base) / cost a game (13 on Windows, 9 on a Mac)
+    let limit = 1400u64;
+    h.machine.lock().unwrap().settings.max_ram_mb = Some(limit);
+    let cost = farm_agent::rolling::cpu_cost();
+    let room = ((limit as f64 * farm_agent::rolling::PLAN_SHARE) as u64 - cost.base_mb) / cost.per_game_mb;
+    assert!(room < 16, "{room}");
+    let before = job_lines(&h).len();
+    h.push(tuning_lease(&h, "l_TS2", fake(peaked()), json!(16), None));
+    h.start();
+    assert!(
+        h.mock.wait(Duration::from_secs(120), |_| entry(&h)["state"] == "tuned"),
+        "not tuned: {}
+{}",
+        tuning_json(&h),
+        tuning_log(&h)
+    );
+    let layouts = layouts_from(&h, before);
+    let first = layouts[0];
+    assert_eq!(first.4, room, "the remembered layout as the memory holds it: {layouts:?}");
+    // its first worker measured it - the incumbent's measurement - and no worker ran it again (no discards here)
+    assert_eq!(layouts.iter().filter(|l| **l == first).count(), 1, "handed over to the same layout again: {layouts:?}
+{}", tuning_log(&h));
+    let e = entry(&h);
+    let m0 = &e["measured"][0];
+    assert_eq!((m0["layout"]["conc"].as_u64(), m0["layout"]["threads"].clone()), (Some(room), start["threads"].clone()), "{e}");
+    assert!(e["trials"].as_u64().unwrap() <= 9 && layouts.len() <= 11, "{e}
+{layouts:?}");
+    assert!(m0["load"].as_f64().is_some(), "the load is recorded with the measurement: {e}");
+    // (both leases play the same block of ids: only the first one's are accounted for here)
+    h.stop();
+}
+
+/// Agent 0.3.3: a real Mac's background daemons burst (a sync daemon ~55 % of a core, syncthing to ~90 %): 0.3.2
+/// discarded a trial on any sample over 10 % of the CPUs, so every trial died within seconds of a burst. Short bursts
+/// now pass (the load is judged as a mean over the trial and before it), sustained load still discards.
+#[test]
+fn bursty_background_load_doesnt_discard_every_trial_but_sustained_load_does() {
+    let mut h = harness();
+    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let bursts = {
+        let (signals, stop) = (h.signals.clone(), stop.clone());
+        // 25 % of the CPUs for 0.2 s every second (5 % on average), 0 otherwise
+        std::thread::spawn(move || {
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                signals.set_other_load(Some(0.25));
+                std::thread::sleep(Duration::from_millis(200));
+                if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                signals.set_other_load(Some(0.0));
+                std::thread::sleep(Duration::from_millis(800));
+            }
+        })
+    };
+    let mut fk = fake(peaked());
+    fk["game_ms"] = json!(60);
+    h.push(tuning_lease(&h, "l_TB", fk, json!(16), None));
+    h.start();
+    let measured = |h: &H| h.agent_log().lines().filter(|l| l.contains("tuning [l_TB]:") && l.contains(" measured ")).count();
+    assert!(wait(|| measured(&h) >= 3), "trials count despite the bursts: {}", tuning_log(&h));
+    let discarded = h.agent_log().lines().filter(|l| l.contains("tuning [l_TB]: the trial of") && l.contains("other programs")).count();
+    assert!(discarded <= 1, "a burst discards no trial: {}", tuning_log(&h));
+    assert!(h.agent_log().contains("(other programs "), "each measurement says its load: {}", tuning_log(&h));
+    // sustained load during a trial: discarded
+    let running = |h: &H| h.status.lock().unwrap().tuning.as_deref().is_some_and(|t| t.starts_with("measuring"));
+    assert!(wait(|| running(&h) || entry(&h)["state"] == "tuned"), "{}", tuning_log(&h));
+    stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    bursts.join().unwrap();
+    if running(&h) {
+        h.signals.set_other_load(Some(0.5));
+        assert!(wait(|| h.agent_log().lines().any(|l| l.contains("tuning [l_TB]: the trial of") && l.contains("is discarded: other programs used"))), "{}", tuning_log(&h));
+        let n = measured(&h);
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(measured(&h), n, "nothing is measured under sustained load: {}", tuning_log(&h));
+    }
+    h.signals.set_other_load(Some(0.0));
+    h.stop();
+    let done = h.wait_done("l_TB");
+    ids_accounted(&h, "l_TB", &done);
 }
