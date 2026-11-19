@@ -31,7 +31,7 @@ use zerofarm_common::rotlog::RotatingFile;
 #[path = "worker_unix.rs"]
 mod unix;
 #[cfg(unix)]
-pub use unix::{kill_orphans, CpuMark, WorkerProc};
+pub use unix::{kill_orphans, sys_cpu_ms, CpuMark, WorkerProc};
 
 /// Longest stdout line accepted from a worker.
 pub const MAX_LINE: usize = 1 << 20;
@@ -339,6 +339,20 @@ impl Drop for WorkerProc {
 #[cfg(windows)]
 fn ft(t: &windows_sys::Win32::Foundation::FILETIME) -> u64 {
     ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64
+}
+
+/// rev 19 (PROTOCOL 13): the system's CPU time so far over all CPUs, ms: (idle, total).
+#[cfg(windows)]
+pub fn sys_cpu_ms() -> (u64, u64) {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::GetSystemTimes;
+    let z = || FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let (mut i, mut k, mut u) = (z(), z(), z());
+    if unsafe { GetSystemTimes(&mut i, &mut k, &mut u) } == 0 {
+        return (0, 0);
+    }
+    // (kernel time includes idle time; 100 ns units)
+    (ft(&i) / 10_000, (ft(&k) + ft(&u)) / 10_000)
 }
 
 #[cfg(windows)]

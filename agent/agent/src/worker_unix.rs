@@ -258,6 +258,14 @@ pub fn kill_orphans(work: &Path) -> usize {
     n
 }
 
+/// rev 19 (PROTOCOL 13): the system's CPU time so far over all cores, ms: (idle, total).
+pub fn sys_cpu_ms() -> (u64, u64) {
+    let (idle, total) = crate::macos::cpu_ticks();
+    // SAFETY: sysconf with a valid name.
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as u64;
+    (idle * 1000 / hz, total * 1000 / hz)
+}
+
 /// A point in time for starvation checks: the worker's CPU time and the system's idle/total CPU ticks.
 #[derive(Debug, Clone, Copy)]
 pub struct CpuMark {

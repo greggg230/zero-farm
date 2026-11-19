@@ -68,6 +68,11 @@ pub struct Settings {
     /// written to `machine.json` only when off.
     #[serde(skip_serializing_if = "is_true")]
     pub keep_awake: bool,
+    /// rev 19 (PROTOCOL 13): measure and tune the CPU layout of self-play jobs on this machine (default on); written
+    /// to `machine.json` only when off. Off: the fixed rules of before (threads = `cpu_threads`, the worker's own
+    /// inference default, rolling "auto"'s games in flight).
+    #[serde(skip_serializing_if = "is_true")]
+    pub autotune: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -92,6 +97,7 @@ impl Default for Settings {
             respect_fullscreen: true,
             on_battery: false,
             keep_awake: true,
+            autotune: true,
         }
     }
 }
@@ -116,7 +122,7 @@ impl Settings {
 
     /// The keys `ZeroFarm set <key> <value>` takes (macOS, PROTOCOL 11.5; the tray's settings on Windows).
     pub const KEYS: &'static [&'static str] =
-        &["cpu_threads", "work_when", "mode", "idle_minutes", "on_battery", "keep_awake", "hours", "max_ram_mb", "disk_cap_mb", "gpu"];
+        &["cpu_threads", "work_when", "mode", "idle_minutes", "on_battery", "keep_awake", "hours", "max_ram_mb", "disk_cap_mb", "gpu", "autotune"];
 
     /// `set <key> <value>`: changes one setting, or says why not. Returns how it reads now.
     pub fn set_by_name(&mut self, key: &str, value: &str) -> Result<String, String> {
@@ -142,6 +148,7 @@ impl Settings {
             "idle_minutes" => self.idle_minutes = number(&v, 1, 240)? as u32,
             "on_battery" => self.on_battery = flag(&v)?,
             "keep_awake" => self.keep_awake = flag(&v)?,
+            "autotune" => self.autotune = flag(&v)?,
             "gpu" => self.gpu = flag(&v)?,
             "max_ram_mb" => self.max_ram_mb = if auto(&v) { None } else { Some(number(&v, 1024, 1 << 22)?) },
             "disk_cap_mb" => self.disk_cap_mb = number(&v, 1024, 1 << 24)?,
@@ -172,6 +179,7 @@ impl Settings {
             "idle_minutes" => self.idle_minutes.to_string(),
             "on_battery" => yes(self.on_battery).to_string(),
             "keep_awake" => yes(self.keep_awake).to_string(),
+            "autotune" => (if self.autotune { "on" } else { "off" }).to_string(),
             "gpu" => yes(self.gpu).to_string(),
             "max_ram_mb" => self.max_ram_mb.map_or("auto".to_string(), |n| n.to_string()),
             "disk_cap_mb" => self.disk_cap_mb.to_string(),
@@ -375,6 +383,10 @@ mod tests {
         assert_eq!(s.set_by_name("mode", "idle_only").unwrap(), "work_when idle");
         assert_eq!(s.set_by_name("on_battery", "true").unwrap(), "on_battery true");
         assert_eq!(s.set_by_name("keep_awake", "off").unwrap(), "keep_awake false");
+        assert_eq!(s.set_by_name("autotune", "off").unwrap(), "autotune off");
+        assert!(!s.autotune);
+        assert!(serde_json::to_string(&s).unwrap().contains("\"autotune\":false"));
+        assert_eq!(s.set_by_name("autotune", "on").unwrap(), "autotune on");
         assert_eq!(s.set_by_name("hours", "22:00-07:30").unwrap(), "hours 22:00-07:30");
         assert_eq!(s.hours, Some(Hours { start_min: 1320, end_min: 450 }));
         assert_eq!(s.set_by_name("hours", "off").unwrap(), "hours off");
@@ -385,11 +397,11 @@ mod tests {
         // The new settings stay out of machine.json at their defaults (Windows files unchanged); a missing key reads as
         // its default.
         let d = serde_json::to_string(&Settings::default()).unwrap();
-        assert!(!d.contains("on_battery") && !d.contains("keep_awake"), "{d}");
+        assert!(!d.contains("on_battery") && !d.contains("keep_awake") && !d.contains("autotune"), "{d}");
         let back: Settings = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
         assert!(back.on_battery && !back.keep_awake && back == s);
         let old: Settings = serde_json::from_str(r#"{"mode":"idle_only"}"#).unwrap();
-        assert!(!old.on_battery && old.keep_awake);
+        assert!(!old.on_battery && old.keep_awake && old.autotune);
     }
 
     #[test]

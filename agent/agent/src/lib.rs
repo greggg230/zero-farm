@@ -32,6 +32,7 @@ pub mod startfail;
 pub mod status;
 #[cfg(windows)]
 pub mod tray;
+pub mod tune;
 pub mod update;
 pub mod util;
 pub mod worker;
@@ -94,6 +95,15 @@ pub struct Timings {
     pub presence: Duration,
     /// rev 15 (PROTOCOL 10.4): a rolling lease asks for more game ids at most this often (10 s).
     pub extend_every: Duration,
+    /// rev 19 (PROTOCOL 13): a trial's measurement starts this long after its games in flight refilled (the first
+    /// measurement of a search; later ones start at the same game progress).
+    pub tune_warm: Duration,
+    /// rev 19: the first measurement of a search lasts this long (it fixes the window later trials are measured over).
+    pub tune_window: Duration,
+    /// rev 19: a trial's worker is pinged this often (a `status` each time: the measurement's samples).
+    pub tune_ping: Duration,
+    /// rev 19: a layout handoff waits this long after `finish` before reading where the old worker's ids stop.
+    pub tune_settle: Duration,
 }
 
 impl Default for Timings {
@@ -120,6 +130,10 @@ impl Default for Timings {
             crash_resend: Duration::from_secs(60),
             presence: Duration::from_secs(300),
             extend_every: Duration::from_secs(10),
+            tune_warm: Duration::from_secs(20),
+            tune_window: Duration::from_secs(75),
+            tune_ping: Duration::from_secs(2),
+            tune_settle: Duration::from_secs(1),
         }
     }
 }

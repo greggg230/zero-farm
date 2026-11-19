@@ -56,6 +56,12 @@ pub trait SignalSource: Send {
     /// The engine holds a lease (true) or not (false): macOS keeps a working Mac on AC power from idle-sleeping
     /// meanwhile (`keep_awake`, PROTOCOL 11.5). Nothing elsewhere.
     fn lease_active(&mut self, _active: bool) {}
+
+    /// rev 19 (PROTOCOL 13): the share of the CPUs other programs used (`measured`: from the system's CPU times minus
+    /// our workers', `worker::LoadMark`). Tests set their own.
+    fn other_load(&self, measured: f64) -> f64 {
+        measured
+    }
 }
 
 /// The GPUs are measured at most this often; `sample` reuses the last measurement in between
@@ -538,11 +544,16 @@ pub struct SharedSignals {
     pub frozen_now: bool,
     /// Tests: the worker counts as starved of CPU (as well as when it really is).
     pub starved: Arc<AtomicBool>,
+    /// Tests: other programs' share of the CPUs (None: as measured).
+    pub other_load: Arc<Mutex<Option<f64>>>,
 }
 
 impl SharedSignals {
     pub fn new(s: Signals) -> Self {
-        SharedSignals { inner: Arc::new(Mutex::new(s)), frozen_now: false, starved: Arc::new(AtomicBool::new(false)) }
+        SharedSignals { inner: Arc::new(Mutex::new(s)), frozen_now: false, starved: Arc::new(AtomicBool::new(false)), other_load: Arc::new(Mutex::new(Some(0.0))) }
+    }
+    pub fn set_other_load(&self, share: Option<f64>) {
+        *self.other_load.lock().unwrap() = share;
     }
     pub fn set_starved(&self, starved: bool) {
         self.starved.store(starved, Ordering::SeqCst);
@@ -566,6 +577,9 @@ impl SignalSource for SharedSignals {
     }
     fn worker_starved(&self, mark: &CpuMark, worker: &WorkerProc) -> bool {
         self.starved.load(Ordering::SeqCst) || mark.starved_since(worker)
+    }
+    fn other_load(&self, measured: f64) -> f64 {
+        self.other_load.lock().unwrap().unwrap_or(measured)
     }
 }
 

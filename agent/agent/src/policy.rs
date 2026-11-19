@@ -195,6 +195,16 @@ pub fn decide(st: &mut PolicyState, s: &Signals, cfg: &Settings) -> Decision {
     Decision { work, block, gpu: work && gpu_block.is_none(), gpu_block, mem_pressure }
 }
 
+/// rev 19 (PROTOCOL 13): a tuning trial may start or go on - stricter than work. The machine is idle (no input for
+/// `idle_minutes`, whatever `work_when` says), on AC power and not in battery saver / Low Power Mode (whatever
+/// `on_battery` says), no fullscreen app (whatever `respect_fullscreen` says), and nothing else blocks work (paused,
+/// outside the hours, low memory). Real work may go on without it (an owner's `work_when active`, `on_battery`); trials
+/// don't.
+pub fn tuning_allowed(s: &Signals, cfg: &Settings) -> bool {
+    let strict = Settings { mode: Mode::IdleOnly, on_battery: false, respect_fullscreen: true, ..cfg.clone() };
+    decide(&mut PolicyState::default(), s, &strict).work
+}
+
 fn update_gpu_state(st: &mut PolicyState, s: &Signals) -> Option<GpuBlock> {
     let Some(g) = &s.gpu else {
         *st = PolicyState::default();
@@ -277,6 +287,36 @@ mod tests {
         s.notification = Notification::D3dFullscreen;
         let lax = Settings { respect_fullscreen: false, ..always };
         assert!(d(&s, &lax).work);
+    }
+
+    #[test]
+    fn tuning_needs_an_idle_machine_on_ac_whatever_the_work_settings() {
+        // the owner's laptop: works while in use and on battery, but trials need idle + AC + no fullscreen
+        let owner = Settings { mode: Mode::Always, on_battery: true, respect_fullscreen: false, ..Settings::default() };
+        let s = Signals::all_clear(0);
+        assert!(tuning_allowed(&s, &owner) && tuning_allowed(&s, &Settings::default()));
+        let mut active = s.clone();
+        active.idle_s = 10;
+        assert!(d(&active, &owner).work && !tuning_allowed(&active, &owner), "in use: work yes, trials no");
+        let mut battery = s.clone();
+        battery.on_ac = Some(false);
+        assert!(d(&battery, &owner).work && !tuning_allowed(&battery, &owner), "on battery");
+        let mut saver = s.clone();
+        saver.battery_saver = true;
+        assert!(!tuning_allowed(&saver, &owner), "Low Power Mode / battery saver");
+        let mut full = s.clone();
+        full.notification = Notification::D3dFullscreen;
+        assert!(d(&full, &owner).work && !tuning_allowed(&full, &owner), "fullscreen, even with respect_fullscreen off");
+        let mut unknown = s.clone();
+        unknown.on_ac = None;
+        assert!(tuning_allowed(&unknown, &owner), "unknown power = a desktop");
+        let paused = Settings { pause: Pause::Indefinitely, ..owner.clone() };
+        assert!(!tuning_allowed(&s, &paused));
+        let idle5 = Settings { idle_minutes: 5, ..owner };
+        active.idle_s = 299;
+        assert!(!tuning_allowed(&active, &idle5));
+        active.idle_s = 300;
+        assert!(tuning_allowed(&active, &idle5));
     }
 
     #[test]

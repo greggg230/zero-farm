@@ -92,6 +92,10 @@ pub fn fast_timings() -> Timings {
         crash_resend: Duration::from_millis(500),
         presence: Duration::from_millis(300),
         extend_every: Duration::from_millis(200),
+        tune_warm: Duration::from_millis(300),
+        tune_window: Duration::from_millis(1200),
+        tune_ping: Duration::from_millis(100),
+        tune_settle: Duration::from_millis(150),
     }
 }
 
