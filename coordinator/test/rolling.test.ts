@@ -20,6 +20,7 @@ import {
   err,
   finish,
   lease,
+  makeBuild,
   makeCampaign,
   makeRun,
   ok,
@@ -301,6 +302,22 @@ describe("rolling leases: extend (10.4)", () => {
     ok(await admin("PUT", "/v1/admin/run/st", body)); // paused: the lease is cancelled at its next beat
     expect(ok(await extend(m, l.lease_id, { games: 8 }))).toEqual({ ...fin, games: 72 });
     expect(ok(await beat(m, l.lease_id)).action).toBe("cancel");
+  });
+
+  it("finishes with state once the run's current definition no longer lists the lease's build (the run was re-pinned)", async () => {
+    await rollingRun("rp", { quota: 10000 });
+    const m = await enroll("m");
+    const l = await rollingLease(m);
+    expect(ok(await extend(m, l.lease_id, { games: 8 }))).toEqual({ games: 72 });
+    const nb = await makeBuild({ tag: "rp-repinned" });
+    const body: any = runBody(nb, { quota: 10000 });
+    body.selfplay.rolling = ROLLING;
+    ok(await admin("PUT", "/v1/admin/run/rp", body));
+    await define("run", "rp"); // the next version lists only the new build
+    expect(ok(await extend(m, l.lease_id, { games: 8 }))).toEqual({ games: 72, finish: true, reason: "state" });
+    // a fresh lease carries the new build
+    const m2 = await enroll("m2");
+    expect((await rollingLease(m2)).build.build_id).toBe(nb);
   });
 
   it("400 for a classic lease or bad games, 404 for another machine's lease, 410 for a closed one; the beat bucket", async () => {

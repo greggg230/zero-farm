@@ -1021,6 +1021,11 @@ export async function extend(env: Env, r: ExtendReq): Promise<ExtendAnswer> {
   if (!run || run.state !== "active" || !sp || !sp.rolling || run.current_gen === null || l.pending !== null || r.paused) {
     return finish("state");
   }
+  // A re-pinned run's current definition may no longer list this lease's worker build (an old build): its results
+  // would only be refused and it can't switch generations (the agent refuses a definition without its build), so
+  // it ends here and the agent asks for a fresh lease with the run's current builds (PROTOCOL 10.4).
+  const def = await currentDef(db, "run", run.run);
+  if (def && !def.builds.includes(l.build_id)) return finish("state");
   if (rel >= hi) return finish("block");
 
   const stmts: Stmt[] = [];

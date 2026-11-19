@@ -1228,7 +1228,9 @@ A rolling lease is a self-play lease (section 3) plus
   games in flight and close the lease (`done`). `max_s`: `until` has passed and the coordinator does not renew it;
   `block`: the block is used up; `state`: the run's self-play is no longer rolling, or the run, the machine or the
   whole farm (`POST /v1/admin/pause`) is paused, or the lease's next beat cancels it or gives it back (a paused run's
-  leases are also cancelled at their next beat, section 4).
+  leases are also cancelled at their next beat, section 4), or (2026-11-19) the run's current definition no longer
+  lists the lease's worker build (the run was re-pinned: its results would be refused and it can't switch
+  generations; the agent asks for a fresh lease with the current builds).
 - **Renewal.** Past `until`, the coordinator renews the lease (`until` += `max_s`, and the answer releases ids as
   usual) unless something else is waiting for this machine, in the order section 3 picks work: a diagnostics request
   for it; an eval batch of an active run with unissued ids; a fuzz campaign with a `share` that is below it (5.4);
