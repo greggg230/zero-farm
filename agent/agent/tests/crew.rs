@@ -320,7 +320,10 @@ fn the_memory_plan_holds_the_whole_crew() {
     let lines = job_lines(&h);
     assert!(lines.iter().any(|j| j["conc"].as_u64().unwrap() < 4), "fewer games a worker after running into the limit: {lines:?}");
     let learned: Value = serde_json::from_slice(&std::fs::read(h.layout.state().join("rolling_memory.json")).unwrap()).unwrap();
-    assert!(learned[format!("{RUN}/{}/cpu", h.build_id)].as_u64().unwrap() >= 800, "the cost per game remembered (per run and worker build): {learned}");
+    // (at least what a worker of 4 games in flight shows at 92 % of its 4,000 MB part over the platform's base: Windows'
+    // job object fails it at the limit, 850; macOS reads its footprint while it still commits, 664-844)
+    let least = ((4000.0 * farm_agent::rolling::HIGH_SHARE) as u64 - farm_agent::rolling::cpu_cost().base_mb) / 4;
+    assert!(learned[format!("{RUN}/{}/cpu", h.build_id)].as_u64().unwrap() >= least, "the cost per game remembered (per run and worker build, >= {least}): {learned}");
     assert!(h.crashes().len() <= 1, "{:?}", h.crashes());
     h.stop();
 }
