@@ -198,11 +198,12 @@ fn a_changed_template_finishes_the_lease() {
     assert_eq!(h.mock.count("GET", &format!("/v1/artifact/ckpt/{RUN}/2/")), 0, "the new network is never fetched");
     assert_eq!(definition_crashes(&h), 0, "a new template is no fault");
     // "auto" on the CPU: 32 in flight in 4 groups (macOS: per core, rev 17), never more than fits the memory cap
-    // (rolling.rs)
+    // (rolling.rs; macOS: what the cap leaves still in batches of 192 rows or more, 0.3.2)
     let j = h.job_line();
     let (conc, groups) = (j["conc"].as_u64().unwrap(), j["groups"].as_u64().unwrap());
     let (auto_n, auto_g) = farm_agent::rolling::cpu_auto();
-    assert!((1..=auto_n).contains(&conc) && groups == conc.min(auto_g), "{j}");
+    let want_g = if cfg!(target_os = "macos") { auto_g.min(farm_agent::rolling::mac_groups(conc)) } else { auto_g };
+    assert!((1..=auto_n).contains(&conc) && groups == conc.min(want_g), "{j}");
     h.stop();
 }
 
