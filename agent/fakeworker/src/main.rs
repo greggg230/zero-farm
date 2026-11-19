@@ -37,7 +37,7 @@
 //! flight) (a fresh worker's games grow); time suspended doesn't count. Workers of one lease share the machine (the
 //! agent's crews, PROTOCOL 13.5): each one with a rate model beats a file in `.crew/` of its working directory (the
 //! lease's) every 100 ms, and plays `crew[N - 1] / N` of its rate while N of them beat (`"crew": [1.0, 1.3, 1.25]`: two
-//! workers 30 % more in all; default 1.0 for any N - the machine's rate shared, nothing gained); a worker told `finish`
+//! workers 30 % more in all; default 1.0 for any N - the machine's rate shared, nothing gained; a beat counts for 250 ms); a worker told `finish`
 //! removes its beat file (a drainer, which the agent stops while a crew is measured). With `rate` a rolling job keeps `conc` games in
 //! flight (`games_started` = finished + in flight; still played one at a time), `finish` plays the games in flight to
 //! the end first, and `status` carries `leaves`, `games_started`, `concurrency` and `wall_s`.
@@ -393,8 +393,8 @@ impl W {
         self.leaves += r * dt * (in_flight / conc).min(1.0) * decay * share;
     }
 
-    /// Every 100 ms: this worker's beat file touched, and the crew counted (beat files touched in the last 400 ms: a
-    /// stopped or dead worker drops out).
+    /// Every 100 ms: this worker's beat file touched, and the crew counted (beat files touched in the last 250 ms: a
+    /// stopped or dead worker drops out - before a trial's window starts, `tune_warm` after its refill in the tests).
     fn crew_beat(&mut self) {
         let Some((path, at)) = self.beat.as_mut() else { return };
         if at.elapsed() < Duration::from_millis(100) {
@@ -406,7 +406,7 @@ impl W {
         let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
         let _ = std::fs::write(&*path, stamp.to_string());
         let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-        let fresh = |e: &std::fs::DirEntry| e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|d| d < Duration::from_millis(400));
+        let fresh = |e: &std::fs::DirEntry| e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|d| d < Duration::from_millis(250));
         self.crew_n = std::fs::read_dir(dir).map(|rd| rd.flatten().filter(fresh).count()).unwrap_or(1).max(1);
     }
 
@@ -433,7 +433,7 @@ impl W {
             "finish" => {
                 self.stop = Stop::Finish;
                 // (a worker finishing its games no longer counts in the crew: the agent stops such a drainer while
-                // the crew is measured, and its beat file would stay fresh for up to 400 ms after - agent 0.3.3)
+                // the crew is measured, and its beat file would stay fresh for up to 250 ms after - agent 0.3.3)
                 if let Some((path, _)) = self.beat.take() {
                     let _ = std::fs::remove_file(path);
                 }
