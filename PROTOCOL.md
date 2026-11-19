@@ -1684,9 +1684,10 @@ feature, a coordinator before rev 19, eval, fuzz, classic and GPU jobs are uncha
 ### 13.5 Several workers per lease
 
 **Why.** A single native worker process caps out: on the M4 Max (2026-11-18, clean windows, leaves/s) one process
-played at best ~12.6k (old export) / ~18.7k (fast export) and more threads inside it always hurt, while two processes of
-12 search + 4 x 3 inference threads with 1,152 games in flight in 6 groups each played 16.4k old export / ~18.0k with the
-CUDA-safe `fast` export - the owner's SSH self-play's parity (3 Python processes, ~18k) -; three 16.1k, four 15.2k. The
+played at best ~12.6k with the old export (~18.7k with the new fast export, in another session) and more threads inside
+it always hurt, while two processes of 12 search + 4 x 3 inference threads with 1,152 games in flight in 6 groups each
+played 16.4k with the old export (+30 %) / ~18.0k with the CUDA-safe `fast` export - the owner's SSH self-play's parity
+in that session (3 Python processes, ~18k) -; three 16.1k, four 15.2k. The
 processes don't share a tree arena, an evaluation cache or a runtime; what costs is contention inside one process, not
 the thread total. Memory: ~21 GB for 2,304 games in flight across two processes (~9 MB per game with the process).
 
