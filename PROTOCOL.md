@@ -1699,13 +1699,13 @@ before rev 19, eval, fuzz and classic jobs are unchanged; GPU jobs are tuned fro
   and reports say `infer_workers` 1, `infer_threads` = `threads`). **Bounds:** workers 1 to 3, at most one per physical
   core, the owner's `workers`, and as many as the memory plan (10.6, each worker its own base) and the video memory plan
   (10.6 **Video memory**: each worker's base and biggest batch within its share) hold with the fewest games in flight
-  allowed; search threads: the owner's `cpu_threads`, else 1.5 per physical core (at most the logical processors), shared
-  - each of N workers 1/N of them (the 4-core PC: 6; one worker 6, two 3, three 2, as measured; the trainer's own torch
+  allowed; search threads: the owner's `cpu_threads`, else 1.5 per physical core (at most the logical processors), shared:
+  each of N workers gets 1/N of them (the 4-core PC: 6; one worker 6, two 3, three 2, as measured; the trainer's own torch
   path there found 6 faster than 8); games in flight (all workers'): `"auto"` from half 10.6's target (two full batches)
   to 1.5 times it, a run's number kept; batches up to 2,048 rows. **Start** (no coordinator hint: a report doesn't say
   whether its layout ran on the GPU or the CPU of the same build and pack): on an NVIDIA GPU the most workers within the bounds whose start holds the target in all
-  - each its share rounded up to a multiple of 64 (1,024: 1 x 1,024 in two groups of 512, 2 x 512, 3 x 384) in batches of
-  at most the full batch, and its share of the search threads -, else one; on other GPUs one (the tuner tries more). A
+  (each its share rounded up to a multiple of 64 - 1,024: 1 x 1,024 in two groups of 512, 2 x 512, 3 x 384 - in batches
+  of at most the full batch, and its share of the search threads), else one; on other GPUs one (the tuner tries more). A
   layout the memory plan held back is lifted to its share of the target, not past it (10.6). `autotune` off: the start
   for the owner's `workers` (else one), fixed (handed over only when the memory plan holds more, 10.6). A CPU job on a
   GPU runtime pack takes no hint either (the hint for that build and pack is most likely a GPU layout).
