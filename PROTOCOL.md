@@ -446,7 +446,7 @@ Worker → agent (`"ev"`):
 |---|---|
 | `hello` | `aw: 1`, `build_id`, `game`, `kinds`, `zero_onnx: [1]`, `pid` |
 | `selftest` | `provider`, `max_abs`, `ok` (before the first real batch with a model); `gen` (rev 5): the network it tested, one event per gen of an eval job's `models` |
-| `status` | `stats`: Stats (section 3) |
+| `status` | `stats`: Stats (section 3); its `provider` is `""` until the worker has built its sessions (section 8, **Which provider a job uses**) |
 | `fin` | `n`: games finished since the last `fin` |
 | `shard` / `records` | `seq`, `path` (relative, under out_dir), `games`, `rows`, `bytes`, `gids`, `gen`? — a result file ready to upload (`shard` until phase 3, then `records`: rev 8, below); the agent moves the file away and sends `gids` as `x-ids`, `gen` (the oldest checkpoint generation of its games) as `x-gen` |
 | `evals` | eval (rev 5): `seq`, `path`, `games`, `gids` (as `shard`, no `gen`): a file of eval rows (section 5.2); the agent uploads it with `gids` as `x-ids` |
@@ -892,6 +892,16 @@ verified provider list, the lease's allowlist and the user's "Use the GPU" setti
 skipped, `cpu` is added last) and `gpu: {"luid": "<hex>", "vendor", "name"} | null`. A job line
 without `providers` means `["cpu"]`. The worker's CLI has `--providers a,b` and `--gpu <luid>`.
 
+**Which provider a job uses** (what the agent's pauses go by: a GPU job yields when GPU work stops being allowed, a
+CPU job only when work does). Stats `provider` and `selftest`'s name the provider the worker's sessions use; before
+its sessions exist (it builds them after the job line, which can take a while) a worker reports `""`. Agents from
+0.3.2 take `""` as not known yet: until the worker names a provider, the job is what the agent chose for it - a GPU
+job when its job line's `providers` names a GPU provider, else a CPU job -, and from then on the one it names (a GPU
+job whose worker fell back to the CPU is a CPU job). 0.3.1 took `""` for a GPU provider: on a machine where GPU work
+isn't allowed (every Mac) it yielded a CPU job's worker as soon as a `status` came before the sessions - at once with
+a crew of workers (13.5), whose main worker is pinged right after its start - and the worker stayed suspended, its
+sessions never built, until the coordinator took the lease back.
+
 **`probe-providers`** (`<worker> probe-providers [--runtime-dir D] [--model M --reference R]
 [--providers a,b] [--gpu LUID] [--threads T] [--reps N] [--bench-rows 64,256,...] [--ensure-ready]
 [--json FILE]`): the CPU first, then every candidate GPU provider on every adapter it serves, each
@@ -1062,13 +1072,17 @@ there at any size (the lease keeps its normal size).
 An agent from 0.2.10, for a lease whose runtime differs from its definition's `runtime` (an alternate), or whose
 pack's manifest has `gpu`: fetches and verifies the build's and the pack's signed manifests alone (no other file),
 and refuses the lease before anything else is downloaded unless all hold: the build's `requires_runtime` is the
-lease's runtime (for an alternate); the job is self-play or eval; the policy allows GPU work now; this PC has an
-adapter that meets the pack's `gpu` (vendor and driver); the pack is not marked bad here (a probe of it for these
-adapters and drivers in which none of its GPU providers passed, or for a pack without `gpu` no GPU provider); and
-the build's and pack's files fit under the disk cap. A refusal is `done` with `refused: "runtime"` (the lease is
-closed as given back), a crash report of kind `definition` at most once a day per pack and reason, and the
-start-failure wait (1 min doubling to 1 h). Agents before 0.2.10 refuse such a lease anyway (their exact runtime
-rule, section 7), before downloading anything.
+lease's runtime (for an alternate); the build's and pack's files fit under the disk cap; and for a pack with `gpu`
+(GPU work): the job is self-play or eval; the policy allows GPU work now; this PC has an adapter that meets the
+pack's `gpu` (vendor and driver); the pack is not marked bad here (a probe of it for these adapters and drivers in
+which none of its GPU providers passed) and not held (9.8). A pack without `gpu` - the CPU pack, a CPU alternate's
+(11.4), Windows ML's - is not GPU work, default or alternate, and none of the GPU conditions apply to it (agents from
+0.3.2; 0.2.10-0.3.1 applied them to every alternate, so a Mac refused a CPU alternate as GPU work): its job runs on
+the CPU unless 9.6's probe and bench, which run only while GPU work is allowed and the pack isn't held, pick a GPU
+provider of it (Windows ML's DirectML), and the platform check (11.3) applies as to every lease. A refusal is
+`done` with `refused: "runtime"` (the lease is closed as given back), a crash report of kind `definition` at most
+once a day per pack and reason, and the start-failure wait (1 min doubling to 1 h). Agents before 0.2.10 refuse such
+a lease anyway (their exact runtime rule, section 7), before downloading anything.
 
 ### 9.6 Probe first, then choose CPU or GPU by measured speed
 
@@ -1130,9 +1144,10 @@ went down during it - a GPU driver fault, a hard hang ended with a reset, a cras
 probe** of that pack on those adapters (`state\unfinished.json`): once, the pack is held for `RETRY_S` (a day);
 twice, it is held for good on those adapters and drivers (a driver update changes the key: one more try). A held
 pack gets no probe (between leases or in a lease) and no bench, its jobs run on the CPU, the guard (9.5) refuses it
-as an alternate (`refused: "runtime"`), and the profile's `runtime_providers` lists it with no provider (`[]`), so
-the coordinator stops offering it as an alternate (9.4 condition 4). The agent reports each one at that start
-(`POST /v1/crash` `probe_unfinished`: the pack, the worker, the count, how long before the start).
+when it has `gpu` (`refused: "runtime"`; agents before 0.3.2: any alternate), and the profile's `runtime_providers`
+lists it with no provider (`[]`), so the coordinator stops offering it as an alternate (9.4 condition 4). The agent
+reports each one at that start (`POST /v1/crash` `probe_unfinished`: the pack, the worker, the count, how long before
+the start).
 
 **What a probe may load.** The built-in probe and the bench pass `--providers tensorrt_rtx,cuda,openvino,dml,cpu`:
 never AMD's providers (`amdgpu`, `migraphx`), and the measured choice never picks them, even from a bench an older
@@ -1251,9 +1266,9 @@ A rolling lease is a self-play lease (section 3) plus
   in-flight count among 64, 128, 256 and 512 after which doubling gains less than 15% rows/s (each rated at its batch:
   1 group from 256 in flight, else 2, batches of half of it), in those groups; both capped so that the games in flight
   fit the worker's memory limit (`caps.ram_mb`, the job object's limit): planned to commit at most 85% of it at a base
-  plus a cost per game in flight - 1,800 MB + 45 MB on a GPU, 600 MB + 45 MB on the CPU, or this PC's measured cost
-  for the run when it is higher (**Memory**, below) - ((0.85 x `ram_mb` - base) / per game, rounded down to a multiple
-  of 32 when at least 32; agent constants, `rolling.rs`, from the soak of 2026-11-17: pb3's network at 224 in flight
+  plus a cost per game in flight - 1,800 MB + 45 MB on a GPU, 600 MB + 45 MB on the CPU (macOS: 11.5), or this PC's
+  measured cost for the run when it is higher (**Memory**, below) - ((0.85 x `ram_mb` - base) / per game, rounded
+  down to a multiple of 32 when at least 32; agent constants, `rolling.rs`, from the soak of 2026-11-17: pb3's network at 224 in flight
   with no limit levelled off at about 11.4 GB, 1.75 GB + 43 MB per game; a 4070 Ti PC with a 10,735 MB limit gets 160
   on the GPU, where 0.2.13's 1 GB + 40 MB per game gave 224 and every lease ran into the limit after 21-25 minutes). A number is taken as it is (a CPU job in the template's `groups`, a GPU job in at most 2) unless this
   PC measured the run's cost (then it is capped the same way); anything that is neither a number from 1 to 4,096 nor
@@ -1418,7 +1433,8 @@ Platform names: `windows-x64` and `macos-arm64` (Apple silicon, macOS 13 or newe
 
 - **Runs.** An alternate (9.4) takes `when.platform` (default `windows-x64`), and `when.vendor` becomes optional:
   an alternate without `vendor` whose `when` names `platform` (`windows-x64` too) is a **CPU alternate**, offered
-  to every machine of its platform with no GPU condition (its runtime must have no `gpu`; no `min_driver`). One
+  to every machine of its platform with no GPU condition (its runtime must have no `gpu`; no `min_driver`); the agent
+  takes it as CPU work too (9.5, agents from 0.3.2: no GPU condition, the platform check of 11.3). One
   that names neither, with a pack that names no GPU vendor, is refused as before rev 17 (a GPU pack such as Windows
   ML needs its vendor spelled out). GPU alternates (a vendor) are `windows-x64` only in rev 17 (else 400).
   `PUT /v1/admin/run/{run}` checks that the alternate's build and runtime manifests name `when.platform`, and that
@@ -1481,8 +1497,16 @@ Platform names: `windows-x64` and `macos-arm64` (Apple silicon, macOS 13 or newe
   and kills a group a dead agent left behind at its next start (a stopped worker can't see its stdin close). The
   runtime pack is passed as `ZEROFARM_RUNTIME_DIR` and first on `DYLD_LIBRARY_PATH`.
 - **Rolling leases (10.6) on macOS.** "auto" on the CPU is 144 games in flight per physical core (performance and
-  efficiency) in groups of 192 (16 cores: 2,304 in 12 groups); the memory plan's default cost is 1,024 MB + 4 MB per
-  game in flight, in physical footprint (the live self-play of 2026-11-18: about 2.7 MB per game with the process).
+  efficiency) in groups of 192 (16 cores: 2,304 in 12 groups); the memory plan's default cost is 1,024 MB + 14 MB per
+  game in flight, in physical footprint (agents from 0.3.2; 0.3.0-0.3.1 planned 4 MB from the SSH self-play of
+  2026-11-18, about 2.7 MB per game with the process, read early). A real rolling lease on the M4 Max (2026-11-19,
+  legacy-meta3-r1's network, fast export, one worker of 2,304 games in flight, a game lasting about 10 minutes) kept
+  growing: 12.8 GB at 3 minutes, 19.0 at 5, 22.2 at 7, 25.2 at 9, 27.0 at 11, 28.1 at 13, 29.1 at 15 (12.2 MB a game
+  over the base), still about 0.5 GB a minute and slowing, toward ~31 GB (~13 MB a game) at steady state; the memory
+  check (10.6) restarted it at 1,728 and remembered 13 MB a game for the run. With the default memory cap (half the
+  RAM) the plan holds 1,888 games in flight in one worker on a 64 GB Mac (32,768 MB), 2 x 921 in two (13.5), 896 or
+  2 x 424 on a 32 GB Mac, 416 on a 16 GB Mac - about 80 % of the cap at that steady state. When memory caps "auto",
+  the groups shrink with it (batches of at least 192 rows: 1,888 in 9 groups).
 - **When it works.** Input idle time from IOKit (`HIDIdleTime`); `on_battery` from the providing power source and
   `battery_saver` from Low Power Mode (`NSProcessInfo`); `low_memory` when memory pressure is at least "warning"
   (`kern.memorystatus_vm_pressure_level`) or free + inactive memory is below the floor; no fullscreen detection in
@@ -1599,7 +1623,9 @@ feature, a coordinator before rev 19, eval, fuzz, classic and GPU jobs are uncha
   threads (the worker's own default), macOS sessions of 3 threads (16 cores: 5 x 3; under 6 cores one session); 10.6's /
   11.5's games in flight and groups (Windows 32 in 4 groups, an M4 Max 2,304 in 12 groups of 192). A Mac with at least
   12 physical cores and 32 GB starts with two workers of 12 search + 4 x 3 inference threads (16 cores; the budget of
-  13.5), 1,152 games in flight in 6 groups of 192 - the M4 Max's measured best.
+  13.5), 1,152 games in flight in 6 groups of 192 - the M4 Max's measured best -, each within its part of the memory
+  plan (13.5 **Memory**: 921 in 4 groups each on a 64 GB Mac at the default cap, agents from 0.3.2; 0.3.1 started
+  2 x 1,152, which the cap doesn't hold at the measured cost, 11.5).
 - **The owner's settings** `autotune` (default on; Windows `machine.json`, macOS `ZeroFarm set autotune on|off`) and
   `workers` (`auto` (default) | 1 | 2 | 3, 13.5). `autotune` off: the fixed rules of before (one worker, `threads` = the
   CPU threads, no `infer_*` fields, 10.6's games in flight) - unless `workers` is 2 or 3: then that many workers with
@@ -1689,7 +1715,8 @@ it always hurt, while two processes of 12 search + 4 x 3 inference threads with 
 played 16.4k with the old export (+30 %) / ~18.0k with the CUDA-safe `fast` export - the owner's SSH self-play's parity
 in that session (3 Python processes, ~18k) -; three 16.1k, four 15.2k. The
 processes don't share a tree arena, an evaluation cache or a runtime; what costs is contention inside one process, not
-the thread total. Memory: ~21 GB for 2,304 games in flight across two processes (~9 MB per game with the process).
+the thread total. Memory: ~21 GB for 2,304 games in flight across two processes (~9 MB per game with the process,
+read during a short trial; a real lease grows to ~13 MB a game, 11.5).
 
 **One lease, a crew of workers.** The agent serves one rolling CPU self-play lease (section 10) with `workers` worker
 processes (1 to 3; 13.1, 13.2), all of the same worker build, network and per-worker layout. No coordinator change and no
@@ -1724,8 +1751,10 @@ extra lease: the coordinator sees one lease, its released ids, its extensions an
   is the job's limit / `workers`. A member at 92 % of its part finishes its games (its unstarted ids become spare) and the
   crew's next members run fewer games in flight (10.6's restart size; a restart, at most 4 per lease); at 92 % of the
   job's limit in all, with no worker finishing, the biggest gives way the same way; the main worker's own memory is
-  watched as in 10.6. The most any worker committed per game is what is remembered for the run. The tuner's worker
-  count holds each worker's base and games in flight within 85 % of the job's limit.
+  watched as in 10.6. The most any worker committed per game is what is remembered for the run. Every layout - the
+  start, a fixed `workers`, every trial - holds each worker's base and games in flight within 85 % of its part of the
+  job's limit (each worker's games in flight bounded by it; the tuner's range of games in flight is kept), and the
+  tuner's worker count is at most what that holds with the fewest games in flight allowed.
 - **Failures.** A member that exits without `end` or with a fatal error (or stays silent 90 s, or sends no `hello` in
   10 s) loses its games in flight - they go back with the lease - and is reported once per lease (`/v1/crash`); a new
   member joins while restarts are left, then the crew runs smaller. One that ran into its memory limit counts as in
@@ -1744,6 +1773,12 @@ extra lease: the coordinator sees one lease, its released ids, its extensions an
   every member run as long as the lease (an aw/1 change); not needed for the measured gain.
 
 ## Changes
+- v1 rev 19, agent 0.3.2 (2026-11-19; no wire change): fixes from the first real crew on a Mac. A worker's `provider`
+  `""` (no sessions yet) is not known yet, never a GPU provider: the job is what the agent chose until the worker
+  names one (section 8, **Which provider a job uses**; 0.3.1 suspended every crew's main worker on a Mac for good). A
+  runtime pack without `gpu` is not GPU work for the guard, default or alternate (9.5, 11.4: a Mac takes a run's CPU
+  alternate). macOS plans 14 MB per game in flight instead of 4 (11.5), so a crew's start and every layout fit the
+  memory cap (13.1, 13.5), and a memory-capped "auto" keeps its batches of 192 rows.
 - v1 rev 19 (2026-11-18; coordinator migration 0015, agents from 0.3.1, feature `tuning`): **layout tuning** (section
   13). The agent measures the CPU layout of its rolling self-play jobs on the machine (search threads, inference
   sessions x threads, groups, games in flight; near the layout of before, thread counts capped, never searched upward)

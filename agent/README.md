@@ -135,8 +135,8 @@ cargo test --workspace --all-features -- --test-threads=2           # on the Mac
 | keep awake | - | an IOKit `PreventUserIdleSystemSleep` assertion while a lease runs on AC power (`keep_awake`, default on) |
 | launcher version | VERSIONINFO | a 32-byte marker in the binary (`binver.rs`) |
 | UI | tray, invite dialog | headless CLI: `ZeroFarm status \| pause [minutes] \| resume \| set <key> <value> \| quit \| uninstall \| setup` |
-| rolling "auto" (CPU) | 32 in flight in 4 groups | 144 per physical core in groups of 192 (an M4 Max: 2,304 in 12), planned at 1 GB + 4 MB per game of physical footprint |
-| layout tuning (rev 19) | start: one worker, cores search + 1 x cores inference (each its cap); batches >= 8 rows | start: cores search + sessions of 3 (5 x 3 on 16 cores); inference <= cores; batches 192-384 rows; sessions always searched; >= 12 cores and >= 32 GB: two workers of 12 + 4 x 3, 1,152 in flight in 6 groups |
+| rolling "auto" (CPU) | 32 in flight in 4 groups | 144 per physical core in groups of 192 (an M4 Max: 2,304 in 12), planned at 1 GB + 14 MB per game of physical footprint (0.3.2; a 64 GB Mac's default cap holds 1,888, in 9 groups) |
+| layout tuning (rev 19) | start: one worker, cores search + 1 x cores inference (each its cap); batches >= 8 rows | start: cores search + sessions of 3 (5 x 3 on 16 cores); inference <= cores; batches 192-384 rows; sessions always searched; >= 12 cores and >= 32 GB: two workers of 12 + 4 x 3, each with the games in flight its half of the memory plan holds (a 64 GB Mac: 921 in 4 groups) |
 
 **Install** (what `curl -fsSL https://farm.greggg230.com/install-macos.sh | sh -s -- --invite CODE` ends in): the
 tarball `ZeroFarm-macos-arm64.tar.gz` holds `ZeroFarm`, `farm-agent`, `manifest.json` and its signature. `./ZeroFarm
@@ -539,7 +539,8 @@ Agent exit codes: 0 quit, 75 switch to `state\pending`, 76 hand over to the new 
   the worker runs in a job object (kill on close, memory cap, no crash dialogs, no UI: clipboard,
   atoms, desktops, settings, logoff) at idle priority with EcoQoS, as the friend's user.
 - Rev 11 (PROTOCOL 9, agent 0.2.10): run alternates and the agent's guard (`lease.rs` `runtime_guard`: a GPU
-  vendor's runtime pack is refused before anything but its manifest is downloaded unless the PC qualifies),
+  vendor's runtime pack is refused before anything but its manifest is downloaded unless the PC qualifies; from 0.3.2
+  a pack without `gpu`, such as a CPU alternate's, is not GPU work),
   zstd copies of build files (`cache.rs`, `zerofarm_common::zst`), probe-first and the bench of the job's own
   network (`state\bench.json`) and the measured CPU-or-GPU choice (`probe.rs` `choose`), `caps.gpu_allowed`,
   `caps.gpu_games`, a failed GPU pack marked bad per driver and evicted.

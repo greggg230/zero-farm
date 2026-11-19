@@ -4,6 +4,20 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's: `agent-macos-v<version>`).
 
+## Unreleased (0.3.2)
+
+- **Macs no longer freeze at the start of a job run by two job programs.** On a computer that doesn't use its graphics
+  card for the farm (every Mac), Zero Farm 0.3.1 mistook a job program that was still starting up for one that uses the
+  graphics card, paused it straight away ("GPU is busy") and never let it go on, so the job sat there until the farm
+  took it back after 10 minutes - every time two job programs shared a job. A job program now counts as a processor
+  job until it says otherwise.
+- **Macs take the farm's Mac version of a job.** When a run offers a version of its job made for Macs, Zero Farm 0.3.1
+  on a Mac refused it as graphics-card work (and reported a problem); it now runs it on the processor, as intended.
+- **Long jobs on a Mac plan their memory from real measurements.** A Mac's games use more memory as they go than Zero
+  Farm 0.3.1 expected (about 13 MB each once a job has run a while, not 4), so a long job filled its share of memory
+  and had to slow down part-way through. Zero Farm now plans for that from the start: on a 64 GB Mac a long job plays
+  about 1,900 games at once in one job program, or about 920 in each of two.
+
 ## Unreleased (0.3.1)
 
 - **Zero Farm finds the fastest way to use your computer's processor.** For long self-play jobs it now tries a few
