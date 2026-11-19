@@ -77,23 +77,23 @@ The short version, as on the farm's front page:
 
 Sent to the farm (farm.greggg230.com, run by Gregg on Cloudflare; only Gregg can see it):
 
-- **About your PC:** Windows version, processor model and core count, memory, free disk space,
-  graphics card model, memory and driver version, the name you gave your PC when you joined, and a
-  random ID.
+- **About your computer:** operating system version, processor model and core count, memory, free disk
+  space, on Windows the graphics card model, memory and driver version, the name you gave your computer
+  when you joined, and a random ID.
 - **How it's going:** how many games or tests it ran and how long they took, how busy the processor
   and graphics card were, memory used, graphics card temperature, how often it paused because you
-  came back (and how fast), and how many hours a day your PC is idle or on.
+  came back (and how fast), and how many hours a day your computer is idle or on.
 - **Crash reports:** if Zero Farm itself crashes, its error message and where in its own code it
   happened.
 - **Results** of the games and tests it ran.
 - **Your IP address**, which the farm's host (Cloudflare) sees like any website. Zero Farm uses it
   only to stop people guessing invite codes, and keeps it scrambled for at most a day.
 - **Only if you press "Send diagnostics" or Gregg asks for them:** Zero Farm's own log files (what
-  it did and when), with your Windows account name removed.
+  it did and when), with your account name removed.
 
 **Never collected:** your files, documents, photos, browsing, passwords, keystrokes, screen,
 microphone or camera; or the names of programs, windows or games you use. Zero Farm only asks
-Windows yes/no questions such as "is something fullscreen?" and "is another program using the
+the system yes/no questions such as "is something fullscreen?" and "is another program using the
 graphics card?". It reads and writes only its own folder.
 
 **You're in control:** pause or quit from the tray icon; uninstalling removes everything from your

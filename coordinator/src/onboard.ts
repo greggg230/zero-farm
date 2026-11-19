@@ -150,15 +150,43 @@ export async function home(c: Ctx): Promise<Response> {
   } else {
     button = `<span class="button off">No download yet</span><p class="small">The first release isn't out yet. Check back soon.</p>`;
   }
+  let macInstall = "";
   if (mac) {
     const test = mac.channel === "stable" ? "" : ` <span class="tag">test build</span>`;
+    const cmd = `curl -fsSL ${c.url.origin}/install-macos.sh | sh -s -- --invite CODE`;
+    button = (inst ? `<h3>Windows</h3>` : "") + button;
     button +=
-      `<p class="small">On a Mac with Apple silicon (macOS 14 or newer), Zero Farm ${esc(mac.version)}${test}: in Terminal, run<br>` +
-      `<code>curl -fsSL ${esc(c.url.origin)}/install-macos.sh | sh -s -- --invite CODE</code></p>`;
+      `<h3 class="mac">Mac</h3>` +
+      `<p class="small">Apple silicon (M1 or newer), macOS 14 or newer &middot; Zero Farm ${esc(mac.version)}${test}. ` +
+      `Open Terminal and paste this, with your invite code in place of CODE:</p>` +
+      // the command shown in three unbreakable pieces (a browser breaks lines after any hyphen: "sh -" / "s --"),
+      // only the URL may break on a narrow phone; Copy copies the command exactly
+      `<div class="cmd"><code><span class="nw">curl -fsSL</span> <span class="url">${esc(c.url.origin)}/install-macos.sh</span> ` +
+      `<span class="nw">| sh -s -- --invite CODE</span></code>` +
+      `<button class="copy" type="button" data-copy="${esc(cmd)}">Copy</button></div>`;
+    macInstall = MAC_INSTALL;
   }
-  const page = HOME.replace("{{button}}", button).replaceAll("{{source}}", sourceUrl(c.env));
+  const page = HOME.replace("{{button}}", button).replace("{{mac_install}}", macInstall).replaceAll("{{source}}", sourceUrl(c.env));
   return new Response(page, { headers: { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" } });
 }
+
+// The "Installing" steps for a Mac (only once there is a macOS release). Its controls are Terminal commands
+// (PROTOCOL 11.5: no menu-bar icon yet).
+const MAC_INSTALL = `
+<h3>On a Mac</h3>
+<ol>
+  <li>Open Terminal (Applications &rsaquo; Utilities &rsaquo; Terminal, or search "Terminal" in Spotlight).</li>
+  <li>Paste the command from the top of this page with your invite code in place of CODE, and press Return.</li>
+  <li>Enter a name for your Mac when it asks. That's all: it runs in the background and starts at login from now on.</li>
+</ol>
+<p>There's no menu-bar icon yet; its controls are Terminal commands:</p>
+<pre class="cmds"><code>ZF="$HOME/Library/Application Support/ZeroFarm/ZeroFarm"
+"$ZF" status               # what it's doing right now
+"$ZF" pause 60             # pause for an hour ("$ZF" resume to undo)
+"$ZF" quit                 # stop until you next log in
+"$ZF" set keep_awake off   # let the Mac sleep even while it's working
+"$ZF" uninstall            # remove everything</code></pre>
+`;
 
 const HOME = `<!doctype html>
 <html lang="en">
@@ -166,7 +194,7 @@ const HOME = `<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Zero Farm</title>
-<meta name="description" content="Lend your PC's idle time to Gregg's game-playing AIs.">
+<meta name="description" content="Lend your computer's idle time to Gregg's game-playing AIs.">
 <style>
   :root { --bg: #fafaf7; --fg: #1d1d1b; --muted: #5d5d58; --card: #ffffff; --line: #e3e2dc; --accent: #2e7d32; --accent-fg: #fff; --tag: #fff3d6; --tag-fg: #6b4a00; }
   @media (prefers-color-scheme: dark) {
@@ -187,6 +215,16 @@ const HOME = `<!doctype html>
   .small { font-size: 14px; color: var(--muted); margin: 10px 0 0; }
   code { font-size: 14px; overflow-wrap: anywhere; }
   .invite { margin: 16px 0 0; font-weight: 600; }
+  h3 { font-size: 16px; margin: 0 0 10px; }
+  h3.mac { margin-top: 22px; padding-top: 18px; border-top: 1px solid var(--line); }
+  .get h3 { color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: 0.04em; font-size: 13px; }
+  main > h3 { margin-top: 18px; }
+  .cmd { display: flex; align-items: flex-start; gap: 10px; margin: 10px 0 0; background: var(--bg); border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; }
+  .cmd code { flex: 1; min-width: 0; font-size: 14px; overflow-wrap: normal; word-break: normal; }
+  .cmd .nw { white-space: nowrap; }
+  .cmd .url { overflow-wrap: anywhere; }
+  .copy { flex: none; font: inherit; font-size: 14px; font-weight: 600; color: var(--accent); background: none; border: 1px solid var(--line); border-radius: 8px; padding: 4px 10px; cursor: pointer; }
+  pre.cmds { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; overflow-x: auto; font-size: 13px; line-height: 1.5; margin: 8px 0 0; }
   .tag { background: var(--tag); color: var(--tag-fg); border-radius: 6px; padding: 1px 7px; font-weight: 600; }
   ul, ol { padding-left: 22px; margin: 0; }
   li { margin: 6px 0; }
@@ -203,7 +241,7 @@ const HOME = `<!doctype html>
   </svg>
   <h1>Zero Farm</h1>
 </header>
-<p class="lede">Lend your PC's idle time to Gregg's game-playing AIs.</p>
+<p class="lede">Lend your computer's idle time to Gregg's game-playing AIs.</p>
 
 <section class="get">
   {{button}}
@@ -211,34 +249,37 @@ const HOME = `<!doctype html>
 </section>
 
 <h2>What it is</h2>
-<p>Zero Farm is a small Windows app. While you're away from your PC, it plays practice games for
+<p>Zero Farm is a small app for Windows PCs and Macs. While you're away from your computer, it plays practice games for
 AlphaZero-style AIs that Gregg trains (MTG Zero and friends) and sends the results back. Those
 games are what the AIs learn from, so every idle hour helps.</p>
 
-<h2>What it does to your PC</h2>
+<h2>What it does to your computer</h2>
 <ul>
   <li><b>Only works when you're away</b>: after 5 minutes without mouse or keyboard input. Never
-    during fullscreen games or presentations, on battery, or when memory is low.</li>
+    on battery or when memory is low, and on Windows never during fullscreen games or presentations.</li>
   <li><b>Stops when you come back</b>, within 2 seconds of touching the mouse or keyboard.</li>
   <li>Runs at the lowest priority, so anything you run comes first.</li>
-  <li><b>No admin rights.</b> It installs into your own user account; Windows won't ask for
-    permission.</li>
+  <li><b>No admin rights.</b> It installs into your own user account; your computer won't ask for an
+    administrator password.</li>
   <li>Uses at most 3 GB of disk and never looks at your files. What it sends is listed
     below.</li>
-  <li>Updates itself quietly. Pause it or quit it any time from its round "Z" icon next to the clock.</li>
-  <li><b>To remove it</b>: Settings &rsaquo; Apps &rsaquo; Installed apps (Apps &amp; features on
-    Windows 10) &rsaquo; Zero Farm &rsaquo; Uninstall. That removes everything.</li>
+  <li>Updates itself quietly. Pause it or quit it any time: on Windows from its round "Z" icon next to
+    the clock, on a Mac with a Terminal command (see Installing).</li>
+  <li>On a Mac it keeps the computer from going to sleep while it's working on power (the screen still
+    turns off). One command turns that off.</li>
+  <li><b>To remove it</b>: on Windows, Settings &rsaquo; Apps &rsaquo; Installed apps (Apps &amp; features on
+    Windows 10) &rsaquo; Zero Farm &rsaquo; Uninstall; on a Mac, the uninstall command. That removes everything.</li>
 </ul>
 
 <h2>What Zero Farm collects</h2>
 <p>Sent to the farm (farm.greggg230.com, run by Gregg on Cloudflare; only Gregg can see it):</p>
 <ul>
-  <li><b>About your PC:</b> Windows version, processor model and core count, memory, free disk
-    space, graphics card model, memory and driver version, the name you gave your PC when you
-    joined, and a random ID.</li>
+  <li><b>About your computer:</b> operating system version, processor model and core count, memory, free
+    disk space, on Windows the graphics card model, memory and driver version, the name you gave your
+    computer when you joined, and a random ID.</li>
   <li><b>How it's going:</b> how many games or tests it ran and how long they took, how busy the
     processor and graphics card were, memory used, graphics card temperature, how often it paused
-    because you came back (and how fast), and how many hours a day your PC is idle or on.</li>
+    because you came back (and how fast), and how many hours a day your computer is idle or on.</li>
   <li><b>Crash reports:</b> if Zero Farm itself crashes, its error message and where in its own
     code it happened.</li>
   <li><b>Results</b> of the games and tests it ran.</li>
@@ -246,30 +287,37 @@ games are what the AIs learn from, so every idle hour helps.</p>
     uses it only to stop people guessing invite codes, and keeps it scrambled for at most a
     day.</li>
   <li><b>Only if you press "Send diagnostics" or Gregg asks for them:</b> Zero Farm's own log
-    files (what it did and when), with your Windows account name removed.</li>
+    files (what it did and when), with your account name removed.</li>
 </ul>
 <p><b>Never collected:</b> your files, documents, photos, browsing, passwords, keystrokes, screen,
 microphone or camera; or the names of programs, windows or games you use. Zero Farm only asks
-Windows yes/no questions such as "is something fullscreen?" and "is another program using the
+the system yes/no questions such as "is something fullscreen?" and "is another program using the
 graphics card?". It reads and writes only its own folder.</p>
-<p><b>You're in control:</b> pause or quit from the tray icon; uninstalling removes everything from
-your PC; ask Gregg to delete your PC's data from the farm. The source code is public:
+<p><b>You're in control:</b> pause or quit from the tray icon (Windows) or Terminal (Mac); uninstalling
+removes everything from your computer; ask Gregg to delete your computer's data from the farm. The source code is public:
 <a href="{{source}}">{{source}}</a></p>
 
 <h2>Installing</h2>
+<h3>On Windows</h3>
 <ol>
   <li>Run ZeroFarmSetup.exe. Windows may say "Windows protected your PC" because the installer
     isn't code-signed yet: click <b>More info</b>, then <b>Run anyway</b>.</li>
   <li>Enter your invite code and a name for your PC.</li>
   <li>The "Z" icon appears near the clock. That's all: it starts with Windows from now on.</li>
 </ol>
+{{mac_install}}
 
 <h2>Open source</h2>
-<p>Everything this app does on your PC is public: <a href="{{source}}">Source code and all releases on
+<p>Everything this app does on your computer is public: <a href="{{source}}">Source code and all releases on
 GitHub</a>. Each release lists how to check that your download is the signed original.</p>
 
 <footer>Zero Farm is a hobby project between friends. Questions? Ask Gregg.</footer>
 </main>
+<script>
+document.querySelectorAll("button.copy").forEach((b) => b.addEventListener("click", () => {
+  navigator.clipboard.writeText(b.dataset.copy).then(() => { b.textContent = "Copied"; setTimeout(() => (b.textContent = "Copy"), 1500); });
+}));
+</script>
 </body>
 </html>
 `;

@@ -586,7 +586,8 @@ describe("downloads (11.2)", () => {
     await release("0.3.0", "0.3.0", { platform: MAC, github: true });
     let html = (await get("/")).body as string;
     expect(html).toContain("No Windows download yet");
-    expect(html).toContain("<code>curl -fsSL https://farm.test/install-macos.sh | sh -s -- --invite CODE</code>");
+    expect(html).toContain(`data-copy="curl -fsSL https://farm.test/install-macos.sh | sh -s -- --invite CODE"`);
+    expect(html).toContain(`<span class="url">https://farm.test/install-macos.sh</span>`);
     expect(html).toContain("Zero Farm 0.3.0");
     await release("0.2.14", "0.2.5", { github: true });
     html = (await get("/")).body as string;
