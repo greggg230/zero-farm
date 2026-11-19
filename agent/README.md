@@ -88,6 +88,7 @@ ones (`install_macos`, the footprint / signals / token / CLI unit tests) come in
 | `agent/tests/lifecycle` | 38 | whole leases with the real fakeworker and the mock: download + verify, run, yield/suspend/resume, give-back after slack, upload retries after injected 503s, restart with pending results, orphaned leases, cancel, crash, hang, fatal error, slow yield, no hello, fuzz failures + summary, checkpoint switch, expiry, coordinator give-back, tampered / unknown-key / bad-signature builds, disk cap, profile resend, revoked token (only the coordinator's own `revoked`), an unknown token kept (tray "can't sign in", one try then a wait), a WAF's 403/401 HTML on lease requests, uploads and beats retried as network errors, quit event, launcher events, rev 2 (stale chunks, `done` missing, `upload_diag`, repeated checkpoints, duplicate ids, `x-farm-agent`); rev 3: starvation past slack gives back, brief starvation counted and kept, pause + starvation add up, availability recorded, the worker job's UI restrictions; rev 17: a build of another platform refused before anything but its manifest is downloaded (`refused: "platform"`, one `definition` report, the start-failure wait) |
 | `agent/tests/definitions` | 5 | signed definitions (PROTOCOL 7): the job line is the signed template + per-lease fields + the agent's own fields only (a coordinator's `prefix`, `models`, `out_dir`, `runtime_dir`, `threads`, settings dropped or overwritten), the definition remembered; an eval definition's seats and networks (the coordinator's seats ignored); a mid-lease network the definition doesn't name never fetched; refusals (`done` with `refused`, a `definition` report once per reason, a wait): signed with the release key, tampered bytes, an older version, another run's definition, expired, a build or runtime it doesn't name, a checkpoint hash, a job kind it has no template for, per-lease fields out of range; a legacy lease's allowlist (the review's UNC `models` and `prefix` never reach the worker; a path or a kind mismatch refuses it); a declared checkpoint size over the disk cap never downloaded |
 | `agent/tests/rolling` | 13 | rolling self-play leases (rev 15, PROTOCOL 10) with the fakeworker's rolling mode: `features: ["rolling"]` in lease requests; the job line's `rolling`, `flush_s`, `conc` / `groups` (the run's number, "auto" on the CPU) and released `games`; an extension of 2 x `conc` per `low` until the block is used up (`finish`), every id credited once, Stats `inflight` / `released`, beats with `gen`; `wait_s` honoured; the coordinator's `finish` (unfinished = released ids not played); a new generation with a verified definition switched to in place (`checkpoint` with `sha256`, self-tested, fetched once, the version remembered, chunks with the new `x-gen`); a changed template and a definition that fails a check finishing the lease (the latter reported once); a worker without the feature running it as a classic lease (no `extend`); a ready agent update finishing it, then exit 75; a 410 on an extension stopping it like a lost lease; classic leases unchanged; memory (0.2.14, the fakeworker committing real memory against the job's limit): a worker that runs into the limit with a fatal "bad allocation" or a silent abort started again with fewer games (ids after the released ones, its own `out_dir`, the lost ids unfinished, every id credited once, one crash report), the measured cost remembered and capping the run's next lease; a worker past 92 % finishing its games and the lease going on with fewer from the first id it never started, nothing lost, no crash report |
+| `agent/tests/gpu` | 7 (Windows) | agent 0.3.4, rolling GPU leases (PROTOCOL 10.6, 13, 13.5) with a CUDA fakeworker: a crew at the bench target (3 x 384 on a 4070 Ti, search threads shared, no `infer_*`, each worker a third of the memory limit, no hint), the games in flight raised within the lease once the memory measured fits (128-ish -> 1,024), every member yielding its video memory and resuming, a member's crash, the video memory plan (a small GPU: one worker; another program filling the GPU: one gives way, none joins until it fits), a worker out of video memory restarted with smaller batches (learned per row, the memory per game untouched), the tuner choosing the worker count (reported) |
 | `agent/tests/eval` | 3 | eval leases (PROTOCOL 5.2) with the fakeworker's eval mode: two networks and their references downloaded, verified and cached; the job line's `models` (absolute paths, hashes, `model` null); every game uploaded with `x-ids` and no `x-gen`, files that split a pair, seat order per game; per-gen `selftest` in Stats; cached checkpoints in the next lease request; a tampered checkpoint refused before any worker starts, then a wait (no lease storm); a network failing its self-test reported once, with every gen's result |
 | `agent/tests/blocked` | 5 | a worker Windows refuses to start (scripted os error 4551): one `blocked` report with `os_error` and the build, the lease given back, no lease storm (one lease request while the 15 min wait runs), the tray status and balloon, the wait kept across a restart; shortened waits growing ×4 with the same build reported once; an older coordinator gets it as a `crash`; any other start failure: a `crash` report and a 1 min wait; a worker that starts ends the wait |
 | `agent/tests/update` | 6 | self-update in process: download + verify + `state\pending` + exit 75; `{"update"}` answer; tampered update refused; rolled-back version not retried; a required update that can't happen doesn't spin; older/equal ignored |
@@ -214,9 +215,19 @@ the tuning half of `lease.rs` measure the CPU layout of rolling self-play jobs o
   length of the old layout's games, overlapped with real work), so 6-10 trials take a few hours of idle time on a
   Windows CPU PC and longer on a Mac with 2,304 games in flight; discarded trials (the owner came back) add to it. The
   result is reused for every lease of the key.
+- **GPU jobs** (agent 0.3.4, PROTOCOL 13.1): a rolling GPU job always has a layout (fixed with `autotune` off) -
+  workers 1-3 (at most one per physical core, within the memory and video memory plans), search threads shared (the
+  owner's `cpu_threads`, else 1.5 per physical core: `rolling::GPU_THREADS_PER_CORE`), one or two groups a worker, the
+  job's games in flight from half the bench target (`rolling::gpu_target`: two full batches of `gpu_batch`) to 1.5 x it;
+  inference threads are the worker's own (no `infer_*` in the job line). `tune::Space::new_gpu` / `gpu_start` (NVIDIA:
+  the most workers that hold the target - 3 x 384 / 2 x 512 for 1,024 -, else 1), no coordinator hint, the key's
+  hardware with the GPU, driver and provider (`tune::gpu_fingerprint`). Trials, handoffs and the cache as for the CPU.
 - **fakeworker** `fake.rate` (`{"leaves_s", "best": {threads, infer_workers, infer_threads, batch, conc}, "penalty",
   "decay_p", "crew"}`) plays leaves/s by layout and keeps `conc` games in flight, for the integration tests; workers of
-  one lease share the machine (`crew`: the crew's total by its size, beat files in the lease's `.crew/`).
+  one lease share the machine (`crew`: the crew's total by its size, beat files in the lease's `.crew/`, rewritten with
+  changing content - 0.3.4: on Windows an empty rewrite kept the old modification time and every worker counted a crew of
+  one). A GPU job's fake: `provider` cuda, `vram_base_mb` / `vram_per_row_mb` (its `status` `vram_mb`), `vram_oom_rows`
+  (fails at the start like ONNX Runtime's CUDA allocator); it logs `fakeworker: pid P yielded` / `resumed`.
   `mem_base_mb` / `mem_per_game_mb` / `mem_ramp_ms` commit a worker's memory as a real one grows, each change logged
   (`fakeworker: pid P holds N MB`, `... exits`).
 
@@ -241,13 +252,21 @@ the members beside the main worker.
 - **Results** of every worker are queued under the lease (one results directory per worker, `out-w<n>`); `done`'s
   unfinished ids are worked out from the credited ones.
 - **Generations, pauses, ending.** `checkpoint` goes to every member with its job (a finishing one keeps its network);
-  a pause yields the main worker and suspends every other (CPU jobs only: no VRAM to free); `finish`, `quit` and kills
-  reach all; the lease closes once every worker ended.
+  a pause yields the main worker and suspends every other (a CPU job: no VRAM to free); a GPU job's (0.3.4) members are
+  yielded first (`Mate::yield_at` / `yielded`; suspended at `yielded`, killed without it in 2 s, `resume` after), and every
+  worker's pid is the lease's own for the GPU busy rule (`Engine::decide(&pids)`); `finish`, `quit` and kills reach all;
+  the lease closes once every worker ended.
 - **Memory.** Each worker gets its part of the job's limit (job object on Windows, the footprint cap on macOS:
   limit / workers); a member at 92 % of its part finishes its games (its unstarted ids become spare) and the next
   members run fewer games (`restart_games`, counted as a restart); the crew's sum at 92 % of the job's limit makes the
   biggest give way the same way; the most any worker committed per game is remembered (`Learned`). The tuner's worker
-  count stays within what the memory plan holds with each worker's base.
+  count stays within what the memory plan holds with each worker's base. A GPU job's video memory (0.3.4, `Vram` in
+  `lease.rs`, PROTOCOL 10.6): budget 85 % of the adapter less other programs' use (`signals::GpuMemory` from the PDH
+  `GPU Adapter Memory` / `GPU Process Memory` counters, `Win32Signals::gpu_memory`; else 1 GB), 1 GB + 2 MB per batch row a
+  worker until measured (`Learned::vram_plan`, key `<run>/<build>/vram`), readings once a second (the counters or the
+  worker's `vram_mb`), `room_for` / `restart_room` check it, `vram_check` gives way at 95 % of the adapter, a worker out
+  of video memory (`rolling::gpu_oom`, or an allocation failure far from its memory limit) is restarted with smaller
+  batches (`vram_oom_restart`). `farm-agent dry-run --pids A,B` logs the counters.
 - **Failures.** A member that exits without `end` or with a fatal error loses its games in flight (they go back with the
   lease) and is reported once per lease; a new one joins while restarts are left (4 per lease, shared with memory
   restarts), then the crew runs smaller. The main worker failing while members play is replaced the same way (a new
@@ -568,8 +587,9 @@ Agent exit codes: 0 quit, 75 switch to `state\pending`, 76 hand over to the new 
   worker would need the `packageQuery` capability for Windows ML's provider catalog.
 - Authenticode signing (planned before more friends).
 - macOS: a menu-bar icon, a notarized `.pkg` / `.app` (Developer ID), fullscreen detection, GPU work (Core ML).
-- Layout tuning (rev 19) covers rolling CPU self-play only: eval, fuzz, classic and GPU jobs keep their fixed rules;
-  `diag` jobs are passed to the worker as they are. Several workers per lease (13.5) likewise: CPU rolling self-play only.
+- Layout tuning (rev 19) covers rolling self-play only (CPU; GPU from 0.3.4): eval, fuzz and classic jobs keep their
+  fixed rules; `diag` jobs are passed to the worker as they are. Several workers per lease (13.5) likewise. A GPU
+  worker's sessions per process (`infer_workers` > 1 on CUDA) are not tried.
 - A crew member's closed range ends in a finish beside its successor (13.5): a worker op that hands a running worker a
   new range would let every member run for the whole lease (a worker and aw/1 change).
 

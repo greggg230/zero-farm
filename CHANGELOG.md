@@ -4,6 +4,27 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's: `agent-macos-v<version>`).
 
+## Unreleased (0.3.4)
+
+- **Graphics cards are used properly for long jobs.** On a computer that plays the farm's long self-play jobs on its
+  graphics card, Zero Farm 0.3.3 kept far too few games going at once (128 on an RTX 4070 Ti, with the card only a third
+  busy), because it planned for much more memory per game than the job program really needs. Zero Farm now aims for two
+  full batches of games for the card (about 1,000 on a 4070 Ti), learns the memory each game really takes during the job
+  and plays more games at once as soon as it fits, without waiting for the next job.
+- **Several job programs share the graphics card.** One job program can only hand the card one batch at a time, so on
+  an NVIDIA card Zero Farm now starts two or three job programs side by side where the card's memory and the computer's
+  memory allow (three of about 380 games each on a 4070 Ti: almost three times what 0.3.3 played), splitting the
+  processor threads between them. They all step aside together - and give the card's memory back - when you use the
+  graphics card for something else, and if one of them crashes the others carry on.
+- **The card's memory is planned and watched.** Zero Farm plans how much of the graphics card's memory each job program
+  may use, measures what it really uses, and keeps everything within what the card has: when another program fills the
+  card's memory, one job program steps aside, and one that runs out of card memory starts again with smaller batches
+  instead of failing.
+- **The best setup is measured on your computer.** Finding the fastest way to use the processor now also covers the
+  graphics card: how many job programs, how many games each and in how many batches, how many processor threads - tried
+  only while you're away from the computer, it's plugged in and nothing else keeps it busy, kept only when clearly
+  faster, remembered per card and driver, and shared with the farm.
+
 ## Unreleased (0.3.3)
 
 - **Finding the fastest layout no longer goes round in circles.** When a long job's memory plan held fewer games than a

@@ -946,7 +946,8 @@ released) whenever the GPU rules block GPU work, and gets below-normal priority 
 
 **GPU busy signal:** vendor-neutral, from the Windows PDH "GPU Engine" counters (`\GPU
 Engine(*)\Utilization Percentage`, per process: what Task Manager shows): per engine the sum over every
-process except the agent and its worker, per adapter its busiest engine; the gate is the busiest
+process except the agent and its workers (agents from 0.3.4: every worker of a lease's crew, 13.5 - before, only the
+main one), per adapter its busiest engine; the gate is the busiest
 adapter (more than 10 % for 30 s blocks GPU work; 30 s quiet clears it). It replaces NVML as the gate for
 GPU work; NVML only gives the NVIDIA driver version and a cross-check of the adapter count. Temperature:
 `D3DKMTQueryAdapterInfo(KMTQAITYPE_ADAPTERPERFDATA)` per adapter LUID (DESIGN 8.5, decided); a GPU whose
@@ -1264,15 +1265,22 @@ A rolling lease is a self-play lease (section 3) plus
 
 - Sends `"features": ["rolling"]` in `/v1/lease`.
 - **Games in flight.** `conc` of the job line = the lease's `inflight` for the job's provider (a GPU winner: `gpu`,
-  else `cpu`). `"auto"`: CPU: 32 in flight in 4 groups; GPU: from the bench of the job's own network (9.6), the
-  in-flight count among 64, 128, 256 and 512 after which doubling gains less than 15% rows/s (each rated at its batch:
-  1 group from 256 in flight, else 2, batches of half of it), in those groups; both capped so that the games in flight
+  else `cpu`). `"auto"`: CPU: 32 in flight in 4 groups; GPU (agents from 0.3.4): from the bench of the job's own network
+  (9.6) its **full batch** - among 32, 64, 128, 256, 512 and 1,024 rows the batch after which doubling gains less than 15
+  % rows/s - and **two full batches** in flight (every worker's games of the job: while one batch is on the GPU the next
+  one fills), in groups of at most that batch (1 or 2; 0.2.13-0.3.3: the in-flight count among 64, 128, 256 and 512 after
+  which doubling gained less than 15 %, each rated at half of it below 256 - a 4070 Ti PC never got past 512, and its
+  memory plan held it to 128); a GPU job's layout - its workers, their games in flight and groups - is then section 13's
+  from that target (13.1); both capped so that the games in flight
   fit the worker's memory limit (`caps.ram_mb`, the job object's limit): planned to commit at most 85% of it at a base
   plus a cost per game in flight - 1,800 MB + 45 MB on a GPU, 600 MB + 45 MB on the CPU (macOS: 11.5), or this PC's
   measured cost for the run when it is higher (**Memory**, below) - ((0.85 x `ram_mb` - base) / per game, rounded
   down to a multiple of 32 when at least 32; agent constants, `rolling.rs`, from the soak of 2026-11-17: pb3's network at 224 in flight
   with no limit levelled off at about 11.4 GB, 1.75 GB + 43 MB per game; a 4070 Ti PC with a 10,735 MB limit gets 160
-  on the GPU, where 0.2.13's 1 GB + 40 MB per game gave 224 and every lease ran into the limit after 21-25 minutes). A number is taken as it is (a CPU job in the template's `groups`, a GPU job in at most 2) unless this
+  on the GPU, where 0.2.13's 1 GB + 40 MB per game gave 224 and every lease ran into the limit after 21-25 minutes; the
+  4070 Ti PC of 2026-11-19, legacy-meta3-r1's network on the CUDA build, 5-minute windows: its bench's full batch is 512
+  rows, so 1,024 games in flight - one worker of 128 in flight played 5,030 leaves/s with the GPU 37 % busy, 1,024 10,825,
+  where one worker levels off; crews, 13.5). A number is taken as it is (a CPU job in the template's `groups`, a GPU job in at most 2) unless this
   PC measured the run's cost (then it is capped the same way); anything that is neither a number from 1 to 4,096 nor
   `"auto"` counts as `"auto"`. `games` of the job line = the released ids; the template's `conc` / `groups` are replaced as for a GPU job
   today (section 5 tuning fields). A lease whose `rolling` doesn't fit its job (`block[0]` = `gid_base`, the released
@@ -1327,10 +1335,39 @@ A rolling lease is a self-play lease (section 3) plus
     steady reading at most 80 % of the cost the lease is planned with at once - the tuner's bounds widen (an "auto"
     job's games in flight are worked out again), a layout the old plan held back gets the games in flight the new one
     holds, and the job is handed over to it (13.2, within its rules: one drain at a time, the memory cap; a fixed layout
-    too, 13.1). A lease without a tuned layout leaves it to the next lease.
+    too, 13.1); agents from 0.3.4 also work the worker bounds out again (a crew the old plan held back is possible). A
+    lease without a tuned layout leaves it to the next lease - a GPU job always has one (agents from 0.3.4; fixed with
+    `autotune` off, 13.1), so its games in flight follow the measurement within the lease: the 4070 Ti PC's lease, planned
+    at the default 1,800 MB + 45 MB a game (128 in flight with its limit), measured ~3 MB and kept 128 with agent 0.3.3;
+    from 0.3.4 it is handed over to the target's 1,024 (or a crew, 13.1) once the steady reading says it fits.
   - No wire change: the coordinator sees one lease, its released ids and its extensions as before.
+- **Video memory** (agents from 0.3.4; a GPU job). 0.2.13-0.3.3 planned none: one worker of at most 512 games in flight
+  never came near a GPU's. A GPU job's workers (13.5) are planned within it:
+  - The adapter is the job line's `gpu`; its dedicated memory the profile's `vram_mb` (DXGI); other programs' use of it at
+    the lease's start from Windows' `\GPU Adapter Memory(*)\Dedicated Usage` counters (1,024 MB when Windows has
+    none). The budget: 85 % of the dedicated memory less that. Without the adapter's size: one worker.
+  - A worker is planned at 1,024 MB + 2 MB per row of its biggest batch (games in flight / groups), until this PC
+    measured the run's own with the lease's worker build (`state\rolling_memory.json` key `<run>/<build_id>/vram`, MB per
+    row over the base), calibrated as the memory per game: higher at once, lower from steady readings x 1.2 when the lease
+    ends. (The 4070 Ti PC: the whole GPU, its desktop included, held 709 MB with one worker of 128 in flight, 1,605 MB with
+    512 in one group, 2,557 MB with three workers of 384 - about half the plan.)
+  - Readings, at most once a second: each worker's dedicated memory from Windows' `\GPU Process Memory(*)\Dedicated
+    Usage` (per pid, what Task Manager shows; NVML gives no per-process memory under WDDM), or the worker's `status`
+    `vram_mb` when it reports one - the more of both; none while it is paused.
+  - Every layout holds each worker's base and biggest batch within its share of the budget (13.1), and a new worker
+    starts only when its plan fits beside what the lease's workers hold or will hold (13.2's rule: workers playing new
+    games at the more of their reading and plan, drainers at their reading), within the budget less what other programs
+    took since the start.
+  - When the adapter's dedicated memory in use (every program's) reaches 95 % of it, one worker gives way while no drain
+    is in progress: a crew's biggest finishes its games (no restart counted; none joins until its plan fits again); a lone
+    worker is started again with fewer games in flight (10.6's restart).
+  - A worker that runs out of video memory - its fatal error or stderr says so (ONNX Runtime's "CUDA failure 2: out of
+    memory", `cudaMalloc`, `..._ALLOC_FAILED`, `E_OUTOFMEMORY`, "out of memory" / "failed to allocate" with a GPU word), or
+    it failed to allocate below 90 % of its memory limit - raises the plan per row (to what it held, at least a quarter
+    more, remembered) and is started again with fewer games in flight (its games in flight lost; a restart, at most 4; the
+    memory per game untouched); a crew member's makes the next members smaller. Reported once per lease.
 - Stats add `inflight` (the chosen `conc`; after a restart the current worker's) and `released` (the lease's released
-  ids).
+  ids); a GPU job's (agents from 0.3.4) `vram_mb`: its workers' video memory as read.
 
 ### 10.7 Results, staleness and closing
 
@@ -1621,8 +1658,13 @@ rows) 11,155 (12,560), 4 groups (~675 rows) 8,970 (too few groups starve the sea
 size. An 8-core MacBook Air, a Windows desktop and the next network each have their own sweet spot, so the agent
 measures it on the machine, inside real work, near the platform's known-good start, and remembers it. One process is
 also a ceiling of its own: two worker processes of the same network on the M4 Max played 16.4k (+30 %; 13.5), so the
-number of worker processes serving a lease is part of the layout. Everything below is additive: an agent without the
-feature, a coordinator before rev 19, eval, fuzz, classic and GPU jobs are unchanged.
+number of worker processes serving a lease is part of the layout. A GPU job too (agents from 0.3.4): on the 4070 Ti PC
+of 2026-11-19 (4 cores / 8 threads; legacy-meta3-r1's gen-769 network, the CUDA build, 5-minute windows, leaves/s) the
+job as agent 0.3.3 ran it - one worker of 128 games in flight in 2 groups, 6 search threads - played 5,030 with the GPU
+37 % busy; one worker of 256 in one group 8,379, 512 9,803, 1,024 10,825 (2 groups: 10,697) - where one worker levels off
+(one ONNX Runtime call at a time per process) -, two workers of 512 (3 search threads each) 12,529 with the GPU 73 %
+busy, three of 384 (2 each) 14,154 at 82 %. Everything below is additive: an agent without the feature, a coordinator
+before rev 19, eval, fuzz and classic jobs are unchanged; GPU jobs are tuned from agent 0.3.4 (13.1).
 
 ### 13.1 What is tuned
 
@@ -1651,6 +1693,22 @@ feature, a coordinator before rev 19, eval, fuzz, classic and GPU jobs are uncha
   2 x 921, 0.3.1 2 x 1,152, which the cap doesn't hold at the measured cost, 11.5). Several workers share the job's
   groups (agents from 0.3.3: the group count is kept where memory cuts the games, the batches shrink - 6 groups each
   for two on 16 cores, 116-120 rows at 691-716 games in flight; 0.3.2 kept the rows and ran 4 groups, the slow region).
+- **GPU jobs** (agents from 0.3.4). The GPU job of a rolling self-play lease (a provider other than the CPU won 9.6's
+  choice) has a layout too: `workers`, and each one's `threads` (search), `groups` (1 or 2) and `conc`; its inference
+  threads are the worker's own - the job line carries no `infer_*` (one session, `infer_threads` = `threads`; layouts
+  and reports say `infer_workers` 1, `infer_threads` = `threads`). **Bounds:** workers 1 to 3, at most one per physical
+  core, the owner's `workers`, and as many as the memory plan (10.6, each worker its own base) and the video memory plan
+  (10.6 **Video memory**: each worker's base and biggest batch within its share) hold with the fewest games in flight
+  allowed; search threads: the owner's `cpu_threads`, else 1.5 per physical core (at most the logical processors), shared
+  - each of N workers 1/N of them (the 4-core PC: 6; one worker 6, two 3, three 2, as measured; the trainer's own torch
+  path there found 6 faster than 8); games in flight (all workers'): `"auto"` from half 10.6's target (two full batches)
+  to 1.5 times it, a run's number kept; batches up to 2,048 rows. **Start** (no coordinator hint: a report doesn't say
+  whether its layout ran on the GPU or the CPU of the same build and pack): on an NVIDIA GPU the most workers within the bounds whose start holds the target in all
+  - each its share rounded up to a multiple of 64 (1,024: 1 x 1,024 in two groups of 512, 2 x 512, 3 x 384) in batches of
+  at most the full batch, and its share of the search threads -, else one; on other GPUs one (the tuner tries more). A
+  layout the memory plan held back is lifted to its share of the target, not past it (10.6). `autotune` off: the start
+  for the owner's `workers` (else one), fixed (handed over only when the memory plan holds more, 10.6). A CPU job on a
+  GPU runtime pack takes no hint either (the hint for that build and pack is most likely a GPU layout).
 - **The owner's settings** `autotune` (default on; Windows `machine.json`, macOS `ZeroFarm set autotune on|off`) and
   `workers` (`auto` (default) | 1 | 2 | 3, 13.5). `autotune` off: the fixed rules of before (one worker, `threads` = the
   CPU threads, no `infer_*` fields, 10.6's games in flight) - unless `workers` is 2 or 3: then that many workers with
@@ -1659,7 +1717,8 @@ feature, a coordinator before rev 19, eval, fuzz, classic and GPU jobs are uncha
 
 ### 13.2 Trials
 
-- **When.** A trial starts only while the machine is **idle** (no input for `idle_minutes`, whatever `work_when` says),
+- **When** (CPU and, agents from 0.3.4, GPU jobs alike; GPU work blocked by section 8's rules is a pause). A trial
+  starts only while the machine is **idle** (no input for `idle_minutes`, whatever `work_when` says),
   on **AC power** and not in battery saver / Low Power Mode (whatever `on_battery` says), with **no fullscreen app**
   (whatever `respect_fullscreen` says), nothing else blocking work (paused, outside the hours, low memory) - the
   owner's rule, strict -, and **quiet**: other programs used at most 10 % of the CPUs on average over the last trial
@@ -1711,7 +1770,9 @@ feature, a coordinator before rev 19, eval, fuzz, classic and GPU jobs are uncha
 - **The search.** Coordinates in order: workers (one; the job's games in flight and rows per batch kept, each kind of
   thread rescaled to its budget for the new count, 13.5), batch size (two thirds of the groups / half again as many),
   search threads (an eighth of their cap), threads per inference session (one), sessions (one, their threads kept),
-  games in flight (halved / doubled, rows per batch kept; "auto" only). A thread move past a cap is no candidate (never
+  games in flight (each worker's halved / doubled within its part of the job's bounds, rows per batch kept; "auto" only;
+  0.3.1-0.3.3 clamped a worker's to the job's bounds, so a crew's move went nowhere). A GPU job (agents from 0.3.4) has
+  no inference coordinates; its batch move is one group <-> two. A thread move past a cap is no candidate (never
   cut back into another shape); batch, games-in-flight and worker moves stay within bounds. The incumbent's first unmeasured neighbour is
   tried, the move that made the incumbent first. A layout replaces the incumbent when it is at least 3 % faster - and
   (agents from 0.3.3) was not measured with more than 5 points less load from other programs than the incumbent (the CPU
@@ -1721,8 +1782,9 @@ feature, a coordinator before rev 19, eval, fuzz, classic and GPU jobs are uncha
 
 ### 13.3 Remembered and re-checked
 
-- `state/tuning.json`, per key (worker build, runtime pack, network, hardware - with the owner's `workers` when set -,
-  OS version, tuner version 2): the start,
+- `state/tuning.json`, per key (worker build, runtime pack, network, hardware - with the owner's `workers` when set; a
+  GPU job's (agents from 0.3.4) also the GPU - vendor, name, dedicated memory, driver - and the provider -, OS version,
+  tuner version 2): the start,
   the incumbent, every measurement, the window, the search's state. The network's fingerprint is the first 16 hex of the
   sha256 of the job template's canonical JSON without its per-lease fields, `|`, the model file's size in MiB (a run's
   generations keep it; another architecture or other settings change it); the hardware's is the CPU brand, cores,
@@ -1753,7 +1815,9 @@ feature, a coordinator before rev 19, eval, fuzz, classic and GPU jobs are uncha
   the lease's run first, tuned before searching, then the highest rate; `machines`: those reporting that build,
   runtime and network (revoked machines left out, the asking one included). Unsigned and only a starting point: the
   agent checks every bound, fits it to its own budget and memory (its worker count too), and uses it only to start a
-  key it has no result for. The layout keeps `workers` when the report had it.
+  key it has no result for. The layout keeps `workers` when the report had it. Agents from 0.3.4 report GPU jobs' layouts
+  too (their runtime pack tells them apart; no wire change) and use no hint for a GPU job, nor for a CPU job on a GPU
+  runtime pack.
 - Admin: the stats add per machine `tuning` (its report) and `tuning_t`, and `tuning`: per class, platform, build,
   runtime and network the best layout, its rate and state, the machines and runs. The admin page shows "Tuned layouts
   by hardware class" and "Tuned layouts by machine" (a crew's layout as "2 workers x (...)").
@@ -1771,7 +1835,12 @@ processes don't share a tree arena, an evaluation cache or a runtime; what costs
 the thread total. Memory: ~21 GB for 2,304 games in flight across two processes (~9 MB per game with the process,
 read during a short trial; a real lease grows to ~13 MB a game, 11.5).
 
-**One lease, a crew of workers.** The agent serves one rolling CPU self-play lease (section 10) with `workers` worker
+A GPU job's single worker caps out too (agents from 0.3.4): one ONNX Runtime call at a time per process left the 4070 Ti
+PC's GPU 45-56 % busy at 1,024 games in flight (10,825 leaves/s); two workers of 512, each its own CUDA session on the
+GPU, played 12,529, three of 384 14,154 (GPU 82 % busy, +180 % over agent 0.3.3's 5,030).
+
+**One lease, a crew of workers.** The agent serves one rolling self-play lease (section 10) - a CPU job, and from agent
+0.3.4 a GPU job, each worker with its own session on the job's GPU - with `workers` worker
 processes (1 to 3; 13.1, 13.2), all of the same worker build, network and per-worker layout. No coordinator change and no
 extra lease: the coordinator sees one lease, its released ids, its extensions and its result chunks, as before.
 
@@ -1797,9 +1866,13 @@ extra lease: the coordinator sees one lease, its released ids, its extensions an
   (`seq`), each with its own `x-ids` and `x-gen` (a worker's `gen`, else its own floor).
 - **Generations.** `checkpoint` (10.6) goes to every member that has its job (one without gets the network in its job
   line; a finishing one keeps the network it has).
-- **Pauses.** A pause yields the main worker and suspends every other (SIGSTOP / NtSuspendProcess: CPU jobs only, no VRAM
-  to free); resume resumes all. `finish` (the lease ending, 10.6), `quit` and kills reach every worker; the lease closes
-  (`done`) once all ended.
+- **Pauses.** A pause yields the main worker and suspends every other (SIGSTOP / NtSuspendProcess: CPU jobs, no VRAM
+  to free); resume resumes all. A GPU job's (agents from 0.3.4) every worker with its job - playing its range or finishing
+  its games - is yielded first (`yield`: its session and its video memory released) and suspended once it answers
+  `yielded`; one that doesn't within 2 s is killed (a failure, below); resume: `resume` after the process runs again. A
+  worker finishing its games while the next crew is measured is only suspended (13.2). Every worker of the lease is the
+  lease's own for section 8's GPU busy rule. `finish` (the lease ending, 10.6), `quit` and kills reach every worker; the
+  lease closes (`done`) once all ended.
 - **Memory** (10.6 for the crew). Each worker's own limit (job object on Windows, the physical footprint cap on macOS)
   is the job's limit / `workers`. A member at 92 % of its part finishes its games (its unstarted ids become spare) and the
   crew's next members run fewer games in flight (10.6's restart size; a restart, at most 4 per lease); the main
@@ -1811,7 +1884,9 @@ extra lease: the coordinator sees one lease, its released ids, its extensions an
   games, none start until memory frees. A new member joins, and a restarted main worker starts, only when its plan
   fits 85 % of the job's limit beside what the others hold or will hold (13.2 **Handoff**). The most any worker
   committed per game is what is remembered for the run and worker build, and the lease plans with it from then on
-  (10.6, self-calibrating). Every layout - the
+  (10.6, self-calibrating). A GPU job's video memory likewise (agents from 0.3.4; 10.6 **Video memory**): each worker's
+  base and biggest batch within its share of the budget, a new member only when its plan fits, at 95 % of the adapter in
+  use the biggest worker gives way. Every layout - the
   start, a fixed `workers`, every trial - holds each worker's base and games in flight within 85 % of its part of the
   job's limit (each worker's games in flight bounded by it; the tuner's range of games in flight is kept), and the
   tuner's worker count is at most what that holds with the fewest games in flight allowed.
@@ -1823,7 +1898,7 @@ extra lease: the coordinator sees one lease, its released ids, its extensions an
   lease.
 - **Tuning.** `workers` is the search's first coordinate: 1 to 3, at most one per 4 physical cores and per 16 GB of RAM
   and as many as the memory plan holds (each worker's base and the fewest games in flight allowed), or the owner's
-  `workers`. Per worker each kind of thread (search, inference) has floor(1.5 x the cap / `workers`) for N > 1, the cap
+  `workers` (a GPU job: 13.1 - at most one per physical core, within the video memory plan too). Per worker each kind of thread (search, inference) has floor(1.5 x the cap / `workers`) for N > 1, the cap
   for one (2 x 12 on 16 cores). A trial of a crew starts only with memory for all of it; its workers join one after
   the other; the measurement sums every member's counters through rotations (13.2). A layout handoff (13.2) tells
   every member `finish` with the main worker; the next crew's first worker takes the main worker's unstarted ids and
@@ -1833,6 +1908,18 @@ extra lease: the coordinator sees one lease, its released ids, its extensions an
   every member run as long as the lease (an aw/1 change); not needed for the measured gain.
 
 ## Changes
+- v1 rev 19, agent 0.3.4 (2026-11-19; no wire change): **rolling GPU jobs use the GPU properly**, from a measurement on
+  the owner's 4070 Ti PC (agent 0.3.3's job: one worker of 128 games in flight, 5,030 leaves/s, the GPU 37 % busy; three
+  workers of 384: 14,154, 82 %). GPU "auto" targets two full batches of the bench's batch (10.6: 1,024 games in flight
+  there); a GPU job always has a layout, so its games in flight follow the calibrated memory within the lease (10.6); the
+  video memory is planned per worker and batch row, measured (Windows' GPU memory counters, or the worker's `vram_mb`),
+  calibrated per run and worker build, guarded at 95 % of the adapter, and a worker out of video memory is started again
+  with smaller batches (10.6 **Video memory**); crews serve GPU leases - each worker its own session, the search threads
+  shared (1.5 per core), every worker yielded for a pause and counted as the lease's own by the GPU busy rule (8, 13.5);
+  the tuner covers GPU jobs (workers, games in flight, groups, search threads; an NVIDIA GPU starts with the most
+  workers that hold the target; results per GPU and driver; reported with the worker count; no hints for GPU jobs) (13);
+  a games-in-flight move of a crew moves each worker's within its part of the bounds (13.2); a CPU job's memory
+  calibration works the worker bounds out again (10.6).
 - v1 rev 19, agent 0.3.3 (2026-11-19; no wire change): fixes from a real-farm validation of 0.3.2 (the owner's Mac, a
   crew of two on a test run). Remembered layouts are compared as they run in the lease's bounds (13.3: 0.3.2 handed a
   job over to the same layout 3 times in 7 minutes, measuring nothing, when the memory plan held fewer games than the
