@@ -136,6 +136,7 @@ cargo test --workspace --all-features -- --test-threads=2           # on the Mac
 | launcher version | VERSIONINFO | a 32-byte marker in the binary (`binver.rs`) |
 | UI | tray, invite dialog | headless CLI: `ZeroFarm status \| pause [minutes] \| resume \| set <key> <value> \| quit \| uninstall \| setup` |
 | rolling "auto" (CPU) | 32 in flight in 4 groups | 144 per physical core in groups of 192 (an M4 Max: 2,304 in 12), planned at 1 GB + 4 MB per game of physical footprint |
+| layout tuning (rev 19) | start: cores search + 1 x cores inference (each its cap); batches >= 8 rows | start: cores search + sessions of 3 (5 x 3 on 16 cores); inference <= cores; batches 192-384 rows; sessions always searched |
 
 **Install** (what `curl -fsSL https://farm.greggg230.com/install-macos.sh | sh -s -- --invite CODE` ends in): the
 tarball `ZeroFarm-macos-arm64.tar.gz` holds `ZeroFarm`, `farm-agent`, `manifest.json` and its signature. `./ZeroFarm
@@ -151,7 +152,8 @@ running agent wrote to `state/status.json`: its state, games today, CPU threads 
 settings), `pause [minutes]` (no minutes: until `resume`), `resume`, `set <key> <value>` with the keys `cpu_threads`
 (N or `auto`: one per physical core, 12 performance + 4 efficiency on an M4 Max), `work_when` (`idle` | `active`),
 `idle_minutes`, `on_battery` (also work on battery and in Low Power Mode; default false), `keep_awake` (default true),
-`hours` (`HH:MM-HH:MM` | `off`), `max_ram_mb` (N or `auto`: half the RAM), `disk_cap_mb`. A change goes to the running
+`hours` (`HH:MM-HH:MM` | `off`), `max_ram_mb` (N or `auto`: half the RAM), `disk_cap_mb`, `autotune` (`on` | `off`,
+default on: layout tuning, PROTOCOL 13; `status` shows the job's layout, else the last tuned one). A change goes to the running
 agent as a request file in `state/requests/` plus SIGUSR1 (applied as the tray applies its menu, answered within a
 second); with no agent running the CLI changes `machine.json` itself. An owner's own Mac that should work like the
 SSH self-play does: `set work_when active` and `set on_battery true`.
@@ -170,6 +172,43 @@ the GitHub Release `agent-macos-v<version>` (the tarball, `SHA256SUMS` with its 
 for canary; never marked Latest, which stays the Windows release) and then `POST /v1/admin/agent/release` with
 `"platform": "macos-arm64"` and the tarball's GitHub URL. Worker builds and runtime packs for Macs:
 `farm-release sign ... --platform macos-arm64 --min-agent 0.3.0`.
+
+## Layout tuning (PROTOCOL 13, rev 19, agent 0.3.1)
+
+`tune.rs` (shared by both platforms; the only per-platform part is `defaults`, the starting point and the caps) and
+the tuning half of `lease.rs` measure the CPU layout of rolling self-play jobs on the machine: `threads`,
+`infer_workers`, `infer_threads`, `groups`, `conc` in the job line.
+
+- **Space.** Start: the coordinator's `tuning_hint` for a new key, else the layout of before (search threads = physical
+  cores; Windows one session of as many threads, macOS sessions of 3; 10.6's games in flight and groups). Caps, never
+  searched upward: search threads <= cores and inference threads <= cores (never more than before), or the owner's
+  `cpu_threads` for each; macOS batches 192-384 rows, Windows >= 8; games in flight from half of "auto" to "auto" (a
+  run's number fixed). Coordinates: batch size, search threads, threads per session, sessions (a worker listing
+  `infer_workers`, or any macOS build), games in flight; momentum first; a move must gain 3 %; at most 9 trials; the
+  winner re-measured and kept only at 3 % over the start's mean. Unit tests with a fake rate source: `tune::tests`.
+- **Trials** run inside real rolling leases as **layout handoffs**: the main worker gets `finish`, two equal
+  `games_started` reads give the first id it never started, the next worker takes the released ids from there and
+  starts beside it when memory allows (else after it); the old worker finishes its games as a drainer (at most 2,
+  stopped while the main worker is measured or work is paused). No game is lost and no id played twice
+  (`tests/tuning.rs` checks both). A trial starts only while `policy::tuning_allowed` (idle, AC power, no battery
+  saver / Low Power Mode, no fullscreen app, nothing blocking - whatever `work_when`, `on_battery` and
+  `respect_fullscreen` allow) and the machine is quiet (other programs <= 10 % of the CPUs from the system's CPU
+  times minus the workers', the worker not starved); anything else during a trial discards it, the incumbent comes
+  back by a handoff, and the candidate is retried at a later idle period (3 discards: skipped).
+- **Measurement**: leaves/s of the fresh worker between the same leaves-per-game-in-flight marks for every trial
+  (set by the search's first measurement: refill, 20 s, 75 s), pinging it every 2 s. Why not wall time: a fresh rolling
+  worker's rate falls as its games grow, and at a fixed time more games in flight look better than they are (the
+  module doc has the numbers).
+- **Cache** `state/tuning.json` per (build, runtime, network fingerprint, hardware, OS, tuner version), 16 keys; weekly
+  check of runner-up vs incumbent. Lease requests report it (`tuning`, feature `tuning`); the tray (Windows) and
+  `ZeroFarm status` (macOS) show the job's layout. `autotune` (default on; macOS `ZeroFarm set autotune off`) turns all
+  of it off: the fixed rules of before.
+- **Expect** a search to take a while on a real machine: each trial waits for its predecessor's drainers (about a game
+  length of the old layout's games, overlapped with real work), so 6-10 trials take a few hours of idle time on a
+  Windows CPU PC and longer on a Mac with 2,304 games in flight; discarded trials (the owner came back) add to it. The
+  result is reused for every lease of the key.
+- **fakeworker** `fake.rate` (`{"leaves_s", "best": {threads, infer_workers, infer_threads, batch, conc}, "penalty",
+  "decay_p"}`) plays leaves/s by layout and keeps `conc` games in flight, for the integration tests.
 
 ## Install flow (`farm-agent install`, run by ZeroFarmSetup.exe)
 
@@ -474,7 +513,8 @@ Agent exit codes: 0 quit, 75 switch to `state\pending`, 76 hand over to the new 
   worker would need the `packageQuery` capability for Windows ML's provider catalog.
 - Authenticode signing (planned before more friends).
 - macOS: a menu-bar icon, a notarized `.pkg` / `.app` (Developer ID), fullscreen detection, GPU work (Core ML).
-- Autotuning sweeps and `diag` jobs beyond passing them to the worker.
+- Layout tuning (rev 19) covers rolling CPU self-play only: eval, fuzz, classic and GPU jobs keep their fixed rules;
+  `diag` jobs are passed to the worker as they are.
 
 ### Design note: the worker sandbox (AppContainer)
 

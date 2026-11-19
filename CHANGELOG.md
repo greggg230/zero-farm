@@ -4,6 +4,17 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's: `agent-macos-v<version>`).
 
+## Unreleased (0.3.1)
+
+- **Zero Farm finds the fastest way to use your computer's processor.** For long self-play jobs it now tries a few
+  ways of splitting the work between processor cores (how many work on game search, how many on the network, how many
+  games at once and in how large batches) and keeps the fastest - measured on your computer, while it does real work
+  for the farm (nothing is thrown away). It only tries while you're away from the computer, it's plugged in and nothing
+  else keeps it busy; if you come back mid-try, that try is dropped and it goes back to what worked best. The result is
+  remembered (and checked again weekly) and shared with the farm, so computers like yours start from it. It never uses
+  more processor threads than before. `ZeroFarm status` on a Mac and the tray menu on Windows show the current choice;
+  `ZeroFarm set autotune off` (Mac) turns it off.
+
 ## Unreleased (0.3.0)
 
 - **Zero Farm for Macs with Apple silicon.** The same app now runs on a Mac (macOS 13 or newer): install it with

@@ -7,8 +7,8 @@ A change to anything here is a protocol change: bump the version it belongs to a
 bottom.
 
 Versions: HTTP API `v1` (path prefix), agent↔worker protocol `aw/1`, network files `zero-onnx/1`,
-manifests `manifest/1`. Current revision: v1 rev 18 (section 12, hardware routing; rev 17: section 11, platforms:
-macOS on Apple silicon).
+manifests `manifest/1`. Current revision: v1 rev 19 (section 13, layout tuning; rev 18: section 12, hardware routing;
+rev 17: section 11, platforms: macOS on Apple silicon).
 
 ## 1. Conventions
 
@@ -432,7 +432,7 @@ Agent → worker:
 
 | Line | Meaning |
 |---|---|
-| `{"op": "job", "lease_id", "kind", ...Job, "model": "<local path>" \| null, "reference": "<local path>" \| null, "threads": 6, "out_dir": "out", "runtime_dir": "<local path>" \| null}` | start. Optional worker tuning (set by the agent's autotuning, never by the run): `conc`, `groups`, `infer_threads`, `spinning`; also `gen` and `sha256` of the model (else `gen` comes from the graph's metadata), `prefix` for shard names. Eval (rev 5): `models` instead of `model`/`reference` (both null), section 5.2 |
+| `{"op": "job", "lease_id", "kind", ...Job, "model": "<local path>" \| null, "reference": "<local path>" \| null, "threads": 6, "out_dir": "out", "runtime_dir": "<local path>" \| null}` | start. Optional worker tuning (set by the agent's autotuning, never by the run): `conc`, `groups`, `infer_threads`, `spinning`, rev 19 `infer_workers` (ONNX Runtime sessions, each with `infer_threads` threads; a worker that honours it lists the feature `infer_workers` in `hello`, macOS builds always do; section 13); also `gen` and `sha256` of the model (else `gen` comes from the graph's metadata), `prefix` for shard names. Eval (rev 5): `models` instead of `model`/`reference` (both null), section 5.2 |
 | `{"op": "checkpoint", "gen", "model", "reference", "sha256"?}` | self-play: a phase change, as a remote worker's today: games in flight continue, their searches restart on the new network, and each row records the network that searched it (`net`) |
 | `{"op": "yield"}` | stop starting batches, drop the ONNX session (free VRAM), answer `yielded` |
 | `{"op": "resume"}` | rebuild the session, carry on |
@@ -1562,7 +1562,121 @@ An eval lease takes about as long as its slowest game, so a CPU lease of a few g
 `eval_games_per_thread` x `caps.threads` games, no more than the agent's RAM holds (`(caps.ram_mb - 600) / 45`,
 section 10.6's CPU plan) and within the eval limits (2..1024); a set `games_per_lease` is exact, as before. 0: no floor.
 
+## 13. Layout tuning (rev 19; coordinator migration 0015, agents from 0.3.1)
+
+**Why.** One CPU layout doesn't fit every machine, and a wrong one costs a lot. On the M4 Max (12 performance + 4
+efficiency cores, 64 GB, 2026-11-18, legacy-meta3-r1's gen-398 network, clean 5-minute windows, leaves/s; the owner's
+own 3-process setup of the same network 19,035-20,034, 19,504 in a later control) the native worker as agent 0.3.0
+lays it out (16 search threads, 5 inference sessions x 3 threads, 2,304 games in flight in 12 groups of 192 rows)
+played 10,977-11,086 (12,292 with a fused-attention export), and that was the best measured region: 6 groups (384-450
+rows) 11,155 (12,560), 4 groups (~675 rows) 8,970 (too few groups starve the search), 4 x 4 inference threads 6,596,
+24 + 8 x 2 7,707, 36 + 12 x 3 3,475. More threads in any form hurt; inference cost per row is about flat in the batch
+size. An 8-core MacBook Air, a Windows desktop and the next network each have their own sweet spot, so the agent
+measures it on the machine, inside real work, near the platform's known-good start, and remembers it. Everything below
+is additive: an agent without the feature, a coordinator before rev 19, eval, fuzz, classic and GPU jobs are
+unchanged.
+
+### 13.1 What is tuned
+
+- The CPU job of a rolling self-play lease (section 10) whose worker counts `leaves`, `games` and `games_started` in
+  its `status` (one that doesn't is run as before for the rest of the lease). Its **layout** is five job-line tuning
+  fields (section 5): `threads` (search threads), `infer_workers` (ONNX Runtime sessions, each on an evaluator thread
+  of its own), `infer_threads` (threads per session), `groups` (batches in turn: rows per batch = `conc` / `groups`)
+  and `conc` (games in flight). The agent sends all five; a worker that doesn't know `infer_workers` ignores it (one
+  session of `infer_threads`).
+- **Bounds** (caps, never searched upward: oversubscribing collapses the native worker, above). Search threads and
+  inference threads (`infer_workers` x `infer_threads`) each at most the physical cores - never more threads than the
+  layout of before -, or the owner's `cpu_threads` when set (as the worker's default `infer_threads` = `threads`
+  always did). Sessions vary only for a worker whose `hello` lists the feature `infer_workers`, and on macOS
+  (every macOS worker build has it). Rows per batch: Windows at least 8, macOS 192 to 384 (where the games in flight
+  allow). Games in flight: a run's number (`rolling.inflight.cpu`, 10.1) is kept; under `"auto"` from half 10.6's /
+  11.5's choice up to it (more would only make games longer).
+- **Start.** The coordinator's hint (13.4) for a key not tuned here yet, else the platform's default, which is the
+  layout of before: one search thread per physical core; Windows one inference session with as many threads (the
+  worker's own default), macOS sessions of 3 threads (16 cores: 5 x 3; under 6 cores one session); 10.6's / 11.5's games
+  in flight and groups (Windows 32 in 4 groups, an M4 Max 2,304 in 12 groups of 192).
+- **The owner's setting** `autotune` (default on; Windows `machine.json`, macOS `ZeroFarm set autotune on|off`). Off:
+  the fixed rules of before (`threads` = the CPU threads, no `infer_*` fields, 10.6's games in flight).
+
+### 13.2 Trials
+
+- **When.** A trial starts only while the machine is **idle** (no input for `idle_minutes`, whatever `work_when` says),
+  on **AC power** and not in battery saver / Low Power Mode (whatever `on_battery` says), with **no fullscreen app**
+  (whatever `respect_fullscreen` says), nothing else blocking work (paused, outside the hours, low memory), and
+  **quiet**: other programs use at most 10 % of the CPUs (the system's CPU time minus the agent's workers', sampled
+  every 2 s) and the worker isn't starved. Real work may go on outside that (an owner's `work_when active`,
+  `on_battery`); trials don't, and the job runs the incumbent layout.
+- **Handoff** (how a layout changes inside a lease, no game lost). The main worker gets `finish`. After 1 s the agent
+  pings it until two `status` answers give the same `games_started`: its ids stop at its `gid_base` + that. The next
+  worker's job line takes the rest of the released ids from there (`gid_base`, `games`; `extend`s go to it from then
+  on); with no such answer within 10 s it takes fresh ids after the released ones (the old worker's unstarted ids go
+  back to the pool when the lease closes). It starts beside the old one as soon as the old worker's and the drainers'
+  committed memory plus its own plan (10.6's base + `conc` x the cost per game) fit 85 % of the job's limit, else once
+  the old one ended (as 10.6's restart, without counting toward its 4). The old worker - a **drainer** - finishes its
+  games in flight: its results upload as any, nothing else is asked of it, it is stopped (SIGSTOP / NtSuspendProcess)
+  while the main worker is measured or work is paused, and killed when silent 90 s while running. At most 2 drainers;
+  the lease closes (`done`) once every worker ended, its `unfinished` worked out from the credited ids (as after a
+  restart).
+- **Measurement.** Only of a worker that started fresh with the layout (a lease's first worker is one: when a trial
+  may run then, it is the next layout to measure). Leaves per second from its `status` (pinged every 2 s), over a window
+  at the same **game progress** for every layout: from `p0` to `p1` leaves per game in flight, interpolated between
+  samples. The search's first measurement sets the window: once the games in flight refilled (`games_started` - `games`
+  >= 98 % of `conc`), 20 s more, then 75 s. Why not a fixed time: a fresh worker starts every game at once and slows down
+  as they grow (rolling_measure 2026-11-16, 7700K, 32 in flight: 855 leaves/s in its first 20 s, 520 at 7 min, 420 at
+  18 min); compared at the same leaves per game, 32 vs 16 in flight read 1.32 and 64 vs 32 1.20 (steady state 1.30 and
+  1.23), at 30-120 s of wall time 1.42 and 1.26. A trial that doesn't reach `p1` in 4 x (20 + 75) s (more for more games
+  in flight) counts at its rate so far; one that never refills or measures nothing doesn't count.
+- **Discarded, never paused.** When during a trial the machine stops being idle, goes on battery or into Low Power Mode,
+  shows a fullscreen app, work is paused or blocked, the worker is starved, other programs pass 10 % or the lease ends,
+  the trial is discarded: the worker goes back to the incumbent layout (a handoff), and the trial is tried again at a
+  later idle period (after the incumbent is back and at least 2 x (20 + 75) s later); a layout discarded 3 times is
+  skipped.
+- **The search.** Coordinates in order: batch size (two thirds of the groups / half again as many), search threads (an
+  eighth of their cap), threads per inference session (one), sessions (one, their threads kept), games in flight
+  (halved / doubled, rows per batch kept; "auto" only). A thread move past a cap is no candidate (never cut back into
+  another shape); batch and games-in-flight moves stay within bounds. The incumbent's first unmeasured neighbour is
+  tried, the move that made the incumbent first. A layout replaces the incumbent when it is at least 3 % faster. At most 9 candidate trials; then an incumbent that isn't the start is measured once more, and
+  kept only if its mean is still 3 % over the start's (a lucky single window doesn't stick).
+
+### 13.3 Remembered and re-checked
+
+- `state/tuning.json`, per key (worker build, runtime pack, network, hardware, OS version, tuner version 1): the start,
+  the incumbent, every measurement, the window, the search's state. The network's fingerprint is the first 16 hex of the
+  sha256 of the job template's canonical JSON without its per-lease fields, `|`, the model file's size in MiB (a run's
+  generations keep it; another architecture or other settings change it); the hardware's is the CPU brand, cores,
+  logical processors, performance and efficiency cores and RAM in GiB. At most 16 keys (the least recently changed go).
+- A key not seen is searched; a tuned key's leases start with its incumbent and run no trial, except a weekly check:
+  the runner-up (the best other layout measured) and the incumbent measured afresh, the runner-up taken at 3 % faster.
+- `ZeroFarm status` (macOS) and the tray (Windows) show the job's layout and the search's state.
+
+### 13.4 Reports and hints (wire)
+
+- `POST /v1/lease`: `features` adds `"tuning"`; the optional `tuning` is at most 4 reports, the most recently changed
+  keys with a measured incumbent: `{"run", "build", "runtime": build_id | null, "net": 16 hex, "layout": {"threads":
+  1..512, "infer_workers": 1..64, "infer_threads": 1..512, "groups": 1..4096, "conc": 1..4096}, "leaves_s": 0..1e9,
+  "trials", "state": "tuned" | "searching", "t"}` (`groups` <= `conc`; anything else → 400). The coordinator stores the
+  latest non-empty one per machine (`machines.tuning`, `tuning_t`; migration 0015); absent or empty keeps it.
+- A rolling self-play lease to an agent that lists `"tuning"` carries `tuning_hint` `{"layout", "leaves_s", "machines",
+  "net"}` when a machine of its hardware class (`class`, section 3) and platform reported its worker build and runtime:
+  the lease's run first, tuned before searching, then the highest rate; `machines`: those reporting that build,
+  runtime and network (revoked machines left out, the asking one included). Unsigned and only a starting point: the
+  agent checks every bound, fits it to its own budget and memory, and uses it only to start a key it has no result for.
+- Admin: the stats add per machine `tuning` (its report) and `tuning_t`, and `tuning`: per class, platform, build,
+  runtime and network the best layout, its rate and state, the machines and runs. The admin page shows "Tuned layouts
+  by hardware class" and "Tuned layouts by machine".
+
 ## Changes
+- v1 rev 19 (2026-11-18; coordinator migration 0015, agents from 0.3.1, feature `tuning`): **layout tuning** (section
+  13). The agent measures the CPU layout of its rolling self-play jobs on the machine (search threads, inference
+  sessions x threads, groups, games in flight; near the layout of before, thread counts capped, never searched upward)
+  in trials inside
+  real leases - layout handoffs in which the old worker finishes its games beside the next one -, only while the
+  machine is idle, on AC power, without a fullscreen app and quiet (a trial is discarded, never paused, and the
+  incumbent restored), compares fresh workers at the same game progress, keeps a layout only 3 % faster (and still so
+  when measured again), remembers it per worker build, runtime, network, hardware and OS (`state/tuning.json`) and
+  re-checks it weekly. Job line: `infer_workers` among the tuning fields; worker feature `infer_workers`. Lease
+  requests report the tuned layouts (`tuning`); rolling self-play leases to agents with the feature carry the hardware
+  class's best as `tuning_hint`; stats and the admin page show them per machine and class. Setting `autotune`.
 - v1 rev 18 (2026-11-18; coordinator migration 0014, no agent change): **hardware routing** (section 12). CPU
   self-play of a run with a GPU version goes after fuzz (tier 3); a PC that plays self-play on its GPU takes an eval
   batch after that self-play unless the CPU PCs online couldn't finish it within `eval_horizon_s` (1800 s); an `auto`
