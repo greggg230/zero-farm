@@ -250,3 +250,30 @@ fn autotune_off_keeps_the_fixed_rules() {
     assert!(h.status.lock().unwrap().tuning.is_none());
     h.stop();
 }
+
+#[test]
+fn a_trial_is_discarded_when_work_pauses_and_the_incumbent_comes_back_after() {
+    // the default policy: no work at all while the computer is used
+    let mut h = harness();
+    let mut fk = fake(peaked());
+    fk["game_ms"] = json!(60);
+    h.push(tuning_lease(&h, "l_TP", fk, json!(16), None));
+    h.start();
+    let trials = |h: &H| h.agent_log().lines().filter(|l| l.contains("tuning [l_TP]: handing the job over to") && l.contains("(a measured trial)")).count();
+    assert!(wait(|| trials(&h) >= 1), "{}", tuning_log(&h));
+    let n = job_lines(&h).len();
+    assert!(wait(|| job_lines(&h).len() > n), "the trial's worker started");
+    let trial = layout_of(job_lines(&h).last().unwrap());
+    std::thread::sleep(Duration::from_millis(400));
+    h.user_active(true);
+    assert!(wait(|| h.agent_log().contains("tuning [l_TP]: the trial of")), "{}", tuning_log(&h));
+    let incumbent = layout_json(&entry(&h)["incumbent"]);
+    assert_ne!(trial, incumbent);
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(job_lines(&h).last().map(layout_of), Some(trial), "nothing starts while work is paused");
+    h.user_active(false);
+    assert!(wait(|| job_lines(&h).last().map(layout_of) == Some(incumbent)), "the incumbent comes back once work goes on: {}", tuning_log(&h));
+    h.stop();
+    let done = h.wait_done("l_TP");
+    ids_accounted(&h, "l_TP", &done);
+}

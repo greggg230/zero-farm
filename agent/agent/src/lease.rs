@@ -2440,6 +2440,15 @@ impl Run {
             return;
         }
         if self.tuning.as_ref().is_some_and(|x| x.handoff.is_some()) {
+            // (work paused meanwhile: the handoff waits, its reads start again afterwards)
+            if must_pause || !matches!(self.state, WState::Running) {
+                if let Some(h) = self.tuning.as_mut().and_then(|x| x.handoff.as_mut()) {
+                    h.since = Instant::now();
+                    h.reads.clear();
+                    h.last_ping = None;
+                }
+                return;
+            }
             self.handoff_tick(eng, t, strict);
             return;
         }
