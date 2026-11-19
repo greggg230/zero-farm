@@ -1311,9 +1311,14 @@ A rolling lease is a self-play lease (section 3) plus
     that died). Reported once per lease (`/v1/crash` kind `crash`); the lease is not given back.
   - At most 4 restarts per lease. After that, or when one game in flight already didn't fit, a worker at 92% finishes
     the lease (`finish`) and one that runs into the limit fails the lease as before.
-  - The measured cost per game is remembered per run and CPU / GPU job in `state\rolling_memory.json` (only ever
-    raised): at each restart, and when a rolling lease ends whose worker committed more per game than it was planned
-    with. "auto" and a run's number are planned with it from then on.
+  - The measured cost per game is remembered per run and CPU / GPU job in `state\rolling_memory.json`: raised at once,
+    at each restart and when a rolling lease ends whose worker committed more per game than it was planned with. "auto"
+    and a run's number are planned with it from then on - and (agents from 0.3.3) so is the rest of the lease that
+    measured it: its next workers, a crew's next members (13.5), handoffs (13.2) and the tuner's memory bounds. It comes
+    down only slowly (0.3.3): a lease whose workers ran at least 45 minutes (their steady state) and committed less per
+    game than remembered lowers it by at most an eighth (at least 1 MB), never below what any of them committed per
+    game. A run's games change, and a worker build that needs less memory per game arrives; one lease's dip doesn't
+    undo a measured peak.
   - No wire change: the coordinator sees one lease, its released ids and its extensions as before.
 - Stats add `inflight` (the chosen `conc`; after a restart the current worker's) and `released` (the lease's released
   ids).
@@ -1497,16 +1502,21 @@ Platform names: `windows-x64` and `macos-arm64` (Apple silicon, macOS 13 or newe
   and kills a group a dead agent left behind at its next start (a stopped worker can't see its stdin close). The
   runtime pack is passed as `ZEROFARM_RUNTIME_DIR` and first on `DYLD_LIBRARY_PATH`.
 - **Rolling leases (10.6) on macOS.** "auto" on the CPU is 144 games in flight per physical core (performance and
-  efficiency) in groups of 192 (16 cores: 2,304 in 12 groups); the memory plan's default cost is 1,024 MB + 14 MB per
-  game in flight, in physical footprint (agents from 0.3.2; 0.3.0-0.3.1 planned 4 MB from the SSH self-play of
-  2026-11-18, about 2.7 MB per game with the process, read early). A real rolling lease on the M4 Max (2026-11-19,
+  efficiency) in groups of 192 (16 cores: 2,304 in 12 groups); the memory plan's default cost is 1,024 MB + 18 MB per
+  game in flight, in physical footprint (agents from 0.3.3; 0.3.2 planned 14 MB, 0.3.0-0.3.1 4 MB from the SSH
+  self-play of 2026-11-18, about 2.7 MB per game with the process, read early). A real rolling lease on the M4 Max (2026-11-19,
   legacy-meta3-r1's network, fast export, one worker of 2,304 games in flight, a game lasting about 10 minutes) kept
   growing: 12.8 GB at 3 minutes, 19.0 at 5, 22.2 at 7, 25.2 at 9, 27.0 at 11, 28.1 at 13, 29.1 at 15 (12.2 MB a game
   over the base), still about 0.5 GB a minute and slowing, toward ~31 GB (~13 MB a game) at steady state; the memory
-  check (10.6) restarted it at 1,728 and remembered 13 MB a game for the run. With the default memory cap (half the
-  RAM) the plan holds 1,888 games in flight in one worker on a 64 GB Mac (32,768 MB), 2 x 921 in two (13.5), 896 or
-  2 x 424 on a 32 GB Mac, 416 on a 16 GB Mac - about 80 % of the cap at that steady state. When memory caps "auto",
-  the groups shrink with it (batches of at least 192 rows: 1,888 in 9 groups).
+  check (10.6) restarted it at 1,728 and remembered 13 MB a game for the run. The first crew (13.5, agent 0.3.2, two
+  workers of 882 games in flight planned at 14 MB) went further: the main worker committed 14,487 MB of its 15,746 MB
+  part after ~27 minutes - 16 MB a game over the base, still rising slowly - and hit the 92 % trigger. With the default
+  memory cap (half the RAM) the 0.3.3 plan holds 1,472 games in flight in one worker on a 64 GB Mac (32,768 MB),
+  2 x 716 in two (13.5), 704 or 2 x 329 on a 32 GB Mac with 12 cores, 320 on a 16 GB Mac - about 76 % of the cap at
+  16 MB a game, 85 % at 18. When memory caps "auto", the groups stay and the batches shrink (agents from 0.3.3:
+  the cores' groups, batches of at least 96 rows - 1,472 in 12 groups of 123; 0.3.2 kept batches of 192 rows and so
+  cut the groups, 1,888 in 9): the group count keeps the search threads fed (13), inference costs about the same per
+  row whatever the batch.
 - **When it works.** Input idle time from IOKit (`HIDIdleTime`); `on_battery` from the providing power source and
   `battery_saver` from Low Power Mode (`NSProcessInfo`); `low_memory` when memory pressure is at least "warning"
   (`kern.memorystatus_vm_pressure_level`) or free + inactive memory is below the floor; no fullscreen detection in
@@ -1615,7 +1625,7 @@ feature, a coordinator before rev 19, eval, fuzz, classic and GPU jobs are uncha
   layout of before -, or the owner's `cpu_threads` when set (as the worker's default `infer_threads` = `threads`
   always did); with N > 1 workers each worker gets floor(1.5 x that cap / N) of each (13.5). Sessions vary only for a
   worker whose `hello` lists the feature `infer_workers`, and on macOS (every macOS worker build has it). Rows per
-  batch: Windows at least 8, macOS 192 to 384 (where the games in flight allow). Games in flight (all workers'): a
+  batch: Windows at least 8, macOS 96 to 384 (where the games in flight allow; 192 to 384 in agents 0.3.1-0.3.2). Games in flight (all workers'): a
   run's number (`rolling.inflight.cpu`, 10.1) is kept; under `"auto"` from half 10.6's / 11.5's choice up to it (more
   would only make games longer). Workers: 13.5.
 - **Start.** The coordinator's hint (13.4) for a key not tuned here yet, else the platform's default, which is the
@@ -1624,8 +1634,10 @@ feature, a coordinator before rev 19, eval, fuzz, classic and GPU jobs are uncha
   11.5's games in flight and groups (Windows 32 in 4 groups, an M4 Max 2,304 in 12 groups of 192). A Mac with at least
   12 physical cores and 32 GB starts with two workers of 12 search + 4 x 3 inference threads (16 cores; the budget of
   13.5), 1,152 games in flight in 6 groups of 192 - the M4 Max's measured best -, each within its part of the memory
-  plan (13.5 **Memory**: 921 in 4 groups each on a 64 GB Mac at the default cap, agents from 0.3.2; 0.3.1 started
-  2 x 1,152, which the cap doesn't hold at the measured cost, 11.5).
+  plan (13.5 **Memory**: 716 games in flight each on a 64 GB Mac at the default cap, agents from 0.3.3; 0.3.2 started
+  2 x 921, 0.3.1 2 x 1,152, which the cap doesn't hold at the measured cost, 11.5). Several workers share the job's
+  groups (agents from 0.3.3: the group count is kept where memory cuts the games, the batches shrink - 6 groups each
+  for two on 16 cores, 116-120 rows at 691-716 games in flight; 0.3.2 kept the rows and ran 4 groups, the slow region).
 - **The owner's settings** `autotune` (default on; Windows `machine.json`, macOS `ZeroFarm set autotune on|off`) and
   `workers` (`auto` (default) | 1 | 2 | 3, 13.5). `autotune` off: the fixed rules of before (one worker, `threads` = the
   CPU threads, no `infer_*` fields, 10.6's games in flight) - unless `workers` is 2 or 3: then that many workers with
@@ -1635,20 +1647,32 @@ feature, a coordinator before rev 19, eval, fuzz, classic and GPU jobs are uncha
 
 - **When.** A trial starts only while the machine is **idle** (no input for `idle_minutes`, whatever `work_when` says),
   on **AC power** and not in battery saver / Low Power Mode (whatever `on_battery` says), with **no fullscreen app**
-  (whatever `respect_fullscreen` says), nothing else blocking work (paused, outside the hours, low memory), and
-  **quiet**: other programs use at most 10 % of the CPUs (the system's CPU time minus the agent's workers', sampled
-  every 2 s) and the worker isn't starved. Real work may go on outside that (an owner's `work_when active`,
-  `on_battery`); trials don't, and the job runs the incumbent layout.
+  (whatever `respect_fullscreen` says), nothing else blocking work (paused, outside the hours, low memory) - the
+  owner's rule, strict -, and **quiet**: other programs used at most 10 % of the CPUs on average over the last trial
+  length (`tune_warm` + `tune_window`, 95 s; the system's CPU time minus the agent's workers', sampled every 2 s; agents
+  from 0.3.3 - 0.3.1-0.3.2 judged every sample, and a Mac's bursty background daemons, a sync daemon at ~55 % of a core
+  and syncthing at ~90 %, discarded every trial within seconds) and the worker isn't starved. Real work may go on
+  outside that (an owner's `work_when active`, `on_battery`); trials don't, and the job runs the incumbent layout.
 - **Handoff** (how a layout changes inside a lease, no game lost). The main worker gets `finish`. After 1 s the agent
   pings it until two `status` answers give the same `games_started`: its ids stop at its `gid_base` + that. The next
   worker's job line takes the rest of the released ids from there (`gid_base`, `games`; `extend`s go to it from then
   on); with no such answer within 10 s it takes fresh ids after the released ones (the old worker's unstarted ids go
-  back to the pool when the lease closes). It starts beside the old one as soon as the old worker's and the drainers'
-  committed memory plus its own plan (10.6's base + `conc` x the cost per game) fit 85 % of the job's limit, else once
-  the old one ended (as 10.6's restart, without counting toward its 4). The old worker - a **drainer** - finishes its
+  back to the pool when the lease closes). It starts beside the old one as soon as its plan (10.6's base + `conc` x
+  the cost per game; a measured crew's: every one of its workers') fits 85 % of the job's limit beside what the lease's
+  workers hold or will hold - every worker playing new games at the more of its commit and its plan (one that just
+  started commits little and grows to its plan), every worker finishing its games at its commit (agents from 0.3.3;
+  0.3.1-0.3.2 counted commits only, and a Mac's crew ended up holding 38.9 GB against a 31.7 GB cap) -, else once the
+  old one ended (as 10.6's restart, without counting toward its 4), and then too only when its plan fits beside the
+  workers still finishing their games (else it waits for their drain). The old worker - a **drainer** - finishes its
   games in flight: its results upload as any, nothing else is asked of it, it is stopped (SIGSTOP / NtSuspendProcess)
-  while the main worker is measured or work is paused, and killed when silent 90 s while running. At most 2 drainers (per worker of the crew, 13.5);
-  the lease closes (`done`) once every worker ended, its `unfinished` worked out from the credited ids (as after a
+  while the main worker is measured or work is paused, and killed when silent 90 s while running. **One drain at a
+  time** (agents from 0.3.3; before: 2 drainers per worker of the crew): no handoff starts while any worker of the
+  lease finishes its games (a handoff's, a crew member's at the end of its range or after giving way to memory, a
+  restart's). A handoff never goes to the layout the main worker runs unless to measure it (a measurement needs a
+  fresh worker), and at most 6 handoffs start per hour (a safety net; 0.3.2 handed a job over to the same layout 3 times
+  in 7 minutes). A trial that can't be measured any more when its worker would start (the machine got busy or used):
+  a candidate gives way to the incumbent; the incumbent's own measurement starts unmeasured and counts as discarded.
+  The lease closes (`done`) once every worker ended, its `unfinished` worked out from the credited ids (as after a
   restart).
 - **Measurement.** Only of workers that started fresh with the layout (a lease's first worker is one: when a trial
   may run then, it is the next layout to measure; with several workers their counters are summed - every member of the
@@ -1662,17 +1686,24 @@ feature, a coordinator before rev 19, eval, fuzz, classic and GPU jobs are uncha
   1.23), at 30-120 s of wall time 1.42 and 1.26. A trial that doesn't reach `p1` in 4 x (20 + 75) s (more for more games
   in flight) counts at its rate so far; one that never refills or measures nothing doesn't count.
 - **Discarded, never paused.** When during a trial the machine stops being idle, goes on battery or into Low Power Mode,
-  shows a fullscreen app, work is paused or blocked, the worker is starved, other programs pass 10 % or the lease ends,
-  the trial is discarded: the worker goes back to the incumbent layout (a handoff), and the trial is tried again at a
-  later idle period (after the incumbent is back and at least 2 x (20 + 75) s later); a layout discarded 3 times is
-  skipped.
+  shows a fullscreen app, work is paused or blocked, the worker is starved, other programs' load is sustained (more than
+  25 % of the CPUs on average over the last 30 s, 0.4 x `tune_window`) or the lease ends, the trial is discarded at once;
+  and a trial that measured counts only when other programs used at most 10 % of the CPUs on average over its window
+  and at most 5 points more than on average over the trial length before it (load that came with the trial would bias
+  it; short bursts pass, agents from 0.3.3). A discarded trial: the worker goes back to the incumbent layout (a
+  handoff), and the trial is tried again at a later idle period (after the incumbent is back and at least 2 x (20 + 75)
+  s later); a layout discarded 3 times is skipped. Every measurement records other programs' mean load over it
+  (`state/tuning.json` `measured[].load`, 0.3.3).
 - **The search.** Coordinates in order: workers (one; the job's games in flight and rows per batch kept, each kind of
   thread rescaled to its budget for the new count, 13.5), batch size (two thirds of the groups / half again as many),
   search threads (an eighth of their cap), threads per inference session (one), sessions (one, their threads kept),
   games in flight (halved / doubled, rows per batch kept; "auto" only). A thread move past a cap is no candidate (never
   cut back into another shape); batch, games-in-flight and worker moves stay within bounds. The incumbent's first unmeasured neighbour is
-  tried, the move that made the incumbent first. A layout replaces the incumbent when it is at least 3 % faster. At most 9 candidate trials; then an incumbent that isn't the start is measured once more, and
-  kept only if its mean is still 3 % over the start's (a lucky single window doesn't stick).
+  tried, the move that made the incumbent first. A layout replaces the incumbent when it is at least 3 % faster - and
+  (agents from 0.3.3) was not measured with more than 5 points less load from other programs than the incumbent (the CPU
+  it didn't share is no layout's merit; likewise in the final re-measure and the weekly check). At most 9 candidate
+  trials; then an incumbent that isn't the start is measured once more, and kept only if its mean is still 3 % over the
+  start's (a lucky single window doesn't stick).
 
 ### 13.3 Remembered and re-checked
 
@@ -1684,6 +1715,14 @@ feature, a coordinator before rev 19, eval, fuzz, classic and GPU jobs are uncha
   logical processors, performance and efficiency cores and RAM in GiB. At most 16 keys (the least recently changed go).
 - A key not seen is searched; a tuned key's leases start with its incumbent and run no trial, except a weekly check:
   the runner-up (the best other layout measured) and the incumbent measured afresh, the runner-up taken at 3 % faster.
+- **Compared as they run** (agents from 0.3.3). The remembered layouts - start, incumbent, measurements, discards - are
+  compared as the lease's bounds (13.1: the memory plan, the owner's settings, the worker's features) make them: a
+  layout the memory plan no longer holds is its fitted one, and that one's measurements and discards are its own. The
+  entry keeps the bounds it was last used in (`space`) and its layouts as they were (a lease with more memory runs the
+  bigger one again); reports (13.4) carry the incumbent as it ran. 0.3.1-0.3.2 compared the stored layouts: a Mac's
+  entry kept an incumbent of 2 x 958 games in flight planned at 13 MB a game, the next lease's plan (16 MB) held 2 x
+  778, and the fitted incumbent's measurements and discards were never the incumbent's - it stayed "unmeasured" and
+  the job was handed over to the same layout again and again.
 - `ZeroFarm status` (macOS) and the tray (Windows) show the job's layout (with several workers: "2 workers x (...)" and
   how many run) and the search's state; `ZeroFarm status` also the `workers` setting.
 
@@ -1749,9 +1788,15 @@ extra lease: the coordinator sees one lease, its released ids, its extensions an
   (`done`) once all ended.
 - **Memory** (10.6 for the crew). Each worker's own limit (job object on Windows, the physical footprint cap on macOS)
   is the job's limit / `workers`. A member at 92 % of its part finishes its games (its unstarted ids become spare) and the
-  crew's next members run fewer games in flight (10.6's restart size; a restart, at most 4 per lease); at 92 % of the
-  job's limit in all, with no worker finishing, the biggest gives way the same way; the main worker's own memory is
-  watched as in 10.6. The most any worker committed per game is what is remembered for the run. Every layout - the
+  crew's next members run fewer games in flight (10.6's restart size; a restart, at most 4 per lease); the main
+  worker's own memory is watched as in 10.6. Every worker of the lease counts toward the job's limit - those finishing
+  their games too (agents from 0.3.3; before, only while none finished): at 92 % of it in all, the biggest worker
+  playing new games gives way - the same way when it commits more per game than planned, else it just starts no new
+  game (its unstarted ids spare; the main worker's successor takes the released ids it never started, the same games
+  in flight; no restart counted, nothing shrunk) and the crew refills as the drain makes room; once nothing plays new
+  games, none start until memory frees. A new member joins, and a restarted main worker starts, only when its plan
+  fits 85 % of the job's limit beside what the others hold or will hold (13.2 **Handoff**). The most any worker
+  committed per game is what is remembered for the run, and the lease plans with it from then on (10.6). Every layout - the
   start, a fixed `workers`, every trial - holds each worker's base and games in flight within 85 % of its part of the
   job's limit (each worker's games in flight bounded by it; the tuner's range of games in flight is kept), and the
   tuner's worker count is at most what that holds with the fewest games in flight allowed.
@@ -1773,6 +1818,18 @@ extra lease: the coordinator sees one lease, its released ids, its extensions an
   every member run as long as the lease (an aw/1 change); not needed for the measured gain.
 
 ## Changes
+- v1 rev 19, agent 0.3.3 (2026-11-19; no wire change): fixes from a real-farm validation of 0.3.2 (the owner's Mac, a
+  crew of two on a test run). Remembered layouts are compared as they run in the lease's bounds (13.3: 0.3.2 handed a
+  job over to the same layout 3 times in 7 minutes, measuring nothing, when the memory plan held fewer games than the
+  remembered incumbent); a handoff never goes to the layout the main worker runs except to measure it, a measurement
+  lost before its worker starts counts as discarded, at most 6 handoffs an hour (13.2). The memory plan counts every
+  worker - one that just started at its plan, drainers at their commit -, one drain at a time per lease, restarts and
+  new members wait for room, and the crew's guard acts on the total with the drainers (13.2, 13.5: 0.3.2's crew held
+  38.9 GB against a 31.7 GB cap). macOS keeps the group count where memory cuts the games (batches down to 96 rows;
+  13.1, 11.5) and plans 18 MB per game in flight (11.5); a measured cost per game is planned with for the rest of the
+  lease and comes down slowly from steady-state readings (10.6). Other programs' load is judged as a mean over a trial
+  and before it, sustained load discards at once, each measurement records its load, and a candidate measured on a
+  clearly quieter machine doesn't replace the incumbent (13.2).
 - v1 rev 19, agent 0.3.2 (2026-11-19; no wire change): fixes from the first real crew on a Mac. A worker's `provider`
   `""` (no sessions yet) is not known yet, never a GPU provider: the job is what the agent chose until the worker
   names one (section 8, **Which provider a job uses**; 0.3.1 suspended every crew's main worker on a Mac for good). A

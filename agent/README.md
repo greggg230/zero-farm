@@ -135,8 +135,8 @@ cargo test --workspace --all-features -- --test-threads=2           # on the Mac
 | keep awake | - | an IOKit `PreventUserIdleSystemSleep` assertion while a lease runs on AC power (`keep_awake`, default on) |
 | launcher version | VERSIONINFO | a 32-byte marker in the binary (`binver.rs`) |
 | UI | tray, invite dialog | headless CLI: `ZeroFarm status \| pause [minutes] \| resume \| set <key> <value> \| quit \| uninstall \| setup` |
-| rolling "auto" (CPU) | 32 in flight in 4 groups | 144 per physical core in groups of 192 (an M4 Max: 2,304 in 12), planned at 1 GB + 14 MB per game of physical footprint (0.3.2; a 64 GB Mac's default cap holds 1,888, in 9 groups) |
-| layout tuning (rev 19) | start: one worker, cores search + 1 x cores inference (each its cap); batches >= 8 rows | start: cores search + sessions of 3 (5 x 3 on 16 cores); inference <= cores; batches 192-384 rows; sessions always searched; >= 12 cores and >= 32 GB: two workers of 12 + 4 x 3, each with the games in flight its half of the memory plan holds (a 64 GB Mac: 921 in 4 groups) |
+| rolling "auto" (CPU) | 32 in flight in 4 groups | 144 per physical core in groups of 192 (an M4 Max: 2,304 in 12), planned at 1 GB + 18 MB per game of physical footprint (0.3.3; a 64 GB Mac's default cap holds 1,472 - memory cuts the games, the 12 groups stay, batches down to 96 rows) |
+| layout tuning (rev 19) | start: one worker, cores search + 1 x cores inference (each its cap); batches >= 8 rows | start: cores search + sessions of 3 (5 x 3 on 16 cores); inference <= cores; batches 96-384 rows; sessions always searched; >= 12 cores and >= 32 GB: two workers of 12 + 4 x 3, each with the games in flight its half of the memory plan holds and half the cores' groups (a 64 GB Mac: 716 in 6 groups) |
 
 **Install** (what `curl -fsSL https://farm.greggg230.com/install-macos.sh | sh -s -- --invite CODE` ends in): the
 tarball `ZeroFarm-macos-arm64.tar.gz` holds `ZeroFarm`, `farm-agent`, `manifest.json` and its signature. `./ZeroFarm
@@ -183,19 +183,25 @@ the tuning half of `lease.rs` measure the CPU layout of rolling self-play jobs o
 - **Space.** Start: the coordinator's `tuning_hint` for a new key, else the layout of before (search threads = physical
   cores; Windows one session of as many threads, macOS sessions of 3; 10.6's games in flight and groups). Caps, never
   searched upward: search threads <= cores and inference threads <= cores (never more than before), or the owner's
-  `cpu_threads` for each; macOS batches 192-384 rows, Windows >= 8; games in flight from half of "auto" to "auto" (a
-  run's number fixed). Coordinates: batch size, search threads, threads per session, sessions (a worker listing
+  `cpu_threads` for each; macOS batches 96-384 rows (0.3.3; memory cuts games, not groups), Windows >= 8; games in
+  flight from half of "auto" to "auto" (a run's number fixed). Remembered layouts are compared as they run in the
+  lease's bounds (`Space::fit`; the entry keeps them as `space`, 0.3.3). Coordinates: batch size, search threads, threads per session, sessions (a worker listing
   `infer_workers`, or any macOS build), games in flight; momentum first; a move must gain 3 %; at most 9 trials; the
   winner re-measured and kept only at 3 % over the start's mean. Unit tests with a fake rate source: `tune::tests`.
 - **Trials** run inside real rolling leases as **layout handoffs**: the main worker gets `finish`, two equal
   `games_started` reads give the first id it never started, the next worker takes the released ids from there and
-  starts beside it when memory allows (else after it); the old worker finishes its games as a drainer (at most 2,
-  stopped while the main worker is measured or work is paused). No game is lost and no id played twice
-  (`tests/tuning.rs` checks both). A trial starts only while `policy::tuning_allowed` (idle, AC power, no battery
-  saver / Low Power Mode, no fullscreen app, nothing blocking - whatever `work_when`, `on_battery` and
-  `respect_fullscreen` allow) and the machine is quiet (other programs <= 10 % of the CPUs from the system's CPU
-  times minus the workers', the worker not starved); anything else during a trial discards it, the incumbent comes
-  back by a handoff, and the candidate is retried at a later idle period (3 discards: skipped).
+  starts beside it when its plan fits beside what the others hold or will hold (`reserved_mb`: a fresh worker at its
+  plan, a drainer at its commit; else after it, `restart_room`); the old worker finishes its games as a drainer
+  (stopped while the main worker is measured or work is paused). One drain at a time per lease, at most
+  `tune::MAX_HANDOFFS` (6) handoffs per hour, never to the layout running unless to measure it (0.3.3). No game is
+  lost and no id played twice (`tests/tuning.rs` checks both; `tests/crew.rs` adds up what the fakeworkers hold at
+  once). A trial starts only while `policy::tuning_allowed` (idle, AC power, no battery saver / Low Power Mode, no
+  fullscreen app, nothing blocking - whatever `work_when`, `on_battery` and `respect_fullscreen` allow) and the
+  machine is quiet (`tune::LoadTrack`: other programs <= 10 % of the CPUs on average over the last trial length, from
+  the system's CPU times minus the workers'; the worker not starved); sustained load (25 % over 30 s), anything else
+  the policy blocks, or a trial window over 10 % on average / 5 points over the load before it discards it (bursts
+  pass; each measurement records its load), the incumbent comes back by a handoff, and the candidate is retried at a
+  later idle period (3 discards: skipped).
 - **Measurement**: leaves/s of the fresh worker between the same leaves-per-game-in-flight marks for every trial
   (set by the search's first measurement: refill, 20 s, 75 s), pinging it every 2 s. Why not wall time: a fresh rolling
   worker's rate falls as its games grow, and at a fixed time more games in flight look better than they are (the
@@ -211,6 +217,8 @@ the tuning half of `lease.rs` measure the CPU layout of rolling self-play jobs o
 - **fakeworker** `fake.rate` (`{"leaves_s", "best": {threads, infer_workers, infer_threads, batch, conc}, "penalty",
   "decay_p", "crew"}`) plays leaves/s by layout and keeps `conc` games in flight, for the integration tests; workers of
   one lease share the machine (`crew`: the crew's total by its size, beat files in the lease's `.crew/`).
+  `mem_base_mb` / `mem_per_game_mb` / `mem_ramp_ms` commit a worker's memory as a real one grows, each change logged
+  (`fakeworker: pid P holds N MB`, `... exits`).
 
 ## Several workers per lease (PROTOCOL 13.5, rev 19, agent 0.3.1)
 

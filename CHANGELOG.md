@@ -4,6 +4,30 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's: `agent-macos-v<version>`).
 
+## Unreleased (0.3.3)
+
+- **Finding the fastest layout no longer goes round in circles.** When a long job's memory plan held fewer games than a
+  layout remembered from an earlier job, Zero Farm 0.3.2 never counted the measurements of the smaller layout as the
+  remembered one's and handed the job over to the same layout again and again, measuring nothing. A remembered layout
+  is now compared as it actually runs, the job is never handed over to the layout it already runs except to measure
+  it, and at most 6 handovers happen in an hour.
+- **Two job programs stay within their memory while one takes over from the other.** Every handover left the old job
+  programs finishing their games beside the new ones, and Zero Farm 0.3.2 judged the room for a new job program by what
+  the others used right then - little, for one that had just started. On a 64 GB Mac four finishing job programs and
+  the two new ones used 38.9 GB of a 31.7 GB share. Now a new job program starts only when its whole planned memory
+  fits beside the others (one that just started counts at its plan), only one handover finishes its games at a time,
+  and when the memory in use reaches 92 % of the share no job program starts new games until the others made room.
+- **Memory-limited jobs keep the processor busy.** When memory limits how many games a Mac plays at once, the games
+  stay in the same number of batches and each batch gets smaller (down to 96 games), instead of fewer, bigger batches
+  that leave the search threads waiting: on a 64 GB Mac two job programs play about 700 games each in 6 batches.
+- **Memory planned from what Macs really use.** Games on a Mac grew to about 16 MB each after half an hour (Zero Farm
+  0.3.2 planned 14), so a long job filled its share and had to slow down. Macs now plan 18 MB a game; what a computer
+  measured for a run is used for the rest of that job too, and comes down slowly again when later jobs use less.
+- **Background programs no longer stop every measurement.** A Mac's background programs (sync tools, indexing) use the
+  processor in short bursts, and Zero Farm 0.3.2 threw a measurement away at the first burst. It now looks at what other
+  programs used over the whole measurement, compared with just before it: short bursts are fine, lasting use still
+  stops it. Measurements still happen only while the computer isn't in use.
+
 ## Unreleased (0.3.2)
 
 - **Macs no longer freeze at the start of a job run by two job programs.** On a computer that doesn't use its graphics
