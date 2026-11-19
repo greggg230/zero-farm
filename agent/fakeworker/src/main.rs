@@ -15,8 +15,18 @@
 //!  "mem_per_game_mb": 0,       // rolling: memory committed per game in flight (the job's conc), at the start
 //!  "mem_grow_mb": 0,           // rolling: memory committed per finished game on top (a creep)
 //!  "mem_grow_until": null,     // rolling: ... until this many games are finished (then it stays)
-//!  "oom_abort": false}         // a failed commit: abort on stderr (Rust's message) instead of a fatal error
+//!  "oom_abort": false,         // a failed commit: abort on stderr (Rust's message) instead of a fatal error
+//!  "rate": null}               // rolling: leaves per second by layout (below)
 //! ```
+//!
+//! `rate` (rev 19, the agent's layout tuning): `{"leaves_s": 1000, "best": {"threads": 4, "infer_workers": 2,
+//! "infer_threads": 2, "batch": 8, "conc": 32}, "penalty": 0.15, "decay_p": null}`. The job's layout (`threads`,
+//! `infer_workers` - default 1 -, `infer_threads` - default `threads` -, `conc`, `groups`: batch = conc / groups) plays
+//! `leaves_s` x the product over the keys `best` names of max(0.05, 1 - penalty x |log2(value / best)|) leaves per
+//! second, scaled by the share of `conc` games in flight and, with `decay_p`, by decay_p / (decay_p + leaves per game in
+//! flight) (a fresh worker's games grow); time suspended doesn't count. With `rate` a rolling job keeps `conc` games in
+//! flight (`games_started` = finished + in flight; still played one at a time), `finish` plays the games in flight to
+//! the end first, and `status` carries `leaves`, `games_started`, `concurrency` and `wall_s`.
 //!
 //! Memory (rolling jobs) is committed in 1 MB pieces (`VirtualAlloc`), so it counts against the job's memory limit
 //! as a real worker's does and the job's peak ends within 1 MB of the limit when a commit fails. A failed commit ends
@@ -192,6 +202,7 @@ struct Cfg {
     mem_grow_mb: u64,
     mem_grow_until: Option<u64>,
     oom_abort: bool,
+    rate: Option<Value>,
 }
 
 impl Cfg {
@@ -228,6 +239,7 @@ impl Cfg {
             mem_grow_mb: u("mem_grow_mb", 0),
             mem_grow_until: o("mem_grow_until"),
             oom_abort: f.get("oom_abort").and_then(Value::as_bool).unwrap_or(false),
+            rate: f.get("rate").filter(|r| r.is_object()).cloned(),
         }
     }
 }
@@ -295,12 +307,39 @@ struct W {
     /// A rolling job's released ids (`games`, raised by `extend`).
     games: u64,
     mem: Mem,
+    /// `rate`: the layout's leaves per second at full games in flight (None: no rate model).
+    leaves_s: Option<f64>,
+    decay_p: Option<f64>,
+    leaves: f64,
+    /// Ids started (finished + in flight) of a rolling job with a rate model, from its first id.
+    started: u64,
+    conc: u64,
+    t0: Instant,
+    t_acc: Instant,
 }
 
 impl W {
     fn stats(&self) -> Value {
-        json!({"games": self.done, "decisions": self.done * 100, "threads": self.threads, "provider": "cpu",
-               "cpu_pct": 1, "rss_mb": 5, "yields": self.yields})
+        let mut s = json!({"games": self.done, "decisions": self.done * 100, "threads": self.threads, "provider": "cpu",
+               "cpu_pct": 1, "rss_mb": 5, "yields": self.yields});
+        if self.leaves_s.is_some() {
+            s["leaves"] = json!(self.leaves as u64);
+            s["games_started"] = json!(self.started);
+            s["concurrency"] = json!(self.conc);
+            s["wall_s"] = json!((self.t0.elapsed().as_secs_f64() * 10.0).round() / 10.0);
+        }
+        s
+    }
+
+    /// Leaves played since the last call (at most 100 ms counted at a time: a suspended worker's time doesn't count).
+    fn accrue(&mut self) {
+        let dt = self.t_acc.elapsed().as_secs_f64().min(0.1);
+        self.t_acc = Instant::now();
+        let Some(r) = self.leaves_s else { return };
+        let conc = self.conc.max(1) as f64;
+        let in_flight = self.started.saturating_sub(self.done) as f64;
+        let decay = self.decay_p.map_or(1.0, |p| p / (p + self.leaves / conc));
+        self.leaves += r * dt * (in_flight / conc).min(1.0) * decay;
     }
 
     fn status(&mut self) {
@@ -394,6 +433,7 @@ impl W {
             if matches!(self.stop, Stop::Quit) {
                 return;
             }
+            self.accrue();
             if self.last_status.elapsed() >= Duration::from_millis(self.cfg.status_ms) {
                 self.status();
             }
@@ -490,10 +530,19 @@ impl W {
         let mut first_fin: Option<Instant> = None;
         let mut next = 0u64;
         let mut low_for = None;
-        while matches!(self.stop, Stop::No) {
-            if next < self.games {
-                let started = next + 1;
-                if self.games - started < conc && low_for != Some(self.games) {
+        let model = self.leaves_s.is_some();
+        self.conc = conc;
+        loop {
+            // (with a rate model: `conc` games in flight; `finish` plays them to the end, starting none)
+            match self.stop {
+                Stop::No if model => self.started = self.games.min(next + conc).max(self.started),
+                Stop::No => {}
+                Stop::Finish if model && next < self.started => {}
+                _ => break,
+            }
+            if next < self.games && (!model || next < self.started) {
+                let started = if model { self.started } else { next + 1 };
+                if matches!(self.stop, Stop::No) && self.games - started < conc && low_for != Some(self.games) {
                     low_for = Some(self.games);
                     self.out.send(json!({"ev": "low", "started": started, "games": self.games}));
                 }
@@ -528,7 +577,7 @@ impl W {
             Stop::Quit => "quit",
             _ => "finish",
         };
-        let rest: Vec<u64> = (base + next..base + self.games).collect();
+        let rest: Vec<u64> = if model && !matches!(self.stop, Stop::Quit) { (base + self.started.max(next)..base + self.games).collect() } else { (base + next..base + self.games).collect() };
         let unfinished = if rest.is_empty() { Value::Null } else { json!({"gids": ranges(&rest)}) };
         eprintln!("fakeworker: rolling job ended ({reason}): {next} of {} released ids played", self.games);
         self.out.send(json!({"ev": "end", "reason": reason, "stats": self.stats(), "unfinished": unfinished}));
@@ -722,7 +771,19 @@ fn main() {
         rolling: rolling_feature && job.get("kind").and_then(Value::as_str) == Some("selfplay") && job.get("rolling").and_then(Value::as_bool) == Some(true),
         games: 0,
         mem: Mem::default(),
+        leaves_s: None,
+        decay_p: None,
+        leaves: 0.0,
+        started: 0,
+        conc: 1,
+        t0: Instant::now(),
+        t_acc: Instant::now(),
     };
+    if let Some(r) = w.cfg.rate.clone() {
+        w.leaves_s = Some(layout_rate(&r, &job));
+        w.decay_p = r.get("decay_p").and_then(Value::as_f64);
+        eprintln!("fakeworker: {} leaves/s at this layout", w.leaves_s.unwrap_or(0.0));
+    }
     if job.get("model").and_then(Value::as_str).is_some() {
         w.out.send(json!({"ev": "selftest", "provider": "cpu", "max_abs": 0.0, "ok": true}));
     }
@@ -735,9 +796,43 @@ fn main() {
     }
 }
 
+/// `rate`'s leaves per second for the job's layout (see the module's notes).
+fn layout_rate(r: &Value, job: &Value) -> f64 {
+    let u = |k: &str| job.get(k).and_then(Value::as_u64);
+    let threads = u("threads").unwrap_or(1).max(1) as f64;
+    let workers = u("infer_workers").unwrap_or(1).max(1) as f64;
+    let per = u("infer_threads").map_or(threads, |t| t.max(1) as f64);
+    let conc = u("conc").unwrap_or(1).max(1) as f64;
+    let groups = u("groups").unwrap_or(1).max(1) as f64;
+    let have = |k: &str| match k {
+        "threads" => Some(threads),
+        "infer_workers" => Some(workers),
+        "infer_threads" => Some(per),
+        "batch" => Some((conc / groups).ceil()),
+        "conc" => Some(conc),
+        _ => None,
+    };
+    let pen = r.get("penalty").and_then(Value::as_f64).unwrap_or(0.15);
+    let mut x = r.get("leaves_s").and_then(Value::as_f64).unwrap_or(1000.0);
+    for (k, b) in r.get("best").and_then(Value::as_object).into_iter().flatten() {
+        if let (Some(v), Some(b)) = (have(k), b.as_f64().filter(|b| *b > 0.0)) {
+            x *= (1.0 - pen * (v / b).log2().abs()).max(0.05);
+        }
+    }
+    x
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn layout_rates() {
+        let r = json!({"leaves_s": 1000, "best": {"threads": 4, "batch": 8}, "penalty": 0.25});
+        assert_eq!(layout_rate(&r, &json!({"threads": 4, "conc": 32, "groups": 4})), 1000.0);
+        assert_eq!(layout_rate(&r, &json!({"threads": 8, "conc": 32, "groups": 4})), 750.0, "one doubling away");
+        assert_eq!(layout_rate(&r, &json!({"threads": 8, "conc": 32, "groups": 2})), 562.5);
+    }
+
     #[test]
     fn sha_and_ranges() {
         assert_eq!(sha256_hex(b"abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");

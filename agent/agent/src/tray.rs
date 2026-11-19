@@ -258,6 +258,10 @@ impl Tray {
             if let Some(g) = &st.gpu_note {
                 add(MF_STRING | MF_GRAYED, 4, g);
             }
+            // rev 19 (PROTOCOL 13): the job's CPU layout (a menu item doesn't wrap: at most ~100 characters)
+            if let Some(t) = &st.tuning {
+                add(MF_STRING | MF_GRAYED, 7, &t.chars().take(100).collect::<String>());
+            }
             if let Pause::Until { t } = s.pause {
                 if t > now {
                     add(MF_STRING | MF_GRAYED, 5, &format!("Paused for {} more minutes", (t - now + 59) / 60));

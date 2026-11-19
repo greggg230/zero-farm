@@ -134,6 +134,10 @@ pub struct LeaseReq {
     /// leases). Names a coordinator doesn't know are ignored; absent before 0.2.13.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub features: Vec<String>,
+    /// rev 19 (PROTOCOL 13): the CPU layouts this agent tuned (at most 4, newest first: run, build, runtime, net,
+    /// layout, leaves_s, trials, state, t). Absent before 0.3.1 and while nothing was measured.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tuning: Vec<Value>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -241,6 +245,11 @@ pub struct Lease {
     /// rev 15 (PROTOCOL 10.3): a rolling self-play lease (only to agents that asked with `features: ["rolling"]`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rolling: Option<Rolling>,
+    /// rev 19 (PROTOCOL 13): the best CPU layout the coordinator knows for this machine's hardware class and the
+    /// lease's build and runtime (`{"layout", "leaves_s", "machines", "net"}`), to agents that asked with
+    /// `features: ["tuning"]`. Unsigned and only a starting point: the agent checks its bounds (tune.rs).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tuning_hint: Option<Value>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]

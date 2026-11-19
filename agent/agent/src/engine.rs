@@ -111,6 +111,9 @@ pub struct Engine {
     /// rev 16: the last presence sent while blocked (when, why); None while working.
     presence_sent: Option<(Instant, Block)>,
     presence_sending: Arc<AtomicBool>,
+    /// rev 19 (PROTOCOL 13): at the last `decide`, a tuning trial was allowed (idle, on AC, no fullscreen, no block:
+    /// `policy::tuning_allowed`).
+    pub(crate) tune_ok: bool,
 }
 
 impl Engine {
@@ -169,6 +172,7 @@ impl Engine {
             crash_sending: Arc::new(AtomicBool::new(false)),
             presence_sent: None,
             presence_sending: Arc::new(AtomicBool::new(false)),
+            tune_ok: false,
             cfg,
         })
     }
@@ -189,6 +193,7 @@ impl Engine {
         let s = self.signals.sample(worker_pid);
         let cfg = self.settings();
         let d = decide(&mut self.policy, &s, &cfg);
+        self.tune_ok = crate::policy::tuning_allowed(&s, &cfg);
         self.avail.record(crate::availability::now_ms(), &crate::util::local_now().0, d.work);
         d
     }
@@ -479,8 +484,10 @@ impl Engine {
             caps,
             cached: Cached { builds, ckpts },
             kinds,
-            // rev 15 (PROTOCOL 10.2): rolling self-play leases
-            features: crate::rolling::FEATURES.iter().map(|f| f.to_string()).collect(),
+            // rev 15 (PROTOCOL 10.2): rolling self-play leases; rev 19 (PROTOCOL 13): tuning hints
+            features: crate::rolling::FEATURES.iter().chain(crate::tune::FEATURES.iter()).map(|f| f.to_string()).collect(),
+            // rev 19: the layouts this PC tuned
+            tuning: crate::tune::Cache::load(&self.cfg.layout).reports(),
         };
         let resp: LeaseResp = match self.client.post_json("/v1/lease", &req) {
             Err(CallError::Http { status: 409, body: Some(b), .. }) if b.get("need_profile").and_then(Value::as_bool) == Some(true) => {

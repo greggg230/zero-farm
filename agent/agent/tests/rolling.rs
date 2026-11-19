@@ -109,7 +109,7 @@ fn extends_on_low_until_the_block_is_used_up() {
     assert_eq!((done["stats"]["inflight"].clone(), done["stats"]["released"].clone()), (json!(2), json!(16)), "{done}");
     let b = beats(&h, "l_R1");
     assert!(!b.is_empty() && b.iter().all(|b| b["gen"] == 1), "rolling beats carry the generation: {b:?}");
-    assert_eq!(h.mock.with(|s| s.lease_requests[0]["features"].clone()), json!(["rolling"]));
+    assert_eq!(h.mock.with(|s| s.lease_requests[0]["features"].clone()), json!(["rolling", "tuning"]), "rev 19: tuning hints too");
     assert!(h.crashes().is_empty(), "{:?}", h.crashes());
     h.stop();
 }

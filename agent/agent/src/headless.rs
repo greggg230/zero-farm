@@ -138,6 +138,7 @@ fn status_json(status: &SharedStatus, machine: &SharedMachine, cores: Cores) -> 
         "machine_id": m.machine_id,
         "threads": cores.threads(&m.settings),
         "threads_text": cores.describe(&m.settings),
+        "tuning": st.tuning,
         "settings": m.settings,
     })
 }
@@ -293,6 +294,15 @@ pub fn cli_status(layout: &Layout) -> i32 {
     }
     let s = &m.settings;
     println!("  CPU threads: {}", cores.describe(s));
+    // rev 19 (PROTOCOL 13): the layout of the current self-play job, else the last tuned one
+    match st.as_ref().and_then(|v| v["tuning"].as_str()) {
+        Some(t) => println!("  layout: {t}"),
+        None if !s.autotune => println!("  layout: autotune off (`ZeroFarm set autotune on` measures the best one)"),
+        None => match crate::tune::Cache::load(layout).entries.iter().filter(|e| e.rate().is_some()).max_by_key(|e| e.t) {
+            Some(e) => println!("  layout (last tuned, {}): {}", e.run, e.describe()),
+            None => println!("  layout: not tuned yet (measured during the first self-play while the Mac is idle)"),
+        },
+    }
     let when = if s.mode == crate::settings::Mode::Always {
         "also while the Mac is in use".to_string()
     } else {

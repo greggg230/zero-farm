@@ -42,6 +42,8 @@ pub struct Status {
     pub version: String,
     /// A one-time balloon the tray shows and clears (first work only).
     pub toast: Option<String>,
+    /// rev 19 (PROTOCOL 13): the CPU layout of the current self-play job, tuned or being tuned (None: not tuning).
+    pub tuning: Option<String>,
 }
 
 impl Status {
