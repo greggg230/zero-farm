@@ -218,8 +218,8 @@ pub fn take_inflight(layout: &Layout, now: i64) -> Option<(Inflight, u32)> {
 }
 
 /// Whether a pack is held on these adapters: unfinished `UNFINISHED_NEVER` times, or once less than `RETRY_S` ago.
-/// A held pack is neither probed nor benched, gets no GPU job (the CPU), the guard refuses it as an alternate, and
-/// the profile lists it with no provider.
+/// A held pack is neither probed nor benched, gets no GPU job (the CPU), the guard refuses it when it is a GPU pack
+/// (`gpu`; one without runs its job on the CPU), and the profile lists it with no provider.
 pub fn held(unfinished: &[Unfinished], runtime: &str, adapters: &str, now: i64) -> bool {
     unfinished
         .iter()

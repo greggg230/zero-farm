@@ -506,10 +506,13 @@ impl Engine {
         Ok(())
     }
 
-    /// The agent's guard (rev 11, PROTOCOL 9.5), before anything but manifests is downloaded: a lease whose runtime is
-    /// an alternate, or whose pack declares a GPU requirement, needs a self-play or eval job, GPU work allowed now, an
-    /// adapter that meets the pack's requirement, the pack not failed here, and room under the disk cap. Returns the
-    /// pack's requirement.
+    /// The agent's guard (rev 11, PROTOCOL 9.5), before anything but manifests is downloaded: a lease whose pack
+    /// declares a GPU requirement (`gpu`) needs a self-play or eval job, GPU work allowed now, an adapter that meets the
+    /// requirement, and the pack neither failed here nor held (9.8); an alternate pack, GPU or not, needs room under the
+    /// disk cap. A pack without `gpu` - the CPU pack, a CPU alternate's (11.4), Windows ML's - is not GPU work, default
+    /// or alternate: none of the GPU conditions apply to it (its job runs on the CPU unless 9.6's probe and bench, which
+    /// run only while GPU work is allowed and the pack isn't held, pick a GPU provider for it). Returns the pack's
+    /// requirement.
     fn runtime_guard(&mut self, lease: &Lease, plan: &Plan) -> Result<Option<GpuNeed>, PlanError> {
         use zerofarm_common::manifest::Kind;
         let Some(rt) = &lease.runtime else { return Ok(None) };
@@ -519,13 +522,13 @@ impl Engine {
             return Ok(None);
         }
         let no = |m: String| Err(PlanError::Refused(m));
-        if !matches!(lease.kind.as_str(), "selfplay" | "eval") {
-            return no(format!("a {} lease can't use runtime pack {} (only self-play and evaluation get a GPU pack)", lease.kind, rt.build_id));
-        }
-        if !self.decide(None).gpu {
-            return no(format!("runtime pack {} is for GPU work, which isn't allowed here right now", rt.build_id));
-        }
         if let Some(n) = &need {
+            if !matches!(lease.kind.as_str(), "selfplay" | "eval") {
+                return no(format!("a {} lease can't use runtime pack {} (only self-play and evaluation get a GPU pack)", lease.kind, rt.build_id));
+            }
+            if !self.decide(None).gpu {
+                return no(format!("runtime pack {} is for GPU work, which isn't allowed here right now", rt.build_id));
+            }
             if !self.profile.gpus.iter().any(|g| n.met_by(&g.vendor, &g.driver)) {
                 let have: Vec<String> = self.profile.gpus.iter().map(|g| format!("{} {} (driver {})", g.vendor, g.name, g.driver)).collect();
                 return no(format!(
@@ -536,14 +539,14 @@ impl Engine {
                     if have.is_empty() { "none".to_string() } else { have.join(", ") }
                 ));
             }
-        }
-        let probes = crate::probe::load(&self.cfg.layout);
-        let akey = crate::probe::adapters_key(&self.profile.gpus);
-        if crate::probe::pack_bad(&probes, &rt.build_id, &akey, need.as_ref().map(|n| n.providers.as_slice()), zerofarm_common::now_unix()) {
-            return no(format!("runtime pack {} failed on this PC's GPU and driver before", rt.build_id));
-        }
-        if crate::probe::held(&crate::probe::load_unfinished(&self.cfg.layout), &rt.build_id, &akey, zerofarm_common::now_unix()) {
-            return no(format!("runtime pack {} stopped this PC during a GPU check before (the agent or the PC went down)", rt.build_id));
+            let probes = crate::probe::load(&self.cfg.layout);
+            let akey = crate::probe::adapters_key(&self.profile.gpus);
+            if crate::probe::pack_bad(&probes, &rt.build_id, &akey, Some(n.providers.as_slice()), zerofarm_common::now_unix()) {
+                return no(format!("runtime pack {} failed on this PC's GPU and driver before", rt.build_id));
+            }
+            if crate::probe::held(&crate::probe::load_unfinished(&self.cfg.layout), &rt.build_id, &akey, zerofarm_common::now_unix()) {
+                return no(format!("runtime pack {} stopped this PC during a GPU check before (the agent or the PC went down)", rt.build_id));
+            }
         }
         let mut bytes = 0u64;
         for (r, kind) in [(&lease.build, Kind::Worker), (rt, Kind::Runtime)] {
