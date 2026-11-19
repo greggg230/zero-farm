@@ -136,7 +136,7 @@ cargo test --workspace --all-features -- --test-threads=2           # on the Mac
 | launcher version | VERSIONINFO | a 32-byte marker in the binary (`binver.rs`) |
 | UI | tray, invite dialog | headless CLI: `ZeroFarm status \| pause [minutes] \| resume \| set <key> <value> \| quit \| uninstall \| setup` |
 | rolling "auto" (CPU) | 32 in flight in 4 groups | 144 per physical core in groups of 192 (an M4 Max: 2,304 in 12), planned at 1 GB + 4 MB per game of physical footprint |
-| layout tuning (rev 19) | start: cores search + 1 x cores inference (each its cap); batches >= 8 rows | start: cores search + sessions of 3 (5 x 3 on 16 cores); inference <= cores; batches 192-384 rows; sessions always searched |
+| layout tuning (rev 19) | start: one worker, cores search + 1 x cores inference (each its cap); batches >= 8 rows | start: cores search + sessions of 3 (5 x 3 on 16 cores); inference <= cores; batches 192-384 rows; sessions always searched; >= 12 cores and >= 32 GB: two workers of 12 + 4 x 3, 1,152 in flight in 6 groups |
 
 **Install** (what `curl -fsSL https://farm.greggg230.com/install-macos.sh | sh -s -- --invite CODE` ends in): the
 tarball `ZeroFarm-macos-arm64.tar.gz` holds `ZeroFarm`, `farm-agent`, `manifest.json` and its signature. `./ZeroFarm
@@ -153,7 +153,8 @@ settings), `pause [minutes]` (no minutes: until `resume`), `resume`, `set <key> 
 (N or `auto`: one per physical core, 12 performance + 4 efficiency on an M4 Max), `work_when` (`idle` | `active`),
 `idle_minutes`, `on_battery` (also work on battery and in Low Power Mode; default false), `keep_awake` (default true),
 `hours` (`HH:MM-HH:MM` | `off`), `max_ram_mb` (N or `auto`: half the RAM), `disk_cap_mb`, `autotune` (`on` | `off`,
-default on: layout tuning, PROTOCOL 13; `status` shows the job's layout, else the last tuned one). A change goes to the running
+default on: layout tuning, PROTOCOL 13; `status` shows the job's layout, else the last tuned one), `workers` (`auto` |
+1-3: worker processes per self-play job, PROTOCOL 13.5; auto = the tuner's choice). A change goes to the running
 agent as a request file in `state/requests/` plus SIGUSR1 (applied as the tray applies its menu, answered within a
 second); with no agent running the CLI changes `machine.json` itself. An owner's own Mac that should work like the
 SSH self-play does: `set work_when active` and `set on_battery true`.
@@ -208,7 +209,52 @@ the tuning half of `lease.rs` measure the CPU layout of rolling self-play jobs o
   Windows CPU PC and longer on a Mac with 2,304 games in flight; discarded trials (the owner came back) add to it. The
   result is reused for every lease of the key.
 - **fakeworker** `fake.rate` (`{"leaves_s", "best": {threads, infer_workers, infer_threads, batch, conc}, "penalty",
-  "decay_p"}`) plays leaves/s by layout and keeps `conc` games in flight, for the integration tests.
+  "decay_p", "crew"}`) plays leaves/s by layout and keeps `conc` games in flight, for the integration tests; workers of
+  one lease share the machine (`crew`: the crew's total by its size, beat files in the lease's `.crew/`).
+
+## Several workers per lease (PROTOCOL 13.5, rev 19, agent 0.3.1)
+
+One native worker process tops out well below what a big CPU can do (the M4 Max: one process at best ~12.6k leaves/s,
+every extra thread inside it slower; two processes of 12 + 4 x 3 threads with 1,152 games in flight each 16.4k, the fast
+export ~18.0k = the SSH self-play's parity; three 16.1k, four 15.2k). So a rolling CPU self-play lease can be served by
+a **crew** of worker processes, the worker count being the tuner's first coordinate (`tune.rs`) and `lease.rs`'s `Mate`
+the members beside the main worker.
+
+- **Ids.** aw/1 gives a worker one contiguous range that only grows at its end (`extend`), and the coordinator releases
+  ids only at the lease's tail, so one worker - the main one, the **tail** - gets the extensions; every other member
+  plays a **closed** range of released ids. A new member takes the tail's place (the main worker becomes a member and
+  keeps every id released so far from its first - at least 2 x its games in flight unstarted, else more ids are asked
+  for first - and the new worker starts at the end of the released ids with none: its `low` asks) or plays a **spare**
+  range that fills its games in flight (ids a worker told `finish` early never started: its frozen `games_started` read
+  twice, as in a handoff, or its `finish` end's `unfinished`). A member that started all of its ids is told `finish`
+  and a new one joins (memory permitting: every worker's commit plus the new one's plan within 85 % of the job's
+  limit). Extensions ask for 2 x the crew's games in flight (the same ids in hand as one worker with all of them). No
+  coordinator change, no extra lease: the coordinator sees one lease, its released ids and its extensions.
+- **Results** of every worker are queued under the lease (one results directory per worker, `out-w<n>`); `done`'s
+  unfinished ids are worked out from the credited ones.
+- **Generations, pauses, ending.** `checkpoint` goes to every member with its job (a finishing one keeps its network);
+  a pause yields the main worker and suspends every other (CPU jobs only: no VRAM to free); `finish`, `quit` and kills
+  reach all; the lease closes once every worker ended.
+- **Memory.** Each worker gets its part of the job's limit (job object on Windows, the footprint cap on macOS:
+  limit / workers); a member at 92 % of its part finishes its games (its unstarted ids become spare) and the next
+  members run fewer games (`restart_games`, counted as a restart); the crew's sum at 92 % of the job's limit makes the
+  biggest give way the same way; the most any worker committed per game is remembered (`Learned`). The tuner's worker
+  count stays within what the memory plan holds with each worker's base.
+- **Failures.** A member that exits without `end` or with a fatal error loses its games in flight (they go back with the
+  lease) and is reported once per lease; a new one joins while restarts are left (4 per lease, shared with memory
+  restarts), then the crew runs smaller. The main worker failing while members play is replaced the same way (a new
+  tail after every released id). A self-test failure is fatal as before.
+- **Tuner.** `workers` 1..3 within physical cores / 4, RAM / 16 GB and the memory plan, or the owner's `workers`; thread
+  caps per worker: one worker the caps of before, N > 1 workers 1.5 x the cores per kind between them (2 x 12 on 16
+  cores); a worker move keeps the job's games in flight and rows per batch and rescales each kind of thread to its
+  budget. Trials measure the crew's summed counters (a member leaving discards it) and start only with memory for the
+  whole crew. A Mac with >= 12 cores and >= 32 GB starts at 2 x (12 + 4 x 3, 1,152 in 6 groups); everything else at 1.
+  `autotune off` with `workers N` (N > 1) runs that crew fixed; `autotune off` with `workers auto` is one worker, the
+  rules of before. The tray and `ZeroFarm status` show "2 workers x (...)" and how many are running.
+- **Cost.** Rotations: a member's closed range lasts between one and a few game lengths of its own (about 1-3 h on the
+  M4 Max), then it finishes its games beside its successor (a third process for up to a game length, and the successor
+  waits for room). A worker `extend` that takes a new range would remove that (a worker change, aw/1 rev); not needed
+  for the measured gain.
 
 ## Install flow (`farm-agent install`, run by ZeroFarmSetup.exe)
 
@@ -514,7 +560,9 @@ Agent exit codes: 0 quit, 75 switch to `state\pending`, 76 hand over to the new 
 - Authenticode signing (planned before more friends).
 - macOS: a menu-bar icon, a notarized `.pkg` / `.app` (Developer ID), fullscreen detection, GPU work (Core ML).
 - Layout tuning (rev 19) covers rolling CPU self-play only: eval, fuzz, classic and GPU jobs keep their fixed rules;
-  `diag` jobs are passed to the worker as they are.
+  `diag` jobs are passed to the worker as they are. Several workers per lease (13.5) likewise: CPU rolling self-play only.
+- A crew member's closed range ends in a finish beside its successor (13.5): a worker op that hands a running worker a
+  new range would let every member run for the whole lease (a worker and aw/1 change).
 
 ### Design note: the worker sandbox (AppContainer)
 

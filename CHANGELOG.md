@@ -14,6 +14,12 @@ version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's:
   remembered (and checked again weekly) and shared with the farm, so computers like yours start from it. It never uses
   more processor threads than before. `ZeroFarm status` on a Mac and the tray menu on Windows show the current choice;
   `ZeroFarm set autotune off` (Mac) turns it off.
+- **Big computers run several jobs side by side.** On a computer with many cores and plenty of memory, one job program
+  can't keep every core busy; two of them side by side play about 30 % more on a 16-core Mac. Zero Farm now runs a long
+  self-play job as up to three job programs at once where the processor and memory allow it, sharing the job's games
+  and its memory between them - a Mac with at least 12 cores and 32 GB starts with two, other computers try it while
+  tuning and keep it only if it's faster. They pause, resume and stop together, and if one of them crashes the others
+  carry on. `ZeroFarm set workers 1` (Mac) keeps it to one; `workers auto` (the default) lets Zero Farm choose.
 
 ## Unreleased (0.3.0)
 
