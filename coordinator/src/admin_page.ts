@@ -250,6 +250,22 @@ function render(s) {
     ["since", (b) => ago(b.t, now)], ["until", (b) => when(b.until)], ["message", (b) => esc((b.message || "").slice(0, 160))],
   ], s.blocks || []);
 
+  // Rev 19 (PROTOCOL 13): the CPU layouts agents tuned, best per hardware class, build, runtime and network.
+  const lay = (l) => (l ? esc(l.threads + " + " + l.infer_workers + "x" + l.infer_threads + " thr, " + l.conc + " in " + l.groups + " groups (" + Math.ceil(l.conc / l.groups) + " rows)") : "");
+  h += "<h2>Tuned layouts by hardware class</h2>" + table([
+    ["class", (x) => esc(x.class) + '<br><span class="muted">' + esc(x.platform) + "</span>"],
+    ["build", (x) => "<code>" + esc(String(x.build).slice(0, 8)) + "</code>" + (x.runtime ? ' <span class="muted">runtime</span> <code>' + esc(String(x.runtime).slice(0, 8)) + "</code>" : "")],
+    ["network", (x) => "<code>" + esc(x.net) + '</code><br><span class="muted">' + esc((x.runs || []).join(", ")) + "</span>"],
+    ["best layout", (x) => lay(x.layout) + (x.state === "tuned" ? "" : ' <span class="warn">searching</span>')],
+    ["leaves/s", (x) => num(Math.round(x.leaves_s)), "n"], ["machines", (x) => x.machines, "n"],
+  ], s.tuning || []);
+  h += "<h2>Tuned layouts by machine</h2>" + table([
+    ["machine", (x) => esc(x.m.name)], ["class", (x) => esc(x.m.class)], ["run", (x) => esc(x.r.run)],
+    ["build", (x) => "<code>" + esc(String(x.r.build).slice(0, 8)) + "</code>"],
+    ["layout", (x) => lay(x.r.layout) + (x.r.state === "tuned" ? "" : ' <span class="warn">searching</span>')],
+    ["leaves/s", (x) => num(Math.round(x.r.leaves_s)), "n"], ["trials", (x) => x.r.trials, "n"], ["reported", (x) => ago(x.m.tuning_t, now)],
+  ], (s.machines || []).flatMap((m) => (m.tuning || []).map((r) => ({ m, r }))));
+
   h += "<h2>Rates by hardware class</h2>" + table([
     ["class", (r) => esc(r.class)], ["kind", (r) => r.kind], ["scope", (r) => esc(r.scope)],
     ["per hour", (r) => num(Math.round(r.rate * 3600)), "n"], ["machines", (r) => r.machines, "n"],

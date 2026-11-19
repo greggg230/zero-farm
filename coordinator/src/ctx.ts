@@ -84,6 +84,8 @@ export interface MachineRow {
   revoked_at: number | null;
   platform: string; // rev 17 (PROTOCOL 11.1): fixed at enrollment; migration 0013 (rows before it: windows-x64)
   gpu_play?: number | null; // rev 18 (migration 0014): 1 while its last offer had self-play it plays on its GPU
+  tuning?: string | null; // rev 19 (migration 0015): its agent's last `tuning` report (JSON)
+  tuning_t?: number | null;
 }
 
 function bearer(req: Request): string | null {

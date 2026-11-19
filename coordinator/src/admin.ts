@@ -2,6 +2,7 @@
 // release tool, scripts/admin.ts and the /admin dashboard.
 
 import { presenceOf } from "./presence";
+import { storedTuning, tuningClasses } from "./tuning";
 import { accessEnabled } from "./access";
 import * as book from "./book";
 import { blockLifted } from "./blocks";
@@ -1027,7 +1028,7 @@ export async function stats(c: Ctx): Promise<Response> {
   const cfg = config(c.env);
   const [machinesR, leasesR, crashesR, thrR, runsR, campsR, recentCrashR, fuzzR, classR, pausedR, failCountR, releasesR, diagR, blocksR, batchesR, perMachineR, perScopeR, externalR] = await db.batch<any>([
     db.prepare(
-      `SELECT machine_id, name, class, channel, platform, agent_version, created_at, last_seen, revoked_at, paused, caps, presence, presence_t,
+      `SELECT machine_id, name, class, channel, platform, agent_version, created_at, last_seen, revoked_at, paused, caps, presence, presence_t, tuning, tuning_t,
          json_extract(profile, '$.idle_h_day') AS idle_h_day, json_extract(profile, '$.on_h_day') AS on_h_day,
          json_extract(profile, '$.providers') AS providers, json_extract(profile, '$.gpus') AS gpus
        FROM machines ORDER BY created_at`,
@@ -1127,6 +1128,9 @@ export async function stats(c: Ctx): Promise<Response> {
       paused: !!m.paused,
       // Rev 16: why an online agent isn't working (POST /v1/presence), while fresh.
       presence: presenceOf(m, c.now),
+      // Rev 19 (PROTOCOL 13): the CPU layouts its agent tuned (its last report) and when it sent them.
+      tuning: storedTuning(m.tuning),
+      tuning_t: m.tuning_t ?? null,
       caps: parseJson(m.caps, null),
       // Rev 7: the execution providers that passed this PC's probe, and its adapters' LUIDs.
       providers: parseJson<unknown>(m.providers, null),
@@ -1308,6 +1312,8 @@ export async function stats(c: Ctx): Promise<Response> {
     campaigns,
     eval_batches: evalBatchesOut,
     classes: classR.results,
+    // Rev 19: the best reported layout per hardware class (and platform), worker build, runtime and network.
+    tuning: tuningClasses(machinesR.results as any[]),
     releases: releasesR.results,
     diag_uploads: diagR.results.map((d: any) => ({ ...d, user: !!d.user })),
     failures: {

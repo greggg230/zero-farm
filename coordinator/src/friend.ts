@@ -41,6 +41,7 @@ import {
   hwRoutingOf,
 } from "./routing";
 import { presenceOf } from "./presence";
+import { TUNING_FEATURE, cleanTuning, hintFor, storedTuning, type Hint } from "./tuning";
 import { cleanStats, telemetry } from "./telemetry";
 import {
   BUILD_RE,
@@ -343,6 +344,8 @@ export async function lease(c: Ctx): Promise<Response> {
   const kinds = new Set(strList(b.kinds, "kinds", { max: 32, itemMax: 32 }).filter((k) => (KINDS as readonly string[]).includes(k)));
   // Rev 15 (PROTOCOL 10.2): optional features of the agent; names this coordinator doesn't know are ignored.
   const features = new Set(strList(b.features, "features", { optional: true, max: 32, itemMax: 64 }));
+  // Rev 19 (PROTOCOL 13): the CPU layouts the agent tuned (kept per machine; hints come from them).
+  const tuning = cleanTuning(b.tuning);
   const agent = c.req.headers.get("x-farm-agent");
   if (!agent || !isSemver(agent)) throw bad("x-farm-agent header (the agent's semver) is required");
   const awHeader = c.req.headers.get("x-farm-aw") ?? "1";
@@ -363,6 +366,10 @@ export async function lease(c: Ctx): Promise<Response> {
   // (otherWorkWaits) sees the same GPU self-play this request does (an agent may send gpu false, gpu_allowed true).
   const capsJson = JSON.stringify({ ...caps, gpu_allowed: gpuAllowed, ...(gpuGames.size ? { gpu_games: Object.fromEntries(gpuGames) } : {}) });
   if (capsJson !== m.caps) await db.prepare(`UPDATE machines SET caps = ? WHERE machine_id = ?`).bind(capsJson, m.machine_id).run();
+  if (tuning && tuning.length) {
+    const t = JSON.stringify(tuning);
+    if (t !== m.tuning) await db.prepare(`UPDATE machines SET tuning = ?, tuning_t = ? WHERE machine_id = ?`).bind(t, c.now, m.machine_id).run();
+  }
   // Rev 7 routing reads the profile the coordinator keeps: the one just sent, else the stored one.
   const machineProfile = profile && digest !== m.profile_digest ? profile : parseJson<Profile | null>(m.profile, null);
   const o = await offer(c, m, { caps, gpuAllowed, gpuGames, cachedBuilds, cachedCkpts, kinds, agent, aw }, machineProfile);
@@ -422,10 +429,26 @@ export async function lease(c: Ctx): Promise<Response> {
         ...(rolling && cd.kind === "selfplay" ? { rolling: true } : {}),
       }),
     );
-    // Rev 7: the job's provider allowlist rides along (a routing hint, not part of the signed job).
-    if (l) return withDiag({ lease: { ...l, providers: cd.providers } });
+    // Rev 7: the job's provider allowlist rides along (a routing hint, not part of the signed job). Rev 19: so does
+    // the best layout this hardware class reported for a rolling self-play lease's build and runtime.
+    if (l) {
+      const hint = (l as any).rolling && features.has(TUNING_FEATURE) ? await tuningHint(db, m, l as any) : null;
+      return withDiag({ lease: { ...l, providers: cd.providers, ...(hint ? { tuning_hint: hint } : {}) } });
+    }
   }
   return withDiag({ wait_s: WAIT_S, reason: "no_work" });
+}
+
+// Rev 19 (PROTOCOL 13): the best layout the machines of `m`'s hardware class and platform reported for the lease's
+// build and runtime (its own report included: a machine whose agent lost its results starts from it), or null.
+async function tuningHint(db: D1Database, m: MachineRow, l: { build: { build_id: string }; runtime: { build_id: string } | null; run?: string | null }): Promise<Hint | null> {
+  if (!m.class) return null;
+  const { results } = await db
+    .prepare(`SELECT machine_id, tuning FROM machines WHERE class = ? AND platform = ? AND tuning IS NOT NULL AND revoked_at IS NULL`)
+    .bind(m.class, m.platform)
+    .all<{ machine_id: string; tuning: string }>();
+  const reports = results.map((r) => ({ machine_id: r.machine_id, reports: storedTuning(r.tuning) }));
+  return hintFor(reports, l.build.build_id, l.runtime?.build_id ?? null, l.run ?? null);
 }
 
 // What a machine asks with (POST /v1/lease); for an extension's renewal (rev 15), what the coordinator last stored.
