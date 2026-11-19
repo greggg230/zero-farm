@@ -90,7 +90,7 @@ export async function installMacos(c: Ctx): Promise<Response> {
 }
 
 const INSTALL_MACOS = `#!/bin/sh
-# Zero Farm for macOS (Apple silicon, macOS 13 or newer):
+# Zero Farm for macOS (Apple silicon, macOS 14 or newer):
 #   curl -fsSL {{origin}}/install-macos.sh | sh -s -- --invite CODE
 # Downloads the newest agent from GitHub Releases, checks it against the release's SHA256SUMS,
 # unpacks it into a temporary directory and runs its setup, which verifies the signed agent and
@@ -102,6 +102,8 @@ die() { echo "Zero Farm install: $*" >&2; exit 1; }
 main() {
   [ "$(uname -s)" = Darwin ] || die "this installer is for macOS"
   [ "$(uname -m)" = arm64 ] || die "Zero Farm needs a Mac with Apple silicon (arm64); this one is $(uname -m)"
+  v=$(sw_vers -productVersion 2>/dev/null || echo 0)
+  [ "\${v%%.*}" -ge 14 ] 2>/dev/null || die "Zero Farm needs macOS 14 or newer; this Mac runs macOS $v"
   url=$(curl -fsS -o /dev/null -w '%{redirect_url}' '{{download}}') || die "no macOS release to download yet"
   case "$url" in
     '{{release}}'*/ZeroFarm-macos-arm64.tar.gz) ;;
@@ -151,7 +153,7 @@ export async function home(c: Ctx): Promise<Response> {
   if (mac) {
     const test = mac.channel === "stable" ? "" : ` <span class="tag">test build</span>`;
     button +=
-      `<p class="small">On a Mac with Apple silicon (macOS 13 or newer), Zero Farm ${esc(mac.version)}${test}: in Terminal, run<br>` +
+      `<p class="small">On a Mac with Apple silicon (macOS 14 or newer), Zero Farm ${esc(mac.version)}${test}: in Terminal, run<br>` +
       `<code>curl -fsSL ${esc(c.url.origin)}/install-macos.sh | sh -s -- --invite CODE</code></p>`;
   }
   const page = HOME.replace("{{button}}", button).replaceAll("{{source}}", sourceUrl(c.env));

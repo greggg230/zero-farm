@@ -1376,7 +1376,7 @@ A Mac (Apple silicon) can do the same CPU work, but it needs its own agent, work
 Windows PC must never be handed a Mac build (or the reverse). Rev 17 names the platform everywhere a build is chosen.
 Everything below is additive: an agent or manifest that says nothing is `windows-x64`, exactly as before.
 
-Platform names: `windows-x64` and `macos-arm64` (Apple silicon, macOS 13 or newer). Intel Macs and Linux: not yet.
+Platform names: `windows-x64` and `macos-arm64` (Apple silicon, macOS 14 or newer: the ONNX Runtime 1.31 pack's minimum; the install script refuses older). Intel Macs and Linux: not yet.
 `PLATFORM_AGENT` (coordinator var, default `0.3.0`) is the first agent that knows platforms.
 
 ### 11.1 The agent's platform
