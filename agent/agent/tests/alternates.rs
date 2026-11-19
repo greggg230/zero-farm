@@ -105,6 +105,11 @@ fn setup_with(h: &H, probe: Option<&Value>, conc: u64) -> Setup {
 }
 
 fn setup_with2(h: &H, probe: Option<&Value>, on_model: Option<&Value>, conc: u64) -> Setup {
+    setup_with3(h, probe, on_model, conc, json!({"game_ms": 5, "shard_every": 8}))
+}
+
+/// `fake`: the jobs' fakeworker script.
+fn setup_with3(h: &H, probe: Option<&Value>, on_model: Option<&Value>, conc: u64, fake: Value) -> Setup {
     let (pack, big) = cuda_pack(&h.dir.path().join("pack"), &h.key.key);
     h.mock.add_build_dir(&h.dir.path().join("pack"));
     let alt = worker_for2(&h.dir.path().join("wcuda"), &h.key.key, &pack, probe, on_model);
@@ -116,7 +121,7 @@ fn setup_with2(h: &H, probe: Option<&Value>, on_model: Option<&Value>, conc: u64
     let def = json!({"definition": 1, "kind": "run", "id": RUN, "version": 1, "created": zerofarm_common::now_unix() - 60, "expires": null,
         "game": "fake", "builds": [h.build_id, alt], "runtime": null,
         "checkpoints": {"1": {"model_sha256": sha, "model_size": ml, "reference_sha256": rsha, "reference_size": rl}},
-        "jobs": {"selfplay": {"settings": {"sims": 8, "conc": conc, "fake": {"game_ms": 5, "shard_every": 8}}}}});
+        "jobs": {"selfplay": {"settings": {"sims": 8, "conc": conc, "fake": fake}}}});
     let dref = h.define(&def);
     let ckpt = json!({"gen": 1, "model": "ckpt/cuda-run/1/model.onnx", "sha256": sha, "reference": "ckpt/cuda-run/1/reference.npz", "reference_sha256": rsha});
     Setup { pack, alt, big, dref, ckpt }
@@ -308,6 +313,61 @@ fn an_nvidia_pc_fetches_the_pack_compressed_benches_and_runs_cuda_when_it_pays()
     let g = req["caps"]["gpu_games"][RUN].as_u64().unwrap();
     assert!((1..=32).contains(&g), "CUDA reaches 2x the CPU at a few rows: {g}");
     assert_eq!(req["caps"]["gpu_allowed"], true);
+    h.stop();
+}
+
+/// Agent 0.3.2: a GPU job yields when GPU work stops being allowed - from its start, before its worker has sessions and
+/// names its provider (`provider: ""` until then: the agent's choice, CUDA, counts), and once it reports CUDA; a GPU job
+/// whose worker reports the CPU (it fell back) plays on.
+#[test]
+fn a_gpu_job_yields_when_gpu_work_stops_being_allowed_before_and_after_its_sessions_exist() {
+    let mut h = H::new();
+    quick(&mut h);
+    h.version = "0.2.10".into();
+    h.gpus = vec![nvidia("560.94")];
+    gpu_signal(&h, true);
+    let s = setup_with3(&h, Some(&cuda_passes()), None, 8, json!({"game_ms": 60, "shard_every": 8, "build_ms": 3000, "provider": "cuda"}));
+    h.push(alt_lease_n(&h, &s, "l_G1", "selfplay", 128));
+    h.start();
+    assert!(wait(|| h.job_line_n(0).is_some()), "{}", h.agent_log());
+    assert_eq!(h.job_line()["providers"], json!(["cuda", "cpu"]), "a CUDA job");
+    // the GPU is taken while the worker builds its sessions (it says provider "")
+    gpu_signal(&h, false);
+    let paused = |h: &H| h.phase() == farm_agent::status::Phase::Paused && h.status.lock().unwrap().detail == "GPU is busy";
+    assert!(wait(|| paused(&h)), "{:?}
+{}", h.status.lock().unwrap(), h.agent_log());
+    assert!(!h.agent_log().contains("sessions built"), "yielded before the worker named its provider: {}", h.agent_log());
+    gpu_signal(&h, true);
+    assert!(wait(|| h.agent_log().contains("sessions built (cuda)")), "{}", h.agent_log());
+    assert!(wait(|| h.phase() == farm_agent::status::Phase::Working));
+    // and again once it plays on CUDA
+    assert!(wait(|| h.status.lock().unwrap().games_today >= 1), "{}", h.agent_log());
+    gpu_signal(&h, false);
+    assert!(wait(|| paused(&h)), "{}", h.agent_log());
+    gpu_signal(&h, true);
+    let done = h.wait_done("l_G1");
+    assert!(done.get("refused").is_none_or(Value::is_null), "{done}");
+    assert_eq!(done["given_back"], false, "{done}");
+    assert!(done["stats"]["yields"].as_u64().unwrap() >= 2, "{done}");
+    assert_eq!(done["stats"]["provider"], "cuda", "{done}");
+    h.stop();
+
+    // the same CUDA job whose worker reports the CPU: GPU work not allowed doesn't pause it
+    let mut h = H::new();
+    quick(&mut h);
+    h.version = "0.2.10".into();
+    h.gpus = vec![nvidia("560.94")];
+    gpu_signal(&h, true);
+    let s = setup_with3(&h, Some(&cuda_passes()), None, 8, json!({"game_ms": 60, "shard_every": 8, "build_ms": 500, "provider": "cpu"}));
+    h.push(alt_lease_n(&h, &s, "l_G2", "selfplay", 128));
+    h.start();
+    assert!(wait(|| h.agent_log().contains("sessions built (cpu)")), "{}", h.agent_log());
+    assert!(wait(|| h.status.lock().unwrap().games_today >= 1));
+    gpu_signal(&h, false);
+    let done = h.wait_done("l_G2");
+    assert_eq!(h.job_line()["providers"], json!(["cuda", "cpu"]));
+    assert_eq!(done["given_back"], false, "{done}");
+    assert_eq!(done["stats"]["yields"], 0, "a CPU worker plays on: {done}");
     h.stop();
 }
 

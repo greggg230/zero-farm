@@ -17,6 +17,9 @@
 //!  "mem_grow_until": null,     // rolling: ... until this many games are finished (then it stays)
 //!  "oom_abort": false,         // a failed commit: abort on stderr (Rust's message) instead of a fatal error
 //!  "crash_gid": null,          // the worker that finishes this game id panics (exit 101): one member of a crew
+//!  "build_ms": 0,              // its sessions take this long to build after the job line: meanwhile `status` says
+//!                              // `provider: ""` (zero-core's default) and nothing is self-tested or played
+//!  "provider": "cpu",          // the provider `status` and `selftest` report once the sessions are built
 //!  "rate": null}               // rolling: leaves per second by layout (below)
 //! ```
 //!
@@ -208,6 +211,8 @@ struct Cfg {
     oom_abort: bool,
     crash_gid: Option<u64>,
     rate: Option<Value>,
+    build_ms: u64,
+    provider: String,
 }
 
 impl Cfg {
@@ -246,6 +251,8 @@ impl Cfg {
             oom_abort: f.get("oom_abort").and_then(Value::as_bool).unwrap_or(false),
             crash_gid: o("crash_gid"),
             rate: f.get("rate").filter(|r| r.is_object()).cloned(),
+            build_ms: u("build_ms", 0),
+            provider: f.get("provider").and_then(Value::as_str).unwrap_or("cpu").to_string(),
         }
     }
 }
@@ -326,11 +333,14 @@ struct W {
     crew: Vec<f64>,
     beat: Option<(PathBuf, Instant)>,
     crew_n: usize,
+    /// Its sessions are being built (`build_ms`): no provider yet.
+    building: bool,
 }
 
 impl W {
     fn stats(&self) -> Value {
-        let mut s = json!({"games": self.done, "decisions": self.done * 100, "threads": self.threads, "provider": "cpu",
+        let provider = if self.building { "" } else { self.cfg.provider.as_str() };
+        let mut s = json!({"games": self.done, "decisions": self.done * 100, "threads": self.threads, "provider": provider,
                "cpu_pct": 1, "rss_mb": 5, "yields": self.yields});
         if self.leaves_s.is_some() {
             s["leaves"] = json!(self.leaves as u64);
@@ -407,7 +417,7 @@ impl W {
                 .and_then(Value::as_str)
                 .and_then(|p| std::fs::read(p).ok())
                 .is_some_and(|b| sha.is_none_or(|h| sha256_hex(&b) == h));
-            self.out.send(json!({"ev": "selftest", "gen": gen, "provider": "cpu", "max_abs": if file_ok { 0.0 } else { 0.5 }, "ok": file_ok}));
+            self.out.send(json!({"ev": "selftest", "gen": gen, "provider": self.cfg.provider, "max_abs": if file_ok { 0.0 } else { 0.5 }, "ok": file_ok}));
             if !file_ok {
                 self.out.send(json!({"ev": "error", "message": format!("network {gen:?} failed the self-test"), "fatal": true}));
                 std::process::exit(2);
@@ -635,7 +645,7 @@ fake crash at game {gid:?}");
                 && file_ok(m.get("model").and_then(Value::as_str), m.get("sha256").and_then(Value::as_str))
                 && file_ok(m.get("reference").and_then(Value::as_str), None)
                 && self.cfg.selftest_fail_gen != Some(gen);
-            self.out.send(json!({"ev": "selftest", "gen": gen, "provider": "cpu", "max_abs": if ok { 2.5e-6 } else { 0.5 }, "ok": ok}));
+            self.out.send(json!({"ev": "selftest", "gen": gen, "provider": self.cfg.provider, "max_abs": if ok { 2.5e-6 } else { 0.5 }, "ok": ok}));
             if !ok {
                 self.out.send(json!({"ev": "error", "message": format!("network {gen} failed the self-test"), "fatal": true}));
                 return false;
@@ -818,6 +828,7 @@ fn main() {
         crew: vec![],
         beat: None,
         crew_n: 1,
+        building: false,
     };
     if let Some(r) = w.cfg.rate.clone() {
         w.leaves_s = Some(layout_rate(&r, &job));
@@ -832,8 +843,17 @@ fn main() {
         }
         eprintln!("fakeworker: {} leaves/s at this layout", w.leaves_s.unwrap_or(0.0));
     }
+    if w.cfg.build_ms > 0 {
+        // (a real worker builds its sessions first: its `status` says `provider: ""` until they exist)
+        w.building = true;
+        w.status();
+        let ms = w.cfg.build_ms;
+        w.work(ms);
+        w.building = false;
+        eprintln!("fakeworker: sessions built ({})", w.cfg.provider);
+    }
     if job.get("model").and_then(Value::as_str).is_some() {
-        w.out.send(json!({"ev": "selftest", "provider": "cpu", "max_abs": 0.0, "ok": true}));
+        w.out.send(json!({"ev": "selftest", "provider": w.cfg.provider, "max_abs": 0.0, "ok": true}));
     }
     w.status();
     match job.get("kind").and_then(Value::as_str) {

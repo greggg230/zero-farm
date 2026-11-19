@@ -3,7 +3,8 @@
 //! the lease's released ids (only the tail extended), members that started all of their ids replaced, every released id
 //! played once or returned, results from every worker uploaded under the lease, the crew paused and resumed together, a
 //! member's crash leaving the others going, a new generation switched to by all of them, the memory plan for the whole
-//! crew, and the tuner choosing the worker count.
+//! crew, the tuner choosing the worker count, and (0.3.2) workers that report no provider before their sessions exist
+//! never taken for GPU jobs.
 
 mod harness;
 
@@ -200,6 +201,36 @@ fn crash_in_crew(id: &str, game_ms: u64, gid: u64, lost: u64) -> H {
     assert_eq!(crashes[0]["kind"], "panic", "{crashes:?}");
     assert!(job_lines(&h).len() >= 3, "a worker took its place: {}", crew_log(&h));
     h
+}
+
+/// Agent 0.3.2: a worker that hasn't built its sessions yet answers `status` with `provider: ""` (zero-core's default).
+/// On a machine where GPU work isn't allowed (every Mac) 0.3.1 took that for a GPU job: it yielded the main worker
+/// right after its start ("GPU is busy") and the worker stayed suspended, its sessions never built, until the
+/// coordinator took the lease back - a crew of two (fixed, or the tuner's) pings its main worker at once, and one worker
+/// is pinged too when quiet. A job is what the agent chose for it (here the CPU) until the worker names a provider.
+#[test]
+fn workers_without_sessions_yet_are_never_taken_for_gpu_jobs() {
+    for (name, workers, tune) in [("a crew of two", Some(2), false), ("one worker", None, false), ("tuned", None, true)] {
+        let mut h = harness(workers, tune);
+        h.signals.set(|s| s.gpu = None); // no GPU signal: GPU work isn't allowed here
+        let mut fk = fake(25, json!([1.0, 1.3]));
+        fk["build_ms"] = json!(1500);
+        h.push(crew_lease(&h, "l_CB", &fk, json!(8), 300));
+        h.start();
+        let done = h.wait_done("l_CB");
+        assert_eq!(done["given_back"], false, "{name}: {done}
+{}", crew_log(&h));
+        assert_eq!(done["stats"]["yields"], 0, "{name}: never yielded: {done}");
+        assert_eq!(done["stats"]["paused_ms"], 0, "{name}: {done}");
+        assert_eq!(done["stats"]["released"], 300, "{name}: the block used up: {done}");
+        ids_accounted(&h, "l_CB", &done);
+        assert!(h.agent_log().contains("sessions built (cpu)"), "{name}: {}", h.agent_log());
+        if workers == Some(2) {
+            assert!(job_lines(&h).len() >= 2 && workers_uploading(&h, "l_CB") >= 2, "{name}: {}", crew_log(&h));
+        }
+        assert!(h.crashes().is_empty(), "{name}: {:?}", h.crashes());
+        h.stop();
+    }
 }
 
 #[test]

@@ -1130,6 +1130,8 @@ struct Run {
     ckpt_inflight: bool,
     games_done: u64,
     stats: Stats,
+    /// The execution provider the worker reports (`selftest`, `status`) once it has built its sessions; None until then
+    /// (a worker says `""` before, zero-core's default: never stored).
     provider: Option<String>,
     yields: u64,
     yield_ms_max: u64,
@@ -1332,8 +1334,22 @@ impl Run {
         true
     }
 
+    /// The job uses a GPU (it yields when GPU work stops being allowed): the provider the worker reports once it has
+    /// built its sessions, until then what the agent chose for the job (its job line's `providers`). A worker that has
+    /// no sessions yet says `provider: ""` - unknown, never a GPU: a CPU job taken for a GPU one would yield on every
+    /// machine without a usable GPU (every Mac) and stay suspended, its sessions never built.
     fn gpu_job(&self) -> bool {
-        self.provider.as_deref().is_some_and(|p| p != "cpu")
+        match self.provider.as_deref() {
+            Some(p) => p != "cpu",
+            None => self.providers.0.iter().any(|p| p != "cpu"),
+        }
+    }
+
+    /// A provider the worker reported (`selftest`, `status`): stored once it names one (`""`: no sessions yet).
+    fn note_provider(&mut self, v: Option<&Value>) {
+        if let Some(p) = v.and_then(Value::as_str).filter(|p| !p.is_empty()) {
+            self.provider = Some(p.to_string());
+        }
     }
 
     fn go(&mut self, eng: &mut Engine) -> LeaseEnd {
@@ -2120,9 +2136,7 @@ impl Run {
                     log::error!("lease {}: network {gen:?} failed its self-test: {v}", self.id());
                     self.selftest_failed = true;
                 }
-                if let Some(p) = v.get("provider").and_then(Value::as_str) {
-                    self.provider = Some(p.to_string());
-                }
+                self.note_provider(v.get("provider"));
             }
             "status" => {
                 let s = match v.get("stats") {
@@ -2133,9 +2147,7 @@ impl Run {
                         m
                     }
                 };
-                if let Some(p) = s.get("provider").and_then(Value::as_str) {
-                    self.provider = Some(p.to_string());
-                }
+                self.note_provider(s.get("provider"));
                 self.tune_status(eng, &s);
                 self.stats = s;
             }
