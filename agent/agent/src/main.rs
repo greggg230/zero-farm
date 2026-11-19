@@ -2,7 +2,7 @@
 //!
 //! ```text
 //! farm-agent run       [--root DIR] [--headless] [--coordinator URL]   (what the launcher starts)
-//! farm-agent dry-run   [--root DIR] [--seconds N] [--every N]   log idle-policy decisions (and per-GPU readings) only; no work
+//! farm-agent dry-run   [--root DIR] [--seconds N] [--every N] [--pids A,B]   log idle-policy decisions (and per-GPU readings, the video memory in use) only; no work
 //! farm-agent install   [--root DIR] [--reg-name NAME] [--shortcut-dir DIR] [--no-shortcut] [--no-start] [--quiet]
 //! farm-agent uninstall [--root DIR] [--reg-name NAME] [--shortcut-dir DIR] [--quiet]
 //! farm-agent enroll    --invite CODE [--name NAME] [--root DIR] [--coordinator URL]
@@ -325,6 +325,8 @@ fn cmd_dry_run(args: &Args) -> i32 {
     let secs: u64 = args.get("seconds").and_then(|s| s.parse().ok()).unwrap_or(u64::MAX);
     // Log at least this often even when the decision doesn't change (with the per-GPU readings).
     let every: u64 = args.get("every").and_then(|s| s.parse().ok()).unwrap_or(60).max(1);
+    // (agent 0.3.4: processes whose dedicated GPU memory is logged too, e.g. workers run by hand)
+    let pids: Vec<u32> = args.get("pids").map(|s| s.split(',').filter_map(|p| p.trim().parse().ok()).collect()).unwrap_or_default();
     #[cfg(windows)]
     let mut signals = Win32Signals::new(true);
     #[cfg(target_os = "macos")]
@@ -339,7 +341,7 @@ fn cmd_dry_run(args: &Args) -> i32 {
     );
     while start.elapsed().as_secs() < secs {
         let t0 = std::time::Instant::now();
-        let s = signals.sample(None);
+        let s = signals.sample(&pids);
         let took_ms = t0.elapsed().as_millis();
         let d = farm_agent::policy::decide(&mut st, &s, &machine.settings);
         let line = format!(
@@ -352,8 +354,13 @@ fn cmd_dry_run(args: &Args) -> i32 {
             log::info!("decision: {line}");
             for r in signals.gpu_readings() {
                 let temp = r.temp_c.map_or_else(|| "none".to_string(), |t| format!("{t} C"));
+                // (agent 0.3.4: the dedicated memory in use, every program's and the processes `--pids` names)
+                let mem = match farm_agent::signals::SignalSource::gpu_memory(&signals, r.luid, &pids) {
+                    Some(m) => format!(", dedicated memory in use {} MB{}", m.adapter_used_mb, m.per_pid.iter().map(|(p, mb)| format!(", pid {p} {mb} MB")).collect::<String>()),
+                    None => ", dedicated memory not measured".to_string(),
+                };
                 log::info!(
-                    "  gpu luid {} {} ({}): other use {} %, temperature {temp}",
+                    "  gpu luid {} {} ({}): other use {} %, temperature {temp}{mem}",
                     farm_agent::profile::luid_hex(r.luid),
                     r.vendor,
                     r.name,

@@ -22,6 +22,10 @@
 //!  "build_ms": 0,              // its sessions take this long to build after the job line: meanwhile `status` says
 //!                              // `provider: ""` (zero-core's default) and nothing is self-tested or played
 //!  "provider": "cpu",          // the provider `status` and `selftest` report once the sessions are built
+//!  "vram_base_mb": 0,          // agent 0.3.4: `status` reports `vram_mb` = this + `vram_per_row_mb` x the job's batch
+//!  "vram_per_row_mb": 0,       //   rows (conc / groups, rounded up) once its sessions exist (0 while yielded)
+//!  "vram_oom_rows": null,      // agent 0.3.4: batches of more rows than this fail at the start like a GPU out of
+//!                              //   memory (ONNX Runtime's CUDA allocator's fatal error, exit 2)
 //!  "rate": null}               // rolling: leaves per second by layout (below)
 //! ```
 //!
@@ -220,6 +224,9 @@ struct Cfg {
     rate: Option<Value>,
     build_ms: u64,
     provider: String,
+    vram_base_mb: u64,
+    vram_per_row_mb: u64,
+    vram_oom_rows: Option<u64>,
 }
 
 impl Cfg {
@@ -262,6 +269,9 @@ impl Cfg {
             rate: f.get("rate").filter(|r| r.is_object()).cloned(),
             build_ms: u("build_ms", 0),
             provider: f.get("provider").and_then(Value::as_str).unwrap_or("cpu").to_string(),
+            vram_base_mb: u("vram_base_mb", 0),
+            vram_per_row_mb: u("vram_per_row_mb", 0),
+            vram_oom_rows: o("vram_oom_rows"),
         }
     }
 }
@@ -346,6 +356,9 @@ struct W {
     building: bool,
     /// `mem_ramp_ms`: (the job's start, the games' MB to commit, committed so far).
     ramp: Option<(Instant, u64, u64)>,
+    /// The job's batch rows (conc / groups, rounded up) and whether it yielded (its sessions released).
+    batch: u64,
+    yielded: bool,
 }
 
 impl W {
@@ -353,6 +366,10 @@ impl W {
         let provider = if self.building { "" } else { self.cfg.provider.as_str() };
         let mut s = json!({"games": self.done, "decisions": self.done * 100, "threads": self.threads, "provider": provider,
                "cpu_pct": 1, "rss_mb": 5, "yields": self.yields});
+        if self.cfg.vram_base_mb + self.cfg.vram_per_row_mb > 0 {
+            let held = !self.building && !self.yielded;
+            s["vram_mb"] = json!(if held { self.cfg.vram_base_mb + self.cfg.vram_per_row_mb * self.batch } else { 0 });
+        }
         if self.leaves_s.is_some() {
             s["leaves"] = json!(self.leaves as u64);
             s["games_started"] = json!(self.started);
@@ -384,7 +401,10 @@ impl W {
             return;
         }
         *at = Instant::now();
-        let _ = std::fs::write(&*path, b"");
+        // (changing content: on Windows rewriting an empty file leaves its modification time - every worker then counted
+        // a crew of one)
+        let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map_or(0, |d| d.as_nanos());
+        let _ = std::fs::write(&*path, stamp.to_string());
         let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
         let fresh = |e: &std::fs::DirEntry| e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|d| d < Duration::from_millis(400));
         self.crew_n = std::fs::read_dir(dir).map(|rd| rd.flatten().filter(fresh).count()).unwrap_or(1).max(1);
@@ -457,17 +477,22 @@ impl W {
         if self.cfg.yield_delay_ms > 0 {
             std::thread::sleep(Duration::from_millis(self.cfg.yield_delay_ms as u64));
         }
+        self.yielded = true;
+        eprintln!("fakeworker: pid {} yielded", std::process::id());
         self.out.send(json!({"ev": "yielded"}));
         // Wait for resume or quit. (The agent suspends us; time stands still meanwhile.)
         loop {
             match self.rx.recv() {
                 Ok(Some(op)) => match op.get("op").and_then(Value::as_str).unwrap_or("") {
                     "resume" => {
+                        self.yielded = false;
+                        eprintln!("fakeworker: pid {} resumed", std::process::id());
                         self.out.send(json!({"ev": "resumed"}));
                         return;
                     }
                     "quit" => {
                         self.stop = Stop::Quit;
+                        self.yielded = false;
                         return;
                     }
                     "finish" => self.stop = Stop::Finish,
@@ -876,6 +901,11 @@ fn main() {
         crew_n: 1,
         building: false,
         ramp: None,
+        batch: {
+            let conc = job.get("conc").and_then(Value::as_u64).unwrap_or(1).max(1);
+            conc.div_ceil(job.get("groups").and_then(Value::as_u64).unwrap_or(1).max(1))
+        },
+        yielded: false,
     };
     if let Some(r) = w.cfg.rate.clone() {
         w.leaves_s = Some(layout_rate(&r, &job));
@@ -901,6 +931,12 @@ fn main() {
     }
     if job.get("model").and_then(Value::as_str).is_some() {
         w.out.send(json!({"ev": "selftest", "provider": w.cfg.provider, "max_abs": 0.0, "ok": true}));
+    }
+    // (a batch the GPU's memory doesn't hold: the CUDA allocator's error at the first batch)
+    if w.cfg.vram_oom_rows.is_some_and(|n| w.batch > n) {
+        eprintln!("fakeworker: batches of {} rows don't fit the GPU", w.batch);
+        w.out.send(json!({"ev": "error", "fatal": true, "message": "ONNX Runtime: Non-zero status code returned while running MatMul node. Status Message: onnxruntime::CudaCall CUDA failure 2: out of memory ; GPU=0 ; expr=cudaMalloc((void**)&p, size);"}));
+        std::process::exit(2);
     }
     w.status();
     match job.get("kind").and_then(Value::as_str) {

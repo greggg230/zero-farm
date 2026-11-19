@@ -30,12 +30,24 @@ pub const WORKER_FEATURE: &str = "rolling";
 pub const CPU_INFLIGHT: u64 = 32;
 /// ... in this many groups (batches in turn).
 pub const CPU_GROUPS: u64 = 4;
-/// "auto" on a GPU: the games in flight tried, in order; the next is taken while doubling gains enough.
-pub const GPU_STEPS: [u64; 4] = [64, 128, 256, 512];
-/// "auto" on a GPU: doubling the games in flight must raise the bench's rows/s at least this much (15 %).
+/// "auto" on a GPU (agent 0.3.4): the batch sizes (rows) tried, in order; the next is taken while doubling it gains
+/// enough on the bench of the job's own network (`gpu_batch`). 0.2.13-0.3.3 tried 64-512 games in flight, rated at
+/// half of them below 256: a 4070 Ti PC never got past 512, and its memory plan held it to 128.
+pub const GPU_BATCH_STEPS: [u64; 6] = [32, 64, 128, 256, 512, 1024];
+/// "auto" on a GPU: doubling the batch must raise the bench's rows/s at least this much (15 %).
 pub const GPU_DOUBLING_GAIN: f64 = 1.15;
-/// "auto" on a GPU: from this many games in flight one group (one batch of all of them), below it 2 (each batch half).
-pub const GPU_ONE_GROUP_FROM: u64 = 256;
+/// agent 0.3.4: a GPU job keeps this many full batches in flight (all its workers' games: `GPU_BATCHES` x the bench's
+/// batch): while one batch is on the GPU the next one fills. The 4070 Ti PC of 2026-11-19 (legacy-meta3-r1 gen 769, the
+/// CUDA build, 5-minute windows, leaves/s): one worker of 128 in flight in 2 groups 5,030 (GPU 37 % busy), 256 in one
+/// group 8,379, 512 9,803, 1,024 10,825 (2 groups of 512: 10,697), two workers of 512 12,529, three of 384 14,154 (GPU 82
+/// % busy); the bench's batch there is 512 rows, so 1,024 games in flight - where one worker levels off.
+pub const GPU_BATCHES: u64 = 2;
+/// A GPU job's worker runs at most this many groups (batches in turn).
+pub const GPU_MAX_GROUPS: u64 = 2;
+/// agent 0.3.4: a GPU job's workers share this many search threads per physical core (at most the logical processors;
+/// the owner's `cpu_threads` instead when set). On the 4-core / 8-thread PC above: 6 - one worker 6, two 3 each, three
+/// 2 each, as measured; the trainer's own torch path there found 6 search threads faster than 8.
+pub const GPU_THREADS_PER_CORE: f64 = 1.5;
 /// What a rolling job's worker commits (the memory its job's limit counts, MB): `base_mb` before any game (the
 /// network's session, the runtime, the process), and `per_game_mb` for each game in flight (its search trees, its
 /// positions and records so far, its share of the evaluation cache and of the runtime's buffers).
@@ -120,6 +132,55 @@ pub fn cpu_cost() -> MemCost {
 }
 /// A GPU job's cost until this PC measured the run's own: the GPU runtime commits more before any game.
 pub const GPU_COST: MemCost = MemCost { base_mb: 1800, per_game_mb: 45 };
+
+/// agent 0.3.4: the video memory a GPU job's worker holds (dedicated GPU memory, MB): `base_mb` before any batch (the
+/// CUDA context, the network, the runtime's workspaces) and `per_row_mb` for each row of its biggest batch (the
+/// activations). 0.2.13-0.3.3 didn't plan video memory: one worker of at most 512 games in flight never came near a
+/// GPU's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VramCost {
+    pub base_mb: u64,
+    pub per_row_mb: u64,
+}
+
+impl VramCost {
+    /// What a worker batching `rows` rows is planned to hold.
+    pub fn plan_mb(&self, rows: u64) -> u64 {
+        self.base_mb + rows.max(1) * self.per_row_mb
+    }
+}
+
+/// A GPU job's video memory until this PC measured the run's own with the lease's worker build (`Learned`): 1 GB + 2 MB
+/// per batch row, about twice what the 4070 Ti PC above used - the whole GPU (its desktop included) held 709 MB with one
+/// worker of 128 in flight, 1,605 MB with 512 in one group, 2,557 MB with three workers of 384 (nvidia-smi, 5-s samples).
+pub const GPU_VRAM: VramCost = VramCost { base_mb: 1024, per_row_mb: 2 };
+/// A GPU job's workers are planned within this share of the adapter's dedicated memory, less what other programs use.
+pub const VRAM_SHARE: f64 = 0.85;
+/// When the adapter's dedicated memory in use (every program's) reaches this share, a worker of the lease gives way.
+pub const VRAM_HIGH_SHARE: f64 = 0.95;
+/// Other programs' dedicated GPU memory when Windows doesn't say (no `GPU Adapter Memory` counters).
+pub const VRAM_OTHERS_MB: u64 = 1024;
+
+/// The video memory a GPU job's workers are planned within (MB): `VRAM_SHARE` of the adapter's `total_mb`, less what
+/// other programs hold (`others_mb`).
+pub fn vram_budget(total_mb: u64, others_mb: u64) -> u64 {
+    ((total_mb as f64 * VRAM_SHARE) as u64).saturating_sub(others_mb)
+}
+
+/// The rows a batch of one of `n` workers sharing `budget_mb` may have at `cost` (0: not even its base fits).
+pub fn vram_rows(budget_mb: u64, n: u32, cost: VramCost) -> u64 {
+    (budget_mb / n.max(1) as u64).saturating_sub(cost.base_mb) / cost.per_row_mb.max(1)
+}
+
+/// A worker's fatal error or stderr says the GPU ran out of memory (ONNX Runtime's CUDA allocator: "CUDA failure 2: out
+/// of memory ... cudaMalloc", cuBLAS / cuDNN "ALLOC_FAILED", DirectML's "E_OUTOFMEMORY" / "device removed" on a full
+/// adapter).
+pub fn gpu_oom(text: &str) -> bool {
+    let m = text.to_ascii_lowercase();
+    let gpu = ["cuda", "cudamalloc", "cublas", "cudnn", "gpu", "device", "directml", "dml", "vram"].iter().any(|k| m.contains(k));
+    ["cuda failure 2", "cuda_error_out_of_memory", "cudaerrormemoryallocation", "status_alloc_failed", "e_outofmemory"].iter().any(|k| m.contains(k))
+        || (gpu && (m.contains("out of memory") || m.contains("failed to allocate")))
+}
 /// The games in flight are planned to commit at most this share of the memory cap (the job's limit): the rest is
 /// headroom for games that run long and for the runtime's buffers.
 pub const PLAN_SHARE: f64 = 0.85;
@@ -291,24 +352,53 @@ impl Learned {
     /// Records `per_game_mb` for `run` / `build` when it is more than what is planned with now (the stored value, else
     /// the default) -> true when it was.
     pub fn raise(layout: &Layout, run: &str, build: &str, gpu: bool, per_game_mb: u64) -> bool {
-        let mut m = Self::load(layout);
-        let k = Self::key(run, build, gpu);
-        let now = m.get(&k).copied().unwrap_or(Self::default_cost(gpu).per_game_mb);
-        if per_game_mb <= now {
-            return false;
-        }
-        m.insert(k, per_game_mb);
-        Self::save(layout, &m);
-        true
+        Self::raise_key(layout, Self::key(run, build, gpu), Self::default_cost(gpu).per_game_mb, per_game_mb)
     }
 
     /// agent 0.3.3: a steady reading (`steady_reading`) of `reading_mb` per game: remembered as `reading_mb` x
     /// `LEARN_MARGIN` (rounded up, at least 1) when that is less than what is planned with now (the stored value, else the
     /// default) -> the new value when it was lowered. Rises go through `raise`, at once.
     pub fn steady(layout: &Layout, run: &str, build: &str, gpu: bool, reading_mb: u64) -> Option<u64> {
+        Self::steady_key(layout, Self::key(run, build, gpu), Self::default_cost(gpu).per_game_mb, reading_mb)
+    }
+
+    /// agent 0.3.4: a GPU job's video memory per batch row over `GPU_VRAM`'s base, per run and worker build (key
+    /// `<run>/<build_id>/vram`), calibrated as the memory per game: a build not measured here is planned with `GPU_VRAM`;
+    /// more is remembered at once (`vram_raise`), less from steady readings with the margin (`vram_steady`). -> (the cost,
+    /// whether it was measured here).
+    pub fn vram_plan(layout: &Layout, run: &str, build: &str) -> (VramCost, bool) {
+        let m = Self::load(layout).get(&Self::vram_key(run, build)).copied();
+        (VramCost { per_row_mb: m.unwrap_or(GPU_VRAM.per_row_mb).max(1), ..GPU_VRAM }, m.is_some())
+    }
+
+    fn vram_key(run: &str, build: &str) -> String {
+        format!("{run}/{build}/vram")
+    }
+
+    /// Records `per_row_mb` of video memory when it is more than what is planned with now -> true when it was.
+    pub fn vram_raise(layout: &Layout, run: &str, build: &str, per_row_mb: u64) -> bool {
+        Self::raise_key(layout, Self::vram_key(run, build), GPU_VRAM.per_row_mb, per_row_mb)
+    }
+
+    /// A steady reading of `reading_mb` of video memory per row, remembered with the margin when lower -> the new value.
+    pub fn vram_steady(layout: &Layout, run: &str, build: &str, reading_mb: u64) -> Option<u64> {
+        Self::steady_key(layout, Self::vram_key(run, build), GPU_VRAM.per_row_mb, reading_mb)
+    }
+
+    fn raise_key(layout: &Layout, k: String, default: u64, v: u64) -> bool {
         let mut m = Self::load(layout);
-        let k = Self::key(run, build, gpu);
-        let now = m.get(&k).copied().unwrap_or(Self::default_cost(gpu).per_game_mb);
+        let now = m.get(&k).copied().unwrap_or(default);
+        if v <= now {
+            return false;
+        }
+        m.insert(k, v);
+        Self::save(layout, &m);
+        true
+    }
+
+    fn steady_key(layout: &Layout, k: String, default: u64, reading_mb: u64) -> Option<u64> {
+        let mut m = Self::load(layout);
+        let now = m.get(&k).copied().unwrap_or(default);
         let v = ((reading_mb as f64 * LEARN_MARGIN).ceil() as u64).max(1);
         if v >= now {
             return None;
@@ -355,12 +445,32 @@ impl MemPlan {
     }
 }
 
-/// A GPU job's groups for "auto": one at `GPU_ONE_GROUP_FROM` games in flight or more, else 2 (at most one per game).
-pub fn gpu_groups(conc: u64) -> u64 {
-    if conc >= GPU_ONE_GROUP_FROM {
-        1
-    } else {
-        2.min(conc.max(1))
+/// agent 0.3.4: the groups of a GPU worker of `conc` games in flight whose full batch is `batch` rows: as many as make
+/// batches of at most `batch` rows, at most `GPU_MAX_GROUPS`, at most one per game.
+pub fn gpu_groups(conc: u64, batch: u64) -> u64 {
+    conc.div_ceil(batch.max(1)).clamp(1, GPU_MAX_GROUPS).min(conc.max(1))
+}
+
+/// agent 0.3.4: the bench's full batch on a GPU (rows): among `GPU_BATCH_STEPS` the batch after which doubling gains
+/// less than `GPU_DOUBLING_GAIN` rows/s (the smallest step without numbers).
+pub fn gpu_batch(rows: &BTreeMap<String, f64>) -> u64 {
+    let rate = |b: u64| crate::probe::rate_at(rows, b);
+    let mut b = GPU_BATCH_STEPS[0];
+    for &next in &GPU_BATCH_STEPS[1..] {
+        match (rate(b), rate(next)) {
+            (Some(a), Some(c)) if c >= a * GPU_DOUBLING_GAIN => b = next,
+            _ => break,
+        }
+    }
+    b
+}
+
+/// agent 0.3.4: the games in flight a GPU job targets in all (its workers'): `GPU_BATCHES` full batches, or the run's
+/// number.
+pub fn gpu_target(setting: Inflight, batch: u64) -> u64 {
+    match setting {
+        Inflight::N(n) => n,
+        Inflight::Auto => (GPU_BATCHES * batch).min(MAX_INFLIGHT),
     }
 }
 
@@ -382,27 +492,20 @@ pub fn cpu_shape(setting: Inflight, template_groups: u64, mem: MemPlan) -> (u64,
     }
 }
 
-/// A GPU job's (conc, groups) from the bench of the job's network on the provider (rows/s by batch rows): the run's
-/// number (in at most 2 groups), or "auto": among `GPU_STEPS` the games in flight after which doubling gains less than
-/// `GPU_DOUBLING_GAIN` rows/s (each rated at its batch, `conc / gpu_groups(conc)` rows), in `gpu_groups` groups; capped
-/// by memory (`MemPlan::cap`).
+/// One GPU worker's (conc, groups) from the bench of the job's network on the provider (rows/s by batch rows): the run's
+/// number (in at most 2 groups), or "auto" (agent 0.3.4): `GPU_BATCHES` full batches of the bench's batch (`gpu_batch`)
+/// in groups of at most that batch (`gpu_groups`); capped by memory (`MemPlan::cap`). A GPU job's layout (its workers,
+/// their games in flight and groups) is then the tuner's (lease.rs, PROTOCOL 13), starting from this target.
 pub fn gpu_shape(setting: Inflight, rows: &BTreeMap<String, f64>, template_groups: u64, mem: MemPlan) -> (u64, u64) {
     match setting {
         Inflight::N(n) => {
             let n = mem.cap(n, false);
-            (n, template_groups.clamp(1, 2).min(n))
+            (n, template_groups.clamp(1, GPU_MAX_GROUPS).min(n))
         }
         Inflight::Auto => {
-            let rate = |n: u64| crate::probe::rate_at(rows, n.div_ceil(gpu_groups(n)));
-            let mut n = GPU_STEPS[0];
-            for &next in &GPU_STEPS[1..] {
-                match (rate(n), rate(next)) {
-                    (Some(a), Some(b)) if b >= a * GPU_DOUBLING_GAIN => n = next,
-                    _ => break,
-                }
-            }
-            let conc = mem.cap(n, true);
-            (conc, gpu_groups(conc))
+            let b = gpu_batch(rows);
+            let conc = mem.cap(gpu_target(setting, b), true);
+            (conc, gpu_groups(conc, b))
         }
     }
 }
@@ -585,21 +688,62 @@ mod tests {
     }
 
     #[test]
-    fn gpu_auto_stops_doubling_below_15_percent_and_fits_memory() {
-        // batch rows 32, 64 (2 groups) for 64, 128 in flight; 256, 512 (1 group) for 256, 512
+    fn gpu_auto_targets_two_full_batches_and_fits_memory() {
         let climbing = rows(&[(1, 100.0), (32, 3000.0), (64, 4800.0), (256, 9000.0), (512, 11000.0), (1024, 11500.0)]);
-        // 64 -> 128: 3000 -> 4800 (+60 %); 128 -> 256: 4800 -> 9000; 256 -> 512: 9000 -> 11000 (+22 %): 512, one group
-        assert_eq!(gpu_shape(Inflight::Auto, &climbing, 1, auto_gpu(100_000)), (512, 1));
-        // (10,000 x 0.85 - 1,500) / 50 = 140 -> 128, in 2 groups
-        assert_eq!(gpu_shape(Inflight::Auto, &climbing, 1, plan(10_000, 1500, 50, false)), (128, 2));
-        assert_eq!(gpu_shape(Inflight::Auto, &climbing, 1, plan(40_000, 0, 100, false)), (320, 1), "340 -> a multiple of 32, one group from 256");
+        // 32 -> 64 rows: +60 %; 64 -> 128 (log-log between 64 and 256): +37 %; 128 -> 256 +37 %; 256 -> 512 +22 %; 512 ->
+        // 1,024 +4.5 %: a full batch is 512 rows, the target 1,024 games in flight in 2 groups of 512
+        assert_eq!(gpu_batch(&climbing), 512);
+        assert_eq!(gpu_shape(Inflight::Auto, &climbing, 1, auto_gpu(100_000)), (1024, 2));
+        // (10,000 x 0.85 - 1,500) / 50 = 140 -> 128, in 1 group (a batch of 128 <= 512 rows)
+        assert_eq!(gpu_shape(Inflight::Auto, &climbing, 1, plan(10_000, 1500, 50, false)), (128, 1));
+        assert_eq!(gpu_shape(Inflight::Auto, &climbing, 1, plan(40_000, 0, 50, false)), (672, 2), "680 -> a multiple of 32, 2 batches of 336");
         let flat = rows(&[(1, 100.0), (32, 3000.0), (64, 3300.0), (1024, 3400.0)]);
-        assert_eq!(gpu_shape(Inflight::Auto, &flat, 1, auto_gpu(100_000)), (64, 2), "64 -> 128 gains 10 %");
-        let r2 = rows(&[(32, 3000.0), (64, 6000.0), (256, 6600.0)]);
-        assert_eq!(gpu_shape(Inflight::Auto, &r2, 1, auto_gpu(100_000)), (128, 2), "128 -> 256 gains 10 %");
+        assert_eq!(gpu_batch(&flat), 32, "32 -> 64 rows gains 10 %");
+        assert_eq!(gpu_shape(Inflight::Auto, &flat, 1, auto_gpu(100_000)), (64, 2));
+        let r2 = rows(&[(32, 3000.0), (64, 6000.0), (128, 9000.0), (256, 9900.0)]);
+        assert_eq!(gpu_shape(Inflight::Auto, &r2, 1, auto_gpu(100_000)), (256, 2), "128 -> 256 rows gains 10 %");
         assert_eq!(gpu_shape(Inflight::N(300), &climbing, 4, auto_gpu(100)), (300, 2), "the run's number, at most 2 groups");
         assert_eq!(gpu_shape(Inflight::N(300), &climbing, 4, plan(40_000, 0, 200, true)), (160, 2), "measured: 170 -> 160");
         assert_eq!(gpu_shape(Inflight::Auto, &BTreeMap::new(), 1, auto_gpu(100_000)), (64, 2), "no numbers: the smallest step");
+        // the canary PC's 4070 Ti (the agent's bench of legacy-meta3-r1 there, rows/s): 512 rows, 1,024 games in flight
+        let canary = rows(&[(1, 300.0), (8, 2400.0), (32, 7000.0), (128, 16000.0), (512, 24000.0), (1024, 24000.0)]);
+        assert_eq!((gpu_batch(&canary), gpu_target(Inflight::Auto, gpu_batch(&canary))), (512, 1024));
+        // 0.3.3 planned that PC's lease at 1,800 MB + 45 MB a game: 128 in flight with a ~9.5 GB limit; at the 4 MB a game
+        // measured there (2-3 MB, x 1.2, rounded up) the target fits
+        assert_eq!(gpu_shape(Inflight::Auto, &canary, 1, plan(9_500, 1800, 45, false)), (128, 1));
+        assert_eq!(gpu_shape(Inflight::Auto, &canary, 1, plan(9_500, 1800, 4, true)), (1024, 2));
+        assert_eq!((gpu_groups(384, 512), gpu_groups(1024, 512), gpu_groups(4096, 512), gpu_groups(1, 512)), (1, 2, 2, 1));
+    }
+
+    #[test]
+    fn video_memory_is_planned_per_batch_row_and_learned_per_run_and_build() {
+        // the 4070 Ti (12,282 MB) with 500 MB used by the desktop: 9,939 MB for the job; three workers of 384 rows plan
+        // 3 x 1,792 MB, more than the whole GPU held then (2,557 MB) and well within it
+        let b = vram_budget(12_282, 500);
+        assert_eq!(b, 9_939);
+        assert_eq!(GPU_VRAM.plan_mb(384), 1_792);
+        assert!(3 * GPU_VRAM.plan_mb(384) <= b);
+        assert_eq!(vram_rows(b, 3, GPU_VRAM), 1_144, "(3,313 - 1,024) / 2");
+        assert_eq!(vram_rows(4_000, 2, GPU_VRAM), 488);
+        assert_eq!(vram_rows(1_500, 2, GPU_VRAM), 0, "no room for a second worker's base");
+        let dir = std::env::temp_dir().join(format!("zf-rolling-vram-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let layout = Layout::new(&dir);
+        assert_eq!(Learned::vram_plan(&layout, "r", "b"), (GPU_VRAM, false));
+        assert!(Learned::vram_raise(&layout, "r", "b", 5));
+        assert!(!Learned::vram_raise(&layout, "r", "b", 4), "only up");
+        assert_eq!(Learned::vram_plan(&layout, "r", "b"), (VramCost { base_mb: 1024, per_row_mb: 5 }, true));
+        assert_eq!(Learned::vram_steady(&layout, "r", "b", 1), Some(2), "1 x 1.2, rounded up");
+        assert_eq!(Learned::vram_plan(&layout, "r", "b2"), (GPU_VRAM, false), "per worker build");
+        // the memory per game keys are apart
+        assert_eq!(Learned::get(&layout, "r", "b", true), None);
+        let _ = std::fs::remove_dir_all(&dir);
+        // a GPU out of memory, told from a host one
+        assert!(gpu_oom("onnxruntime::CudaCall CUDA failure 2: out of memory ; GPU=0 ; expr=cudaMalloc((void**)&p, size);"));
+        assert!(gpu_oom("CUBLAS failure 3: CUBLAS_STATUS_ALLOC_FAILED"));
+        assert!(gpu_oom("DirectML: E_OUTOFMEMORY"));
+        assert!(!gpu_oom("ONNX Runtime: Non-zero status code returned while running Concat node. Status Message: bad allocation"));
+        assert!(!gpu_oom("memory allocation of 1048576 bytes failed"));
     }
 
     #[test]

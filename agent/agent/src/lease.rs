@@ -11,7 +11,7 @@ use crate::cache::{Cache, CacheError, CkptFiles};
 use crate::engine::Engine;
 use crate::jobplan::{Plan, PlanError, Recheck};
 use crate::results::{compute_unfinished, ResultMeta, Source};
-use crate::rolling::{Learned, MemPlan, Setup};
+use crate::rolling::{Learned, MemPlan, Setup, VramCost};
 use crate::status::Phase;
 use crate::tune::{self, Layout, LoadMark, LoadTrack, Probe, Verdict};
 use crate::worker::{CpuMark, SpawnOpts, WorkerMsg, WorkerProc};
@@ -109,6 +109,33 @@ struct Roll {
     restarts: u32,
     /// A restart for memory is due once the current worker is gone.
     restart: Option<Restart>,
+    /// agent 0.3.4: a GPU job's full batch (rows, `rolling::gpu_batch` of its bench; 0 on the CPU).
+    gpu_batch: u64,
+    /// agent 0.3.4 (PROTOCOL 13.5): a GPU job's video memory plan and readings (None on the CPU, or when the adapter's
+    /// size isn't known: then one worker).
+    vram: Option<Vram>,
+}
+
+/// agent 0.3.4 (PROTOCOL 10.6, 13.5): a GPU job's video memory: the adapter, what its workers are planned within, the
+/// cost of a worker (`rolling::Learned::vram_plan`) and what they were measured to hold.
+#[derive(Debug, Clone)]
+struct Vram {
+    luid: u64,
+    /// The adapter's dedicated memory (MB).
+    total_mb: u64,
+    /// What the lease's workers are planned within (MB): `rolling::vram_budget` at the lease's start.
+    budget_mb: u64,
+    /// Other programs' dedicated memory on the adapter at the start (MB; `rolling::VRAM_OTHERS_MB` when not measured).
+    others_mb: u64,
+    cost: VramCost,
+    /// The most a worker held per row of its batch over the base, and at its steady state (MB), and the most remembered
+    /// at once (`Learned::vram_raise`).
+    per_row_max: u64,
+    steady_per_row: u64,
+    raised: u64,
+    /// The last reading (at most one a second) and the adapter's memory in use then (every program's, MB).
+    read_at: Option<Instant>,
+    adapter_used_mb: u64,
 }
 
 /// rev 15 (PROTOCOL 10.6): a rolling lease's worker restarted with fewer games in flight, for memory; rev 19
@@ -170,6 +197,13 @@ struct Mate {
     peak_mb: u64,
     /// Its fatal error's message (a memory failure is told by it).
     fatal: Option<String>,
+    /// agent 0.3.4: a GPU job's worker: `yield` was sent (when), it answered `yielded` (its session released), it is to be
+    /// stopped now (`mates_tick`); its video memory (MB: Windows' counters, else its `vram_mb`) and its last `vram_mb`.
+    yield_at: Option<Instant>,
+    yielded: bool,
+    want_stop: bool,
+    vram_mb: u64,
+    stats_vram: u64,
 }
 
 /// rev 19 (PROTOCOL 13.5): where a finishing worker's ids stop: its `games_started` after `finish`, read until two agree.
@@ -219,6 +253,11 @@ struct Tuning {
     fixed: bool,
     /// The most workers this lease may still run (lowered when a member fails with no restart left).
     crew_cap: u32,
+    /// agent 0.3.4: the worker bounds' inputs (the owner's `workers`, the most the cores and RAM allow): the bounds are
+    /// worked out again when the memory plan changes (`calibrate`).
+    bounds: (Option<u32>, u32),
+    /// agent 0.3.4: a GPU job's layout (PROTOCOL 13.1).
+    gpu: bool,
     /// rev 19 (PROTOCOL 13.5): the workers a measurement counts (generation, last counters): every member of the crew
     /// since it started - one that finished its range stays counted until it ends, then with its last counters (a
     /// rotation is the crew's normal work); one that fails discards it.
@@ -564,7 +603,7 @@ impl Engine {
             if !matches!(lease.kind.as_str(), "selfplay" | "eval") {
                 return no(format!("a {} lease can't use runtime pack {} (only self-play and evaluation get a GPU pack)", lease.kind, rt.build_id));
             }
-            if !self.decide(None).gpu {
+            if !self.decide(&[]).gpu {
                 return no(format!("runtime pack {} is for GPU work, which isn't allowed here right now", rt.build_id));
             }
             if !self.profile.gpus.iter().any(|g| n.met_by(&g.vendor, &g.driver)) {
@@ -857,7 +896,7 @@ impl Engine {
         if let Err(e) = std::fs::create_dir_all(work.join("out")) {
             return self.setup_failed(lease, &format!("work dir: {e}"));
         }
-        let d = self.decide(None);
+        let d = self.decide(&[]);
         let caps = self.caps(&d);
         // rev 15 (PROTOCOL 10): a rolling lease (its block checked against its job; with a definition only, which is
         // what its new generations are verified against); else, or anything amiss, a classic lease
@@ -903,14 +942,44 @@ impl Engine {
         if plan_providers.0 != ["cpu"] {
             log::info!("lease {id}: providers {:?} on {}", plan_providers.0, plan_providers.1["name"].as_str().unwrap_or("?"));
         }
+        // agent 0.3.4: a rolling GPU job's full batch (its bench's) and video memory plan (PROTOCOL 10.6, 13.5)
+        let gpu_batch = if gpu_choice { crate::rolling::gpu_batch(&choice.gpu_rows) } else { 0 };
+        let vram = if gpu_choice && roll.is_some() { self.vram_plan(lease, &choice) } else { None };
+        if let Some(v) = &vram {
+            let line = format!(
+                "video memory: {} MB on the GPU, {} MB used by other programs, {} MB for the job's workers at {} MB + {} MB per batch row{}",
+                v.total_mb,
+                v.others_mb,
+                v.budget_mb,
+                v.cost.base_mb,
+                v.cost.per_row_mb,
+                if Learned::vram_plan(&self.cfg.layout, lease.run.as_deref().unwrap_or(""), &lease.build.build_id).1 { " (measured here)" } else { "" }
+            );
+            log::info!("lease {id}: {line}");
+            self.worker_log.write_line(&format!("crew [{id}]: {line}"));
+        }
         // rev 19 (PROTOCOL 13): a rolling CPU job's layout is tuned on this machine (`autotune` on); with `autotune` off
-        // an owner's worker count above 1 (13.5) runs as a fixed layout
+        // an owner's worker count above 1 (13.5) runs as a fixed layout; agent 0.3.4: a rolling GPU job's too - always a
+        // layout (fixed with `autotune` off: the owner's worker count, else one), so its games in flight follow the
+        // memory plan within the lease (`calibrate`)
         let mut tuning = None;
         let mut measure0 = false;
         let settings = self.settings();
         let crew_fixed = settings.workers.is_some_and(|n| n > 1);
-        if let (Some((setup, _)), false, true, "selfplay") = (roll.as_ref(), gpu_choice, settings.autotune || crew_fixed, lease.kind.as_str()) {
-            let (t, m) = self.tuning_for(lease, &plan, &prep, setup, &choice, (limit_mb, mem.0.cost));
+        if let (Some((setup, _)), true, "selfplay") = (roll.as_ref(), gpu_choice, lease.kind.as_str()) {
+            let (t, m) = self.gpu_tuning_for(lease, &plan, &prep, setup, &choice, gpu_batch, (limit_mb, mem.1.cost), vram.as_ref());
+            log::info!(
+                "lease {id}: GPU layout {}{} ({})",
+                t.current.describe_on(true),
+                if m { ", measured" } else { "" },
+                if t.fixed { "fixed: autotune off".to_string() } else { t.entry.describe() }
+            );
+            measure0 = m;
+            tuning = Some(t);
+        } else if let (Some((setup, _)), false, true, "selfplay") = (roll.as_ref(), gpu_choice, settings.autotune || crew_fixed, lease.kind.as_str()) {
+            // (agent 0.3.4: a CPU job on a GPU runtime pack takes no hint - the hint for that build and pack is most likely a
+            // GPU layout now)
+            let (t, m) = self.tuning_for(lease, &plan, &prep, setup, &choice, (limit_mb, mem.0.cost), need.is_none());
             log::info!(
                 "lease {id}: CPU layout {}{} ({})",
                 t.current.describe(),
@@ -1020,8 +1089,11 @@ impl Engine {
                 offset: 0,
                 restarts: 0,
                 restart: None,
+                gpu_batch,
+                vram,
             }),
-            infer: layout0.map(|l| (l.infer_workers, l.infer_threads)),
+            // (a GPU job's inference threads are the worker's own: not in its job line)
+            infer: layout0.filter(|_| !gpu_choice).map(|l| (l.infer_workers, l.infer_threads)),
             mates: Vec::new(),
             tuning: tuning.map(|mut t| {
                 if measure0 {
@@ -1039,6 +1111,8 @@ impl Engine {
             counters_at: None,
             crew_changed: Instant::now(),
             last_counter_ping: None,
+            vram_mb: 0,
+            stats_vram: 0,
         };
         run.show_tuning(self);
         run.go(self)
@@ -1050,7 +1124,8 @@ impl Engine {
     /// number), and the remembered search or a new one (from the coordinator's hint for this hardware class, else the
     /// platform's starting point with 10.6's games in flight and groups). The lease's first worker runs the next layout to
     /// measure when a trial may run now (a fresh start is a free trial), else the incumbent. -> (tuning, measured).
-    fn tuning_for(&self, lease: &Lease, plan: &Plan, prep: &Prepared, setup: &Setup, choice: &crate::probe::Choice, mem: (u64, crate::rolling::MemCost)) -> (Tuning, bool) {
+    #[allow(clippy::too_many_arguments)]
+    fn tuning_for(&self, lease: &Lease, plan: &Plan, prep: &Prepared, setup: &Setup, choice: &crate::probe::Choice, mem: (u64, crate::rolling::MemCost), hint_ok: bool) -> (Tuning, bool) {
         let p = &self.profile;
         let hw = tune::Hw { cores: p.cores, logical: p.threads, perf: p.perf_cores, eff: p.eff_cores, ram_mb: p.ram_mb };
         let d = tune::defaults(tune::Platform::current(), &hw);
@@ -1084,7 +1159,7 @@ impl Engine {
         let mut entry = match tune::Cache::load(&self.cfg.layout).get(&key).filter(|_| !fixed) {
             Some(e) => e.clone(),
             None if fixed => tune::Entry::new(key, &run, start, false, now),
-            None => match tune::hint_layout(lease.tuning_hint.as_ref(), &space) {
+            None => match tune::hint_layout(lease.tuning_hint.as_ref().filter(|_| hint_ok), &space) {
                 Some(h) => {
                     log::info!("lease {}: starting the tuning from the coordinator's hint: {}", lease.lease_id, h.describe());
                     tune::Entry::new(key, &run, h, true, now)
@@ -1119,6 +1194,114 @@ impl Engine {
             fixed,
             crew_cap: tune::MAX_WORKERS_JSON,
             probe_members: Vec::new(),
+            bounds: (settings.workers, d.max_workers),
+            gpu: false,
+        };
+        (t, next.is_some())
+    }
+
+    /// agent 0.3.4 (PROTOCOL 10.6, 13.1, 13.5): a rolling GPU job's video memory: the adapter its job line names, its
+    /// dedicated memory, other programs' use of it now (Windows' counters, else `rolling::VRAM_OTHERS_MB`), the budget of
+    /// the job's workers and a worker's cost (this PC's measurement for the run and worker build, else
+    /// `rolling::GPU_VRAM`). None when the adapter's size isn't known (the job then runs one worker).
+    fn vram_plan(&self, lease: &Lease, choice: &crate::probe::Choice) -> Option<Vram> {
+        let luid_hex = choice.gpu.get("luid").and_then(Value::as_str)?;
+        let luid = u64::from_str_radix(luid_hex.trim_start_matches("0x"), 16).ok()?;
+        let g = self.profile.gpus.iter().find(|g| g.luid.as_deref().is_some_and(|l| l.eq_ignore_ascii_case(luid_hex)))?;
+        if g.vram_mb == 0 {
+            return None;
+        }
+        let others = self.signals.gpu_memory(luid, &[]).map_or(crate::rolling::VRAM_OTHERS_MB, |m| m.adapter_used_mb);
+        let (cost, _) = Learned::vram_plan(&self.cfg.layout, lease.run.as_deref().unwrap_or(""), &lease.build.build_id);
+        Some(Vram {
+            luid,
+            total_mb: g.vram_mb,
+            budget_mb: crate::rolling::vram_budget(g.vram_mb, others),
+            others_mb: others,
+            cost,
+            per_row_max: 0,
+            steady_per_row: 0,
+            raised: 0,
+            read_at: None,
+            adapter_used_mb: others,
+        })
+    }
+
+    /// agent 0.3.4 (PROTOCOL 13.1): a rolling GPU job's layout - its key (worker build, runtime pack, network, the CPU,
+    /// the GPU and its driver, the provider, OS, tuner), what may vary (the workers: 1 to 3, at most one per physical core,
+    /// as many as the memory plan and the video memory plan hold; the search threads they share; one or two groups each;
+    /// the games in flight from half the target to 1.5 times it, or a run's number), and the remembered search or a new
+    /// one from the GPU's start (an NVIDIA GPU: the most workers that hold the target in all, `tune::Space::gpu_start`).
+    /// No coordinator hint: a report doesn't say whether its layout ran on the GPU or on the CPU of the same build and
+    /// pack (no wire change), and the GPU's start from its own bench is near. `autotune` off: the start for the owner's worker
+    /// count (else one), fixed. -> (tuning, measured).
+    #[allow(clippy::too_many_arguments)]
+    fn gpu_tuning_for(&self, lease: &Lease, plan: &Plan, prep: &Prepared, setup: &Setup, choice: &crate::probe::Choice, batch: u64, mem: (u64, crate::rolling::MemCost), vram: Option<&Vram>) -> (Tuning, bool) {
+        let p = &self.profile;
+        let settings = self.settings();
+        let fixed = !settings.autotune;
+        // the search threads the workers share: the owner's `cpu_threads`, else 1.5 per physical core (at most the
+        // logical processors)
+        let threads = settings.cpu_threads.unwrap_or(((p.cores.max(1) as f64) * crate::rolling::GPU_THREADS_PER_CORE).round() as u32).clamp(1, p.threads.max(1));
+        let target = crate::rolling::gpu_target(setup.gpu, batch);
+        // (no video memory plan: one worker; `autotune` off without the owner's count: one)
+        let set = match (vram.is_some(), fixed) {
+            (false, _) => Some(1),
+            (true, true) => Some(settings.workers.unwrap_or(1)),
+            (true, false) => settings.workers,
+        };
+        let max_workers = tune::MAX_WORKERS.min(p.cores.max(1));
+        let space = tune::Space::new_gpu(threads, set, max_workers, target, matches!(setup.gpu, crate::rolling::Inflight::N(_)), Some(mem), vram.map(|v| (v.budget_mb, v.cost)));
+        let run = lease.run.clone().unwrap_or_default();
+        let luid = choice.gpu.get("luid").and_then(Value::as_str).unwrap_or("");
+        let g = p.gpus.iter().find(|g| g.luid.as_deref().is_some_and(|l| l.eq_ignore_ascii_case(luid))).cloned().unwrap_or_default();
+        let provider = choice.providers.first().cloned().unwrap_or_default();
+        let hw = tune::gpu_fingerprint(p, &g, &provider);
+        let key = tune::Key {
+            build: lease.build.build_id.clone(),
+            runtime: lease.runtime.as_ref().map(|r| r.build_id.clone()),
+            net: tune::net_fingerprint(&plan.job, prep.ckpt.as_ref().and_then(|(_, f)| f.model_size)),
+            hw: match settings.workers {
+                Some(n) => format!("{hw} | workers {n}"),
+                None => hw,
+            },
+            os: p.os.clone(),
+            tuner: tune::TUNER_VERSION,
+        };
+        let now = zerofarm_common::now_unix();
+        let start = space.gpu_start(g.vendor.eq_ignore_ascii_case("nvidia"), batch);
+        let mut entry = match tune::Cache::load(&self.cfg.layout).get(&key).filter(|_| !fixed) {
+            Some(e) => e.clone(),
+            None => tune::Entry::new(key, &run, start, false, now),
+        };
+        entry.run = run;
+        entry.bind(&space);
+        if !fixed && entry.maybe_check(now) {
+            log::info!("lease {}: the weekly check of the tuned GPU layout is due", lease.lease_id);
+        }
+        let next = if self.tune_ok && !fixed { entry.plan(&space) } else { None };
+        let current = next.unwrap_or_else(|| entry.wanted(&space));
+        let hw0 = tune::Hw { cores: p.cores, logical: p.threads, perf: p.perf_cores, eff: p.eff_cores, ram_mb: p.ram_mb };
+        let t = Tuning {
+            space,
+            entry,
+            current,
+            probe: None,
+            handoff: None,
+            load: None,
+            loads: LoadTrack::default(),
+            origin: Instant::now(),
+            probe_load: None,
+            handoffs: Vec::new(),
+            last_ping: Instant::now(),
+            revert_due: false,
+            no_trial_before: Instant::now(),
+            defaults: tune::defaults(tune::Platform::current(), &hw0),
+            fixed,
+            crew_cap: tune::MAX_WORKERS_JSON,
+            probe_members: Vec::new(),
+            bounds: (set, max_workers),
+            gpu: true,
         };
         (t, next.is_some())
     }
@@ -1264,6 +1447,10 @@ struct Run {
     /// The crew changed (a worker joined or left): no trial for a while.
     crew_changed: Instant,
     last_counter_ping: Option<Instant>,
+    /// agent 0.3.4: a GPU job's main worker's video memory (MB: Windows' counters, else its `vram_mb`) and its last
+    /// `vram_mb`.
+    vram_mb: u64,
+    stats_vram: u64,
 }
 
 impl Run {
@@ -1296,6 +1483,10 @@ impl Run {
             s.insert("released".into(), json!(r.released));
             if !crew.is_empty() || self.tuning.as_ref().is_some_and(|t| t.current.workers > 1) {
                 s.insert("workers".into(), json!(1 + crew.len()));
+            }
+            // (agent 0.3.4: a GPU job's workers' video memory, as measured)
+            if r.vram.is_some() {
+                s.insert("vram_mb".into(), json!(self.vram_mb + self.mates.iter().map(|m| m.vram_mb).sum::<u64>()));
             }
         }
         if !self.selftests.is_empty() {
@@ -1476,7 +1667,7 @@ impl Run {
         if eng.quitting() && !matches!(self.state, WState::Stopping(_)) {
             self.stop(After::Quit);
         }
-        let d = eng.decide(Some(self.worker.pid));
+        let d = eng.decide(&self.worker_pids());
         let must_pause = !d.work || (self.gpu_job() && !d.gpu);
         self.sample_starvation(eng, &t);
         if let Some(since) = self.stall_since {
@@ -1554,6 +1745,7 @@ impl Run {
         self.maybe_beat(eng, paused);
         self.roll_tick(eng);
         self.mem_check(eng);
+        self.vram_check(eng);
         self.calibrate(eng);
         self.mates_tick(&t, must_pause);
         self.tune_tick(eng, &t, must_pause);
@@ -1642,6 +1834,10 @@ impl Run {
     fn memory_failure(&mut self, eng: &Engine, why: &str) -> bool {
         let limit = self.worker.mem_limit_mb;
         let peak = self.worker.job_peak_mb().unwrap_or(0);
+        // (agent 0.3.4: a GPU job's worker that ran out of video memory, not of the job's memory)
+        if self.vram_oom_restart(eng, why, peak, limit) {
+            return true;
+        }
         let hit = (limit > 0 && peak as f64 >= limit as f64 * crate::rolling::HIT_SHARE) || alloc_failure(why) || alloc_failure(&self.worker.stderr_tail());
         let stopping = matches!(self.state, WState::Stopping(_)) || self.after.is_some() || eng.quitting();
         let conc = self.conc.unwrap_or(1);
@@ -1659,6 +1855,37 @@ impl Run {
         let first = r.restarts == 0;
         if first {
             self.report(eng, "crash", &format!("rolling worker ran into its {limit} MB memory limit (peak {peak} MB) with {conc} games in flight: {why}; restarted with {n}"), None);
+        }
+        if self.worker.try_wait().is_none() {
+            self.worker.kill();
+        }
+        self.killed = true;
+        true
+    }
+
+    /// agent 0.3.4 (PROTOCOL 10.6): a GPU job's worker that ran out of video memory (`vram_failed`): the video memory per
+    /// row planned higher (`learn_vram_oom`) and the worker started again with fewer games in flight - its games in
+    /// flight lost, a restart (at most `MAX_RESTARTS`), reported once per lease; the job's memory per game is not touched.
+    /// -> true when a restart is due.
+    fn vram_oom_restart(&mut self, eng: &Engine, why: &str, peak: u64, limit: u64) -> bool {
+        let stopping = matches!(self.state, WState::Stopping(_)) || self.after.is_some() || eng.quitting();
+        let tail = self.worker.stderr_tail();
+        if stopping || !self.roll.as_ref().is_some_and(|r| r.active && !r.finishing) || !self.vram_failed(why, &tail, peak, limit) {
+            return false;
+        }
+        let id = self.lease.lease_id.clone();
+        let conc = self.conc.unwrap_or(1);
+        let rows = self.main_layout().batch();
+        self.learn_vram_oom(eng, rows, self.vram_mb);
+        let Some(r) = self.roll.as_mut() else { return false };
+        let Some(n) = crate::rolling::restart_games(conc, u64::MAX >> 24, r.mem.cost).filter(|_| r.restarts < crate::rolling::MAX_RESTARTS) else {
+            log::error!("lease {id}: the worker ran out of video memory with {conc} games in flight ({why}); no restart left");
+            return false;
+        };
+        log::warn!("lease {id}: the worker ran out of video memory with {conc} games in flight, batches of {rows} rows ({why}); starting it again with {n}");
+        r.restart = Some(Restart { conc: n, burn: true, layout: None, count: true, measure: false });
+        if r.restarts == 0 {
+            self.report(eng, "crash", &format!("rolling worker ran out of video memory with {conc} games in flight (batches of {rows} rows): {why}; restarted with {n}"), None);
         }
         if self.worker.try_wait().is_none() {
             self.worker.kill();
@@ -1699,6 +1926,7 @@ impl Run {
         r.next_extend = Instant::now();
         r.peak_mb = 0;
         let gpu = r.gpu;
+        let batch = r.gpu_batch;
         let restarts = r.restarts;
         let offset = r.offset;
         match rs.layout {
@@ -1707,11 +1935,11 @@ impl Run {
                 self.conc = Some(l.conc);
                 self.groups = Some(l.groups);
                 self.threads = l.threads;
-                self.infer = Some((l.infer_workers, l.infer_threads));
+                self.infer = self.infer_for(&l);
             }
             None => {
                 self.conc = Some(rs.conc);
-                self.groups = Some(if gpu { crate::rolling::gpu_groups(rs.conc) } else { self.groups.unwrap_or(1).clamp(1, rs.conc) });
+                self.groups = Some(if gpu { crate::rolling::gpu_groups(rs.conc, batch) } else { self.groups.unwrap_or(1).clamp(1, rs.conc) });
             }
         }
         self.spawns += 1;
@@ -1720,7 +1948,9 @@ impl Run {
         let timings = eng.cfg.timings.clone();
         let (conc, groups, threads, infer) = (self.conc.unwrap_or(1), self.groups.unwrap_or(1), self.threads, self.infer);
         let mut refit = None;
-        if let (Some(t), Some((w, it))) = (self.tuning.as_mut(), infer) {
+        if let Some(t) = self.tuning.as_mut() {
+            // (a GPU job's inference threads: the worker's own, its search threads)
+            let (w, it) = infer.unwrap_or((1, threads));
             let workers = rs.layout.map_or(t.current.workers, |l| l.workers);
             t.current = Layout { workers, threads, infer_workers: w, infer_threads: it, groups, conc };
             if rs.layout.is_none() {
@@ -1747,7 +1977,7 @@ impl Run {
             self.conc = Some(l.conc);
             self.groups = Some(l.groups);
             self.threads = l.threads;
-            self.infer = Some((l.infer_workers, l.infer_threads));
+            self.infer = self.infer_for(&l);
         }
         let limit = self.worker_limit();
         self.wgen = self.next_gen();
@@ -1772,7 +2002,7 @@ impl Run {
                 self.progress = None;
                 self.crew_changed = Instant::now();
                 match rs.layout {
-                    Some(l) => log::info!("lease {id}: worker pid {} started with layout {} (ids from {}, memory limit {limit} MB)", w.pid, l.per_worker().describe(), lo + offset),
+                    Some(l) => log::info!("lease {id}: worker pid {} started with layout {} (ids from {}, memory limit {limit} MB)", w.pid, l.per_worker().describe_on(gpu), lo + offset),
                     None => log::info!("lease {id}: worker pid {} started again ({} games in flight, ids from {}, restart {restarts})", w.pid, self.conc.unwrap_or(rs.conc), lo + offset),
                 }
                 self.worker = w;
@@ -2193,7 +2423,8 @@ impl Run {
                 }
                 // rev 19 (PROTOCOL 13): a worker that lists `infer_workers` honours the job line's sessions (macOS builds
                 // always do)
-                if let Some(t) = self.tuning.as_mut() {
+                // (agent 0.3.4: a GPU job's inference threads are the worker's own: no sessions)
+                if let Some(t) = self.tuning.as_mut().filter(|t| !t.gpu) {
                     let listed = v.get("features").and_then(Value::as_array).is_some_and(|f| f.iter().any(|x| x.as_str() == Some(tune::WORKER_FEATURE)));
                     t.space.sessions = t.defaults.sessions_always || listed;
                     let fitted = t.space.fit(t.current);
@@ -2243,6 +2474,8 @@ impl Run {
                 if let (Some(g), Some(st)) = (s.get("games").and_then(Value::as_u64), s.get("games_started").and_then(Value::as_u64)) {
                     self.progress = Some((g, st));
                 }
+                // (agent 0.3.4: a worker that reports its video memory)
+                self.stats_vram = s.get("vram_mb").and_then(Value::as_u64).unwrap_or(0);
                 self.tune_status(eng, &s);
                 self.stats = s;
             }
@@ -2553,6 +2786,12 @@ impl Run {
                     log::info!("lease {id}: its workers committed at most {} MB per game at their steady state: remembering {v} MB for this run and worker build", r.steady_per_game);
                 }
             }
+            // agent 0.3.4: a GPU job's video memory per batch row at the workers' steady state likewise
+            if let Some(x) = r.vram.as_ref().filter(|x| x.steady_per_row > 0) {
+                if let Some(v) = Learned::vram_steady(&eng.cfg.layout, run, build, x.steady_per_row) {
+                    log::info!("lease {id}: its workers held at most {} MB of video memory per batch row at their steady state: remembering {v} MB for this run and worker build", x.steady_per_row);
+                }
+            }
         }
         let given_back = !(end.is_some() && matches!(reason.as_str(), "done" | "finish") && self.after.is_none());
         let done = DoneReq {
@@ -2593,6 +2832,28 @@ impl Run {
     fn next_gen(&mut self) -> u32 {
         self.gens += 1;
         self.gens
+    }
+
+    /// agent 0.3.4: the lease's job runs on a GPU (a rolling GPU job's workers yield for pauses, video memory is planned).
+    fn gpu_lease(&self) -> bool {
+        self.roll.as_ref().is_some_and(|r| r.gpu)
+    }
+
+    /// A layout's job-line `infer_workers` / `infer_threads`: a CPU job's; a GPU job's are the worker's own (None).
+    fn infer_for(&self, l: &Layout) -> Option<(u32, u32)> {
+        (!self.gpu_lease()).then_some((l.infer_workers, l.infer_threads))
+    }
+
+    /// A layout as the logs and the tray say it (a GPU job's: `Layout::describe_on`).
+    fn desc(&self, l: &Layout) -> String {
+        l.describe_on(self.gpu_lease())
+    }
+
+    /// agent 0.3.4: the lease's workers' pids (the main one while it runs, every one beside it): their GPU use is the
+    /// lease's, never other programs' (the GPU busy rule, PROTOCOL 8).
+    fn worker_pids(&self) -> Vec<u32> {
+        let main = (self.main_exit.is_none()).then_some(self.worker.pid);
+        main.into_iter().chain(self.mates.iter().map(|m| m.worker.pid)).collect()
     }
 
     /// The crew's size wanted now: the layout's workers, at most what this lease may still run; 1 without tuning.
@@ -2641,12 +2902,16 @@ impl Run {
         let (active, target) = (self.crew_active(), self.crew_target() as usize);
         let building = if target > 1 && active < target { format!(" ({active} of {target} workers running)") } else { String::new() };
         let line = self.tuning.as_ref().map(|t| {
+            let cur = t.current.describe_on(t.gpu);
+            if t.fixed && t.gpu && t.bounds.0.is_none_or(|n| n <= 1) {
+                return format!("{cur} (autotune off){building}{beside}");
+            }
             if t.fixed {
-                return format!("{} (workers {} set, autotune off){building}{beside}", t.current.describe(), t.current.workers);
+                return format!("{cur} (workers {} set, autotune off){building}{beside}", t.current.workers);
             }
             match &t.probe {
-                Some(_) => format!("measuring {} - {}{building}{beside}", t.current.describe(), t.entry.describe()),
-                None if t.current != t.entry.wanted(&t.space) => format!("running {} - {}{building}{beside}", t.current.describe(), t.entry.describe()),
+                Some(_) => format!("measuring {cur} - {}{building}{beside}", t.entry.describe()),
+                None if t.current != t.entry.wanted(&t.space) => format!("running {cur} - {}{building}{beside}", t.entry.describe()),
                 None => format!("{}{building}{beside}", t.entry.describe()),
             }
         });
@@ -2733,17 +2998,18 @@ impl Run {
             (Ok(x), None) => Ok((x, None)),
             (Err(e), _) => Err(e),
         };
+        let ld = l.describe_on(t.gpu);
         match r {
             Ok(((rate, ph), load)) => {
                 let other = load.map(|m| format!(" (other programs {:.0} % of the CPUs)", m * 100.0)).unwrap_or_default();
-                log::info!("lease {id}: {} measured {} leaves/s{other}", l.describe(), rate.round());
-                eng.worker_log.write_line(&format!("tuning [{id}]: {} measured {} leaves/s{other}", l.describe(), rate.round()));
+                log::info!("lease {id}: {ld} measured {} leaves/s{other}", rate.round());
+                eng.worker_log.write_line(&format!("tuning [{id}]: {ld} measured {} leaves/s{other}", rate.round()));
                 t.entry.record(l, rate, load, Some(ph), &t.space, now);
             }
             Err(why) => {
                 // (PROTOCOL 13: a trial is never paused and resumed; it is tried again later, from the incumbent)
-                log::info!("lease {id}: the trial of {} is discarded: {why}", l.describe());
-                eng.worker_log.write_line(&format!("tuning [{id}]: the trial of {} is discarded: {why}", l.describe()));
+                log::info!("lease {id}: the trial of {ld} is discarded: {why}");
+                eng.worker_log.write_line(&format!("tuning [{id}]: the trial of {ld} is discarded: {why}"));
                 t.entry.discard(l, &t.space, now);
                 t.revert_due = l != t.entry.wanted(&t.space);
                 t.no_trial_before = Instant::now() + retry;
@@ -2807,12 +3073,46 @@ impl Run {
         held
     }
 
-    /// A new worker of `conc` games in flight (`n` of them) fits beside the lease's workers: their reservation
-    /// (`reserved_mb`) plus its plan within `PLAN_SHARE` of the job's limit (no limit: always).
-    fn room_for(&mut self, n: u64, conc: u64) -> bool {
+    /// A new worker of layout `l` (`n` of them) fits beside the lease's workers: their reservation (`reserved_mb`) plus
+    /// its plan within `PLAN_SHARE` of the job's limit (no limit: always), and (agent 0.3.4) a GPU job's video memory
+    /// likewise (`vram_room`).
+    fn room_for(&mut self, n: u64, l: &Layout) -> bool {
         let limit = self.lease_limit_mb;
-        let need = n * self.plan_mb(conc);
-        limit == 0 || (self.reserved_mb(true) + need) as f64 <= limit as f64 * crate::rolling::PLAN_SHARE
+        let need = n * self.plan_mb(l.conc);
+        (limit == 0 || (self.reserved_mb(true) + need) as f64 <= limit as f64 * crate::rolling::PLAN_SHARE) && self.vram_room(n, l, true)
+    }
+
+    /// agent 0.3.4: what a GPU worker batching `rows` rows is planned to hold in video memory (MB; 0 without a plan).
+    fn vram_plan_mb(&self, rows: u64) -> u64 {
+        self.roll.as_ref().and_then(|r| r.vram.as_ref()).map_or(0, |v| v.cost.plan_mb(rows))
+    }
+
+    /// agent 0.3.4: the video memory the lease's workers hold or will hold (MB), as `reserved_mb`: every worker playing
+    /// new games at the more of its reading and its plan, every one finishing its games at its reading (`with_main`: the
+    /// main worker counts too, unless it exited).
+    fn vram_reserved(&self, with_main: bool) -> u64 {
+        let with_main = with_main && self.main_exit.is_none();
+        let main_on = with_main
+            && self.tuning.as_ref().is_none_or(|t| t.handoff.is_none())
+            && self.roll.as_ref().is_none_or(|r| !r.finishing && r.restart.is_none());
+        let main = if !with_main {
+            0
+        } else if main_on {
+            self.vram_mb.max(self.vram_plan_mb(self.main_layout().batch()))
+        } else {
+            self.vram_mb
+        };
+        main + self.mates.iter().map(|m| if m.active() { m.vram_mb.max(self.vram_plan_mb(m.layout.batch())) } else { m.vram_mb }).sum::<u64>()
+    }
+
+    /// agent 0.3.4: `n` new GPU workers of layout `l` fit the video memory plan beside the lease's workers
+    /// (`vram_reserved`): within the budget (no plan, a CPU job: always).
+    fn vram_room(&self, n: u64, l: &Layout, with_main: bool) -> bool {
+        let Some(v) = self.roll.as_ref().and_then(|r| r.vram.as_ref()) else { return true };
+        // (the budget of the lease's start, less what other programs took since: their use at the last reading)
+        let ours = self.vram_mb + self.mates.iter().map(|m| m.vram_mb).sum::<u64>();
+        let budget = v.budget_mb.min(crate::rolling::vram_budget(v.total_mb, v.adapter_used_mb.saturating_sub(ours)));
+        self.vram_reserved(with_main) + n * v.cost.plan_mb(l.batch()) <= budget
     }
 
     /// A restart of the main worker is due (memory, a handoff that had to wait, a crashed tail).
@@ -2826,11 +3126,17 @@ impl Run {
     /// the job's limit. Else it waits for the drain (`go`).
     fn restart_room(&mut self) -> bool {
         let Some(rs) = self.roll.as_ref().and_then(|r| r.restart.clone()) else { return true };
+        // (agent 0.3.4: a GPU job's next worker fits the video memory beside the workers still there)
+        let batch = self.roll.as_ref().map_or(0, |r| r.gpu_batch);
+        let next = rs.layout.map(|l| l.per_worker()).unwrap_or(Layout { conc: rs.conc, groups: crate::rolling::gpu_groups(rs.conc, batch), ..self.main_layout() });
+        if !self.mates.is_empty() && !self.vram_room(1, &next, false) {
+            return false;
+        }
         let limit = self.lease_limit_mb;
         if limit == 0 || !self.mates.iter().any(|m| m.finishing) {
             return true;
         }
-        let need = self.plan_mb(rs.layout.map_or(rs.conc, |l| l.conc));
+        let need = self.plan_mb(next.conc);
         (self.reserved_mb(false) + need) as f64 <= limit as f64 * crate::rolling::PLAN_SHARE
     }
 
@@ -2932,7 +3238,7 @@ impl Run {
     /// the main worker says where its ids stop, the next worker starts beside it with the rest (as memory allows; else
     /// after it ended); the members' unstarted ids go to the spare ranges as they say where theirs stop.
     fn start_handoff(&mut self, eng: &Engine, next: Layout, measure: bool) {
-        let line = format!("handing the job over to {} ({})", next.describe(), if measure { "a measured trial" } else { "the incumbent, not measured" });
+        let line = format!("handing the job over to {} ({})", self.desc(&next), if measure { "a measured trial" } else { "the incumbent, not measured" });
         log::info!("lease {}: {line}", self.lease.lease_id);
         eng.worker_log.write_line(&format!("tuning [{}]: {line}", self.lease.lease_id));
         self.send(json!({"op": "finish"}));
@@ -2975,7 +3281,7 @@ impl Run {
             h.measure = false;
             let l = std::mem::replace(&mut h.next, wanted);
             if l == wanted {
-                let line = format!("the trial of {} can't run now (the computer is busy or not idle): counted as discarded", l.describe());
+                let line = format!("the trial of {} can't run now (the computer is busy or not idle): counted as discarded", l.describe_on(tu.gpu));
                 log::info!("lease {id}: {line}");
                 eng.worker_log.write_line(&format!("tuning [{id}]: {line}"));
                 tu.entry.discard(l, &tu.space, zerofarm_common::now_unix());
@@ -3003,7 +3309,7 @@ impl Run {
         };
         // (a measured crew starts together: room for all of it; otherwise its workers join as memory allows)
         let workers = if h.measure { h.next.workers.max(1) as u64 } else { 1 };
-        if !self.room_for(workers, h.next.conc) {
+        if !self.room_for(workers, &h.next.per_worker()) {
             // (no room yet: the old workers finish their games, and the next one starts once they freed enough - at the
             // latest after the main worker ended, `handoff_after_exit`)
             return;
@@ -3043,7 +3349,7 @@ impl Run {
         log::info!(
             "lease {id}: worker pid {} started with layout {} (ids from {}{}, memory limit {limit} MB); pid {} finishes its games beside it",
             w.pid,
-            next.describe(),
+            self.desc(&next),
             first,
             if started.is_none() { ", fresh: the old worker's id count is unknown" } else { "" },
             self.worker.pid
@@ -3076,6 +3382,11 @@ impl Run {
             gen_floor: self.gen_floor,
             peak_mb: old_peak,
             fatal: None,
+            yield_at: None,
+            yielded: false,
+            want_stop: false,
+            vram_mb: std::mem::take(&mut self.vram_mb),
+            stats_vram: std::mem::take(&mut self.stats_vram),
         });
         if let Some(r) = self.roll.as_mut() {
             r.offset = first - lo;
@@ -3087,7 +3398,7 @@ impl Run {
         self.conc = Some(per.conc);
         self.groups = Some(per.groups);
         self.threads = per.threads;
-        self.infer = Some((per.infer_workers, per.infer_threads));
+        self.infer = self.infer_for(&per);
         self.batch_rows = per.batch();
         self.state = WState::Starting;
         self.started = Instant::now();
@@ -3165,7 +3476,7 @@ impl Run {
                 }
                 let m = &self.mates[i];
                 let l = m.layout;
-                let line = self.job_line_with(l.threads, Some(l.conc), Some(l.groups), Some((l.infer_workers, l.infer_threads)), &m.out_dir, Some((m.offset, m.end - m.offset)));
+                let line = self.job_line_with(l.threads, Some(l.conc), Some(l.groups), self.infer_for(&l), &m.out_dir, Some((m.offset, m.end - m.offset)));
                 let m = &mut self.mates[i];
                 if let Err(e) = m.worker.send(&line) {
                     log::warn!("lease {}: write to worker pid {} failed: {e}", self.lease.lease_id, m.worker.pid);
@@ -3197,6 +3508,7 @@ impl Run {
                 if let (Some(l), Some(g), Some(st)) = (n("leaves"), n("games"), n("games_started")) {
                     m.counters = Some((l, g, st));
                 }
+                m.stats_vram = n("vram_mb").unwrap_or(0);
                 if m.active() {
                     self.probe_sample(eng);
                 }
@@ -3215,6 +3527,16 @@ impl Run {
                 }
             }
             "end" => self.mates[i].end_ev = Some(v),
+            // agent 0.3.4: a GPU job's member released its session for a pause: stopped now (unless the pause ended)
+            "yielded" => {
+                let m = &mut self.mates[i];
+                m.yield_at = None;
+                // (a pause that ended before it answered: `resume` went out already, `mates_tick`)
+                m.yielded = m.want_stop;
+                if m.want_stop && !m.worker.is_suspended() {
+                    m.worker.suspend();
+                }
+            }
             "error" if v.get("fatal").and_then(Value::as_bool) == Some(true) => {
                 let msg = v.get("message").and_then(Value::as_str).unwrap_or("").to_string();
                 log::warn!("lease {}: worker pid {} failed: {msg}", self.id(), self.mates[i].worker.pid);
@@ -3300,7 +3622,9 @@ impl Run {
         let peak = d.worker.job_peak_mb().unwrap_or(0).max(d.peak_mb);
         let tail = d.worker.stderr_tail();
         let why = d.fatal.clone().unwrap_or_else(|| format!("exit code {code} without `end`"));
-        let hit = (limit > 0 && peak as f64 >= limit as f64 * crate::rolling::HIT_SHARE) || alloc_failure(&why) || alloc_failure(&tail);
+        // (agent 0.3.4: a GPU job's member that ran out of video memory, not of its memory)
+        let vram_hit = self.vram_failed(&why, &tail, peak, limit);
+        let hit = !vram_hit && ((limit > 0 && peak as f64 >= limit as f64 * crate::rolling::HIT_SHARE) || alloc_failure(&why) || alloc_failure(&tail));
         log::warn!("lease {id}: worker pid {} of the crew failed ({why}); its games in flight are lost", d.worker.pid);
         if self.tuning.as_ref().is_some_and(|t| t.probe.is_some()) {
             self.end_probe(eng, Err("a worker of the crew failed during the trial".into()));
@@ -3311,11 +3635,15 @@ impl Run {
             let per = crate::rolling::measured_per_game(peak.max(limit), d.layout.conc, base);
             self.learn_cost(eng, per);
         }
+        if vram_hit {
+            self.learn_vram_oom(eng, d.layout.batch(), d.vram_mb);
+        }
         let Some(r) = self.roll.as_mut() else { return };
         let restart_left = r.restarts < crate::rolling::MAX_RESTARTS && !self.selftest_failed;
-        if hit {
+        if hit || vram_hit {
             let cost = r.mem.cost;
-            match crate::rolling::restart_games(d.layout.conc, limit, cost).filter(|_| restart_left) {
+            let lim = if vram_hit || limit == 0 { u64::MAX >> 24 } else { limit };
+            match crate::rolling::restart_games(d.layout.conc, lim, cost).filter(|_| restart_left) {
                 Some(n) => {
                     r.restarts += 1;
                     self.shrink_members(n);
@@ -3324,7 +3652,11 @@ impl Run {
             }
             if !self.crash_reported {
                 self.crash_reported = true;
-                let msg = format!("crew worker ran into its {limit} MB memory limit (peak {peak} MB) with {} games in flight: {why}", d.layout.conc);
+                let msg = if vram_hit {
+                    format!("crew worker ran out of video memory with {} games in flight (batches of {} rows): {why}", d.layout.conc, d.layout.batch())
+                } else {
+                    format!("crew worker ran into its {limit} MB memory limit (peak {peak} MB) with {} games in flight: {why}", d.layout.conc)
+                };
                 self.report_with(eng, "crash", &msg, &tail, Some(code as i64));
             }
         } else {
@@ -3394,16 +3726,21 @@ impl Run {
         let Some(t) = self.tuning.as_mut().filter(|t| t.space.mem.is_some()) else { return };
         let old = t.space;
         t.space.mem = Some((limit, cost));
-        match setting {
-            crate::rolling::Inflight::Auto => {
+        // (agent 0.3.4: a GPU job's games in flight are its target's, the memory plan cuts each worker's - `Space::fit`)
+        match (t.gpu, setting) {
+            (true, _) => {}
+            (false, crate::rolling::Inflight::Auto) => {
                 let (c, _) = crate::rolling::cpu_shape(setting, groups, MemPlan { ram_mb: limit, cost, measured: true });
                 (t.space.conc_min, t.space.conc_max) = ((c / 2).max(1), c.max(1));
             }
-            crate::rolling::Inflight::N(n) => (t.space.conc_min, t.space.conc_max) = (n, n),
+            (false, crate::rolling::Inflight::N(n)) => (t.space.conc_min, t.space.conc_max) = (n, n),
         }
+        // (agent 0.3.4: as many workers as the memory plan holds now - a crew the old plan held back is possible again)
+        let (set, max) = t.bounds;
+        t.space.bound_workers(set, max);
         t.entry.lift_conc(&old, &t.space);
         let wanted = t.entry.wanted(&t.space);
-        let line = format!("planning {v} MB per game in flight from now on (was {was}): the layout wanted is {}", wanted.describe());
+        let line = format!("planning {v} MB per game in flight from now on (was {was}): the layout wanted is {}", wanted.describe_on(t.gpu));
         log::info!("lease {id}: {line}");
         eng.worker_log.write_line(&format!("tuning [{id}]: {line}"));
         self.save_tuning(eng);
@@ -3470,12 +3807,39 @@ impl Run {
     fn mates_tick(&mut self, t: &crate::Timings, must_pause: bool) {
         let measuring = self.tuning.as_ref().is_some_and(|x| x.probe.is_some()) && self.crew_complete();
         let id = self.lease.lease_id.clone();
+        let gpu = self.gpu_lease();
         for d in &mut self.mates {
             let stop = must_pause || (d.finishing && measuring);
+            d.want_stop = stop;
+            // agent 0.3.4: a GPU job's worker gives its video memory back for a pause first, as the main worker does
+            // (`yield`; stopped once it said `yielded`, killed when it doesn't within `yield_answer`) - a stopped worker
+            // would hold it while another program needs the GPU
+            if stop && gpu && must_pause && d.job_sent && !d.yielded && d.end_ev.is_none() {
+                match d.yield_at {
+                    None => {
+                        let _ = d.worker.send(&json!({"op": "yield"}));
+                        d.yield_at = Some(Instant::now());
+                    }
+                    Some(at) if at.elapsed() > t.yield_answer => {
+                        log::warn!("lease {id}: worker pid {} did not answer yield within {} s: killing it", d.worker.pid, t.yield_answer.as_secs());
+                        d.fatal.get_or_insert_with(|| format!("did not answer yield within {} s", t.yield_answer.as_secs()));
+                        d.yield_at = None;
+                        d.worker.kill();
+                    }
+                    Some(_) => {}
+                }
+                continue;
+            }
             if stop && !d.worker.is_suspended() {
                 d.worker.suspend();
             } else if !stop && d.worker.is_suspended() {
                 d.worker.resume();
+                d.last_msg = Instant::now();
+            }
+            if !stop && (d.yielded || d.yield_at.is_some()) {
+                // (its session is built again: `resume`; a `yield` the pause outlived is answered by it too)
+                let _ = d.worker.send(&json!({"op": "resume"}));
+                (d.yielded, d.yield_at) = (false, None);
                 d.last_msg = Instant::now();
             }
             if d.worker.is_suspended() {
@@ -3521,8 +3885,9 @@ impl Run {
             self.after = Some(After::Quit);
             self.quit_mates();
         }
-        let d = eng.decide(None);
-        let pause = !d.work;
+        let d = eng.decide(&self.worker_pids());
+        // (agent 0.3.4: a GPU job's workers pause too when GPU work stops being allowed)
+        let pause = !d.work || (self.gpu_lease() && !d.gpu);
         if pause {
             let since = *self.stall_since.get_or_insert(Instant::now());
             if since.elapsed() > Duration::from_secs(self.lease.slack_s) && self.after.is_none() {
@@ -3610,6 +3975,127 @@ impl Run {
         if changed {
             self.crew_changed = Instant::now();
             self.show_tuning(eng);
+        }
+    }
+
+    /// agent 0.3.4 (PROTOCOL 10.6, 13.5): a GPU job's video memory, read at most once a second - each worker's (Windows'
+    /// counters, else its `status` `vram_mb`; none while it is paused) and the adapter's in use (every program's). A
+    /// worker holding more per batch row than planned raises the plan at once (remembered per run and worker build: the
+    /// crew's next workers, handoffs and the tuner's bounds plan with it); steady readings lower it when the lease ends.
+    /// When the adapter's memory in use reaches `VRAM_HIGH_SHARE`, one worker gives way while no drain is in progress: a
+    /// crew's biggest finishes its games (the next one joins only when the video memory allows), a lone worker is started
+    /// again with fewer games in flight (a memory restart).
+    fn vram_check(&mut self, eng: &Engine) {
+        let Some(v) = self.roll.as_ref().filter(|r| r.active).and_then(|r| r.vram.clone()) else { return };
+        if v.read_at.is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
+            return;
+        }
+        let pids = self.worker_pids();
+        let m = eng.signals.gpu_memory(v.luid, &pids);
+        let of = |pid: u32| m.as_ref().map_or(0, |m| m.of(pid));
+        let paused = matches!(self.state, WState::Paused(_) | WState::Yielding(_));
+        let main_live = self.main_exit.is_none() && self.job_sent && !paused;
+        self.vram_mb = if self.main_exit.is_none() { of(self.worker.pid).max(if paused { 0 } else { self.stats_vram }) } else { 0 };
+        let mut pdh_ours = if self.main_exit.is_none() { of(self.worker.pid) } else { 0 };
+        for d in &mut self.mates {
+            let held = d.yielded || d.yield_at.is_some();
+            d.vram_mb = of(d.worker.pid).max(if held { 0 } else { d.stats_vram });
+            pdh_ours += of(d.worker.pid);
+        }
+        let ours = self.vram_mb + self.mates.iter().map(|d| d.vram_mb).sum::<u64>();
+        // (Windows' view of our workers replaced by the more of it and theirs)
+        let adapter = m.as_ref().map_or(v.others_mb, |m| m.adapter_used_mb.saturating_sub(pdh_ours)) + ours;
+        // what each worker playing new games holds per row of its batch over the base, and whether it is at its steady state
+        let conc = self.conc.unwrap_or(1);
+        let main_steady = self.progress.is_some_and(|(g, st)| crate::rolling::steady_reading(g, st, conc));
+        let mut readings: Vec<(u64, u64, bool)> = Vec::new();
+        if main_live && self.vram_mb > 0 {
+            readings.push((self.vram_mb, self.main_layout().batch(), main_steady));
+        }
+        for d in self.mates.iter().filter(|d| d.active() && d.job_sent && d.vram_mb > 0) {
+            readings.push((d.vram_mb, d.layout.batch(), d.counters.is_some_and(|(_, g, st)| crate::rolling::steady_reading(g, st, d.layout.conc))));
+        }
+        let (run, build) = (self.lease.run.clone().unwrap_or_default(), self.lease.build.build_id.clone());
+        let id = self.lease.lease_id.clone();
+        let mut raised = None;
+        if let Some(x) = self.roll.as_mut().and_then(|r| r.vram.as_mut()) {
+            x.read_at = Some(Instant::now());
+            x.adapter_used_mb = adapter;
+            for &(mb, rows, steady) in &readings {
+                let per = mb.saturating_sub(x.cost.base_mb).div_ceil(rows.max(1));
+                x.per_row_max = x.per_row_max.max(per);
+                if steady {
+                    x.steady_per_row = x.steady_per_row.max(per);
+                }
+                if per > x.cost.per_row_mb && per > x.raised {
+                    x.raised = per;
+                    x.cost.per_row_mb = per;
+                    raised = Some((per, mb, rows, x.budget_mb, x.cost));
+                }
+            }
+        }
+        if let Some((per, mb, rows, budget, cost)) = raised {
+            if Learned::vram_raise(&eng.cfg.layout, &run, &build, per) {
+                log::info!("lease {id}: a worker holds {mb} MB of video memory with batches of {rows} rows, {per} MB per row - more than planned: remembering it for this run and worker build");
+            }
+            if let Some(t) = self.tuning.as_mut() {
+                t.space.vram = Some((budget, cost));
+            }
+        }
+        // the adapter nearly full: one worker gives way (one drain at a time)
+        let busy = !main_live || self.after.is_some() || self.draining() || self.roll.as_ref().is_none_or(|r| r.finishing || r.restart.is_some());
+        if busy || (adapter as f64) < v.total_mb as f64 * crate::rolling::VRAM_HIGH_SHARE {
+            return;
+        }
+        let line = format!("the GPU's dedicated memory is {adapter} MB of {} MB in use (the lease's workers {ours} MB)", v.total_mb);
+        log::warn!("lease {id}: {line}");
+        eng.worker_log.write_line(&format!("crew [{id}]: {line}"));
+        let biggest = self.mates.iter().enumerate().filter(|(_, d)| d.active() && d.job_sent).max_by_key(|(_, d)| d.vram_mb).map(|(i, d)| (i, d.vram_mb));
+        match biggest {
+            Some((i, mb)) if mb >= self.vram_mb => self.mate_give_way(eng, i, mb),
+            Some(_) => self.primary_give_way(eng, self.vram_mb),
+            None => {
+                let limit = self.worker.mem_limit_mb;
+                let Some(r) = self.roll.as_mut() else { return };
+                let cost = r.mem.cost;
+                match crate::rolling::restart_games(conc, if limit == 0 { u64::MAX >> 24 } else { limit }, cost).filter(|_| r.restarts < crate::rolling::MAX_RESTARTS) {
+                    Some(n) => {
+                        log::warn!("lease {id}: finishing the {conc} games in flight, then going on with {n} (the GPU's memory)");
+                        r.restart = Some(Restart { conc: n, burn: false, layout: None, count: true, measure: false });
+                        self.send(json!({"op": "finish"}));
+                    }
+                    None => self.roll_finish("the GPU's memory is full and the worker can't run fewer games"),
+                }
+            }
+        }
+    }
+
+    /// agent 0.3.4: a GPU job's worker failed with `why` (its fatal error or its exit; `tail` its stderr, `peak` /
+    /// `limit` its job's memory): did it run out of video memory? Its message says so (`rolling::gpu_oom`), or it failed
+    /// to allocate far from its memory limit (ONNX Runtime's CUDA arena says only "Failed to allocate memory").
+    fn vram_failed(&self, why: &str, tail: &str, peak: u64, limit: u64) -> bool {
+        if self.roll.as_ref().is_none_or(|r| r.vram.is_none()) {
+            return false;
+        }
+        let text = format!("{why}\n{tail}");
+        crate::rolling::gpu_oom(&text) || (alloc_failure(&text) && (limit == 0 || (peak as f64) < limit as f64 * 0.9))
+    }
+
+    /// agent 0.3.4: a worker batching `rows` rows (holding `held` MB when last read) ran out of video memory: the plan per
+    /// row is raised - to what it held, at least a quarter more than planned - and remembered for the run and worker build.
+    fn learn_vram_oom(&mut self, eng: &Engine, rows: u64, held: u64) {
+        let id = self.lease.lease_id.clone();
+        let (run, build) = (self.lease.run.clone().unwrap_or_default(), self.lease.build.build_id.clone());
+        let Some(v) = self.roll.as_mut().and_then(|r| r.vram.as_mut()) else { return };
+        let per = held.saturating_sub(v.cost.base_mb).div_ceil(rows.max(1)).max((v.cost.per_row_mb * 5).div_ceil(4)).max(v.cost.per_row_mb + 1);
+        v.cost.per_row_mb = per;
+        v.raised = v.raised.max(per);
+        let (budget, cost) = (v.budget_mb, v.cost);
+        if Learned::vram_raise(&eng.cfg.layout, &run, &build, per) {
+            log::info!("lease {id}: a worker with batches of {rows} rows ran out of video memory: planning {per} MB per row for this run and worker build");
+        }
+        if let Some(t) = self.tuning.as_mut() {
+            t.space.vram = Some((budget, cost));
         }
     }
 
@@ -3763,8 +4249,9 @@ impl Run {
         let per = tu.current.per_worker();
         let (released, offset) = (r.released, r.offset);
         let limit = self.worker_limit();
-        // (agent 0.3.3: beside what every worker holds or will hold - a fresh one at its plan, a drainer at its commit)
-        if !self.room_for(1, per.conc) {
+        // (agent 0.3.3: beside what every worker holds or will hold - a fresh one at its plan, a drainer at its commit;
+        // agent 0.3.4: a GPU job's video memory too)
+        if !self.room_for(1, &per) {
             return;
         }
         // a spare range that holds RUNWAY_INFLIGHTS x its games in flight (a shorter one goes back with the lease)
@@ -3808,7 +4295,7 @@ impl Run {
                 return;
             }
         };
-        let line = format!("worker pid {} joins the crew with ids [{}, {}) ({}, memory limit {limit} MB)", w.pid, lo + a, lo + b, per.describe());
+        let line = format!("worker pid {} joins the crew with ids [{}, {}) ({}, memory limit {limit} MB)", w.pid, lo + a, lo + b, self.desc(&per));
         log::info!("lease {id}: {line}");
         eng.worker_log.write_line(&format!("crew [{id}]: {line}"));
         self.spawns += 1;
@@ -3834,6 +4321,11 @@ impl Run {
             gen_floor: self.prep.ckpt.as_ref().map(|(c, _)| c.gen).or(self.gen_floor),
             peak_mb: 0,
             fatal: None,
+            yield_at: None,
+            yielded: false,
+            want_stop: false,
+            vram_mb: 0,
+            stats_vram: 0,
         });
         self.crew_changed = Instant::now();
         self.show_tuning(eng);
@@ -3860,7 +4352,7 @@ impl Run {
             "worker pid {} joins the crew as its tail, ids from {} ({}, memory limit {limit} MB); pid {} keeps ids [{}, {})",
             w.pid,
             lo + released,
-            per.describe(),
+            self.desc(&per),
             self.worker.pid,
             lo + offset,
             lo + released
@@ -3895,6 +4387,11 @@ impl Run {
             gen_floor: self.gen_floor,
             peak_mb: peak,
             fatal: None,
+            yield_at: None,
+            yielded: false,
+            want_stop: false,
+            vram_mb: std::mem::take(&mut self.vram_mb),
+            stats_vram: std::mem::take(&mut self.stats_vram),
         });
         if let Some(r) = self.roll.as_mut() {
             r.offset = released;
@@ -3905,7 +4402,7 @@ impl Run {
         self.conc = Some(per.conc);
         self.groups = Some(per.groups);
         self.threads = per.threads;
-        self.infer = Some((per.infer_workers, per.infer_threads));
+        self.infer = self.infer_for(&per);
         self.batch_rows = per.batch();
         self.state = WState::Starting;
         self.started = Instant::now();

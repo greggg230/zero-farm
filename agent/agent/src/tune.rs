@@ -141,6 +141,23 @@ impl Layout {
     /// "8 search + 4 x 2 inference threads, 2,304 games in flight in 6 groups (384 rows)"; several workers: "2 workers x
     /// (12 search + 4 x 3 inference threads, 1,152 games in flight in 6 groups (192 rows))".
     pub fn describe(&self) -> String {
+        self.describe_on(false)
+    }
+
+    /// `describe`, or (agent 0.3.4) a GPU job's: "3 workers x (2 search threads, 384 games in flight in 1 group (384
+    /// rows)) on the GPU" - its inference threads are the worker's own.
+    pub fn describe_on(&self, gpu: bool) -> String {
+        if gpu {
+            let one = format!(
+                "{} search threads, {} games in flight in {} group{} ({} rows)",
+                self.threads,
+                thousands(self.conc),
+                self.groups,
+                if self.groups == 1 { "" } else { "s" },
+                self.batch()
+            );
+            return if self.workers > 1 { format!("{} workers x ({one}) on the GPU", self.workers) } else { format!("{one} on the GPU") };
+        }
         let one = format!(
             "{} search + {} x {} inference threads, {} games in flight in {} groups ({} rows)",
             self.threads,
@@ -352,7 +369,31 @@ pub struct Space {
     /// The job's memory plan (PROTOCOL 10.6): its limit (MB) and cost; each worker's base and games in flight together
     /// at most `PLAN_SHARE` of the limit. None: no limit.
     pub mem: Option<(u64, crate::rolling::MemCost)>,
+    /// agent 0.3.4: a GPU job (PROTOCOL 13.1): `max_search` is the search threads the workers share (`max_search` / N
+    /// each, `search_cap`), inference threads follow them (one session each; the job line leaves them to the worker),
+    /// one or two groups a worker (`rolling::GPU_MAX_GROUPS`), batches up to `batch_max`.
+    #[serde(default)]
+    pub gpu: bool,
+    /// agent 0.3.4: a GPU job's video memory plan: the budget of its workers (MB, `rolling::vram_budget`) and a worker's
+    /// cost; each worker's base and its biggest batch together within its share. None: not planned (a CPU job).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vram: Option<(u64, crate::rolling::VramCost)>,
+    /// agent 0.3.4: a GPU job's target games in flight in all (`rolling::gpu_target`): a crew of N starts with it shared
+    /// (`target_conc`, rounded up to a multiple of `GPU_CONC_STEP`), and a layout the memory plan held back is lifted to
+    /// it, not past it (`top_conc`). 0: none (a CPU job: its bounds are the target).
+    #[serde(default)]
+    pub target: u64,
 }
+
+/// agent 0.3.4: a GPU crew's share of the target games in flight is rounded up to a multiple of this (1,024 for three
+/// workers: 384 each, as measured).
+pub const GPU_CONC_STEP: u64 = 64;
+/// agent 0.3.4: a GPU job's games in flight in all may go this far over its target (the tuner's games-in-flight moves; a
+/// crew's rounded-up shares): 1,536 for a target of 1,024.
+pub const GPU_CONC_OVER: f64 = 1.5;
+/// agent 0.3.4: a GPU worker's batch has at most this many rows (the worker answers bigger batches in pieces of 1,024
+/// rows, PROTOCOL 8).
+pub const GPU_BATCH_MAX: u64 = 2048;
 
 impl Space {
     /// The space of a job on a platform: its bounds (the owner's `cpu_threads` caps search and inference threads each,
@@ -374,15 +415,116 @@ impl Space {
             workers_min: 1,
             workers_max: 1,
             mem,
+            gpu: false,
+            vram: None,
+            target: 0,
         };
-        // as many workers as the memory plan holds with the fewest games in flight allowed (each worker its own base)
-        let fits = (1..=MAX_WORKERS_JSON).take_while(|&n| s.mem_room(n).is_none_or(|room| room as u128 * n as u128 >= conc_min.max(n as u64) as u128)).last().unwrap_or(1);
-        let (lo, hi) = match workers {
-            Some(n) => (n.clamp(1, MAX_WORKERS).min(fits), n.clamp(1, MAX_WORKERS).min(fits)),
-            None => (1, d.max_workers.clamp(1, MAX_WORKERS).min(fits)),
-        };
-        (s.workers_min, s.workers_max) = (lo.max(1), hi.max(1));
+        s.bound_workers(workers, d.max_workers);
         s
+    }
+
+    /// agent 0.3.4: the space of a GPU job (PROTOCOL 13.1): `threads` search threads shared by its workers (the owner's
+    /// `cpu_threads`, else `rolling::GPU_THREADS_PER_CORE` per physical core), `target` games in flight in all (the
+    /// bench's, `rolling::gpu_target`; a run's number: fixed), from half of it to `GPU_CONC_OVER` times it ("auto"),
+    /// batches up to `GPU_BATCH_MAX` rows in one or two groups, the workers (the owner's `workers`, else 1 to `max_workers`)
+    /// as many as the memory plan `mem` and the video memory plan `vram` hold with the fewest games in flight allowed.
+    pub fn new_gpu(threads: u32, workers: Option<u32>, max_workers: u32, target: u64, fixed: bool, mem: Option<(u64, crate::rolling::MemCost)>, vram: Option<(u64, crate::rolling::VramCost)>) -> Space {
+        let target = target.clamp(1, crate::rolling::MAX_INFLIGHT);
+        let (conc_min, conc_max) = if fixed { (target, target) } else { ((target / 2).max(1), ((target as f64 * GPU_CONC_OVER) as u64).min(crate::rolling::MAX_INFLIGHT).max(target)) };
+        let mut s = Space {
+            max_search: threads.max(1),
+            max_infer: threads.max(1),
+            sessions: false,
+            conc_min,
+            conc_max,
+            batch_min: 1,
+            batch_max: GPU_BATCH_MAX,
+            workers_min: 1,
+            workers_max: 1,
+            mem,
+            gpu: true,
+            vram,
+            target,
+        };
+        s.bound_workers(workers, max_workers);
+        s
+    }
+
+    /// The worker bounds: the owner's `workers` (`set`), else 1 to `max` (the cores' and RAM's), never more than the
+    /// memory plans hold (`fits`).
+    pub fn bound_workers(&mut self, set: Option<u32>, max: u32) {
+        let fits = (1..=MAX_WORKERS_JSON).take_while(|&n| self.fits(n)).last().unwrap_or(1);
+        let (lo, hi) = match set {
+            Some(n) => (n.clamp(1, MAX_WORKERS).min(fits), n.clamp(1, MAX_WORKERS).min(fits)),
+            None => (1, max.clamp(1, MAX_WORKERS).min(fits)),
+        };
+        (self.workers_min, self.workers_max) = (lo.max(1), hi.max(1));
+    }
+
+    /// `n` workers fit: the memory plan holds each one's base and its share of the fewest games in flight allowed; a GPU
+    /// job's video memory plan holds each one's base and that share in its batches (two groups at most), and each worker
+    /// gets a search thread.
+    fn fits(&self, n: u32) -> bool {
+        let need = self.conc_min.max(n as u64) as u128;
+        let mem = self.mem_room(n).is_none_or(|room| room as u128 * n as u128 >= need);
+        let vram = self.vram_rows(n).is_none_or(|rows| rows > 0 && (rows * crate::rolling::GPU_MAX_GROUPS) as u128 * n as u128 >= need);
+        mem && vram && (!self.gpu || n <= self.max_search)
+    }
+
+    /// agent 0.3.4: the rows one of `n` workers' batches may have under the video memory plan (None: not planned).
+    pub fn vram_rows(&self, n: u32) -> Option<u64> {
+        let (budget, cost) = self.vram?;
+        Some(crate::rolling::vram_rows(budget, n, cost))
+    }
+
+    /// One of `n` workers' search threads at most: a GPU job's share of its total, else `budget` of the cap.
+    pub fn search_cap(&self, n: u32) -> u32 {
+        if self.gpu {
+            (self.max_search / n.max(1)).max(1)
+        } else {
+            budget(self.max_search.clamp(1, MAX_THREADS), n)
+        }
+    }
+
+    fn infer_cap(&self, n: u32) -> u32 {
+        if self.gpu {
+            self.search_cap(n)
+        } else {
+            budget(self.max_infer.max(1), n)
+        }
+    }
+
+    /// agent 0.3.4: a GPU job's games in flight per worker for a crew of `n`: its share of the target (rounded up to a
+    /// multiple of `GPU_CONC_STEP` for N > 1: 1,024 is 1 x 1,024, 2 x 512, 3 x 384).
+    pub fn target_conc(&self, n: u32) -> u64 {
+        let n = n.max(1) as u64;
+        if n > 1 {
+            self.target.div_ceil(n).div_ceil(GPU_CONC_STEP) * GPU_CONC_STEP
+        } else {
+            self.target.max(1)
+        }
+    }
+
+    /// agent 0.3.4: a GPU job's start for `n` workers whose full batch is `batch` rows: each its share of the target
+    /// (`target_conc`) in batches of at most `batch` rows (`rolling::gpu_groups`) and its share of the search threads,
+    /// made valid (the memory plans may cut its games in flight).
+    pub fn gpu_layout(&self, n: u32, batch: u64) -> Layout {
+        let n = n.max(1);
+        let conc = self.target_conc(n);
+        let threads = self.search_cap(n);
+        self.fit(Layout { workers: n, threads, infer_workers: 1, infer_threads: threads, groups: crate::rolling::gpu_groups(conc, batch), conc })
+    }
+
+    /// agent 0.3.4: a GPU job's starting crew (PROTOCOL 13.1): on an NVIDIA GPU the most workers (within the bounds) whose
+    /// start holds the target games in flight in all - three of 384 or two of 512 for a target of 1,024 where the video
+    /// memory and the memory plan allow, else one; on other GPUs one (the tuner tries more).
+    pub fn gpu_start(&self, nvidia: bool, batch: u64) -> Layout {
+        let lo = self.workers_min.max(1);
+        let hi = self.workers_max.max(lo);
+        if lo == hi || !nvidia {
+            return self.gpu_layout(lo, batch);
+        }
+        (lo..=hi).rev().map(|n| self.gpu_layout(n, batch)).find(|l| l.total_conc() >= self.target).unwrap_or_else(|| self.gpu_layout(lo, batch))
     }
 
     /// The games in flight one of `n` workers may run under the memory plan (None: no limit): (`PLAN_SHARE` x the
@@ -393,9 +535,16 @@ impl Space {
         Some((share.saturating_sub(cost.base_mb) / cost.per_game_mb.max(1)).max(1))
     }
 
-    /// The most games in flight one of `n` workers may run: its part of the job's bounds and the memory plan.
+    /// The most games in flight one of `n` workers may run: its part of the job's bounds and the memory plan (a GPU job:
+    /// at most its share of the target, `target_conc`, and what its video memory holds in two groups).
     pub fn top_conc(&self, n: u32) -> u64 {
-        let cmax = (self.conc_max.max(self.conc_min).max(1) / n.max(1) as u64).max(1);
+        let mut cmax = (self.conc_max.max(self.conc_min).max(1) / n.max(1) as u64).max(1);
+        if self.target > 0 {
+            cmax = cmax.min(self.target_conc(n)).max(1);
+        }
+        if let Some(rows) = self.vram_rows(n) {
+            cmax = cmax.min(rows * crate::rolling::GPU_MAX_GROUPS).max(1);
+        }
         self.mem_room(n).map_or(cmax, |r| r.min(cmax))
     }
 
@@ -403,7 +552,10 @@ impl Space {
     /// game.
     fn groups_range(&self, conc: u64) -> (u64, u64) {
         let lo = conc.div_ceil(self.batch_max).max(1);
-        let hi = (conc / self.batch_min).max(1).max(lo).min(conc.max(1));
+        let mut hi = (conc / self.batch_min).max(1).max(lo).min(conc.max(1));
+        if self.gpu {
+            hi = hi.clamp(1, crate::rolling::GPU_MAX_GROUPS);
+        }
         (lo.min(hi), hi)
     }
 
@@ -413,18 +565,20 @@ impl Space {
     /// batches within bounds where the games in flight allow.
     pub fn fit(&self, l: Layout) -> Layout {
         let workers = l.workers.clamp(self.workers_min.max(1), self.workers_max.max(self.workers_min).max(1));
-        let (max_search, max_infer) = (budget(self.max_search.clamp(1, MAX_THREADS), workers), budget(self.max_infer.max(1), workers));
+        let (max_search, max_infer) = (self.search_cap(workers), self.infer_cap(workers));
         let n = workers as u64;
         let (cmin, cmax) = (self.conc_min.max(1).div_ceil(n), (self.conc_max.max(self.conc_min).max(1) / n).max(1));
         let mut conc = l.conc.clamp(cmin.min(cmax), cmax);
         if let Some(room) = self.mem_room(workers) {
             conc = conc.min(room);
         }
+        let threads = l.threads.clamp(1, max_search);
         let mut l = Layout {
             workers,
-            threads: l.threads.clamp(1, max_search),
+            threads,
             infer_workers: if self.sessions { l.infer_workers.clamp(1, MAX_SESSIONS) } else { 1 },
-            infer_threads: l.infer_threads.clamp(1, MAX_THREADS),
+            // (a GPU job: the worker's own default, its search threads)
+            infer_threads: if self.gpu { threads } else { l.infer_threads.clamp(1, MAX_THREADS) },
             groups: l.groups.max(1),
             conc: conc.max(1),
         };
@@ -437,6 +591,17 @@ impl Space {
         }
         let (lo, hi) = self.groups_range(l.conc);
         l.groups = l.groups.clamp(lo, hi);
+        // agent 0.3.4: a GPU job's batches within its video memory: more groups first (up to two), then fewer games
+        if let Some(rows) = self.vram_rows(workers) {
+            let rows = rows.max(1);
+            if l.batch() > rows {
+                let (_, hi) = self.groups_range(l.conc);
+                l.groups = l.conc.div_ceil(rows).clamp(l.groups, hi);
+                l.conc = l.conc.min(rows * l.groups).max(1);
+                let (lo, hi) = self.groups_range(l.conc);
+                l.groups = l.groups.clamp(lo, hi);
+            }
+        }
         l
     }
 }
@@ -474,18 +639,23 @@ pub fn neighbour(l: &Layout, c: Coord, up: bool, s: &Space) -> Option<Layout> {
                 return None;
             }
             // the job's games in flight and rows per batch kept; each kind of thread keeps its share of its budget
-            let scale = |v: u32, cap: u32| ((v as f64 * budget(cap, w) as f64 / budget(cap, l.workers) as f64).round() as u32).max(1);
+            let scale = |v: u32, infer: bool| {
+                let (a, b) = if infer { (s.infer_cap(w), s.infer_cap(l.workers)) } else { (s.search_cap(w), s.search_cap(l.workers)) };
+                ((v as f64 * a as f64 / b.max(1) as f64).round() as u32).max(1)
+            };
             n.workers = w;
             n.conc = (l.total_conc() / w as u64).max(1);
             n.groups = n.conc.div_ceil(l.batch().max(1)).max(1);
-            n.threads = scale(l.threads, s.max_search);
-            let infer = scale(l.infer_total(), s.max_infer);
+            n.threads = scale(l.threads, false);
+            let infer = scale(l.infer_total(), true);
             if s.sessions {
                 n.infer_workers = ((infer as f64 / l.infer_threads.max(1) as f64).round() as u32).max(1);
             } else {
                 n.infer_threads = infer;
             }
         }
+        // (a GPU job's inference threads follow its search threads, one session: no coordinates of their own)
+        Coord::InferThreads | Coord::Sessions if s.gpu => return None,
         Coord::Batch => n.groups = if up { (l.groups * 2 / 3).max(1) } else { (l.groups * 3).div_ceil(2) },
         Coord::Search => {
             let step = (s.max_search / 8).max(1);
@@ -503,9 +673,17 @@ pub fn neighbour(l: &Layout, c: Coord, up: bool, s: &Space) -> Option<Layout> {
                 return None;
             }
             let batch = l.batch();
-            n.conc = (if up { l.conc * 2 } else { l.conc / 2 }).clamp(s.conc_min.max(1), s.conc_max);
+            // (each worker's games in flight within its part of the job's bounds - agent 0.3.4: 0.3.1-0.3.3 clamped them to
+            // the job's, so a crew's move went nowhere)
+            let w = l.workers.max(1) as u64;
+            let (cmin, cmax) = (s.conc_min.max(1).div_ceil(w), (s.conc_max / w).max(1));
+            n.conc = (if up { l.conc * 2 } else { l.conc / 2 }).clamp(cmin.min(cmax), cmax);
             n.groups = n.conc.div_ceil(batch.max(1)).max(1);
         }
+    }
+    if s.gpu {
+        // (a GPU job's inference threads follow its search threads)
+        n.infer_threads = n.threads;
     }
     let f = s.fit(n);
     let thread_move = matches!(c, Coord::Search | Coord::InferThreads | Coord::Sessions);
@@ -552,6 +730,12 @@ pub fn net_fingerprint(template: &Map<String, Value>, model_size: Option<u64>) -
 /// The CPU's fingerprint: brand, cores, threads, performance and efficiency cores, RAM in GiB.
 pub fn hw_fingerprint(p: &zerofarm_common::protocol::Profile) -> String {
     format!("{} | {}c {}t {}p {}e | {} GB", p.cpu, p.cores, p.threads, p.perf_cores, p.eff_cores, p.ram_mb >> 10)
+}
+
+/// agent 0.3.4: a GPU job's hardware: the CPU's fingerprint, the GPU (vendor, name, dedicated memory, driver) and the
+/// execution provider - a GPU job's result is remembered per GPU and driver (PROTOCOL 13.3).
+pub fn gpu_fingerprint(p: &zerofarm_common::protocol::Profile, g: &zerofarm_common::protocol::Gpu, provider: &str) -> String {
+    format!("{} | gpu {} {} {} MB driver {} | {provider}", hw_fingerprint(p), g.vendor, g.name, g.vram_mb, g.driver)
 }
 
 /// One valid measurement: a fresh worker of `layout`, `rate` leaves/s over the search's phase window.
@@ -902,7 +1086,7 @@ impl Entry {
     /// What `ZeroFarm status` / the tray say about it.
     pub fn describe(&self) -> String {
         let rate = self.rate().map(|r| format!(", {} leaves/s", thousands(r.round() as u64))).unwrap_or_default();
-        let inc = self.incumbent_run().describe();
+        let inc = self.incumbent_run().describe_on(self.space.is_some_and(|s| s.gpu));
         match self.state {
             State::Tuned => format!("tuned: {inc}{rate}"),
             State::Checking => format!("weekly check of the tuned layout: {inc}{rate}"),
@@ -1192,7 +1376,7 @@ mod tests {
 
     /// The M4 Max's space: search and inference threads at most 16, sessions, 1,152-2,304 games in flight, 192-384 rows.
     fn space() -> Space {
-        Space { max_search: 16, max_infer: 16, sessions: true, conc_min: 1152, conc_max: 2304, batch_min: 192, batch_max: 384, workers_min: 1, workers_max: 1, mem: None }
+        Space { max_search: 16, max_infer: 16, sessions: true, conc_min: 1152, conc_max: 2304, batch_min: 192, batch_max: 384, workers_min: 1, workers_max: 1, mem: None, gpu: false, vram: None, target: 0 }
     }
 
     fn lay(threads: u32, w: u32, t: u32, groups: u64, conc: u64) -> Layout {
@@ -1673,6 +1857,111 @@ mod tests {
         assert!(run(0.01, 0.09).0, "faster under more load wins");
         let (_, e) = run(0.08, 0.01);
         assert_eq!(e.measured[1].load, Some(0.01), "the load is recorded with the measurement");
+    }
+
+    /// agent 0.3.4: the 4070 Ti PC of 2026-11-19 (4 cores / 8 threads: 6 search threads shared; up to 3 workers) with a
+    /// target of 1,024 games in flight (its bench's 512-row batches), a memory limit of `limit` MB at 1,800 MB + `per_game`
+    /// MB a game, and `budget` MB of video memory at `GPU_VRAM`.
+    fn gpu_space(limit: u64, per_game: u64, budget: u64, set: Option<u32>) -> Space {
+        let mem = crate::rolling::MemCost { base_mb: 1800, per_game_mb: per_game };
+        Space::new_gpu(6, set, 3, 1024, false, Some((limit, mem)), Some((budget, crate::rolling::GPU_VRAM)))
+    }
+
+    fn glay(workers: u32, threads: u32, groups: u64, conc: u64) -> Layout {
+        Layout { workers, threads, infer_workers: 1, infer_threads: threads, groups, conc }
+    }
+
+    #[test]
+    fn a_gpu_crew_starts_at_the_bench_target_where_memory_allows() {
+        // half of 32 GB, 4 MB a game measured, the 4070 Ti's 9,939 MB: three workers of 384 in one group, 2 search threads
+        // each - the bench's best (14,154 leaves/s)
+        let s = gpu_space(16_384, 4, 9_939, None);
+        assert_eq!((s.workers_min, s.workers_max, s.conc_min, s.conc_max), (1, 3, 512, 1536));
+        assert_eq!(s.gpu_start(true, 512), glay(3, 2, 1, 384));
+        assert_eq!((s.target_conc(1), s.target_conc(2), s.target_conc(3)), (1024, 512, 384));
+        // a ~9.5 GB limit: three workers hold 3 x 222 in all, short of 1,024 - two of 512, 3 search threads each
+        let s = gpu_space(9_500, 4, 9_939, None);
+        assert_eq!(s.gpu_start(true, 512), glay(2, 3, 1, 512));
+        // at the default 45 MB a game: one worker, (8,075 - 1,800) / 45 = 139 games in flight (0.3.3's plan: 128)
+        let s = gpu_space(9_500, 45, 9_939, None);
+        assert_eq!(s.workers_max, 1);
+        assert_eq!(s.gpu_start(true, 512), glay(1, 6, 2, 139));
+        // not NVIDIA: one worker of 1,024 in two groups of 512 (the tuner tries more)
+        assert_eq!(gpu_space(16_384, 4, 9_939, None).gpu_start(false, 512), glay(1, 6, 2, 1024));
+        // the owner's two workers; `autotune` off without them: one
+        assert_eq!(gpu_space(16_384, 4, 9_939, Some(2)).gpu_start(true, 512), glay(2, 3, 1, 512));
+        assert_eq!(gpu_space(16_384, 4, 9_939, Some(1)).gpu_start(true, 512), glay(1, 6, 2, 1024));
+        // a run's number: fixed games in flight in all
+        let fixed = Space::new_gpu(6, None, 3, 600, true, None, Some((9_939, crate::rolling::GPU_VRAM)));
+        assert_eq!((fixed.conc_min, fixed.conc_max), (600, 600));
+        assert_eq!(fixed.gpu_start(true, 512).total_conc(), 3 * 200);
+    }
+
+    #[test]
+    fn a_gpu_crew_fits_the_video_memory() {
+        // a 4 GB GPU (3,000 MB for the job): one worker's batch 988 rows at most, two workers' 238, three none
+        let s = gpu_space(16_384, 4, 3_000, None);
+        assert_eq!((s.vram_rows(1), s.vram_rows(2), s.vram_rows(3)), (Some(988), Some(238), Some(0)));
+        assert_eq!(s.workers_max, 2, "a third worker's base doesn't fit");
+        // two of 512 don't fit in one group each: two groups of 238 rows, 476 games in flight - short of the target, so
+        // the start is one worker of 1,024 in two groups of 512
+        assert_eq!(s.fit(glay(2, 3, 1, 512)), glay(2, 3, 2, 476));
+        assert_eq!(s.gpu_start(true, 512), glay(1, 6, 2, 1024));
+        // every layout of the space within the budget at its plan
+        for l in [glay(1, 6, 1, 1536), glay(2, 3, 1, 768), glay(2, 3, 2, 768), glay(1, 6, 2, 4096)] {
+            let f = s.fit(l);
+            assert!(f.workers as u64 * crate::rolling::GPU_VRAM.plan_mb(f.batch()) <= 3_000, "{l:?} -> {f:?}");
+        }
+        // too little for one worker's base and batch: one worker, its batch as small as it goes
+        let tiny = gpu_space(16_384, 4, 1_000, None);
+        assert_eq!(tiny.workers_max, 1);
+        assert_eq!(tiny.fit(glay(1, 6, 2, 1024)).conc, 2, "one row a batch, two groups");
+    }
+
+    #[test]
+    fn gpu_neighbours_split_threads_and_keep_one_session() {
+        let s = gpu_space(16_384, 4, 9_939, None);
+        let three = glay(3, 2, 1, 384);
+        // two workers: the job's 1,152 games in flight and its 384-row batches kept, 3 search threads each
+        assert_eq!(neighbour(&three, Coord::Workers, false, &s), Some(glay(2, 3, 2, 576)));
+        assert_eq!(neighbour(&three, Coord::Workers, true, &s), None, "at most 3");
+        // no inference coordinates; search threads within their share
+        assert_eq!(neighbour(&three, Coord::InferThreads, false, &s), None);
+        assert_eq!(neighbour(&three, Coord::Sessions, true, &s), None);
+        assert_eq!(neighbour(&three, Coord::Search, true, &s), None, "2 of 6 for three workers");
+        assert_eq!(neighbour(&three, Coord::Search, false, &s), Some(glay(3, 1, 1, 384)));
+        // one or two groups
+        assert_eq!(neighbour(&three, Coord::Batch, false, &s), Some(glay(3, 2, 2, 384)));
+        assert_eq!(neighbour(&three, Coord::Batch, true, &s), None);
+        // games in flight per worker: up to 1,536 / 3, down to 512 / 3 (0.3.3 clamped them to the job's bounds)
+        assert_eq!(neighbour(&three, Coord::Conc, true, &s), Some(glay(3, 2, 2, 512)));
+        assert_eq!(neighbour(&three, Coord::Conc, false, &s), Some(glay(3, 2, 1, 192)));
+        let one = glay(1, 6, 2, 1024);
+        assert_eq!(neighbour(&one, Coord::Workers, true, &s), Some(glay(2, 3, 1, 512)), "one worker -> two of 512 (2 groups of 512 rows: 1 group each)");
+        assert!(one.describe_on(true).starts_with("6 search threads, 1,024 games in flight in 2 groups (512 rows) on the GPU"), "{}", one.describe_on(true));
+        assert!(three.describe_on(true).starts_with("3 workers x (2 search threads, 384 games in flight in 1 group (384 rows)) on the GPU"), "{}", three.describe_on(true));
+    }
+
+    #[test]
+    fn a_gpu_layout_the_memory_plan_held_back_is_lifted_to_the_target_not_past_it() {
+        // the canary's first 0.3.4 lease without a measurement: 1 x 139 at 45 MB a game; a steady reading of 3 MB (planned
+        // at 4): 1 x 1,024 (the target, not the 1,536 the bounds allow), and up to three workers
+        let old = gpu_space(9_500, 45, 9_939, None);
+        let start = old.gpu_start(true, 512);
+        let mut e = Entry::new(key(), "r", start, false, 0);
+        e.bind(&old);
+        let mut new = gpu_space(9_500, 4, 9_939, None);
+        new.bound_workers(None, 3);
+        assert_eq!(new.workers_max, 3);
+        e.lift_conc(&old, &new);
+        assert_eq!(e.wanted(&new), glay(1, 6, 2, 1024));
+        assert_eq!(new.top_conc(3), 222, "three workers: the memory plan's 222 each");
+        // a tuner's choice of fewer games than the old plan held stays
+        let roomy = gpu_space(9_500, 10, 9_939, None);
+        assert_eq!(roomy.top_conc(1), 627);
+        let mut e = Entry::new(key(), "r", glay(1, 6, 2, 600), false, 0);
+        e.lift_conc(&roomy, &new);
+        assert_eq!(e.incumbent.conc, 600);
     }
 
     #[test]

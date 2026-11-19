@@ -39,8 +39,15 @@ pub type OsSignals = Win32Signals;
 pub type OsSignals = MacSignals;
 
 pub trait SignalSource: Send {
-    /// `worker_pid`: our own worker, excluded from "other GPU users".
-    fn sample(&mut self, worker_pid: Option<u32>) -> Signals;
+    /// `worker_pids`: our own workers (agent 0.3.4: every worker of a lease's crew), excluded from "other GPU users".
+    fn sample(&mut self, worker_pids: &[u32]) -> Signals;
+
+    /// agent 0.3.4: the dedicated video memory on adapter `luid` (MB): in use by every program, and by each of `pids`
+    /// that holds some (Task Manager's "Dedicated GPU memory"). None: not measured here (no such counters, no GPU, not
+    /// Windows).
+    fn gpu_memory(&self, _luid: u64, _pids: &[u32]) -> Option<GpuMemory> {
+        None
+    }
 
     /// (available, total) physical memory in MB: what a worker's memory cap is worked out from (`Engine::caps`).
     fn memory_mb(&self) -> (u64, u64) {
@@ -64,6 +71,20 @@ pub trait SignalSource: Send {
     }
 }
 
+/// agent 0.3.4: an adapter's dedicated video memory in use (MB): by every program, and by some processes.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GpuMemory {
+    pub adapter_used_mb: u64,
+    pub per_pid: Vec<(u32, u64)>,
+}
+
+impl GpuMemory {
+    /// What `pid` holds (0: nothing measured).
+    pub fn of(&self, pid: u32) -> u64 {
+        self.per_pid.iter().filter(|(p, _)| *p == pid).map(|(_, mb)| *mb).sum()
+    }
+}
+
 /// The GPUs are measured at most this often; `sample` reuses the last measurement in between
 /// (the lease loop samples every 200 ms, and a PDH collection over every process's GPU engines
 /// is not free). A PDH rate is the average since the previous collection.
@@ -76,13 +97,23 @@ pub const ADAPTER_REFRESH: Duration = Duration::from_secs(60);
 /// The real thing.
 pub struct Win32Signals {
     gpu: Option<GpuSampler>,
+    /// agent 0.3.4: the GPU memory counters (opened at the first `gpu_memory`; None inside: Windows has none), and the
+    /// last collection (at most one per `GPU_MEASURE_EVERY`).
+    mem: Mutex<Option<GpuMemSampler>>,
+}
+
+#[cfg(windows)]
+struct GpuMemSampler {
+    pdh: Option<PdhMemory>,
+    at: Option<std::time::Instant>,
+    last: Vec<MemUse>,
 }
 
 #[cfg(windows)]
 impl Win32Signals {
     /// `gpu`: measure the GPUs (false: report none, as on a PC without one).
     pub fn new(gpu: bool) -> Self {
-        Win32Signals { gpu: gpu.then(GpuSampler::new) }
+        Win32Signals { gpu: gpu.then(GpuSampler::new), mem: Mutex::new(None) }
     }
 
     /// Whether Windows has the GPU Engine counters (without them other programs' GPU use reads 0).
@@ -99,11 +130,26 @@ impl Win32Signals {
 
 #[cfg(windows)]
 impl SignalSource for Win32Signals {
-    fn sample(&mut self, worker_pid: Option<u32>) -> Signals {
+    fn gpu_memory(&self, luid: u64, pids: &[u32]) -> Option<GpuMemory> {
+        self.gpu.as_ref()?;
+        let mut g = self.mem.lock().unwrap();
+        let m = g.get_or_insert_with(|| {
+            let pdh = PdhMemory::open().map_err(|st| log::info!("no GPU memory counters (PDH 0x{st:08x}): the video memory in use is not measured")).ok();
+            GpuMemSampler { pdh, at: None, last: Vec::new() }
+        });
+        let pdh = m.pdh.as_mut()?;
+        if m.at.is_none_or(|t| t.elapsed() >= GPU_MEASURE_EVERY) {
+            m.at = Some(std::time::Instant::now());
+            m.last = pdh.collect();
+        }
+        gpu_memory_of(&m.last, luid, pids)
+    }
+
+    fn sample(&mut self, worker_pids: &[u32]) -> Signals {
         let (_, sod) = crate::util::local_now();
         let (mem_avail_mb, mem_total_mb) = memory_mb();
         let (on_ac, battery_saver) = power();
-        let ours: Vec<u32> = worker_pid.into_iter().chain([std::process::id()]).collect();
+        let ours: Vec<u32> = worker_pids.iter().copied().chain([std::process::id()]).collect();
         Signals {
             now: zerofarm_common::now_unix(),
             local_min: sod / 60,
@@ -272,6 +318,53 @@ pub fn parse_engine_instance(name: &str) -> Option<(u32, u64, u32, u32)> {
     }
 }
 
+/// agent 0.3.4: one `GPU Adapter Memory` instance (`pid` None) or `GPU Process Memory` instance: bytes of dedicated
+/// video memory on adapter `luid`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MemUse {
+    pub pid: Option<u32>,
+    pub luid: u64,
+    pub bytes: u64,
+}
+
+/// `luid_0x00000000_0x0000D1F3_phys_0` (an adapter) or `pid_1234_luid_0x00000000_0x0000D1F3_phys_0` (a process on it)
+/// -> (pid, luid).
+pub fn parse_mem_instance(name: &str) -> Option<(Option<u32>, u64)> {
+    let (pid, rest) = match name.strip_prefix("pid_") {
+        Some(r) => {
+            let (p, rest) = r.split_once('_')?;
+            (Some(p.parse::<u32>().ok().filter(|_| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()))?), rest)
+        }
+        None => (None, name),
+    };
+    // (the engine parser reads the same `luid_<hi>_<lo>_phys_<n>` tail; nothing may follow it here)
+    if rest.split('_').count() != 5 {
+        return None;
+    }
+    let (_, luid, _, _) = parse_engine_instance(&format!("pid_0_{rest}_eng_0"))?;
+    Some((pid, luid))
+}
+
+/// The video memory on `luid` (MB) from a collection: the adapter's use (every program; without an adapter instance
+/// the sum of its processes'), and each of `pids`' that holds some. None: nothing on that adapter.
+pub fn gpu_memory_of(uses: &[MemUse], luid: u64, pids: &[u32]) -> Option<GpuMemory> {
+    let on: Vec<&MemUse> = uses.iter().filter(|u| u.luid == luid).collect();
+    if on.is_empty() {
+        return None;
+    }
+    let procs: u64 = on.iter().filter(|u| u.pid.is_some()).map(|u| u.bytes).sum();
+    let adapter = on.iter().filter(|u| u.pid.is_none()).map(|u| u.bytes).max().unwrap_or(procs);
+    let mut per_pid: Vec<(u32, u64)> = Vec::new();
+    for u in on.iter().filter(|u| u.pid.is_some_and(|p| pids.contains(&p))) {
+        let p = u.pid.expect("filtered");
+        match per_pid.iter_mut().find(|(x, _)| *x == p) {
+            Some((_, b)) => *b += u.bytes,
+            None => per_pid.push((p, u.bytes)),
+        }
+    }
+    Some(GpuMemory { adapter_used_mb: adapter >> 20, per_pid: per_pid.into_iter().map(|(p, b)| (p, b >> 20)).collect() })
+}
+
 /// Other programs' GPU use per adapter LUID, percent 0..=100: per engine (luid, phys, eng) the
 /// sum over every process not in `ours`, per adapter its busiest engine.
 pub fn other_use_by_adapter(engines: &[EngineUse], ours: &[u32]) -> BTreeMap<u64, u32> {
@@ -386,6 +479,110 @@ impl PdhEngines {
 
 #[cfg(windows)]
 impl Drop for PdhEngines {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::System::Performance::PdhCloseQuery(self.query) };
+    }
+}
+
+#[cfg(windows)]
+const GPU_ADAPTER_MEMORY_COUNTER: &str = r"\GPU Adapter Memory(*)\Dedicated Usage";
+#[cfg(windows)]
+const GPU_PROCESS_MEMORY_COUNTER: &str = r"\GPU Process Memory(*)\Dedicated Usage";
+
+#[cfg(windows)]
+/// agent 0.3.4: one open PDH query on the dedicated GPU memory counters (every adapter's, every process's; what Task
+/// Manager shows). Instance names carry only pids and adapter numbers.
+struct PdhMemory {
+    query: windows_sys::Win32::System::Performance::PDH_HQUERY,
+    adapter: windows_sys::Win32::System::Performance::PDH_HCOUNTER,
+    process: windows_sys::Win32::System::Performance::PDH_HCOUNTER,
+}
+
+#[cfg(windows)]
+// SAFETY: as `PdhEngines`; it is used behind a mutex.
+unsafe impl Send for PdhMemory {}
+
+#[cfg(windows)]
+impl PdhMemory {
+    fn open() -> Result<Self, u32> {
+        use windows_sys::Win32::System::Performance::{PdhAddEnglishCounterW, PdhCloseQuery, PdhOpenQueryW};
+        let mut query = std::ptr::null_mut();
+        let st = unsafe { PdhOpenQueryW(std::ptr::null(), 0, &mut query) };
+        if st != 0 {
+            return Err(st);
+        }
+        let add = |path: &str| {
+            let w = crate::util::wide(path);
+            let mut c = std::ptr::null_mut();
+            let st = unsafe { PdhAddEnglishCounterW(query, w.as_ptr(), 0, &mut c) };
+            if st != 0 {
+                Err(st)
+            } else {
+                Ok(c)
+            }
+        };
+        match (add(GPU_ADAPTER_MEMORY_COUNTER), add(GPU_PROCESS_MEMORY_COUNTER)) {
+            (Ok(adapter), Ok(process)) => Ok(PdhMemory { query, adapter, process }),
+            (Err(st), _) | (_, Err(st)) => {
+                unsafe { PdhCloseQuery(query) };
+                Err(st)
+            }
+        }
+    }
+
+    /// Collects, then reads every instance of both counters (raw byte counts: one collection is enough).
+    fn collect(&mut self) -> Vec<MemUse> {
+        use windows_sys::Win32::System::Performance::PdhCollectQueryData;
+        let st = unsafe { PdhCollectQueryData(self.query) };
+        if st != 0 {
+            log::debug!("GPU memory counters: collect failed (PDH 0x{st:08x})");
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        for c in [self.adapter, self.process] {
+            for (name, bytes) in large_array(c) {
+                if let Some((pid, luid)) = parse_mem_instance(&name) {
+                    out.push(MemUse { pid, luid, bytes });
+                }
+            }
+        }
+        out
+    }
+}
+
+#[cfg(windows)]
+/// Every instance of counter `c` with a valid value, as a 64-bit integer: (instance name, value).
+fn large_array(c: windows_sys::Win32::System::Performance::PDH_HCOUNTER) -> Vec<(String, u64)> {
+    use windows_sys::Win32::System::Performance::{PdhGetFormattedCounterArrayW, PDH_CSTATUS_NEW_DATA, PDH_CSTATUS_VALID_DATA, PDH_FMT_COUNTERVALUE_ITEM_W, PDH_FMT_LARGE, PDH_MORE_DATA};
+    let mut out = Vec::new();
+    let mut buf: Vec<u64> = Vec::new();
+    for _ in 0..4 {
+        let mut bytes = (buf.len() * 8) as u32;
+        let mut count = 0u32;
+        let items_ptr = if buf.is_empty() { std::ptr::null_mut() } else { buf.as_mut_ptr() as *mut PDH_FMT_COUNTERVALUE_ITEM_W };
+        let st = unsafe { PdhGetFormattedCounterArrayW(c, PDH_FMT_LARGE, &mut bytes, &mut count, items_ptr) };
+        if st == PDH_MORE_DATA {
+            buf = vec![0u64; (bytes as usize).div_ceil(8).max(1)];
+            continue;
+        }
+        if st != 0 || count == 0 || buf.is_empty() {
+            break;
+        }
+        let items = unsafe { std::slice::from_raw_parts(buf.as_ptr() as *const PDH_FMT_COUNTERVALUE_ITEM_W, count as usize) };
+        for it in items {
+            if it.FmtValue.CStatus != PDH_CSTATUS_VALID_DATA && it.FmtValue.CStatus != PDH_CSTATUS_NEW_DATA {
+                continue;
+            }
+            let v = unsafe { it.FmtValue.Anonymous.largeValue };
+            out.push((unsafe { wide_ptr_to_string(it.szName) }, v.max(0) as u64));
+        }
+        break;
+    }
+    out
+}
+
+#[cfg(windows)]
+impl Drop for PdhMemory {
     fn drop(&mut self) {
         unsafe { windows_sys::Win32::System::Performance::PdhCloseQuery(self.query) };
     }
@@ -549,6 +746,11 @@ pub struct SharedSignals {
     /// Tests: false - the worker counts as starved only when `starved` says so, not when the test machine itself is
     /// busy (a fake worker sleeps, so on a saturated machine it always looks starved).
     pub real_starvation: bool,
+    /// Tests (agent 0.3.4): the dedicated video memory other programs hold on every adapter (MB; None: not measured,
+    /// as without the counters). The workers' own come from their `vram_mb`.
+    pub gpu_others_mb: Arc<Mutex<Option<u64>>>,
+    /// Tests: the pids the last `sample` was told are ours.
+    pub ours: Arc<Mutex<Vec<u32>>>,
 }
 
 impl SharedSignals {
@@ -559,7 +761,12 @@ impl SharedSignals {
             starved: Arc::new(AtomicBool::new(false)),
             other_load: Arc::new(Mutex::new(Some(0.0))),
             real_starvation: true,
+            gpu_others_mb: Arc::new(Mutex::new(None)),
+            ours: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+    pub fn set_gpu_others(&self, mb: Option<u64>) {
+        *self.gpu_others_mb.lock().unwrap() = mb;
     }
     pub fn set_other_load(&self, share: Option<f64>) {
         *self.other_load.lock().unwrap() = share;
@@ -573,7 +780,8 @@ impl SharedSignals {
 }
 
 impl SignalSource for SharedSignals {
-    fn sample(&mut self, _worker_pid: Option<u32>) -> Signals {
+    fn sample(&mut self, worker_pids: &[u32]) -> Signals {
+        *self.ours.lock().unwrap() = worker_pids.to_vec();
         let mut s = self.inner.lock().unwrap().clone();
         if !self.frozen_now {
             s.now = zerofarm_common::now_unix();
@@ -590,11 +798,54 @@ impl SignalSource for SharedSignals {
     fn other_load(&self, measured: f64) -> f64 {
         self.other_load.lock().unwrap().unwrap_or(measured)
     }
+    fn gpu_memory(&self, _luid: u64, _pids: &[u32]) -> Option<GpuMemory> {
+        self.gpu_others_mb.lock().unwrap().map(|mb| GpuMemory { adapter_used_mb: mb, per_pid: vec![] })
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gpu_memory_instances() {
+        assert_eq!(parse_mem_instance("luid_0x00000000_0x0000D1F3_phys_0"), Some((None, 0xD1F3)));
+        assert_eq!(parse_mem_instance("pid_1234_luid_0x00000001_0x00008A2C_phys_0"), Some((Some(1234), 0x1_0000_8A2C)));
+        assert_eq!(parse_mem_instance("pid_x_luid_0x00000000_0x0000D1F3_phys_0"), None);
+        assert_eq!(parse_mem_instance("luid_0x00000000_phys_0"), None);
+        assert_eq!(parse_mem_instance("pid_12_luid_0x00000000_0x0000D1F3_phys_0_eng_0_engtype_3D"), None, "an engine instance is not a memory one");
+        let mb = |n: u64| n << 20;
+        let uses = [
+            MemUse { pid: None, luid: 0xD1F3, bytes: mb(2557) },
+            MemUse { pid: Some(10), luid: 0xD1F3, bytes: mb(700) },
+            MemUse { pid: Some(11), luid: 0xD1F3, bytes: mb(650) },
+            MemUse { pid: Some(12), luid: 0xD1F3, bytes: mb(300) },
+            MemUse { pid: Some(10), luid: 0xBEEF, bytes: mb(5) },
+        ];
+        let m = gpu_memory_of(&uses, 0xD1F3, &[10, 11, 99]).unwrap();
+        assert_eq!(m, GpuMemory { adapter_used_mb: 2557, per_pid: vec![(10, 700), (11, 650)] });
+        assert_eq!((m.of(10), m.of(99)), (700, 0));
+        assert_eq!(gpu_memory_of(&uses[1..4], 0xD1F3, &[]).unwrap().adapter_used_mb, 1650, "no adapter instance: its processes' sum");
+        assert_eq!(gpu_memory_of(&uses, 0x1234, &[10]), None);
+    }
+
+    /// The real counters on this PC (a GPU and Windows' counters needed): every program's dedicated memory in use on
+    /// each adapter, and this process's (none: it uses no GPU).
+    #[test]
+    #[cfg(windows)]
+    #[ignore]
+    fn gpu_memory_counters_on_this_pc() {
+        let s = Win32Signals::new(true);
+        // (`ZF_GPU_PIDS=1,2`: processes whose dedicated memory is shown too)
+        let pids: Vec<u32> = std::env::var("ZF_GPU_PIDS").unwrap_or_default().split(',').filter_map(|p| p.trim().parse().ok()).collect();
+        let mut any = false;
+        for a in crate::profile::adapters() {
+            let m = s.gpu_memory(a.luid, &pids);
+            eprintln!("{} {} ({} MB dedicated): {m:?}", a.vendor, a.name, a.vram_mb);
+            any |= m.is_some_and(|m| m.adapter_used_mb > 0);
+        }
+        assert!(any, "no adapter with dedicated memory in use");
+    }
 
     const LUID_A: u64 = 0xD1F3;
     const LUID_B: u64 = 0x1_0000_8A2C;

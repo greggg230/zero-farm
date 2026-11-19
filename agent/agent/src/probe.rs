@@ -492,6 +492,9 @@ pub struct Choice {
     pub batch_rows: u64,
     /// Rows per second at the job's batch size per provider (Stats `rows_per_s`): the CPU and each GPU candidate.
     pub rows_per_s: BTreeMap<String, f64>,
+    /// agent 0.3.4: the chosen GPU provider's bench (rows/s by batch rows; empty on the CPU): its full batch
+    /// (`rolling::gpu_batch`) shapes a rolling GPU job's layout.
+    pub gpu_rows: BTreeMap<String, f64>,
     pub why: String,
 }
 
@@ -541,6 +544,7 @@ fn choose_shaped(
         gpu_games: None,
         batch_rows: cpu_b,
         rows_per_s: BTreeMap::new(),
+        gpu_rows: BTreeMap::new(),
         why: String::new(),
     };
     let Some(b) = bench.filter(|b| b.error.is_none()) else {
@@ -595,6 +599,7 @@ fn choose_shaped(
             c.gpu = json!({"luid": g.luid.clone().unwrap_or_default(), "vendor": g.vendor, "name": g.name});
             (c.conc, c.groups) = (Some(shape.0), Some(shape.1));
             c.batch_rows = gpu_b;
+            c.gpu_rows = r.rows.clone();
             c.why = format!("{} on {}: {:.0} rows/s at {gpu_b} rows, the CPU {:.0} at {cpu_b}", r.provider, g.name, rate, cpu);
         }
         Some((r, g, rate, _, gpu_b)) => {

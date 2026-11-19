@@ -82,7 +82,7 @@ impl MacSignals {
 }
 
 impl crate::signals::SignalSource for MacSignals {
-    fn sample(&mut self, _worker_pid: Option<u32>) -> Signals {
+    fn sample(&mut self, _worker_pids: &[u32]) -> Signals {
         let (_, sod) = crate::util::local_now();
         let (mem_avail_mb, mem_total_mb) = memory_mb();
         let (on_ac, battery_saver) = self.power();

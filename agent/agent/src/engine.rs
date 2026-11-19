@@ -189,8 +189,9 @@ impl Engine {
     }
 
     /// Samples the signals and applies the policy (and records availability).
-    pub fn decide(&mut self, worker_pid: Option<u32>) -> Decision {
-        let s = self.signals.sample(worker_pid);
+    /// The policy's decision now; `worker_pids`: the lease's workers (their GPU use is ours, not other programs').
+    pub fn decide(&mut self, worker_pids: &[u32]) -> Decision {
+        let s = self.signals.sample(worker_pids);
         let cfg = self.settings();
         let d = decide(&mut self.policy, &s, &cfg);
         self.tune_ok = crate::policy::tuning_allowed(&s, &cfg);
@@ -551,7 +552,7 @@ impl Engine {
                 return EngineExit::RestartLauncher;
             }
             self.maybe_send_saved_crashes();
-            let d = self.decide(None);
+            let d = self.decide(&[]);
             // A worker could not start: no lease until the wait is over (never a lease storm).
             if let Some(left) = self.start_backoff.remaining(zerofarm_common::now_unix(), &self.cfg.timings) {
                 self.show_start_wait();
