@@ -6,7 +6,7 @@
 import { env } from "cloudflare:workers";
 import { describe, expect, it } from "vitest";
 import { type Machine, PROFILE, admin, advance, call, enroll, err, makeRun, ok, runBody } from "./helpers";
-import { cleanTuning, hintFor, type TuningReport } from "../src/tuning";
+import { cleanTuning, describeLayout, hintFor, type TuningReport } from "../src/tuning";
 
 const ROLL = "0.3.1";
 const LAYOUT = { threads: 4, infer_workers: 4, infer_threads: 3, groups: 4, conc: 2304 };
@@ -56,6 +56,9 @@ describe("tuning reports (13.1)", () => {
       [report({ build, layout: { ...LAYOUT, threads: 0 } })],
       [report({ build, layout: { ...LAYOUT, groups: 5000, conc: 4096 } })],
       [report({ build, layout: { ...LAYOUT, infer_workers: 65 } })],
+      [report({ build, layout: { ...LAYOUT, workers: 0 } })],
+      [report({ build, layout: { ...LAYOUT, workers: 9 } })],
+      [report({ build, layout: { ...LAYOUT, workers: 1.5 } as any })],
       [report({ build, state: "great" as any })],
       [report({ build, leaves_s: -1 })],
       Array(5).fill(report({ build })),
@@ -105,6 +108,23 @@ describe("tuning hints (13.2)", () => {
     const l = ok(await ask(asker)).lease;
     expect(l.rolling, JSON.stringify(l)).toBeTruthy();
     expect(l.tuning_hint).toEqual({ layout: LAYOUT, leaves_s: 9000, machines: 1, net: "0123456789abcdef" });
+  });
+
+  it("carry the worker count of a crew's layout (13.5)", async () => {
+    const build = await rollingRun("tw");
+    const reporter = await enroll("crew-reporter");
+    const crew = { workers: 2, threads: 12, infer_workers: 4, infer_threads: 3, groups: 6, conc: 1152 };
+    ok(await ask(reporter, { tuning: [report({ run: "tw", build, leaves_s: 18000, layout: crew })], kinds: ["fuzz"] }));
+    expect(JSON.parse((await stored(reporter)).tuning)[0].layout).toEqual(crew);
+    const asker = await enroll("crew-asker");
+    const l = ok(await ask(asker)).lease;
+    expect(l.tuning_hint).toEqual({ layout: crew, leaves_s: 18000, machines: 1, net: "0123456789abcdef" });
+    const s = ok(await admin("GET", "/v1/admin/stats"));
+    expect(s.tuning.find((x: any) => x.build === build).layout.workers).toBe(2);
+    const page = await call("GET", "/admin", { token: null });
+    expect(page.status).toBe(200);
+    expect(describeLayout(crew)).toBe("2 x (12 + 4x3 thr, 1152 in 6 groups)");
+    expect(describeLayout(LAYOUT)).toBe("4 + 4x3 thr, 2304 in 4 groups");
   });
 
   it("only to agents that list the feature, and never for a classic lease", async () => {

@@ -11,12 +11,14 @@ export const TUNING_FEATURE = "tuning";
 export const MAX_TUNING = 4; // reports per lease request
 export const NET_RE = /^[0-9a-f]{16}$/;
 // A layout's bounds (the agent's own, tune.rs): threads and threads per session 1..512, sessions 1..64, groups and
-// games in flight 1..4096, groups <= games in flight.
+// games in flight 1..4096, groups <= games in flight; worker processes 1..8 (13.5; absent: 1).
 export const MAX_THREADS = 512;
 export const MAX_SESSIONS = 64;
 export const MAX_INFLIGHT = 4096;
+export const MAX_WORKERS = 8;
 
 export interface Layout {
+  workers?: number; // worker processes serving the lease, each with the rest (13.5); absent: 1
   threads: number;
   infer_workers: number;
   infer_threads: number;
@@ -53,6 +55,8 @@ export function cleanLayout(v: unknown, what: string): Layout {
     conc: int(o.conc, `${what}.conc`, { min: 1, max: MAX_INFLIGHT }),
   };
   if (l.groups > l.conc) throw bad(`${what}: more groups than games in flight`);
+  // (13.5: kept only when given, so a one-worker report reads as it always did)
+  if (o.workers !== undefined && o.workers !== null) return { workers: int(o.workers, `${what}.workers`, { min: 1, max: MAX_WORKERS }), ...l };
   return l;
 }
 
@@ -130,7 +134,8 @@ export function tuningClasses(rows: { machine_id: string; class: string | null; 
     .sort((a, b) => String(a.class).localeCompare(String(b.class)) || a.build.localeCompare(b.build) || b.leaves_s - a.leaves_s);
 }
 
-// "8 + 4x2 thr, 2304 in 6 groups" (the admin page).
+// "8 + 4x2 thr, 2304 in 6 groups"; several workers (13.5): "2 x (12 + 4x3 thr, 1152 in 6 groups)".
 export function describeLayout(l: Layout): string {
-  return `${l.threads} + ${l.infer_workers}x${l.infer_threads} thr, ${l.conc} in ${l.groups} groups`;
+  const one = `${l.threads} + ${l.infer_workers}x${l.infer_threads} thr, ${l.conc} in ${l.groups} groups`;
+  return (l.workers ?? 1) > 1 ? `${l.workers} x (${one})` : one;
 }

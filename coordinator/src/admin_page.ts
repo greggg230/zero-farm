@@ -251,7 +251,9 @@ function render(s) {
   ], s.blocks || []);
 
   // Rev 19 (PROTOCOL 13): the CPU layouts agents tuned, best per hardware class, build, runtime and network.
-  const lay = (l) => (l ? esc(l.threads + " + " + l.infer_workers + "x" + l.infer_threads + " thr, " + l.conc + " in " + l.groups + " groups (" + Math.ceil(l.conc / l.groups) + " rows)") : "");
+  // (13.5: several workers per lease, each with the rest of the layout)
+  const lay1 = (l) => l.threads + " + " + l.infer_workers + "x" + l.infer_threads + " thr, " + l.conc + " in " + l.groups + " groups (" + Math.ceil(l.conc / l.groups) + " rows)";
+  const lay = (l) => (l ? esc((l.workers || 1) > 1 ? l.workers + " workers x (" + lay1(l) + ")" : lay1(l)) : "");
   h += "<h2>Tuned layouts by hardware class</h2>" + table([
     ["class", (x) => esc(x.class) + '<br><span class="muted">' + esc(x.platform) + "</span>"],
     ["build", (x) => "<code>" + esc(String(x.build).slice(0, 8)) + "</code>" + (x.runtime ? ' <span class="muted">runtime</span> <code>' + esc(String(x.runtime).slice(0, 8)) + "</code>" : "")],

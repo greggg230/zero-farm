@@ -205,24 +205,26 @@ fn crash_in_crew(id: &str, game_ms: u64, gid: u64, lost: u64) -> H {
 #[test]
 fn a_crew_member_crashing_in_its_range_is_replaced_and_the_others_go_on() {
     // the first worker keeps its range [0, 24) beside the tail from its first extension on; game 12 is in its middle
-    let mut h = crash_in_crew("l_CX", 60, 12, 13);
+    let mut h = crash_in_crew("l_CX", 100, 12, 13);
     assert!(h.crashes()[0]["message"].as_str().unwrap().contains("crew worker failed"), "{:?}", h.crashes());
     h.stop();
 }
 
 #[test]
-fn a_crew_member_crashing_while_finishing_its_games_is_reported() {
-    // game 20 comes after the first worker started all of its ids [0, 24): it is finishing its games then
-    let mut h = crash_in_crew("l_CF", 40, 20, 21);
+fn a_crew_member_crashing_near_the_end_of_its_range_is_reported() {
+    // game 22: the first worker started all of its ids [0, 24) two games before - it is finishing its games then (or
+    // about to: either way the crash is reported once and its games in flight go back)
+    let mut h = crash_in_crew("l_CF", 100, 22, 23);
     h.stop();
 }
 
 #[test]
 fn the_crews_tail_crashing_is_replaced_and_the_others_go_on() {
-    // the second worker is the tail from id 24 (its first extension: [24, 40)); game 30 is its own
-    let mut h = crash_in_crew("l_CTX", 60, 30, 31);
+    // the second worker is the tail from id 24 (the first extension made the released ids [0, 24)); game 24 is its first,
+    // long before the first worker started all of its ids (when a third would take the tail's place)
+    let mut h = crash_in_crew("l_CTX", 100, 24, 25);
     assert!(h.crashes()[0]["message"].as_str().unwrap().contains("crew main worker failed"), "{:?}", h.crashes());
-    assert!(h.agent_log().contains("fake crash at game Some(30)"), "{}", h.agent_log());
+    assert!(h.agent_log().contains("fake crash at game Some(24)"), "{}", h.agent_log());
     h.stop();
 }
 

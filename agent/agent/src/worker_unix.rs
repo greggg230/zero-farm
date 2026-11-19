@@ -16,7 +16,8 @@ use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// The file in the worker's working directory naming its process group (pid and start time), for [`kill_orphans`].
+/// The files in the worker's working directory naming its process group (pid and start time), for [`kill_orphans`]:
+/// `.zerofarm-worker-<pid>`, one per worker (rev 19: a crew's workers share the lease's directory, PROTOCOL 13.5).
 const RECORD: &str = ".zerofarm-worker";
 /// The memory cap is checked at most this often.
 const MEM_EVERY: Duration = Duration::from_millis(100);
@@ -76,7 +77,7 @@ impl WorkerProc {
         }
         let mut child = cmd.spawn()?;
         let pid = child.id();
-        let record = opts.cwd.join(RECORD);
+        let record = opts.cwd.join(format!("{RECORD}-{pid}"));
         match crate::macos::proc_start(pid as i32) {
             Some((s, us)) => {
                 if let Err(e) = std::fs::write(&record, format!("{pid} {s} {us}")) {
@@ -246,13 +247,17 @@ pub fn kill_orphans(work: &Path) -> usize {
     let Ok(rd) = std::fs::read_dir(work) else { return 0 };
     let mut n = 0;
     for e in rd.flatten() {
-        let Ok(text) = std::fs::read_to_string(e.path().join(RECORD)) else { continue };
-        let f: Vec<u64> = text.split_whitespace().filter_map(|x| x.parse().ok()).collect();
-        let [pid, s, us] = f[..] else { continue };
-        if pid > 1 && crate::macos::proc_start(pid as i32) == Some((s, us)) {
-            log::warn!("killing worker pid {pid} left by an earlier agent");
-            killpg(pid as u32, libc::SIGKILL);
-            n += 1;
+        // (every worker of the lease: `.zerofarm-worker-<pid>`; agents before 0.3.1 wrote `.zerofarm-worker`)
+        let Ok(files) = std::fs::read_dir(e.path()) else { continue };
+        for f in files.flatten().filter(|f| f.file_name().to_string_lossy().starts_with(RECORD)) {
+            let Ok(text) = std::fs::read_to_string(f.path()) else { continue };
+            let v: Vec<u64> = text.split_whitespace().filter_map(|x| x.parse().ok()).collect();
+            let [pid, s, us] = v[..] else { continue };
+            if pid > 1 && crate::macos::proc_start(pid as i32) == Some((s, us)) {
+                log::warn!("killing worker pid {pid} left by an earlier agent");
+                killpg(pid as u32, libc::SIGKILL);
+                n += 1;
+            }
         }
     }
     n
@@ -288,5 +293,32 @@ impl CpuMark {
         let total = now.sys_total.saturating_sub(self.sys_total).max(1);
         let idle = now.sys_idle.saturating_sub(self.sys_idle);
         worker < 100 && (idle as f64 / total as f64) < 0.10
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// rev 19 (PROTOCOL 13.5): a crew's workers share the lease's directory; every one a dead agent left is killed.
+    #[test]
+    fn every_worker_of_a_lease_left_behind_is_killed() {
+        let work = tempfile::tempdir().unwrap();
+        let lease = work.path().join("l_ORPHANS");
+        std::fs::create_dir_all(&lease).unwrap();
+        let mut kids = Vec::new();
+        for _ in 0..2 {
+            let mut c = Command::new("sleep").arg("30").process_group(0).spawn().unwrap();
+            let pid = c.id();
+            let (s, us) = crate::macos::proc_start(pid as i32).expect("start time");
+            std::fs::write(lease.join(format!("{RECORD}-{pid}")), format!("{pid} {s} {us}")).unwrap();
+            kids.push(c);
+            let _ = &mut kids;
+        }
+        assert_eq!(kill_orphans(work.path()), 2);
+        for mut c in kids {
+            let status = c.wait().unwrap();
+            assert!(!status.success(), "killed: {status:?}");
+        }
     }
 }
