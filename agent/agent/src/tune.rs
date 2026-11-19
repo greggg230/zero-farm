@@ -275,7 +275,8 @@ impl Defaults {
 /// about flat in the batch size. So the search stays narrow around it: search and inference threads each at most the
 /// cores per worker, batches of 192-384 rows. Two workers of (12 + 4 x 3, 1,152 games in flight in 6 groups) played
 /// 16.4k (fast export ~18.0k, three 16.1k, four 15.2k): a Mac with at least 12 cores and 32 GB starts with two
-/// (PROTOCOL 13.5).
+/// (PROTOCOL 13.5), each with the games in flight the memory plan holds (`Space::fit`: 921 each on a 64 GB Mac at the
+/// default cap, `rolling::MACOS_CPU_COST`).
 pub fn defaults(p: Platform, hw: &Hw) -> Defaults {
     let cores = hw.cores.max(1);
     let max_workers = MAX_WORKERS.min(cores / CORES_PER_WORKER).min((hw.ram_mb / RAM_MB_PER_WORKER) as u32).max(1);
@@ -1316,6 +1317,48 @@ mod tests {
         // Windows starts with one whatever the machine; the search may try more where the cores and RAM allow
         let ws = defaults(Platform::Windows, &Hw { cores: 16, logical: 32, perf: 16, eff: 0, ram_mb: 65_536 });
         assert_eq!((ws.workers, ws.max_workers, ws.threads, ws.infer_workers, ws.infer_threads), (1, 3, 16, 1, 16));
+    }
+
+    #[test]
+    fn a_macs_crew_starts_within_the_default_memory_cap() {
+        // agent 0.3.2: a Mac's games in flight cost ~13 MB each at steady state (rolling::MACOS_CPU_COST), so the start's
+        // two workers of 1,152 (13 GB + ~15 GB each in 16 GB) no longer fit; the plan bounds each worker's games in flight
+        // (each its own base) and the tuner keeps its games-in-flight range
+        let cost = crate::rolling::MACOS_CPU_COST;
+        let start_of = |hw: &Hw, cap: u64| {
+            let d = defaults(Platform::MacOs, hw);
+            let one = crate::rolling::ram_cap(cap, cost).min(crate::rolling::mac_cpu_auto(hw.cores as u64).0);
+            let s = Space::new(&d, None, None, (one / 2).max(1), one, Some((cap, cost)));
+            (s, s.fit(d.layout_for(d.workers, one, crate::rolling::mac_groups(one))), one)
+        };
+        // 64 GB, cap 32,768 MB: one worker would get 1,888; two get (0.85 x 16,384 - 1,024) / 14 = 921 each
+        let (s, l, one) = start_of(&m4max(), 32_768);
+        assert_eq!(one, 1888);
+        assert_eq!(s.mem_room(2), Some(921));
+        assert_eq!(l, Layout { workers: 2, threads: 12, infer_workers: 4, infer_threads: 3, groups: 4, conc: 921 }, "batches of ~230 rows");
+        assert_eq!((s.conc_min, s.conc_max, s.workers_max), (944, 1888, 3), "the tuner's games in flight and workers kept");
+        // every worker's base and games in flight within 85 % of its part, and at the measured steady state (~13.2 MB a
+        // game) under the 92 % where a worker gives way
+        for (cap, l) in [(32_768u64, l), (31_671, start_of(&m4max(), 31_671).1)] {
+            let part = cap as f64 / l.workers as f64;
+            assert!((cost.base_mb + l.conc * cost.per_game_mb) as f64 <= part * crate::rolling::PLAN_SHARE, "{cap}: {l:?}");
+            assert!(1024.0 + l.conc as f64 * 13.2 < part * crate::rolling::HIGH_SHARE, "{cap}: {l:?}");
+        }
+        // the owner's fixed 2 workers (autotune off): the same start
+        let d = defaults(Platform::MacOs, &m4max());
+        let fixed = Space::new(&d, None, Some(2), 944, 1888, Some((32_768, cost)));
+        assert_eq!(fixed.fit(d.layout_for(2, 1888, crate::rolling::mac_groups(1888))), l);
+        // 0.3.1's plan (4 MB a game) let both run 1,152
+        let old = Space { conc_min: 1152, conc_max: 2304, mem: Some((32_768, crate::rolling::MemCost { base_mb: 1024, per_game_mb: 4 })), ..fixed };
+        assert_eq!(old.fit(d.layout_for(2, 2304, 12)).conc, 1152);
+        // a 32 GB Mac with 12 cores (cap 16,384 MB): two workers of 424 in 2 groups
+        let (_, l, one) = start_of(&Hw { cores: 12, logical: 12, perf: 8, eff: 4, ram_mb: 32_768 }, 16_384);
+        assert_eq!(one, 896);
+        assert_eq!((l.workers, l.conc, l.groups), (2, 424, 2));
+        // a 16 GB Mac with 8 cores (cap 8,192 MB): one worker of 416 in 2 groups
+        let (s, l, one) = start_of(&Hw { cores: 8, logical: 8, perf: 4, eff: 4, ram_mb: 16_384 }, 8192);
+        assert_eq!(one, 416);
+        assert_eq!((s.workers_max, l.workers, l.conc, l.groups), (1, 1, 416, 2));
     }
 
     #[test]

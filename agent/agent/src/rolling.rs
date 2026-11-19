@@ -57,10 +57,18 @@ pub const MACOS_CPU_INFLIGHT_PER_CORE: u64 = 144;
 /// Mac's cores waiting for batches.
 pub const MACOS_CPU_BATCH: u64 = 192;
 /// macOS: a CPU job's cost until this Mac measured the run's own, in physical footprint (what the memory cap counts
-/// there, `worker_unix.rs`): the same self-play's processes used 2.03-2.08 GB each with 768 games in flight, about
-/// 2.7 MB per game with the process itself; planned with a 1 GB base and 4 MB per game. With the default memory cap
-/// of half the RAM (32 GB on a 64 GB Mac) that is room for 6,688 games in flight, more than a run may set (4,096).
-pub const MACOS_CPU_COST: MemCost = MemCost { base_mb: 1024, per_game_mb: 4 };
+/// there, `worker_unix.rs`). 0.3.0 planned 4 MB per game from the SSH self-play above (2.03-2.08 GB a process with 768
+/// games in flight, 2.7 MB a game with the process, read early). A real rolling lease on the M4 Max (2026-11-19:
+/// legacy-meta3-r1's network, fast export, one worker of 2,304 games in flight, about 235 games finished a minute, so a
+/// game lasts about 10 minutes) grew all the way: 12.8 GB at 3 minutes, 19.0 at 5, 22.2 at 7, 25.2 at 9, 27.0 at 11,
+/// 28.1 at 13, 29.1 at 15 - about 12.2 MB a game over the base, still climbing about 0.5 GB a minute and slowing, heading
+/// for ~31 GB (~13 MB a game) at steady state - where the agent's memory check restarted it at 1,728 (PROTOCOL 10.6) and
+/// remembered 13 MB a game for the run; a two-worker trial's ~9 MB a game (PROTOCOL 13.5) was read early too. Planned
+/// with a 1 GB base (what this Mac's measurements, `Learned`, are counted over) and 14 MB a game: with the default memory
+/// cap of half the RAM a 64 GB Mac (32,768 MB) holds 1,888 games in flight in one worker, two workers 921 each (each its
+/// own base, `tune::Space`), a 16 GB Mac (8,192 MB) 416 - each about 80 % of its cap at the measured steady state,
+/// under the 92 % where a worker gives way.
+pub const MACOS_CPU_COST: MemCost = MemCost { base_mb: 1024, per_game_mb: 14 };
 
 /// "auto" on the CPU, (games in flight, groups): `CPU_INFLIGHT` in `CPU_GROUPS`; on macOS `MACOS_CPU_INFLIGHT_PER_CORE`
 /// per physical core (rounded as `round_games`) in groups of `MACOS_CPU_BATCH`.
@@ -78,7 +86,12 @@ pub fn cpu_auto() -> (u64, u64) {
 /// macOS "auto" on the CPU for `cores` physical cores.
 pub fn mac_cpu_auto(cores: u64) -> (u64, u64) {
     let conc = round_games(MACOS_CPU_INFLIGHT_PER_CORE * cores.max(1));
-    (conc, (conc / MACOS_CPU_BATCH).max(1))
+    (conc, mac_groups(conc))
+}
+
+/// macOS: the groups of `conc` games in flight - batches of at least `MACOS_CPU_BATCH` rows (one group under it).
+pub fn mac_groups(conc: u64) -> u64 {
+    (conc / MACOS_CPU_BATCH).max(1)
 }
 
 /// A CPU job's cost until this PC measured the run's own: `CPU_COST`, on macOS `MACOS_CPU_COST`.
@@ -281,7 +294,8 @@ pub fn gpu_groups(conc: u64) -> u64 {
 }
 
 /// A CPU job's (conc, groups): the run's number (in the template's groups, at most one per game), or "auto":
-/// `cpu_auto()` (`CPU_INFLIGHT` games in `CPU_GROUPS` groups; more on macOS); capped by memory (`MemPlan::cap`).
+/// `cpu_auto()` (`CPU_INFLIGHT` games in `CPU_GROUPS` groups; more on macOS); capped by memory (`MemPlan::cap`; on
+/// macOS the groups of what is left still batches of `MACOS_CPU_BATCH` rows, `mac_groups`).
 pub fn cpu_shape(setting: Inflight, template_groups: u64, mem: MemPlan) -> (u64, u64) {
     match setting {
         Inflight::N(n) => {
@@ -291,6 +305,7 @@ pub fn cpu_shape(setting: Inflight, template_groups: u64, mem: MemPlan) -> (u64,
         Inflight::Auto => {
             let (inflight, groups) = cpu_auto();
             let conc = mem.cap(inflight, true);
+            let groups = if cfg!(target_os = "macos") { groups.min(mac_groups(conc)) } else { groups };
             (conc, groups.min(conc))
         }
     }
@@ -418,15 +433,34 @@ mod tests {
         assert_eq!(mac_cpu_auto(8), (1152, 6));
         assert_eq!(mac_cpu_auto(10), (1440, 7));
         assert_eq!(mac_cpu_auto(0), (128, 1));
+        assert_eq!((mac_groups(1888), mac_groups(416), mac_groups(100)), (9, 2, 1), "batches of 192 rows at least");
         let mac = |ram_mb| MemPlan { ram_mb, cost: MACOS_CPU_COST, measured: false };
-        // 64 GB Mac, default cap (half): room for more than any run's number
-        assert_eq!(ram_cap(32_768, MACOS_CPU_COST), 6688);
-        assert!(mac(32_768).cap(2304, true) == 2304 && mac(32_768).cap(4096, true) == 4096);
-        // 16 GB Mac: 8 GB cap
-        assert_eq!(mac(8192).cap(2304, true), 1472);
+        // 64 GB Mac, default cap (half the RAM): (27,852 - 1,024) / 14 = 1,916 -> 1,888 of the 16 cores' 2,304
+        assert_eq!(ram_cap(32_768, MACOS_CPU_COST), 1888);
+        assert_eq!(mac(32_768).cap(2304, true), 1888);
+        assert_eq!(mac(32_768).cap(1024, false), 1024, "a run's number as it is until this Mac measured it");
+        // the validation lease's limit (half the RAM, less with little memory free): 1,824
+        assert_eq!(mac(31_671).cap(2304, true), 1824);
+        // 16 GB Mac (8 cores: 1,152 in 6 groups), 8 GB cap: (6,963 - 1,024) / 14 = 424 -> 416
+        assert_eq!(mac(8192).cap(mac_cpu_auto(8).0, true), 416);
+        // the plan fits what the validation lease measured: at its steady state (~13.2 MB a game over the base) a planned
+        // job commits about 80 % of its cap, under the 92 % where it would give way (HIGH_SHARE) ...
+        for ram in [8192u64, 16_384, 31_671, 32_768] {
+            let n = mac(ram).cap(4096, true) as f64;
+            assert!(1024.0 + n * 13.2 < ram as f64 * HIGH_SHARE, "{ram}: {n}");
+            assert!(1024.0 + n * 13.2 > ram as f64 * 0.7, "{ram}: {n} (not far below)");
+        }
+        // ... while 0.3.1's 4 MB let 2,304 in, which committed 29,140 MB of its 31,671 MB limit at 15 minutes (92 %: the
+        // memory check's restart)
+        assert_eq!(ram_cap(31_671, MemCost { base_mb: 1024, per_game_mb: 4 }).min(2304), 2304);
+        assert!(29_140.0 > 31_671.0 * HIGH_SHARE);
+        assert_eq!(measured_per_game(29_140, 2304, MACOS_CPU_COST), 13, "what the agent remembered for the run");
         if cfg!(target_os = "macos") {
             let (n, g) = cpu_auto();
-            assert_eq!(cpu_shape(Inflight::Auto, 1, auto_cpu(32_768)), (n, g));
+            assert_eq!(cpu_shape(Inflight::Auto, 1, auto_cpu(1 << 20)), (n, g), "room for all: the cores' choice");
+            // memory-capped: batches of 192 rows still (a 16-core Mac's 2,304 in 12 groups -> 1,888 in 9 groups of 210)
+            let c = n.min(1888);
+            assert_eq!(cpu_shape(Inflight::Auto, 1, auto_cpu(32_768)), (c, g.min(mac_groups(c))));
             assert_eq!(cpu_shape(Inflight::Auto, 1, auto_cpu(100)), (1, 1), "never 0");
         }
     }
