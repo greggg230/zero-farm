@@ -320,7 +320,7 @@ fn the_memory_plan_holds_the_whole_crew() {
     let lines = job_lines(&h);
     assert!(lines.iter().any(|j| j["conc"].as_u64().unwrap() < 4), "fewer games a worker after running into the limit: {lines:?}");
     let learned: Value = serde_json::from_slice(&std::fs::read(h.layout.state().join("rolling_memory.json")).unwrap()).unwrap();
-    assert!(learned["crew-run/cpu"].as_u64().unwrap() >= 800, "the cost per game remembered: {learned}");
+    assert!(learned[format!("{RUN}/{}/cpu", h.build_id)].as_u64().unwrap() >= 800, "the cost per game remembered (per run and worker build): {learned}");
     assert!(h.crashes().len() <= 1, "{:?}", h.crashes());
     h.stop();
 }
@@ -397,7 +397,7 @@ fn handoffs_and_drains_never_hold_more_than_the_memory_cap() {
     let base = farm_agent::rolling::cpu_cost().base_mb;
     let plan = base + 2 * 300;
     std::fs::create_dir_all(h.layout.state()).unwrap();
-    std::fs::write(h.layout.state().join("rolling_memory.json"), json!({format!("{RUN}/cpu"): 300}).to_string()).unwrap();
+    std::fs::write(h.layout.state().join("rolling_memory.json"), json!({format!("{RUN}/{}/cpu", h.build_id): 300}).to_string()).unwrap();
     // a cap whose 85 % holds three workers' plans, not four: a crew of two and one more beside it
     let limit = (3.2 * plan as f64 / farm_agent::rolling::PLAN_SHARE).ceil() as u64;
     h.machine.lock().unwrap().settings.max_ram_mb = Some(limit);
@@ -442,7 +442,7 @@ fn an_unmeasured_handoff_starts_the_next_crew_only_as_memory_allows() {
     let per = if cfg!(windows) { base } else { 300 };
     let plan = base + 2 * per;
     std::fs::create_dir_all(h.layout.state()).unwrap();
-    std::fs::write(h.layout.state().join("rolling_memory.json"), json!({format!("{RUN}/cpu"): per}).to_string()).unwrap();
+    std::fs::write(h.layout.state().join("rolling_memory.json"), json!({format!("{RUN}/{}/cpu", h.build_id): per}).to_string()).unwrap();
     let limit = (3.95 * plan as f64) as u64;
     h.machine.lock().unwrap().settings.max_ram_mb = Some(limit);
     // games of 4 s (a drain of its 2 games in flight takes up to 8 s); a worker commits its base at once and its games'

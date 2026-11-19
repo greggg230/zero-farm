@@ -20,9 +20,12 @@ version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's:
 - **Memory-limited jobs keep the processor busy.** When memory limits how many games a Mac plays at once, the games
   stay in the same number of batches and each batch gets smaller (down to 96 games), instead of fewer, bigger batches
   that leave the search threads waiting: on a 64 GB Mac two job programs play about 700 games each in 6 batches.
-- **Memory planned from what Macs really use.** Games on a Mac grew to about 16 MB each after half an hour (Zero Farm
-  0.3.2 planned 14), so a long job filled its share and had to slow down. Macs now plan 18 MB a game; what a computer
-  measured for a run is used for the rest of that job too, and comes down slowly again when later jobs use less.
+- **Memory planned from what each job program really uses.** Games on a Mac grew to about 16 MB each after half an
+  hour with the job programs of before (Zero Farm 0.3.2 planned 14), so a long job filled its share and had to slow
+  down, while the fixed job program needs only about 2.5 MB a game. Zero Farm now learns the memory per game for each
+  run and job-program version: a version it hasn't measured starts from a safe default (18 MB a game on a Mac), more
+  use is remembered at once, less use - measured once the job has settled - lowers the plan, and when a job uses much
+  less than planned it plays more games at once straight away.
 - **Background programs no longer stop every measurement.** A Mac's background programs (sync tools, indexing) use the
   processor in short bursts, and Zero Farm 0.3.2 threw a measurement away at the first burst. It now looks at what other
   programs used over the whole measurement, compared with just before it: short bursts are fine, lasting use still

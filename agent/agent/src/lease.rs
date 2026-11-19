@@ -94,9 +94,14 @@ struct Roll {
     /// rev 19 (PROTOCOL 13.5): the most any worker of the lease committed per game in flight over the cost's base (MB),
     /// remembered at the end when more than planned.
     per_game_max: u64,
-    /// agent 0.3.3: the most a worker committed per game once it had run `rolling::STEADY_S` (0: none ran that long);
-    /// such a lease may lower a higher remembered cost (`Learned::settle`).
+    /// agent 0.3.3: the most a worker committed per game at its steady state (`rolling::steady_reading`; 0: none reached
+    /// it yet): remembered when lower than planned (`Learned::steady`, with a margin), and planned with when well lower
+    /// (`calibrate`).
     steady_per_game: u64,
+    /// agent 0.3.3: the steady reading `calibrate` last acted on, and the most a reading over the plan was remembered at
+    /// (`Learned::raise`, at once).
+    calibrated: u64,
+    raised: u64,
     /// The current worker's ids start at `lo + offset` (0 until a restart; a restart's worker gets the ids after
     /// the ones its predecessor started).
     offset: u64,
@@ -877,7 +882,9 @@ impl Engine {
         // measurement when it has one)
         let limit_mb = caps.ram_mb.max(256);
         let run_name = lease.run.clone().unwrap_or_default();
-        let mem = (Learned::plan(&self.cfg.layout, &run_name, false, limit_mb), Learned::plan(&self.cfg.layout, &run_name, true, limit_mb));
+        // (agent 0.3.3: per run and worker build - a build not measured here starts from the platform's default)
+        let build_id = lease.build.build_id.clone();
+        let mem = (Learned::plan(&self.cfg.layout, &run_name, &build_id, false, limit_mb), Learned::plan(&self.cfg.layout, &run_name, &build_id, true, limit_mb));
         let choice = self.choose_providers(lease, &plan, &prep, d.gpu && !self.profile.gpus.is_empty(), caps.threads, mem, need.as_ref(), roll.as_ref().map(|(s, _)| s));
         let plan_providers = (choice.providers.clone(), choice.gpu.clone());
         let gpu_choice = plan_providers.0 != ["cpu"];
@@ -1008,6 +1015,8 @@ impl Engine {
                 peak_mb: 0,
                 per_game_max: 0,
                 steady_per_game: 0,
+                calibrated: 0,
+                raised: 0,
                 offset: 0,
                 restarts: 0,
                 restart: None,
@@ -1026,6 +1035,7 @@ impl Engine {
             lease_limit_mb: limit_mb,
             spare: Vec::new(),
             counters: None,
+            progress: None,
             counters_at: None,
             crew_changed: Instant::now(),
             last_counter_ping: None,
@@ -1247,6 +1257,9 @@ struct Run {
     spare: Vec<(u64, u64)>,
     /// The main worker's last `status` counters (leaves, games, games_started from its first id), and when.
     counters: Option<(u64, u64, u64)>,
+    /// agent 0.3.3: the main worker's own `games` and `games_started` from its last `status` (None until it sent one;
+    /// whether its memory reading is a steady one, `rolling::steady_reading`).
+    progress: Option<(u64, u64)>,
     counters_at: Option<Instant>,
     /// The crew changed (a worker joined or left): no trial for a while.
     crew_changed: Instant,
@@ -1541,6 +1554,7 @@ impl Run {
         self.maybe_beat(eng, paused);
         self.roll_tick(eng);
         self.mem_check(eng);
+        self.calibrate(eng);
         self.mates_tick(&t, must_pause);
         self.tune_tick(eng, &t, must_pause);
         self.crew_tick(eng, &t, must_pause);
@@ -1577,7 +1591,8 @@ impl Run {
             return;
         }
         let conc = self.conc.unwrap_or(1);
-        let steady = self.started.elapsed().as_secs() >= crate::rolling::STEADY_S;
+        let steady = self.progress.is_some_and(|(g, s)| crate::rolling::steady_reading(g, s, conc));
+        let (run, build) = (self.lease.run.clone().unwrap_or_default(), self.lease.build.build_id.clone());
         let Some(r) = self.roll.as_mut().filter(|r| r.active) else { return };
         let Some(now) = self.worker.commit_mb() else { return };
         r.peak_mb = r.peak_mb.max(now);
@@ -1585,6 +1600,13 @@ impl Run {
         r.per_game_max = r.per_game_max.max(per);
         if steady {
             r.steady_per_game = r.steady_per_game.max(per);
+        }
+        // (agent 0.3.3: more per game than planned is remembered at once; the plan of this lease changes at 92 %)
+        if per > r.mem.cost.per_game_mb && per > r.raised {
+            r.raised = per;
+            if Learned::raise(&eng.cfg.layout, &run, &build, r.gpu, per) {
+                log::info!("lease {}: the worker commits {per} MB per game in flight, more than planned: remembering it for this run and worker build", self.lease.lease_id);
+            }
         }
         if !live || r.finishing || r.restart.is_some() || limit == 0 || (now as f64) < limit as f64 * crate::rolling::HIGH_SHARE {
             return;
@@ -1747,6 +1769,7 @@ impl Run {
         match self.spawn.spawn(self.wgen, self.tx.clone(), limit) {
             Ok(w) => {
                 self.counters = None;
+                self.progress = None;
                 self.crew_changed = Instant::now();
                 match rs.layout {
                     Some(l) => log::info!("lease {id}: worker pid {} started with layout {} (ids from {}, memory limit {limit} MB)", w.pid, l.per_worker().describe(), lo + offset),
@@ -2217,6 +2240,9 @@ impl Run {
                     }
                 };
                 self.note_provider(s.get("provider"));
+                if let (Some(g), Some(st)) = (s.get("games").and_then(Value::as_u64), s.get("games_started").and_then(Value::as_u64)) {
+                    self.progress = Some((g, st));
+                }
                 self.tune_status(eng, &s);
                 self.stats = s;
             }
@@ -2516,14 +2542,15 @@ impl Run {
         // (rev 19, PROTOCOL 13.5: the most any worker of the crew committed per game)
         if let (Some(r), Some(conc)) = (self.roll.as_ref().filter(|r| r.active && (r.peak_mb > 0 || r.per_game_max > 0)), self.conc) {
             let per = crate::rolling::measured_per_game(r.peak_mb, conc, r.mem.cost).max(r.per_game_max);
-            if per > r.mem.cost.per_game_mb && Learned::raise(&eng.cfg.layout, self.lease.run.as_deref().unwrap_or(""), r.gpu, per) {
+            let (run, build) = (self.lease.run.as_deref().unwrap_or(""), self.lease.build.build_id.as_str());
+            if per > r.mem.cost.per_game_mb && Learned::raise(&eng.cfg.layout, run, build, r.gpu, per) {
                 log::info!("lease {id}: the worker committed up to {} MB with {conc} games in flight: remembering {per} MB per game for this run", r.peak_mb);
             }
-            // agent 0.3.3: a lease whose workers ran to their steady state under the remembered cost lowers it a little
-            // (never below what any of them committed per game)
+            // agent 0.3.3: workers that ran to their steady state under the plan lower it (with a margin, never below
+            // what any of them committed per game at it)
             if r.steady_per_game > 0 {
-                if let Some(v) = Learned::settle(&eng.cfg.layout, self.lease.run.as_deref().unwrap_or(""), r.gpu, per.max(r.steady_per_game)) {
-                    log::info!("lease {id}: its workers committed at most {} MB per game at their steady state: remembering {v} MB for this run", per.max(r.steady_per_game));
+                if let Some(v) = Learned::steady(&eng.cfg.layout, run, build, r.gpu, r.steady_per_game) {
+                    log::info!("lease {id}: its workers committed at most {} MB per game at their steady state: remembering {v} MB for this run and worker build", r.steady_per_game);
                 }
             }
         }
@@ -2871,9 +2898,9 @@ impl Run {
             self.handoff_tick(eng, t, strict);
             return;
         }
-        if self.tuning.as_ref().is_some_and(|x| x.fixed) {
-            return;
-        }
+        // (a fixed layout, `autotune` off, runs no trial; it is handed over only when the memory plan holds more games in
+        // flight, `calibrate`)
+        let fixed = self.tuning.as_ref().is_some_and(|x| x.fixed);
         let running = matches!(self.state, WState::Running) && self.job_sent && self.after.is_none() && !eng.quitting();
         // (a worker runs a while before it is replaced; one drain at a time - no handoff while any worker finishes its
         // games; a crew is handed over only once it is complete and settled)
@@ -2888,10 +2915,10 @@ impl Run {
             return;
         }
         let wanted = tu.entry.wanted(&tu.space);
-        let next = if strict && !tu.revert_due && Instant::now() >= tu.no_trial_before { tu.entry.plan(&tu.space) } else { None };
+        let next = if !fixed && strict && !tu.revert_due && Instant::now() >= tu.no_trial_before { tu.entry.plan(&tu.space) } else { None };
         let (target, measure) = match next {
             Some(l) => (l, true),
-            None if tu.current != wanted => (wanted, strict),
+            None if tu.current != wanted && (!fixed || wanted.conc > tu.current.conc) => (wanted, strict && !fixed),
             None => return,
         };
         // (never to the layout the main worker runs, unless to measure it: a measurement needs a fresh worker)
@@ -3070,6 +3097,7 @@ impl Run {
         self.killed = false;
         self.stall_since = None;
         self.counters_at = None;
+        self.progress = None;
         self.crew_changed = Instant::now();
         self.mark = CpuMark::take(&self.worker);
         self.sample = (self.mark, Instant::now());
@@ -3339,14 +3367,58 @@ impl Run {
         }
     }
 
+    /// agent 0.3.3 (PROTOCOL 10.6): the memory plan calibrates itself. The lease's steady readings (the most a worker
+    /// committed per game at its steady state, `rolling::steady_reading`) are remembered when lower than planned
+    /// (`Learned::steady`: with a margin, per run and worker build); when well lower (`RAISE_INFLIGHT_SHARE`) the lease
+    /// plans with them from now on - the tuner's memory bounds widen (an "auto" job's games in flight are worked out
+    /// again), a layout the old plan held back gets what the new one holds (`tune::Entry::lift_conc`), and the layout
+    /// wanted changes: handed over to as any (one drain at a time, within the memory cap). Without a tuned layout the
+    /// next lease plans with it.
+    fn calibrate(&mut self, eng: &Engine) {
+        let id = self.lease.lease_id.clone();
+        let (run, build) = (self.lease.run.clone().unwrap_or_default(), self.lease.build.build_id.clone());
+        let groups = Engine::job_shape(&self.plan).2;
+        let limit = self.lease_limit_mb;
+        let Some(r) = self.roll.as_mut().filter(|r| r.active && !r.finishing && r.steady_per_game > 0 && r.steady_per_game != r.calibrated) else { return };
+        r.calibrated = r.steady_per_game;
+        let reading = r.steady_per_game;
+        let Some(v) = Learned::steady(&eng.cfg.layout, &run, &build, r.gpu, reading) else { return };
+        let was = r.mem.cost.per_game_mb;
+        log::info!("lease {id}: its workers commit {reading} MB per game in flight at their steady state (planned {was}): remembering {v} MB for this run and worker build");
+        if v as f64 > was as f64 * crate::rolling::RAISE_INFLIGHT_SHARE {
+            return;
+        }
+        r.mem.cost.per_game_mb = v;
+        r.mem.measured = true;
+        let (cost, setting) = (r.mem.cost, r.setup.cpu);
+        let Some(t) = self.tuning.as_mut().filter(|t| t.space.mem.is_some()) else { return };
+        let old = t.space;
+        t.space.mem = Some((limit, cost));
+        match setting {
+            crate::rolling::Inflight::Auto => {
+                let (c, _) = crate::rolling::cpu_shape(setting, groups, MemPlan { ram_mb: limit, cost, measured: true });
+                (t.space.conc_min, t.space.conc_max) = ((c / 2).max(1), c.max(1));
+            }
+            crate::rolling::Inflight::N(n) => (t.space.conc_min, t.space.conc_max) = (n, n),
+        }
+        t.entry.lift_conc(&old, &t.space);
+        let wanted = t.entry.wanted(&t.space);
+        let line = format!("planning {v} MB per game in flight from now on (was {was}): the layout wanted is {}", wanted.describe());
+        log::info!("lease {id}: {line}");
+        eng.worker_log.write_line(&format!("tuning [{id}]: {line}"));
+        self.save_tuning(eng);
+        self.show_tuning(eng);
+    }
+
     /// agent 0.3.3: a measured cost per game (MB over the base) - remembered for the run when higher (`Learned`) and
     /// planned with for the rest of the lease: the crew's next members, handoffs and restarts, and the tuner's memory
     /// bounds (0.3.2 remembered it for the next lease only). -> the cost planned with from now on.
     fn learn_cost(&mut self, eng: &Engine, per: u64) -> crate::rolling::MemCost {
         let id = self.lease.lease_id.clone();
-        let run = self.lease.run.clone().unwrap_or_default();
+        let (run, build) = (self.lease.run.clone().unwrap_or_default(), self.lease.build.build_id.clone());
         let Some(r) = self.roll.as_mut() else { return crate::rolling::cpu_cost() };
-        if Learned::raise(&eng.cfg.layout, &run, r.gpu, per) {
+        r.raised = r.raised.max(per);
+        if Learned::raise(&eng.cfg.layout, &run, &build, r.gpu, per) {
             log::info!("lease {id}: remembering {per} MB per game in flight for this run");
         }
         r.mem.cost.per_game_mb = r.mem.cost.per_game_mb.max(per);
@@ -3568,7 +3640,7 @@ impl Run {
             }
             let per = crate::rolling::measured_per_game(c, m.layout.conc, cost);
             per_max = per_max.max(per);
-            if m.spawned.elapsed().as_secs() >= crate::rolling::STEADY_S {
+            if m.counters.is_some_and(|(_, g, s)| crate::rolling::steady_reading(g, s, m.layout.conc)) {
                 steady = steady.max(per);
             }
             let lim = m.worker.mem_limit_mb;
@@ -3843,6 +3915,7 @@ impl Run {
         self.killed = false;
         self.stall_since = None;
         self.counters_at = None;
+        self.progress = None;
         self.gen_floor = self.prep.ckpt.as_ref().map(|(c, _)| c.gen).or(self.gen_floor);
         self.crew_changed = Instant::now();
         self.mark = CpuMark::take(&self.worker);

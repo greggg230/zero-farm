@@ -390,3 +390,45 @@ fn bursty_background_load_doesnt_discard_every_trial_but_sustained_load_does() {
     let done = h.wait_done("l_TB");
     ids_accounted(&h, "l_TB", &done);
 }
+
+/// Agent 0.3.3 (the native worker's memory fix of 2026-11-19: 13.1 -> 2.5 MB a game on the Mac): the memory plan
+/// calibrates itself per run and worker build. A build not measured here starts from the platform's default (45 MB a
+/// game on Windows, 18 on a Mac), which caps "auto" under this lease's limit; its workers, at their steady state, commit
+/// 1 MB a game (and the process's own few MB) - remembered with a margin (2-4), planned with from then on, and the layout
+/// the old plan held back gets the games in flight the new one holds, by a handoff.
+#[test]
+fn a_lower_steady_footprint_lowers_the_plan_and_the_games_in_flight_rise() {
+    let mut h = harness();
+    let limit = if cfg!(windows) { 1500u64 } else { 2000 };
+    h.machine.lock().unwrap().settings.max_ram_mb = Some(limit);
+    let default = farm_agent::rolling::cpu_cost();
+    let (auto_n, _) = farm_agent::rolling::cpu_auto();
+    let first = farm_agent::rolling::ram_cap(limit, default).min(auto_n);
+    let mut fk = fake(peaked());
+    (fk["mem_base_mb"], fk["mem_per_game_mb"]) = (json!(default.base_mb), json!(1));
+    h.push(tuning_lease(&h, "l_TC", fk, json!("auto"), None));
+    h.start();
+    assert!(wait(|| !job_lines(&h).is_empty()));
+    assert_eq!(job_lines(&h)[0]["conc"].as_u64(), Some(first), "a build not measured here: the platform's default plan");
+    let key = format!("{RUN}/{}/cpu", h.build_id);
+    let stored = |h: &H| -> Option<u64> {
+        std::fs::read(h.layout.state().join("rolling_memory.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).and_then(|v| v[&key].as_u64())
+    };
+    assert!(wait(|| stored(&h).is_some_and(|v| v <= 4)), "1 MB a game at the steady state, x 1.2: {:?}
+{}", stored(&h), tuning_log(&h));
+    let v = stored(&h).unwrap();
+    let more = farm_agent::rolling::ram_cap(limit, farm_agent::rolling::MemCost { per_game_mb: v, ..default }).min(auto_n);
+    assert!(more > first, "{more} {first}");
+    assert!(wait(|| job_lines(&h).iter().any(|j| j["conc"].as_u64() == Some(more))), "the games in flight the new plan holds, by a handoff: {}", tuning_log(&h));
+    assert!(h.agent_log().contains(&format!("planning {v} MB per game in flight from now on (was {})", default.per_game_mb)), "{}", tuning_log(&h));
+    h.stop();
+    let done = h.wait_done("l_TC");
+    ids_accounted(&h, "l_TC", &done);
+    // the next lease of this build plans with what is remembered
+    let before = job_lines(&h).len();
+    h.push(tuning_lease(&h, "l_TC2", fake(peaked()), json!("auto"), None));
+    h.start();
+    assert!(wait(|| job_lines(&h).len() > before));
+    assert_eq!(job_lines(&h)[before]["conc"].as_u64(), Some(more), "{}", tuning_log(&h));
+    h.stop();
+}

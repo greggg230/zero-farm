@@ -135,7 +135,7 @@ cargo test --workspace --all-features -- --test-threads=2           # on the Mac
 | keep awake | - | an IOKit `PreventUserIdleSystemSleep` assertion while a lease runs on AC power (`keep_awake`, default on) |
 | launcher version | VERSIONINFO | a 32-byte marker in the binary (`binver.rs`) |
 | UI | tray, invite dialog | headless CLI: `ZeroFarm status \| pause [minutes] \| resume \| set <key> <value> \| quit \| uninstall \| setup` |
-| rolling "auto" (CPU) | 32 in flight in 4 groups | 144 per physical core in groups of 192 (an M4 Max: 2,304 in 12), planned at 1 GB + 18 MB per game of physical footprint (0.3.3; a 64 GB Mac's default cap holds 1,472 - memory cuts the games, the 12 groups stay, batches down to 96 rows) |
+| rolling "auto" (CPU) | 32 in flight in 4 groups | 144 per physical core in groups of 192 (an M4 Max: 2,304 in 12), planned at 1 GB + 18 MB per game of physical footprint for a worker build not measured here (0.3.3: the plan calibrates itself per run and build, `rolling::Learned`; a 64 GB Mac's default cap holds 1,472 - memory cuts the games, the 12 groups stay, batches down to 96 rows) |
 | layout tuning (rev 19) | start: one worker, cores search + 1 x cores inference (each its cap); batches >= 8 rows | start: cores search + sessions of 3 (5 x 3 on 16 cores); inference <= cores; batches 96-384 rows; sessions always searched; >= 12 cores and >= 32 GB: two workers of 12 + 4 x 3, each with the games in flight its half of the memory plan holds and half the cores' groups (a 64 GB Mac: 716 in 6 groups) |
 
 **Install** (what `curl -fsSL https://farm.greggg230.com/install-macos.sh | sh -s -- --invite CODE` ends in): the

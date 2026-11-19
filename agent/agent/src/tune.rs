@@ -393,6 +393,12 @@ impl Space {
         Some((share.saturating_sub(cost.base_mb) / cost.per_game_mb.max(1)).max(1))
     }
 
+    /// The most games in flight one of `n` workers may run: its part of the job's bounds and the memory plan.
+    pub fn top_conc(&self, n: u32) -> u64 {
+        let cmax = (self.conc_max.max(self.conc_min).max(1) / n.max(1) as u64).max(1);
+        self.mem_room(n).map_or(cmax, |r| r.min(cmax))
+    }
+
     /// The groups the games in flight allow: batches within the bounds where possible, at least one, at most one per
     /// game.
     fn groups_range(&self, conc: u64) -> (u64, u64) {
@@ -760,6 +766,18 @@ impl Entry {
     /// The layout the main worker runs between trials (the incumbent).
     pub fn wanted(&self, s: &Space) -> Layout {
         s.fit(self.incumbent)
+    }
+
+    /// agent 0.3.3: the memory plan grew from `old` to `new` (a lower cost per game measured, rolling.rs
+    /// `Learned::steady`): the incumbent and the start, where the old bounds held their games in flight back (at the
+    /// most a worker could run there), get the most the new bounds hold; a tuner's choice of fewer games stays.
+    pub fn lift_conc(&mut self, old: &Space, new: &Space) {
+        for l in [&mut self.incumbent, &mut self.start] {
+            let f = old.fit(*l);
+            if f.conc >= old.top_conc(f.workers) {
+                l.conc = l.conc.max(new.top_conc(f.workers));
+            }
+        }
     }
 
     /// A valid measurement of `l` (`load`: other programs' mean share of the CPUs over its trial).

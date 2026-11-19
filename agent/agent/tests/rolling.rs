@@ -334,6 +334,11 @@ fn learned(h: &H) -> Value {
     std::fs::read(h.layout.state().join("rolling_memory.json")).map(|b| serde_json::from_slice(&b).unwrap()).unwrap_or(json!(null))
 }
 
+/// The key of the run's CPU cost per game with the harness's worker build (agent 0.3.3: per run and worker build).
+fn mem_key(h: &H) -> String {
+    format!("{RUN}/{}/cpu", h.build_id)
+}
+
 /// No id credited twice, and every released id credited or reported unfinished.
 fn accounted_once(h: &H, id: &str, done: &Value, released: u64) {
     let dup: u64 = h.mock.with(|s| s.credits.iter().filter(|(l, ..)| l == id).map(|(.., a)| *a).sum());
@@ -359,7 +364,7 @@ fn out_of_memory_lease(oom_abort: bool) {
         assert_eq!((j0["conc"].clone(), j0["out_dir"].clone()), (json!(16), json!("out")), "{j0}");
         assert!(j1["conc"].as_u64().unwrap() < 16 && j1["out_dir"] == "out-r1", "{j1}");
         accounted_once(&h, "l_RM", &done, 80);
-        assert!(learned(&h)["roll-run/cpu"].as_u64().is_some(), "{}", learned(&h));
+        assert!(learned(&h)[mem_key(&h)].as_u64().is_some(), "{}", learned(&h));
         assert!(h.crashes().len() <= 1, "{:?}", h.crashes());
         h.stop();
         return;
@@ -373,7 +378,7 @@ fn out_of_memory_lease(oom_abort: bool) {
     let u = done["unfinished"]["gids"].as_array().unwrap();
     assert_eq!(u[0], json!([0, 32]), "the dead worker's ids go back: {done}");
     assert_eq!(done["stats"]["inflight"], 12, "{done}");
-    assert_eq!(learned(&h), json!({"roll-run/cpu": 63}));
+    assert_eq!(learned(&h), json!({mem_key(&h): 63}));
     let crashes = h.crashes();
     assert_eq!(crashes.len(), 1, "reported once: {crashes:?}");
     assert!(crashes[0]["message"].as_str().unwrap().contains("memory limit"), "{crashes:?}");
@@ -418,7 +423,7 @@ fn a_worker_near_its_memory_limit_finishes_its_games_and_goes_on_with_fewer() {
     accounted_once(&h, "l_RH", &done, 40);
     assert!(unfinished_n(&done) < 8, "only ids never started go back: {done}");
     assert!(first_played >= base1);
-    let per = learned(&h)["roll-run/cpu"].as_u64().expect("measured");
+    let per = learned(&h)[mem_key(&h)].as_u64().expect("measured");
     // (macOS plans with a larger base in physical footprint, rolling.rs `MACOS_CPU_COST`)
     let base = farm_agent::rolling::cpu_cost().base_mb;
     let least = if cfg!(windows) { 100 } else { (1472 - base) / 8 };
@@ -427,32 +432,63 @@ fn a_worker_near_its_memory_limit_finishes_its_games_and_goes_on_with_fewer() {
     h.stop();
 }
 
-/// Agent 0.3.3 (finding of 2026-11-19: the plan must follow the evidence): the cost per game this PC remembered for the
-/// run plans "auto" - here 120 MB a game against the platform's 45 (Windows) / 18 (macOS) - and so does the default
-/// when nothing is remembered.
+/// Agent 0.3.3 (findings of 2026-11-19: the plan follows the evidence, per worker build): what this PC measured for the
+/// run with the lease's worker build plans "auto" - 120 MB a game, or 2 (below the platform's 45 / 18: a fixed worker
+/// build's) - while a measurement of another build, or 0.3.2's key without a build, leaves the platform's default.
 #[test]
 fn the_remembered_cost_per_game_plans_the_games_in_flight() {
     let limit = 3000;
     let (auto_n, _) = farm_agent::rolling::cpu_auto();
     let default = farm_agent::rolling::cpu_cost();
-    for (name, remembered) in [("remembered", Some(120u64)), ("default", None)] {
+    for (name, stored, per) in [
+        ("this build, more", Some(true), 120u64),
+        ("this build, less", Some(true), 2),
+        ("another build", Some(false), 120),
+        ("0.3.2's key", None, 120),
+        ("nothing", None, 0),
+    ] {
         let mut h = H::new();
         h.machine.lock().unwrap().settings.max_ram_mb = Some(limit);
-        if let Some(per) = remembered {
+        if per > 0 {
+            let key = match stored {
+                Some(true) => mem_key(&h),
+                Some(false) => format!("{RUN}/0123456789abcdef01234567/cpu"),
+                None => format!("{RUN}/cpu"),
+            };
             std::fs::create_dir_all(h.layout.state()).unwrap();
-            std::fs::write(h.layout.state().join("rolling_memory.json"), json!({format!("{RUN}/cpu"): per}).to_string()).unwrap();
+            std::fs::write(h.layout.state().join("rolling_memory.json"), json!({key: per}).to_string()).unwrap();
         }
         let g1 = generation_1(&h, 100);
         h.push(rolling_lease(&h, "l_RM", &g1, 0, 8, 1000, json!("auto")));
         h.start();
         assert!(wait(|| h.job_line_n(0).is_some()), "{name}: {}", h.agent_log());
         let j = h.job_line();
-        let cost = farm_agent::rolling::MemCost { per_game_mb: default.per_game_mb.max(remembered.unwrap_or(0)), ..default };
+        let cost = farm_agent::rolling::MemCost { per_game_mb: if stored == Some(true) { per } else { default.per_game_mb }, ..default };
         let want = farm_agent::rolling::ram_cap(limit, cost).min(auto_n);
         assert_eq!(j["conc"].as_u64(), Some(want), "{name}: (0.85 x {limit} - {}) / {} MB a game: {j}", cost.base_mb, cost.per_game_mb);
-        if remembered.is_some() {
-            assert!(want < farm_agent::rolling::ram_cap(limit, default).min(auto_n), "the remembered cost is the one that counts");
-        }
         h.stop();
     }
+}
+
+/// Agent 0.3.3: a worker that commits more per game than its plan - here 80 MB a game against the platform's default,
+/// still under the 92 % where it would give way - has that remembered at once, for the run and its worker build, while
+/// the lease goes on (0.3.2 remembered it at a restart or when the lease ended).
+#[test]
+fn a_cost_over_the_plan_is_remembered_at_once() {
+    let mut h = H::new();
+    let limit = if cfg!(windows) { 1600 } else { 2400 };
+    h.machine.lock().unwrap().settings.max_ram_mb = Some(limit);
+    let base = farm_agent::rolling::cpu_cost().base_mb;
+    let g1 = generation_1_with(&h, settings_with(60, json!({"mem_base_mb": base, "mem_per_game_mb": 80})));
+    h.push(rolling_lease(&h, "l_RR", &g1, 0, 16, 100_000, json!(8)));
+    h.start();
+    assert!(wait(|| learned(&h)[mem_key(&h)].as_u64().is_some_and(|v| v >= 80)), "{}
+{}", learned(&h), h.agent_log());
+    let j = h.job_line();
+    assert_eq!(j["conc"], 8, "{j}");
+    assert!(h.job_line_n(1).is_none(), "no restart: under 92 % of the limit");
+    assert!(!h.finished());
+    h.stop();
+    let done = h.wait_done("l_RR");
+    assert!(done.get("refused").is_none(), "{done}");
 }

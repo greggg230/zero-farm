@@ -1311,14 +1311,21 @@ A rolling lease is a self-play lease (section 3) plus
     that died). Reported once per lease (`/v1/crash` kind `crash`); the lease is not given back.
   - At most 4 restarts per lease. After that, or when one game in flight already didn't fit, a worker at 92% finishes
     the lease (`finish`) and one that runs into the limit fails the lease as before.
-  - The measured cost per game is remembered per run and CPU / GPU job in `state\rolling_memory.json`: raised at once,
-    at each restart and when a rolling lease ends whose worker committed more per game than it was planned with. "auto"
-    and a run's number are planned with it from then on - and (agents from 0.3.3) so is the rest of the lease that
-    measured it: its next workers, a crew's next members (13.5), handoffs (13.2) and the tuner's memory bounds. It comes
-    down only slowly (0.3.3): a lease whose workers ran at least 45 minutes (their steady state) and committed less per
-    game than remembered lowers it by at most an eighth (at least 1 MB), never below what any of them committed per
-    game. A run's games change, and a worker build that needs less memory per game arrives; one lease's dip doesn't
-    undo a measured peak.
+  - **Self-calibrating** (agents from 0.3.3). The measured cost per game is remembered per run, **worker build** and
+    CPU / GPU job in `state\rolling_memory.json` (keys `<run>/<build_id>/cpu|gpu`; 0.2.14-0.3.2 kept one value per run,
+    `<run>/cpu`, only ever raised and planned as the more of it and the default - those keys, measured with the builds of
+    before, are not read). A build not measured here is planned with the platform's default cost (above; macOS 11.5),
+    which came from the builds of before and is conservative; a measured build with what was measured, below the default
+    too (zero-core's native worker fixed on 2026-11-19 needs ~2.5 MB a game where the builds of before needed 13-16). It
+    is raised at once: whenever a worker commits more per game than planned, at each restart and when a lease ends. It
+    is lowered from **steady** readings - a worker that finished twice its games in flight since it started, its games
+    in flight full -: the most such a worker committed per game x 1.2 (rounded up), when that is below the plan. "auto"
+    and a run's number are planned with it from then on, and so is the rest of the lease that measured it: a raise at
+    its memory checks (its next workers, a crew's next members, 13.5, handoffs, 13.2, and the tuner's memory bounds); a
+    steady reading at most 80 % of the cost the lease is planned with at once - the tuner's bounds widen (an "auto"
+    job's games in flight are worked out again), a layout the old plan held back gets the games in flight the new one
+    holds, and the job is handed over to it (13.2, within its rules: one drain at a time, the memory cap; a fixed layout
+    too, 13.1). A lease without a tuned layout leaves it to the next lease.
   - No wire change: the coordinator sees one lease, its released ids and its extensions as before.
 - Stats add `inflight` (the chosen `conc`; after a restart the current worker's) and `released` (the lease's released
   ids).
@@ -1502,9 +1509,13 @@ Platform names: `windows-x64` and `macos-arm64` (Apple silicon, macOS 13 or newe
   and kills a group a dead agent left behind at its next start (a stopped worker can't see its stdin close). The
   runtime pack is passed as `ZEROFARM_RUNTIME_DIR` and first on `DYLD_LIBRARY_PATH`.
 - **Rolling leases (10.6) on macOS.** "auto" on the CPU is 144 games in flight per physical core (performance and
-  efficiency) in groups of 192 (16 cores: 2,304 in 12 groups); the memory plan's default cost is 1,024 MB + 18 MB per
-  game in flight, in physical footprint (agents from 0.3.3; 0.3.2 planned 14 MB, 0.3.0-0.3.1 4 MB from the SSH
-  self-play of 2026-11-18, about 2.7 MB per game with the process, read early). A real rolling lease on the M4 Max (2026-11-19,
+  efficiency) in groups of 192 (16 cores: 2,304 in 12 groups); the memory plan's default cost (a worker build not
+  measured here, 10.6) is 1,024 MB + 18 MB per game in flight, in physical footprint (agents from 0.3.3; 0.3.2 planned
+  14 MB, 0.3.0-0.3.1 4 MB from the SSH self-play of 2026-11-18, about 2.7 MB per game with the process, read early).
+  The numbers below are the builds of before; zero-core's native worker fixed on 2026-11-19 (fix/worker-memory:
+  records kept sparse in flight, ONNX Runtime memory patterns off, a compact evaluation cache) measured 2.5 MB a game
+  at 882 in flight after 12 minutes (13.1 before), and such a build is planned with what the Mac measures (10.6:
+  about 4 MB a game with the margin). A real rolling lease on the M4 Max (2026-11-19,
   legacy-meta3-r1's network, fast export, one worker of 2,304 games in flight, a game lasting about 10 minutes) kept
   growing: 12.8 GB at 3 minutes, 19.0 at 5, 22.2 at 7, 25.2 at 9, 27.0 at 11, 28.1 at 13, 29.1 at 15 (12.2 MB a game
   over the base), still about 0.5 GB a minute and slowing, toward ~31 GB (~13 MB a game) at steady state; the memory
@@ -1641,7 +1652,8 @@ feature, a coordinator before rev 19, eval, fuzz, classic and GPU jobs are uncha
 - **The owner's settings** `autotune` (default on; Windows `machine.json`, macOS `ZeroFarm set autotune on|off`) and
   `workers` (`auto` (default) | 1 | 2 | 3, 13.5). `autotune` off: the fixed rules of before (one worker, `threads` = the
   CPU threads, no `infer_*` fields, 10.6's games in flight) - unless `workers` is 2 or 3: then that many workers with
-  the platform's start for them, fixed (no trials, nothing remembered).
+  the platform's start for them, fixed (no trials, nothing remembered; handed over only when the memory plan comes to
+  hold more games in flight, 10.6, agents from 0.3.3).
 
 ### 13.2 Trials
 
@@ -1796,7 +1808,8 @@ extra lease: the coordinator sees one lease, its released ids, its extensions an
   in flight; no restart counted, nothing shrunk) and the crew refills as the drain makes room; once nothing plays new
   games, none start until memory frees. A new member joins, and a restarted main worker starts, only when its plan
   fits 85 % of the job's limit beside what the others hold or will hold (13.2 **Handoff**). The most any worker
-  committed per game is what is remembered for the run, and the lease plans with it from then on (10.6). Every layout - the
+  committed per game is what is remembered for the run and worker build, and the lease plans with it from then on
+  (10.6, self-calibrating). Every layout - the
   start, a fixed `workers`, every trial - holds each worker's base and games in flight within 85 % of its part of the
   job's limit (each worker's games in flight bounded by it; the tuner's range of games in flight is kept), and the
   tuner's worker count is at most what that holds with the fewest games in flight allowed.
@@ -1826,8 +1839,9 @@ extra lease: the coordinator sees one lease, its released ids, its extensions an
   worker - one that just started at its plan, drainers at their commit -, one drain at a time per lease, restarts and
   new members wait for room, and the crew's guard acts on the total with the drainers (13.2, 13.5: 0.3.2's crew held
   38.9 GB against a 31.7 GB cap). macOS keeps the group count where memory cuts the games (batches down to 96 rows;
-  13.1, 11.5) and plans 18 MB per game in flight (11.5); a measured cost per game is planned with for the rest of the
-  lease and comes down slowly from steady-state readings (10.6). Other programs' load is judged as a mean over a trial
+  13.1, 11.5); the memory plan calibrates itself per run and worker build - a build not measured here starts from the
+  platform's default (macOS now 18 MB per game in flight, 11.5), a rise is remembered at once, a steady reading lowers
+  it (x 1.2), and one well below the lease's plan raises the job's games in flight by a handoff (10.6). Other programs' load is judged as a mean over a trial
   and before it, sustained load discards at once, each measurement records its load, and a candidate measured on a
   clearly quieter machine doesn't replace the incumbent (13.2).
 - v1 rev 19, agent 0.3.2 (2026-11-19; no wire change): fixes from the first real crew on a Mac. A worker's `provider`

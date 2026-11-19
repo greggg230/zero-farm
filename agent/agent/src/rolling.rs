@@ -64,8 +64,9 @@ pub const MACOS_CPU_BATCH: u64 = 192;
 /// whatever the batch (192-675 rows measured), so smaller batches cost little. 96 rows keep 6 groups down to 576 games
 /// in flight a worker (2 x 691 on a 64 GB Mac: 6 groups of 116 rows).
 pub const MACOS_CPU_MIN_BATCH: u64 = 96;
-/// macOS: a CPU job's cost until this Mac measured the run's own, in physical footprint (what the memory cap counts
-/// there, `worker_unix.rs`). 0.3.0 planned 4 MB per game from the SSH self-play above (2.03-2.08 GB a process with 768
+/// macOS: a CPU job's cost until this Mac measured the run's own with the lease's worker build (`Learned`), in physical
+/// footprint (what the memory cap counts there, `worker_unix.rs`); the numbers below are the native worker builds of
+/// before (zero-core's fix of 2026-11-19 needs ~2.5 MB a game, and is planned with what is measured). 0.3.0 planned 4 MB per game from the SSH self-play above (2.03-2.08 GB a process with 768
 /// games in flight, 2.7 MB a game with the process, read early). A real rolling lease on the M4 Max (2026-11-19:
 /// legacy-meta3-r1's network, fast export, one worker of 2,304 games in flight, about 235 games finished a minute, so a
 /// game lasts about 10 minutes) grew all the way: 12.8 GB at 3 minutes, 19.0 at 5, 22.2 at 7, 25.2 at 9, 27.0 at 11,
@@ -133,13 +134,17 @@ pub const RESTART_SHARE: f64 = 0.75;
 pub const MAX_RESTARTS: u32 = 4;
 /// A memory cap of at least this many games in flight is rounded down to a multiple of it.
 pub const RAM_CAP_STEP: u64 = 32;
-/// agent 0.3.3: a worker's commit counts as its steady state once it has run this long (a few game lengths: a game lasts
-/// ~10 minutes on the M4 Max, ~19 on a Windows CPU at 32 in flight); only such readings may lower the remembered cost.
-pub const STEADY_S: u64 = 45 * 60;
-/// ... and a lease whose steady readings stayed under the remembered cost lowers it by at most this share (rounded up,
-/// at least 1 MB): a cost goes up at once (memory first) and comes down slowly (a run's games change, a worker build
-/// with less memory per game arrives).
-pub const LEARN_DECAY: f64 = 0.125;
+/// agent 0.3.3: a worker's commit counts as its steady state once it finished this many times its games in flight with
+/// them full (`steady_reading`): every game in flight then started after the worker did, at least twice over (a game
+/// lasts ~10 minutes on the M4 Max at the start's layout).
+pub const STEADY_TURNOVERS: u64 = 2;
+/// ... and a steady reading is remembered with this margin (the cost per game it shows x 1.2, rounded up): the old native
+/// worker's footprint still crept up after half an hour (11.5); the fixed one (zero-core fix/worker-memory, 2026-11-19:
+/// 2.5 MB a game at 882 in flight after 12 minutes, growth tailing off; read as 3, whole MB rounded up) is planned at 4.
+pub const LEARN_MARGIN: f64 = 1.2;
+/// A steady cost at most this share of the cost a lease is planned with raises its games in flight (a layout handoff,
+/// lease.rs `calibrate`); a smaller gain only waits for the next lease.
+pub const RAISE_INFLIGHT_SHARE: f64 = 0.8;
 
 /// The run's setting for a CPU or GPU job (`rolling.inflight.cpu` / `.gpu`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -238,10 +243,14 @@ pub fn measured_per_game(commit_mb: u64, conc: u64, cost: MemCost) -> u64 {
     commit_mb.saturating_sub(cost.base_mb).div_ceil(conc.max(1))
 }
 
-/// The memory a game in flight was measured to take on this PC, per run and provider class (`state\rolling_memory.json`,
-/// keys `<run>/cpu` and `<run>/gpu`, MB per game over the base): "auto" and a run's number are planned with it from
-/// then on (PROTOCOL 10.6), and so are the rest of the lease that measured it (lease.rs). It goes up at once (`raise`)
-/// and down only slowly, from steady-state readings (`settle`, agent 0.3.3).
+/// The memory a game in flight was measured to take on this PC, per run, worker build and provider class
+/// (`state\rolling_memory.json`, keys `<run>/<build_id>/cpu` and `.../gpu`, MB per game over the base; agent 0.3.3 -
+/// 0.2.14-0.3.2's `<run>/cpu` keys, measured with builds of before, are not read). The memory plan calibrates itself
+/// (PROTOCOL 10.6): a build not measured here starts from the platform's conservative default (`cpu_cost`, `GPU_COST`);
+/// a measured one is planned with what was measured - lower than the default too: a worker build fixed to need less
+/// memory per game (zero-core fix/worker-memory: 13.1 -> 2.5 MB a game on the Mac) gets the games in flight it holds.
+/// It goes up at once (`raise`) and down from steady readings with a margin (`steady`); the lease that measured it plans
+/// with it from then on (lease.rs).
 pub struct Learned;
 
 impl Learned {
@@ -249,32 +258,43 @@ impl Learned {
         layout.state().join("rolling_memory.json")
     }
 
-    fn key(run: &str, gpu: bool) -> String {
-        format!("{run}/{}", if gpu { "gpu" } else { "cpu" })
+    fn key(run: &str, build: &str, gpu: bool) -> String {
+        format!("{run}/{build}/{}", if gpu { "gpu" } else { "cpu" })
     }
 
     pub fn load(layout: &Layout) -> BTreeMap<String, u64> {
         std::fs::read(Self::path(layout)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
     }
 
-    /// The measured per-game cost of `run` on the CPU or a GPU (None: never measured here).
-    pub fn get(layout: &Layout, run: &str, gpu: bool) -> Option<u64> {
-        Self::load(layout).get(&Self::key(run, gpu)).copied()
+    /// The measured per-game cost of `run` with worker build `build` on the CPU or a GPU (None: never measured here).
+    pub fn get(layout: &Layout, run: &str, build: &str, gpu: bool) -> Option<u64> {
+        Self::load(layout).get(&Self::key(run, build, gpu)).copied()
     }
 
-    /// What a job of `run` is planned with: the default's cost with the larger of its and the measured per-game
-    /// cost, and whether there was a measurement.
-    pub fn plan(layout: &Layout, run: &str, gpu: bool, ram_mb: u64) -> MemPlan {
-        let d = if gpu { GPU_COST } else { cpu_cost() };
-        let m = Self::get(layout, run, gpu);
-        MemPlan { ram_mb, cost: MemCost { per_game_mb: d.per_game_mb.max(m.unwrap_or(0)), ..d }, measured: m.is_some() }
+    /// The platform's default cost of a job on the CPU or a GPU (a build not measured here).
+    pub fn default_cost(gpu: bool) -> MemCost {
+        if gpu {
+            GPU_COST
+        } else {
+            cpu_cost()
+        }
     }
 
-    /// Records `per_game_mb` for `run` when it is more than what was recorded -> true when it was.
-    pub fn raise(layout: &Layout, run: &str, gpu: bool, per_game_mb: u64) -> bool {
+    /// What a job of `run` with worker build `build` is planned with: the default's base and the measured per-game cost
+    /// (the default's when there is none), and whether there was a measurement.
+    pub fn plan(layout: &Layout, run: &str, build: &str, gpu: bool, ram_mb: u64) -> MemPlan {
+        let d = Self::default_cost(gpu);
+        let m = Self::get(layout, run, build, gpu);
+        MemPlan { ram_mb, cost: MemCost { per_game_mb: m.unwrap_or(d.per_game_mb).max(1), ..d }, measured: m.is_some() }
+    }
+
+    /// Records `per_game_mb` for `run` / `build` when it is more than what is planned with now (the stored value, else
+    /// the default) -> true when it was.
+    pub fn raise(layout: &Layout, run: &str, build: &str, gpu: bool, per_game_mb: u64) -> bool {
         let mut m = Self::load(layout);
-        let k = Self::key(run, gpu);
-        if m.get(&k).is_some_and(|&v| v >= per_game_mb) {
+        let k = Self::key(run, build, gpu);
+        let now = m.get(&k).copied().unwrap_or(Self::default_cost(gpu).per_game_mb);
+        if per_game_mb <= now {
             return false;
         }
         m.insert(k, per_game_mb);
@@ -282,21 +302,20 @@ impl Learned {
         true
     }
 
-    /// agent 0.3.3: a lease whose workers, at their steady state (`STEADY_S`), committed at most `steady_mb` per game
-    /// lowers a higher remembered cost toward it, by at most `LEARN_DECAY` of it (at least 1 MB, never below
-    /// `steady_mb` or 1) -> the new value when it was lowered.
-    pub fn settle(layout: &Layout, run: &str, gpu: bool, steady_mb: u64) -> Option<u64> {
+    /// agent 0.3.3: a steady reading (`steady_reading`) of `reading_mb` per game: remembered as `reading_mb` x
+    /// `LEARN_MARGIN` (rounded up, at least 1) when that is less than what is planned with now (the stored value, else the
+    /// default) -> the new value when it was lowered. Rises go through `raise`, at once.
+    pub fn steady(layout: &Layout, run: &str, build: &str, gpu: bool, reading_mb: u64) -> Option<u64> {
         let mut m = Self::load(layout);
-        let k = Self::key(run, gpu);
-        let old = *m.get(&k)?;
-        if steady_mb == 0 || steady_mb >= old {
+        let k = Self::key(run, build, gpu);
+        let now = m.get(&k).copied().unwrap_or(Self::default_cost(gpu).per_game_mb);
+        let v = ((reading_mb as f64 * LEARN_MARGIN).ceil() as u64).max(1);
+        if v >= now {
             return None;
         }
-        let step = ((old as f64 * LEARN_DECAY).ceil() as u64).max(1);
-        let new = old.saturating_sub(step).max(steady_mb).max(1);
-        m.insert(k, new);
+        m.insert(k, v);
         Self::save(layout, &m);
-        Some(new)
+        Some(v)
     }
 
     fn save(layout: &Layout, m: &BTreeMap<String, u64>) {
@@ -305,6 +324,14 @@ impl Learned {
             log::warn!("could not record a rolling job's memory per game: {e}");
         }
     }
+}
+
+/// agent 0.3.3: a worker's reading counts as its steady state: it finished `STEADY_TURNOVERS` times its `conc` games in
+/// flight since it started, and its games in flight are full (at least 98 % of `conc`: a worker short of ids holds fewer
+/// games than its per-game cost would be read over).
+pub fn steady_reading(games: u64, started: u64, conc: u64) -> bool {
+    let conc = conc.max(1);
+    games >= STEADY_TURNOVERS * conc && started.saturating_sub(games) as f64 >= (0.98 * conc as f64).floor().max(1.0)
 }
 
 /// The memory a rolling job is planned within: the cap (`caps.ram_mb`, the job's limit), the cost per game, and
@@ -453,21 +480,52 @@ mod tests {
     }
 
     #[test]
-    fn the_measured_cost_is_remembered_per_run_and_provider_and_only_goes_up() {
+    fn the_measured_cost_is_remembered_per_run_build_and_provider() {
         let dir = std::env::temp_dir().join(format!("zf-rolling-mem-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let layout = Layout::new(&dir);
-        assert_eq!(Learned::plan(&layout, "r", true, 10_000), MemPlan { ram_mb: 10_000, cost: GPU_COST, measured: false });
-        assert!(Learned::raise(&layout, "r", true, 75));
-        assert!(!Learned::raise(&layout, "r", true, 70), "only up");
-        assert!(Learned::raise(&layout, "r", false, 20));
-        assert_eq!(Learned::get(&layout, "r", true), Some(75));
-        assert_eq!(Learned::get(&layout, "other", true), None);
-        let p = Learned::plan(&layout, "r", true, 10_000);
+        assert_eq!(Learned::plan(&layout, "r", "b1", true, 10_000), MemPlan { ram_mb: 10_000, cost: GPU_COST, measured: false });
+        // a rise is remembered at once, and only a rise over what is planned with
+        assert!(Learned::raise(&layout, "r", "b1", true, 75));
+        assert!(!Learned::raise(&layout, "r", "b1", true, 70), "only up");
+        assert!(!Learned::raise(&layout, "r", "b1", false, cpu_cost().per_game_mb), "not over the default: nothing to remember");
+        assert!(Learned::raise(&layout, "r", "b1", false, cpu_cost().per_game_mb + 2));
+        assert_eq!(Learned::get(&layout, "r", "b1", true), Some(75));
+        assert_eq!(Learned::get(&layout, "other", "b1", true), None);
+        let p = Learned::plan(&layout, "r", "b1", true, 10_000);
         assert_eq!((p.cost.per_game_mb, p.cost.base_mb, p.measured), (75, GPU_COST.base_mb, true));
-        // measured below the default: the default is planned with (a run's number is capped by it, measured)
-        let p = Learned::plan(&layout, "r", false, 10_000);
-        assert_eq!((p.cost.per_game_mb, p.measured), (cpu_cost().per_game_mb.max(20), true));
+        // a new worker build starts fresh: the platform's default
+        assert_eq!(Learned::plan(&layout, "r", "b2", true, 10_000), MemPlan { ram_mb: 10_000, cost: GPU_COST, measured: false });
+        assert_eq!(Learned::get(&layout, "r", "b2", false), None);
+        // 0.3.2's keys (no build: measured with builds of before) are not read
+        std::fs::write(layout.state().join("rolling_memory.json"), r#"{"r/cpu": 99}"#).unwrap();
+        assert_eq!(Learned::plan(&layout, "r", "b1", false, 10_000).cost, cpu_cost());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_steady_reading_lowers_the_plan_with_a_margin_and_a_rise_raises_it_at_once() {
+        let dir = std::env::temp_dir().join(format!("zf-rolling-steady-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let layout = Layout::new(&dir);
+        let d = cpu_cost().per_game_mb;
+        // the fixed native worker (2026-11-19): 2.5 MB a game at its steady state, read as 3 (whole MB, rounded up) ->
+        // planned at 4 (x 1.2, rounded up), below the platform's default: no max with it any more
+        assert_eq!(Learned::steady(&layout, "r", "fixed", false, 3), Some(4));
+        assert_eq!(Learned::plan(&layout, "r", "fixed", false, 10_000).cost.per_game_mb, 4);
+        assert_eq!(Learned::steady(&layout, "r", "fixed", false, 2), Some(3), "lower again");
+        assert_eq!(Learned::steady(&layout, "r", "fixed", false, 3), None, "3 x 1.2 = 4 is no lower than 3");
+        // a rise is remembered at once
+        assert!(Learned::raise(&layout, "r", "fixed", false, 7));
+        assert_eq!(Learned::plan(&layout, "r", "fixed", false, 10_000).cost.per_game_mb, 7);
+        // an old build at the default (no measurement): a steady reading near it changes nothing; one well under lowers it
+        assert_eq!(Learned::steady(&layout, "r", "old", false, d), None);
+        assert_eq!(Learned::steady(&layout, "r", "old", false, d - d / 4), Some(((d - d / 4) as f64 * 1.2).ceil() as u64).filter(|&v| v < d));
+        // steady: twice the games in flight finished, the games in flight full
+        assert!(steady_reading(1764, 2646, 882));
+        assert!(!steady_reading(1763, 2645, 882), "one turnover and a bit");
+        assert!(!steady_reading(5000, 5100, 882), "short of ids: few games in flight");
+        assert!(steady_reading(2, 3, 1));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -513,28 +571,6 @@ mod tests {
             assert_eq!(cpu_shape(Inflight::Auto, 1, auto_cpu(32_768)), (c, mac_capped_groups(c, g)));
             assert_eq!(cpu_shape(Inflight::Auto, 1, auto_cpu(100)), (1, 1), "never 0");
         }
-    }
-
-    #[test]
-    fn the_remembered_cost_goes_up_at_once_and_down_slowly() {
-        let dir = std::env::temp_dir().join(format!("zf-rolling-settle-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        let layout = Layout::new(&dir);
-        assert_eq!(Learned::settle(&layout, "r", false, 5), None, "nothing remembered: nothing to lower");
-        assert!(Learned::raise(&layout, "r", false, 20));
-        // steady readings under it: an eighth (rounded up) a lease at most, never below the reading
-        assert_eq!(Learned::settle(&layout, "r", false, 16), Some(17));
-        assert_eq!(Learned::settle(&layout, "r", false, 16), Some(16));
-        assert_eq!(Learned::settle(&layout, "r", false, 16), None, "at the reading");
-        assert_eq!(Learned::settle(&layout, "r", false, 0), None, "no steady reading");
-        assert_eq!(Learned::get(&layout, "r", false), Some(16));
-        // a higher reading raises it at once
-        assert!(Learned::raise(&layout, "r", false, 19));
-        assert_eq!(Learned::get(&layout, "r", false), Some(19));
-        // the plan uses it (with the platform's default as the floor)
-        assert_eq!(Learned::plan(&layout, "r", false, 10_000).cost.per_game_mb, cpu_cost().per_game_mb.max(19));
-        assert_eq!(Learned::settle(&layout, "r", false, 1), Some(16), "19 - 3");
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
