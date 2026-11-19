@@ -32,6 +32,8 @@ src/admin_page.ts  the /admin dashboard (static HTML + JS)
 src/onboard.ts     the public pages: / (onboarding), /download (302 to the installer on GitHub) and
                    /install-macos.sh (rev 17: the macOS installer script)
 src/platform.ts    rev 17 platform names (windows-x64, macos-arm64) and the x-farm-platform header
+src/tuning.ts      rev 19 layout tuning: lease-request `tuning` reports checked, the class's best as `tuning_hint`,
+                   the per-class summary of the stats
 src/ratelimit.ts   per-machine (and per-IP-HMAC for enroll) rate limits: GCRA in D1, 429 + retry-after
 src/blocks.ts      worker builds Windows refused to start on a machine (crash kind "blocked")
 src/cron.ts        every minute: expire silent leases, delete acked results after 7 days, crash
@@ -234,6 +236,14 @@ macos-arm64 --github-url <the agent-macos-v<v> tarball>`, give runs a CPU altern
 `{"build_id", "runtime", "when": {"platform": "macos-arm64"}}` and campaigns `"alternates": [{"build_id", "when":
 {"platform": "macos-arm64"}}]`, and list those builds in the next definition (the stats' `platforms` then name
 macos-arm64). Friends install with `curl -fsSL https://farm.greggg230.com/install-macos.sh | sh -s -- --invite CODE`.
+
+### Deploy notes: rev 19 (layout tuning)
+
+Migration `0015_tuning.sql` adds `machines.tuning` and `machines.tuning_t`; the code reads and writes them, so the
+migration goes first (`npm run deploy` does that). No new var. Agents before 0.3.1 send no `tuning` and don't list
+the feature `tuning`: nothing changes for them. Agents that list it get `tuning_hint` on rolling self-play leases once a
+machine of their hardware class and platform reported a layout for the lease's build and runtime. The admin page's
+"Tuned layouts by hardware class / by machine" and the stats' `tuning` show what agents chose.
 
 ### Cloudflare Access (security review H1)
 
