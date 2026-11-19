@@ -84,10 +84,12 @@ fn ids_accounted(h: &H, id: &str, done: &Value) {
     assert_eq!(credited + unfinished, released, "{done}");
 }
 
-/// The harness, its fake worker never counted as starved by the test machine's own load (it sleeps).
+/// The harness, its fake worker never counted as starved by the test machine's own load (it sleeps); one worker per
+/// job (these tests search one worker's layout; several workers, PROTOCOL 13.5: crew.rs).
 fn harness() -> H {
     let mut h = H::new();
     h.signals.real_starvation = false;
+    h.machine.lock().unwrap().settings.workers = Some(1);
     h
 }
 

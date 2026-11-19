@@ -73,6 +73,11 @@ pub struct Settings {
     /// inference default, rolling "auto"'s games in flight).
     #[serde(skip_serializing_if = "is_true")]
     pub autotune: bool,
+    /// rev 19 (PROTOCOL 13.5): worker processes per self-play job: `None` = auto (the tuner's choice, from what the
+    /// cores and memory allow; one with `autotune` off), else 1 to 3 (with `autotune` off a fixed layout of that many);
+    /// written to `machine.json` only when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workers: Option<u32>,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -98,6 +103,7 @@ impl Default for Settings {
             on_battery: false,
             keep_awake: true,
             autotune: true,
+            workers: None,
         }
     }
 }
@@ -122,7 +128,7 @@ impl Settings {
 
     /// The keys `ZeroFarm set <key> <value>` takes (macOS, PROTOCOL 11.5; the tray's settings on Windows).
     pub const KEYS: &'static [&'static str] =
-        &["cpu_threads", "work_when", "mode", "idle_minutes", "on_battery", "keep_awake", "hours", "max_ram_mb", "disk_cap_mb", "gpu", "autotune"];
+        &["cpu_threads", "work_when", "mode", "idle_minutes", "on_battery", "keep_awake", "hours", "max_ram_mb", "disk_cap_mb", "gpu", "autotune", "workers"];
 
     /// `set <key> <value>`: changes one setting, or says why not. Returns how it reads now.
     pub fn set_by_name(&mut self, key: &str, value: &str) -> Result<String, String> {
@@ -149,6 +155,7 @@ impl Settings {
             "on_battery" => self.on_battery = flag(&v)?,
             "keep_awake" => self.keep_awake = flag(&v)?,
             "autotune" => self.autotune = flag(&v)?,
+            "workers" => self.workers = if auto(&v) { None } else { Some(number(&v, 1, crate::tune::MAX_WORKERS as u64)? as u32) },
             "gpu" => self.gpu = flag(&v)?,
             "max_ram_mb" => self.max_ram_mb = if auto(&v) { None } else { Some(number(&v, 1024, 1 << 22)?) },
             "disk_cap_mb" => self.disk_cap_mb = number(&v, 1024, 1 << 24)?,
@@ -180,6 +187,7 @@ impl Settings {
             "on_battery" => yes(self.on_battery).to_string(),
             "keep_awake" => yes(self.keep_awake).to_string(),
             "autotune" => (if self.autotune { "on" } else { "off" }).to_string(),
+            "workers" => self.workers.map_or("auto".to_string(), |n| n.to_string()),
             "gpu" => yes(self.gpu).to_string(),
             "max_ram_mb" => self.max_ram_mb.map_or("auto".to_string(), |n| n.to_string()),
             "disk_cap_mb" => self.disk_cap_mb.to_string(),
@@ -387,6 +395,14 @@ mod tests {
         assert!(!s.autotune);
         assert!(serde_json::to_string(&s).unwrap().contains("\"autotune\":false"));
         assert_eq!(s.set_by_name("autotune", "on").unwrap(), "autotune on");
+        // rev 19 (PROTOCOL 13.5): worker processes per job
+        assert_eq!(s.set_by_name("workers", "2").unwrap(), "workers 2");
+        assert_eq!(s.workers, Some(2));
+        assert!(serde_json::to_string(&s).unwrap().contains("\"workers\":2"));
+        assert_eq!(s.set_by_name("workers", "auto").unwrap(), "workers auto");
+        assert_eq!(s.workers, None);
+        assert!(!serde_json::to_string(&s).unwrap().contains("workers"));
+        assert!(s.set_by_name("workers", "0").is_err() && s.set_by_name("workers", "4").is_err());
         assert_eq!(s.set_by_name("hours", "22:00-07:30").unwrap(), "hours 22:00-07:30");
         assert_eq!(s.hours, Some(Hours { start_min: 1320, end_min: 450 }));
         assert_eq!(s.set_by_name("hours", "off").unwrap(), "hours off");

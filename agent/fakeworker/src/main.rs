@@ -16,6 +16,7 @@
 //!  "mem_grow_mb": 0,           // rolling: memory committed per finished game on top (a creep)
 //!  "mem_grow_until": null,     // rolling: ... until this many games are finished (then it stays)
 //!  "oom_abort": false,         // a failed commit: abort on stderr (Rust's message) instead of a fatal error
+//!  "crash_gid": null,          // the worker that finishes this game id panics (exit 101): one member of a crew
 //!  "rate": null}               // rolling: leaves per second by layout (below)
 //! ```
 //!
@@ -24,7 +25,10 @@
 //! `infer_workers` - default 1 -, `infer_threads` - default `threads` -, `conc`, `groups`: batch = conc / groups) plays
 //! `leaves_s` x the product over the keys `best` names of max(0.05, 1 - penalty x |log2(value / best)|) leaves per
 //! second, scaled by the share of `conc` games in flight and, with `decay_p`, by decay_p / (decay_p + leaves per game in
-//! flight) (a fresh worker's games grow); time suspended doesn't count. With `rate` a rolling job keeps `conc` games in
+//! flight) (a fresh worker's games grow); time suspended doesn't count. Workers of one lease share the machine (the
+//! agent's crews, PROTOCOL 13.5): each one with a rate model beats a file in `.crew/` of its working directory (the
+//! lease's) every 100 ms, and plays `crew[N - 1] / N` of its rate while N of them beat (`"crew": [1.0, 1.3, 1.25]`: two
+//! workers 30 % more in all; default 1.0 for any N - the machine's rate shared, nothing gained). With `rate` a rolling job keeps `conc` games in
 //! flight (`games_started` = finished + in flight; still played one at a time), `finish` plays the games in flight to
 //! the end first, and `status` carries `leaves`, `games_started`, `concurrency` and `wall_s`.
 //!
@@ -202,6 +206,7 @@ struct Cfg {
     mem_grow_mb: u64,
     mem_grow_until: Option<u64>,
     oom_abort: bool,
+    crash_gid: Option<u64>,
     rate: Option<Value>,
 }
 
@@ -239,6 +244,7 @@ impl Cfg {
             mem_grow_mb: u("mem_grow_mb", 0),
             mem_grow_until: o("mem_grow_until"),
             oom_abort: f.get("oom_abort").and_then(Value::as_bool).unwrap_or(false),
+            crash_gid: o("crash_gid"),
             rate: f.get("rate").filter(|r| r.is_object()).cloned(),
         }
     }
@@ -316,6 +322,10 @@ struct W {
     conc: u64,
     t0: Instant,
     t_acc: Instant,
+    /// The crew's total rate by its size (`rate.crew`), this worker's beat file and the crew's size as last counted.
+    crew: Vec<f64>,
+    beat: Option<(PathBuf, Instant)>,
+    crew_n: usize,
 }
 
 impl W {
@@ -336,10 +346,27 @@ impl W {
         let dt = self.t_acc.elapsed().as_secs_f64().min(0.1);
         self.t_acc = Instant::now();
         let Some(r) = self.leaves_s else { return };
+        self.crew_beat();
         let conc = self.conc.max(1) as f64;
         let in_flight = self.started.saturating_sub(self.done) as f64;
         let decay = self.decay_p.map_or(1.0, |p| p / (p + self.leaves / conc));
-        self.leaves += r * dt * (in_flight / conc).min(1.0) * decay;
+        let n = self.crew_n.max(1);
+        let share = self.crew.get(n - 1).or(self.crew.last()).copied().unwrap_or(1.0) / n as f64;
+        self.leaves += r * dt * (in_flight / conc).min(1.0) * decay * share;
+    }
+
+    /// Every 100 ms: this worker's beat file touched, and the crew counted (beat files touched in the last 400 ms: a
+    /// stopped or dead worker drops out).
+    fn crew_beat(&mut self) {
+        let Some((path, at)) = self.beat.as_mut() else { return };
+        if at.elapsed() < Duration::from_millis(100) {
+            return;
+        }
+        *at = Instant::now();
+        let _ = std::fs::write(&*path, b"");
+        let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        let fresh = |e: &std::fs::DirEntry| e.metadata().and_then(|m| m.modified()).ok().and_then(|t| t.elapsed().ok()).is_some_and(|d| d < Duration::from_millis(400));
+        self.crew_n = std::fs::read_dir(dir).map(|rd| rd.flatten().filter(fresh).count()).unwrap_or(1).max(1);
     }
 
     fn status(&mut self) {
@@ -450,6 +477,16 @@ impl W {
     }
 
     fn after_game_hooks(&mut self) {
+        self.after_game_hooks_gid(None);
+    }
+
+    /// `after_game_hooks`, `gid` the game just finished (`crash_gid`).
+    fn after_game_hooks_gid(&mut self, gid: Option<u64>) {
+        if gid.is_some() && self.cfg.crash_gid == gid {
+            eprintln!("thread 'main' panicked at src/fake.rs:21:5:
+fake crash at game {gid:?}");
+            std::process::exit(101);
+        }
         if self.cfg.crash_after == Some(self.done) {
             eprintln!("thread 'main' panicked at src/fake.rs:13:5:\nfake crash after {} games", self.done);
             std::process::exit(101);
@@ -555,7 +592,7 @@ impl W {
                 next += 1;
                 self.done += 1;
                 self.out.send(json!({"ev": "fin", "n": 1}));
-                self.after_game_hooks();
+                self.after_game_hooks_gid(Some(base + next - 1));
                 if self.cfg.mem_grow_until.is_none_or(|u| self.done <= u) {
                     self.mem.commit(self.cfg.mem_grow_mb, &self.out, self.cfg.oom_abort);
                 }
@@ -778,10 +815,21 @@ fn main() {
         conc: 1,
         t0: Instant::now(),
         t_acc: Instant::now(),
+        crew: vec![],
+        beat: None,
+        crew_n: 1,
     };
     if let Some(r) = w.cfg.rate.clone() {
         w.leaves_s = Some(layout_rate(&r, &job));
         w.decay_p = r.get("decay_p").and_then(Value::as_f64);
+        w.crew = r.get("crew").and_then(Value::as_array).map(|a| a.iter().filter_map(Value::as_f64).collect()).unwrap_or_default();
+        // (the crew's beat files: in the lease's working directory, shared by its workers)
+        let dir = Path::new(".crew");
+        if std::fs::create_dir_all(dir).is_ok() {
+            let f = dir.join(std::process::id().to_string());
+            let _ = std::fs::write(&f, b"");
+            w.beat = Some((f, Instant::now()));
+        }
         eprintln!("fakeworker: {} leaves/s at this layout", w.leaves_s.unwrap_or(0.0));
     }
     if job.get("model").and_then(Value::as_str).is_some() {

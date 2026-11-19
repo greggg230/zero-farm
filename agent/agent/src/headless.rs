@@ -294,6 +294,16 @@ pub fn cli_status(layout: &Layout) -> i32 {
     }
     let s = &m.settings;
     println!("  CPU threads: {}", cores.describe(s));
+    // rev 19 (PROTOCOL 13.5): worker processes per self-play job
+    println!(
+        "  worker processes: {}",
+        match (s.workers, s.autotune) {
+            (Some(n), true) => format!("{n} (set; `ZeroFarm set workers auto` lets the tuner choose)"),
+            (Some(n), false) => format!("{n} (set, a fixed layout: autotune off)"),
+            (None, true) => "auto (the tuner measures 1 to what the cores and memory allow)".to_string(),
+            (None, false) => "auto: 1 (autotune off)".to_string(),
+        }
+    );
     // rev 19 (PROTOCOL 13): the layout of the current self-play job, else the last tuned one
     match st.as_ref().and_then(|v| v["tuning"].as_str()) {
         Some(t) => println!("  layout: {t}"),

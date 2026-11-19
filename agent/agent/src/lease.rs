@@ -91,6 +91,9 @@ struct Roll {
     gpu: bool,
     /// The most the current worker committed (MB).
     peak_mb: u64,
+    /// rev 19 (PROTOCOL 13.5): the most any worker of the lease committed per game in flight over the cost's base (MB),
+    /// remembered at the end when more than planned.
+    per_game_max: u64,
     /// The current worker's ids start at `lo + offset` (0 until a restart; a restart's worker gets the ids after
     /// the ones its predecessor started).
     offset: u64,
@@ -119,9 +122,13 @@ struct Restart {
     measure: bool,
 }
 
-/// rev 19 (PROTOCOL 13): a worker that finishes its games beside the current one after a layout handoff. It takes no
-/// new games and no ids; its results are uploaded as any; the lease closes only after it ended.
-struct Drainer {
+/// rev 19 (PROTOCOL 13, 13.5): a worker beside the main one. Either a member of the lease's crew (several workers serving
+/// one lease): it plays a closed range of the lease's released ids `[lo + offset, lo + end)` (never extended: only the
+/// main worker, the tail, gets `extend`s), switches networks with the main worker, pauses with it, and is finished once
+/// it started all of its ids (a new worker takes its place); or `finishing` - after a layout handoff, a retirement or
+/// the lease's end - it finishes its games in flight, takes no new games and no ids. Either way its results are
+/// uploaded as any and the lease closes only after it ended.
+struct Mate {
     worker: WorkerProc,
     wgen: u32,
     out_dir: String,
@@ -132,7 +139,48 @@ struct Drainer {
     in_flight: Option<u64>,
     /// Where the next worker's ids were taken to start (its unstarted tail, estimated): checked against its `end`.
     tail: Option<u64>,
+    /// It starts no game: it finishes the ones in flight (a drainer).
+    finishing: bool,
+    /// Its ids, relative to the lease's first: `[offset, end)` (fixed).
+    offset: u64,
+    end: u64,
+    /// Its own job line's layout (one worker).
+    layout: Layout,
+    /// It said `hello` and got its job line.
+    job_sent: bool,
+    spawned: Instant,
+    pinged: bool,
+    /// When it was last pinged for fresh counters (near the end of its range).
+    pinged_at: Option<Instant>,
+    /// Its last `status` counters: (leaves, games, games_started from its first id).
+    counters: Option<(u64, u64, u64)>,
+    /// After `finish`: its frozen `games_started` read twice - the ids it never started go to the spare ranges.
+    reclaim: Option<Reclaim>,
+    /// The oldest generation the next result chunk of it may have used (`x-gen`).
+    gen_floor: Option<u64>,
+    /// The most it committed (MB).
+    peak_mb: u64,
+    /// Its fatal error's message (a memory failure is told by it).
+    fatal: Option<String>,
 }
+
+/// rev 19 (PROTOCOL 13.5): where a finishing worker's ids stop: its `games_started` after `finish`, read until two agree.
+#[derive(Debug, Clone)]
+struct Reclaim {
+    since: Instant,
+    reads: Vec<u64>,
+    last_ping: Option<Instant>,
+}
+
+impl Mate {
+    fn active(&self) -> bool {
+        !self.finishing
+    }
+}
+
+/// rev 19 (PROTOCOL 13.5): a crew's tail (the main worker) is handed a new member only with at least this many of its
+/// games in flight in unstarted ids (the member that takes the tail's place leaves it a closed range that long).
+const RUNWAY_INFLIGHTS: u64 = 2;
 
 /// rev 19 (PROTOCOL 13): the tuning of a rolling lease's CPU job.
 struct Tuning {
@@ -152,6 +200,13 @@ struct Tuning {
     no_trial_before: Instant,
     /// The platform's starting point (whether every worker honours `infer_workers`).
     defaults: tune::Defaults,
+    /// rev 19 (PROTOCOL 13.5): the owner's worker count with `autotune` off: the layout is fixed, nothing is measured
+    /// or remembered.
+    fixed: bool,
+    /// The most workers this lease may still run (lowered when a member fails with no restart left).
+    crew_cap: u32,
+    /// The workers a measurement counts (their generations): one that leaves discards it.
+    probe_members: Vec<u32>,
 }
 
 /// rev 19: a layout handoff in progress, before the next worker starts: the main worker was told `finish`.
@@ -165,14 +220,13 @@ struct Handoff {
     last_ping: Option<Instant>,
 }
 
-/// At most this many workers finish their games beside the current one.
+/// At most this many workers (per worker of the crew) finish their games beside the current ones before a new handoff.
 const MAX_DRAINERS: usize = 2;
 
 /// What a worker is started with (kept: a rolling lease's restart starts another).
 struct SpawnSpec {
     exe: PathBuf,
     cwd: PathBuf,
-    mem_limit_mb: u64,
     cpu_job: bool,
     log: Arc<zerofarm_common::rotlog::RotatingFile>,
     tag: String,
@@ -180,14 +234,15 @@ struct SpawnSpec {
 }
 
 impl SpawnSpec {
-    /// Starts the worker; its lines reach `tx` as generation `gen`'s.
-    fn spawn(&self, gen: u32, tx: Sender<Ev>) -> std::io::Result<WorkerProc> {
+    /// Starts the worker with its own memory limit (`mem_limit_mb`: the job's, or one worker's part of it); its lines
+    /// reach `tx` as generation `gen`'s.
+    fn spawn(&self, gen: u32, tx: Sender<Ev>, mem_limit_mb: u64) -> std::io::Result<WorkerProc> {
         WorkerProc::spawn(
             SpawnOpts {
                 exe: &self.exe,
                 args: &["serve"],
                 cwd: &self.cwd,
-                mem_limit_mb: self.mem_limit_mb,
+                mem_limit_mb,
                 cpu_job: self.cpu_job,
                 log: self.log.clone(),
                 tag: self.tag.clone(),
@@ -803,27 +858,36 @@ impl Engine {
         if plan_providers.0 != ["cpu"] {
             log::info!("lease {id}: providers {:?} on {}", plan_providers.0, plan_providers.1["name"].as_str().unwrap_or("?"));
         }
-        // rev 19 (PROTOCOL 13): a rolling CPU job's layout is tuned on this machine (`autotune` on)
+        // rev 19 (PROTOCOL 13): a rolling CPU job's layout is tuned on this machine (`autotune` on); with `autotune` off
+        // an owner's worker count above 1 (13.5) runs as a fixed layout
         let mut tuning = None;
         let mut measure0 = false;
-        if let (Some((setup, _)), false, true, "selfplay") = (roll.as_ref(), gpu_choice, self.settings().autotune, lease.kind.as_str()) {
-            let (t, m) = self.tuning_for(lease, &plan, &prep, setup, &choice);
+        let settings = self.settings();
+        let crew_fixed = settings.workers.is_some_and(|n| n > 1);
+        if let (Some((setup, _)), false, true, "selfplay") = (roll.as_ref(), gpu_choice, settings.autotune || crew_fixed, lease.kind.as_str()) {
+            let (t, m) = self.tuning_for(lease, &plan, &prep, setup, &choice, (limit_mb, mem.0.cost));
             log::info!(
                 "lease {id}: CPU layout {}{} ({})",
                 t.current.describe(),
                 if m { ", measured" } else { "" },
-                t.entry.describe()
+                if t.fixed { "fixed: autotune off".to_string() } else { t.entry.describe() }
             );
             measure0 = m;
-            tuning = Some(t);
+            // (an owner's worker count the memory doesn't hold with autotune off: one worker, the fixed rules of before)
+            if t.fixed && t.current.workers <= 1 {
+                log::info!("lease {id}: the memory limit holds one worker only: the fixed rules");
+            } else {
+                tuning = Some(t);
+            }
         }
         let layout0 = tuning.as_ref().map(|t| t.current);
+        // (a crew's workers each get their part of the job's memory limit, PROTOCOL 13.5)
+        let limit0 = layout0.map_or(limit_mb, |l| (limit_mb / l.workers.max(1) as u64).max(256));
         let (tx, rx) = mpsc::channel::<Ev>();
         let entry = build.entry_path().expect("worker manifests have an entry");
         let spawn_spec = SpawnSpec {
             exe: entry,
             cwd: work.clone(),
-            mem_limit_mb: limit_mb,
             cpu_job: plan_providers.0 == ["cpu"],
             log: self.worker_log.clone(),
             tag: id.clone(),
@@ -831,13 +895,13 @@ impl Engine {
         };
         let spawn = match self.cfg.test_spawn_error.filter(|_| cfg!(debug_assertions)) {
             Some(code) => Err(std::io::Error::from_raw_os_error(code)),
-            None => spawn_spec.spawn(0, tx.clone()),
+            None => spawn_spec.spawn(0, tx.clone(), limit0),
         };
         let worker = match spawn {
             Ok(w) => w,
             Err(e) => return self.worker_not_started(lease, &e),
         };
-        log::info!("lease {id}: worker pid {} started", worker.pid);
+        log::info!("lease {id}: worker pid {} started (memory limit {limit0} MB)", worker.pid);
         let mark = CpuMark::take(&worker);
         let mut run = Run {
             lease: lease.clone(),
@@ -904,20 +968,29 @@ impl Engine {
                 mem: if gpu_choice { mem.1 } else { mem.0 },
                 gpu: gpu_choice,
                 peak_mb: 0,
+                per_game_max: 0,
                 offset: 0,
                 restarts: 0,
                 restart: None,
             }),
             infer: layout0.map(|l| (l.infer_workers, l.infer_threads)),
-            drainers: Vec::new(),
+            mates: Vec::new(),
             tuning: tuning.map(|mut t| {
                 if measure0 {
-                    t.probe = Some((Probe::new(t.current.conc, t.entry.phase, self.cfg.timings.tune_warm.as_secs_f64(), self.cfg.timings.tune_window.as_secs_f64()), Instant::now()));
+                    t.probe = Some((Probe::new(t.current.total_conc(), t.entry.phase, self.cfg.timings.tune_warm.as_secs_f64(), self.cfg.timings.tune_window.as_secs_f64()), Instant::now()));
+                    t.probe_members.clear();
                 }
                 t
             }),
             spawns: 0,
             main_exit: None,
+            gens: 0,
+            lease_limit_mb: limit_mb,
+            spare: Vec::new(),
+            counters: None,
+            counters_at: None,
+            crew_changed: Instant::now(),
+            last_counter_ping: None,
         };
         run.show_tuning(self);
         run.go(self)
@@ -929,46 +1002,53 @@ impl Engine {
     /// number), and the remembered search or a new one (from the coordinator's hint for this hardware class, else the
     /// platform's starting point with 10.6's games in flight and groups). The lease's first worker runs the next layout to
     /// measure when a trial may run now (a fresh start is a free trial), else the incumbent. -> (tuning, measured).
-    fn tuning_for(&self, lease: &Lease, plan: &Plan, prep: &Prepared, setup: &Setup, choice: &crate::probe::Choice) -> (Tuning, bool) {
+    fn tuning_for(&self, lease: &Lease, plan: &Plan, prep: &Prepared, setup: &Setup, choice: &crate::probe::Choice, mem: (u64, crate::rolling::MemCost)) -> (Tuning, bool) {
         let p = &self.profile;
-        let hw = tune::Hw { cores: p.cores, logical: p.threads, perf: p.perf_cores, eff: p.eff_cores };
+        let hw = tune::Hw { cores: p.cores, logical: p.threads, perf: p.perf_cores, eff: p.eff_cores, ram_mb: p.ram_mb };
         let d = tune::defaults(tune::Platform::current(), &hw);
         let settings = self.settings();
         // (10.6's choice already fits the memory plan; the search only lowers it)
         let conc = choice.conc.unwrap_or(crate::rolling::CPU_INFLIGHT).max(1);
+        let groups = choice.groups.unwrap_or(1);
         let (conc_min, conc_max) = match setup.cpu {
             crate::rolling::Inflight::N(_) => (conc, conc),
             crate::rolling::Inflight::Auto => ((conc / 2).max(1), conc),
         };
-        let space = tune::Space::new(&d, settings.cpu_threads, conc_min, conc_max);
+        // rev 19 (PROTOCOL 13.5): the worker count is searched from 1 to what the cores, the RAM and the memory plan allow,
+        // or fixed by the owner's `workers`
+        let space = tune::Space::new(&d, settings.cpu_threads, settings.workers, conc_min, conc_max, Some(mem));
         let run = lease.run.clone().unwrap_or_default();
         let key = tune::Key {
             build: lease.build.build_id.clone(),
             runtime: lease.runtime.as_ref().map(|r| r.build_id.clone()),
             net: tune::net_fingerprint(&plan.job, prep.ckpt.as_ref().and_then(|(_, f)| f.model_size)),
-            hw: tune::hw_fingerprint(p),
+            // (an owner's fixed worker count is searched apart from "auto")
+            hw: match settings.workers {
+                Some(n) => format!("{} | workers {n}", tune::hw_fingerprint(p)),
+                None => tune::hw_fingerprint(p),
+            },
             os: p.os.clone(),
             tuner: tune::TUNER_VERSION,
         };
         let now = zerofarm_common::now_unix();
-        let mut entry = match tune::Cache::load(&self.cfg.layout).get(&key) {
+        let start = space.fit(d.layout_for(d.workers.clamp(space.workers_min, space.workers_max), conc, groups));
+        let fixed = !settings.autotune;
+        let mut entry = match tune::Cache::load(&self.cfg.layout).get(&key).filter(|_| !fixed) {
             Some(e) => e.clone(),
-            None => {
-                let start = space.fit(Layout { threads: d.threads, infer_workers: d.infer_workers, infer_threads: d.infer_threads, groups: choice.groups.unwrap_or(1), conc });
-                match tune::hint_layout(lease.tuning_hint.as_ref(), &space) {
-                    Some(h) => {
-                        log::info!("lease {}: starting the tuning from the coordinator's hint: {}", lease.lease_id, h.describe());
-                        tune::Entry::new(key, &run, h, true, now)
-                    }
-                    None => tune::Entry::new(key, &run, start, false, now),
+            None if fixed => tune::Entry::new(key, &run, start, false, now),
+            None => match tune::hint_layout(lease.tuning_hint.as_ref(), &space) {
+                Some(h) => {
+                    log::info!("lease {}: starting the tuning from the coordinator's hint: {}", lease.lease_id, h.describe());
+                    tune::Entry::new(key, &run, h, true, now)
                 }
-            }
+                None => tune::Entry::new(key, &run, start, false, now),
+            },
         };
         entry.run = run;
-        if entry.maybe_check(now) {
+        if !fixed && entry.maybe_check(now) {
             log::info!("lease {}: the weekly check of the tuned layout is due", lease.lease_id);
         }
-        let next = if self.tune_ok { entry.plan(&space) } else { None };
+        let next = if self.tune_ok && !fixed { entry.plan(&space) } else { None };
         let current = next.unwrap_or_else(|| entry.wanted(&space));
         let t = Tuning {
             space,
@@ -982,6 +1062,9 @@ impl Engine {
             revert_due: false,
             no_trial_before: Instant::now(),
             defaults: d,
+            fixed,
+            crew_cap: tune::MAX_WORKERS_JSON,
+            probe_members: Vec::new(),
         };
         (t, next.is_some())
     }
@@ -1100,14 +1183,28 @@ struct Run {
     roll: Option<Roll>,
     /// rev 19 (PROTOCOL 13): the job line's `infer_workers` and `infer_threads` (a tuned layout; None: not sent).
     infer: Option<(u32, u32)>,
-    /// rev 19: workers finishing their games after a layout handoff.
-    drainers: Vec<Drainer>,
+    /// rev 19: workers beside the main one - a crew's members (PROTOCOL 13.5) and workers finishing their games after a
+    /// layout handoff.
+    mates: Vec<Mate>,
     /// rev 19: the CPU layout's tuning (a rolling CPU job with `autotune` on).
     tuning: Option<Tuning>,
     /// Workers started after the first (memory restarts, handoffs): `done`'s unfinished ids are then worked out.
     spawns: u32,
     /// The main worker exited (its exit code) while drainers still finish their games.
     main_exit: Option<i32>,
+    /// The last worker generation handed out (`Ev::Worker`): every spawn takes the next.
+    gens: u32,
+    /// The job's memory limit (MB): a crew's workers share it (PROTOCOL 13.5).
+    lease_limit_mb: u64,
+    /// rev 19 (PROTOCOL 13.5): released ids no worker owns and none started (relative `[a, b)`, from workers that
+    /// finished early): a new member plays one before it would take the tail's place.
+    spare: Vec<(u64, u64)>,
+    /// The main worker's last `status` counters (leaves, games, games_started from its first id), and when.
+    counters: Option<(u64, u64, u64)>,
+    counters_at: Option<Instant>,
+    /// The crew changed (a worker joined or left): no trial for a while.
+    crew_changed: Instant,
+    last_counter_ping: Option<Instant>,
 }
 
 impl Run {
@@ -1133,8 +1230,14 @@ impl Run {
         }
         // rev 15 (PROTOCOL 10.6)
         if let Some(r) = &self.roll {
-            s.insert("inflight".into(), json!(self.conc));
+            // (rev 19, PROTOCOL 13.5: the crew's games in flight in all, and its workers)
+            let crew: Vec<&Mate> = self.mates.iter().filter(|m| m.active()).collect();
+            let inflight = self.conc.map(|c| c + crew.iter().map(|m| m.layout.conc).sum::<u64>());
+            s.insert("inflight".into(), json!(inflight));
             s.insert("released".into(), json!(r.released));
+            if !crew.is_empty() || self.tuning.as_ref().is_some_and(|t| t.current.workers > 1) {
+                s.insert("workers".into(), json!(1 + crew.len()));
+            }
         }
         if !self.selftests.is_empty() {
             let max = self.selftests.values().filter_map(|t| t.get("max_abs").and_then(Value::as_f64)).fold(None, |m: Option<f64>, x| {
@@ -1185,7 +1288,7 @@ impl Run {
 
     fn kill(&mut self, why: &str) {
         log::warn!("lease {}: killing worker: {why}", self.id());
-        for d in &mut self.drainers {
+        for d in &mut self.mates {
             d.worker.kill();
         }
         self.worker.kill();
@@ -1210,7 +1313,7 @@ impl Run {
         }
         self.send(json!({"op": "quit"}));
         self.state = WState::Stopping(Instant::now());
-        self.quit_drainers();
+        self.quit_mates();
     }
 
     /// A deadline window (started at `since`) has passed. True if the worker was starved by other
@@ -1239,10 +1342,11 @@ impl Run {
                 Err(RecvTimeoutError::Timeout) => {}
                 Err(RecvTimeoutError::Disconnected) => {}
             }
-            self.reap_drainers(eng);
-            // rev 19 (PROTOCOL 13): the main worker is gone; workers handed off from finish their games first
+            self.reap_mates(eng);
+            // rev 19 (PROTOCOL 13): the main worker is gone; workers handed off from (and a crew's members, 13.5) finish
+            // their games first
             if let Some(code) = self.main_exit {
-                if self.drainers.is_empty() {
+                if self.mates.is_empty() {
                     break code;
                 }
                 self.wind_down(eng);
@@ -1261,15 +1365,16 @@ impl Run {
                 }
                 // rev 15 (PROTOCOL 10.6): a rolling worker that died at the job's memory limit without a word (an
                 // abort on a failed allocation) is restarted smaller, as one that said so
-                if self.end_ev.is_none() && !self.killed {
-                    self.memory_failure(eng, &format!("worker exited with code {code}"));
+                if self.end_ev.is_none() && !self.killed && !self.memory_failure(eng, &format!("worker exited with code {code}")) {
+                    // rev 19 (PROTOCOL 13.5): a crew's main worker that crashed is replaced; the others go on
+                    self.crew_crash(eng, &format!("worker exited with code {code} without `end`"), Some(code as i64));
                 }
                 // rev 19: a handoff whose old worker finished its games before the next one could start beside it
                 self.handoff_after_exit();
                 if self.restart_worker(eng) {
                     continue;
                 }
-                if !self.drainers.is_empty() {
+                if !self.mates.is_empty() {
                     self.main_exit = Some(code);
                     continue;
                 }
@@ -1364,8 +1469,9 @@ impl Run {
         self.maybe_beat(eng, paused);
         self.roll_tick(eng);
         self.mem_check(eng);
-        self.drainers_tick(&t, must_pause);
+        self.mates_tick(&t, must_pause);
         self.tune_tick(eng, &t, must_pause);
+        self.crew_tick(eng, &t, must_pause);
     }
 
     /// A beat when one is due (on its own thread; the answer comes back as an event).
@@ -1398,12 +1504,23 @@ impl Run {
         if self.tuning.as_ref().is_some_and(|t| t.handoff.is_some()) {
             return;
         }
+        let conc = self.conc.unwrap_or(1);
         let Some(r) = self.roll.as_mut().filter(|r| r.active) else { return };
         let Some(now) = self.worker.commit_mb() else { return };
         r.peak_mb = r.peak_mb.max(now);
+        r.per_game_max = r.per_game_max.max(crate::rolling::measured_per_game(now, conc, r.mem.cost));
         if !live || r.finishing || r.restart.is_some() || limit == 0 || (now as f64) < limit as f64 * crate::rolling::HIGH_SHARE {
             return;
         }
+        self.primary_memory_high(eng, now);
+    }
+
+    /// rev 15 (PROTOCOL 10.6): the main worker committed `now` MB, near its limit (or, rev 19, the crew's sum is near the
+    /// job's, 13.5): it finishes its games and is started again with fewer in flight; one that can't have fewer
+    /// finishes the lease.
+    fn primary_memory_high(&mut self, eng: &Engine, now: u64) {
+        let limit = self.worker.mem_limit_mb;
+        let Some(r) = self.roll.as_mut() else { return };
         let id = self.lease.lease_id.clone();
         let conc = self.conc.unwrap_or(1);
         let per = crate::rolling::measured_per_game(now, conc, r.mem.cost);
@@ -1508,14 +1625,23 @@ impl Run {
         let (warm, window) = (eng.cfg.timings.tune_warm.as_secs_f64(), eng.cfg.timings.tune_window.as_secs_f64());
         let (conc, groups, threads, infer) = (self.conc.unwrap_or(1), self.groups.unwrap_or(1), self.threads, self.infer);
         if let (Some(t), Some((w, it))) = (self.tuning.as_mut(), infer) {
-            t.current = Layout { threads, infer_workers: w, infer_threads: it, groups, conc };
+            let workers = rs.layout.map_or(t.current.workers, |l| l.workers);
+            t.current = Layout { workers, threads, infer_workers: w, infer_threads: it, groups, conc };
+            if rs.layout.is_none() {
+                // (a memory restart: the layouts of this lease keep within the games in flight that fit - else the
+                // incumbent would be handed back to at once, PROTOCOL 13.5)
+                t.space.conc_max = t.space.conc_max.min(t.current.total_conc());
+                t.space.conc_min = t.space.conc_min.min(t.space.conc_max);
+            }
             t.handoff = None;
-            t.probe = rs.measure.then(|| (Probe::new(conc, t.entry.phase, warm, window), Instant::now()));
+            t.probe = rs.measure.then(|| (Probe::new(t.current.total_conc(), t.entry.phase, warm, window), Instant::now()));
+            t.probe_members.clear();
             if rs.layout.is_some() {
                 t.revert_due = false;
             }
         }
-        self.wgen += 1;
+        let limit = self.worker_limit();
+        self.wgen = self.next_gen();
         self.end_ev = None;
         self.killed = false;
         self.eof = false;
@@ -1531,10 +1657,12 @@ impl Run {
             self.after = Some(After::Kill(format!("restart: {e}")));
             return false;
         }
-        match self.spawn.spawn(self.wgen, self.tx.clone()) {
+        match self.spawn.spawn(self.wgen, self.tx.clone(), limit) {
             Ok(w) => {
+                self.counters = None;
+                self.crew_changed = Instant::now();
                 match rs.layout {
-                    Some(l) => log::info!("lease {id}: worker pid {} started with layout {} (ids from {})", w.pid, l.describe(), lo + offset),
+                    Some(l) => log::info!("lease {id}: worker pid {} started with layout {} (ids from {}, memory limit {limit} MB)", w.pid, l.per_worker().describe(), lo + offset),
                     None => log::info!("lease {id}: worker pid {} started again ({} games in flight, ids from {}, restart {restarts})", w.pid, rs.conc, lo + offset),
                 }
                 self.worker = w;
@@ -1563,13 +1691,14 @@ impl Run {
             self.roll_finish(&format!("agent {v} is ready to switch to"));
             return;
         }
+        // about 2 x the games in flight (PROTOCOL 10.4; rev 19, 13.5: the whole crew's)
+        let ask = 2 * self.crew_conc().max(1);
         let Some(r) = self.roll.as_mut() else { return };
         let now = Instant::now();
         if r.want_more && !r.extend_inflight && now >= r.next_extend {
             r.extend_inflight = true;
             r.next_extend = now + eng.cfg.timings.extend_every;
-            // about 2 x the games in flight (PROTOCOL 10.4)
-            let body = ExtendReq { games: 2 * self.conc.unwrap_or(1).max(1) };
+            let body = ExtendReq { games: ask };
             log::info!("lease {}: the worker is low on game ids ({} released); asking for {} more", self.lease.lease_id, r.released, body.games);
             let (client, tx, id) = (eng.client.clone(), self.tx.clone(), self.lease.lease_id.clone());
             std::thread::spawn(move || {
@@ -1621,6 +1750,16 @@ impl Run {
         log::info!("lease {}: finishing the games in flight ({why})", self.lease.lease_id);
         if !matches!(self.state, WState::Stopping(_)) {
             self.send(json!({"op": "finish"}));
+        }
+        // rev 19 (PROTOCOL 13.5): every member of the crew too (the ids they never started go back)
+        for m in self.mates.iter_mut().filter(|m| m.active()) {
+            m.finishing = true;
+            if m.job_sent {
+                let _ = m.worker.send(&json!({"op": "finish"}));
+            } else {
+                // (no job yet: nothing to finish)
+                let _ = m.worker.send(&json!({"op": "quit"}));
+            }
         }
     }
 
@@ -1723,7 +1862,7 @@ impl Run {
     fn on_event(&mut self, eng: &mut Engine, ev: Ev) {
         match ev {
             // rev 19 (PROTOCOL 13): a worker finishing its games after a layout handoff
-            Ev::Worker(g, m) if g != self.wgen && self.drainers.iter().any(|d| d.wgen == g) => self.on_drainer(eng, g, m),
+            Ev::Worker(g, m) if g != self.wgen && self.mates.iter().any(|d| d.wgen == g) => self.on_mate(eng, g, m),
             // (an earlier worker's lines, after a restart: dropped)
             Ev::Worker(g, _) if g != self.wgen => {}
             Ev::Worker(_, WorkerMsg::Line(v)) => self.on_worker(eng, v),
@@ -1746,7 +1885,14 @@ impl Run {
                         }
                         // (a restarted worker without its job yet gets the network in its job line)
                         if self.job_sent || !rolling {
-                            self.send(op);
+                            self.send(op.clone());
+                        }
+                        // rev 19 (PROTOCOL 13.5): a crew switches together (a member without its job yet gets it in its
+                        // job line; one finishing its games keeps the network it has)
+                        for m in self.mates.iter_mut().filter(|m| m.active() && m.job_sent) {
+                            if let Err(e) = m.worker.send(&op) {
+                                log::warn!("lease {}: write to worker pid {} failed: {e}", self.lease.lease_id, m.worker.pid);
+                            }
                         }
                         self.prep.ckpt = Some((c, f));
                     }
@@ -1829,6 +1975,13 @@ impl Run {
     /// network paths (`model`, `reference`, eval `models`), `threads`, `out_dir`, `runtime_dir`.
     /// No other coordinator-supplied key gets here.
     fn job_line(&self) -> Value {
+        let ids = self.roll.as_ref().filter(|r| r.active).map(|r| (r.offset, r.released - r.offset));
+        self.job_line_with(self.threads, self.conc, self.groups, self.infer, &self.out_dir, ids)
+    }
+
+    /// The job line of a worker with these tuning fields, results directory and (rolling) ids: `(offset, games)` -
+    /// `gid_base` = the lease's first id + `offset` (rev 19, PROTOCOL 13.5: a crew member's range).
+    fn job_line_with(&self, threads: u32, conc: Option<u64>, groups: Option<u64>, infer: Option<(u32, u32)>, out_dir: &str, ids: Option<(u64, u64)>) -> Value {
         let mut j = self.plan.job.clone();
         j.insert("op".into(), json!("job"));
         j.insert("lease_id".into(), json!(self.lease.lease_id));
@@ -1849,12 +2002,12 @@ impl Run {
         } else {
             j.remove("models");
         }
-        j.insert("threads".into(), json!(self.threads));
+        j.insert("threads".into(), json!(threads));
         // rev 7 (PROTOCOL 8): the agent's own, never the coordinator's
         j.insert("providers".into(), json!(self.providers.0));
         j.insert("gpu".into(), self.providers.1.clone());
         // rev 11 (PROTOCOL 9.6): a GPU job runs at a high conc (the agent's tuning field, PROTOCOL 5)
-        for (k, v) in [("conc", self.conc), ("groups", self.groups)] {
+        for (k, v) in [("conc", conc), ("groups", groups)] {
             match v {
                 Some(x) => {
                     j.insert(k.into(), json!(x));
@@ -1865,7 +2018,7 @@ impl Run {
             }
         }
         // rev 19 (PROTOCOL 13): a tuned layout's inference sessions and threads per session
-        match self.infer {
+        match infer {
             Some((w, t)) => {
                 j.insert("infer_workers".into(), json!(w));
                 j.insert("infer_threads".into(), json!(t));
@@ -1875,19 +2028,20 @@ impl Run {
                 j.remove("infer_threads");
             }
         }
-        j.insert("out_dir".into(), json!(self.out_dir));
+        j.insert("out_dir".into(), json!(out_dir));
         j.insert("runtime_dir".into(), self.prep.runtime.as_ref().map(|r| json!(r.dir)).unwrap_or(Value::Null));
         // rev 15 (PROTOCOL 10.5): a worker with the feature keeps `conc` games in flight past `games` (the released
         // ids), asks for more with `low`, and flushes finished games every `flush_s`
-        match self.roll.as_ref().filter(|r| r.active) {
-            Some(r) => {
+        match (self.roll.as_ref().filter(|r| r.active), ids) {
+            (Some(r), Some((offset, games))) => {
                 j.insert("rolling".into(), json!(true));
                 j.insert("flush_s".into(), json!(r.setup.flush_s));
-                // (a restarted worker: the ids after the ones its predecessors started, PROTOCOL 10.6)
-                j.insert("gid_base".into(), json!(r.setup.lo + r.offset));
-                j.insert("games".into(), json!(r.released - r.offset));
+                // (a restarted worker: the ids after the ones its predecessors started, PROTOCOL 10.6; a crew member: its
+                // range, 13.5)
+                j.insert("gid_base".into(), json!(r.setup.lo + offset));
+                j.insert("games".into(), json!(games));
             }
-            None => {
+            _ => {
                 j.remove("rolling");
                 j.remove("flush_s");
             }
@@ -1998,7 +2152,8 @@ impl Run {
             }
             "shard" | "records" | "evals" => {
                 let dir = self.out_dir.clone();
-                self.on_result_file(eng, &ev, &v, &dir)
+                let floor = self.gen_floor;
+                self.gen_floor = self.on_result_file(eng, &ev, &v, &dir, floor);
             }
             // rev 15 (PROTOCOL 10.5): fewer than `conc` of the released ids are unstarted
             "low" => {
@@ -2057,6 +2212,12 @@ impl Run {
                     if self.memory_failure(eng, &msg) {
                         return;
                     }
+                    // rev 19 (PROTOCOL 13.5): a crew's main worker that failed is replaced; the others go on
+                    if self.crew_crash(eng, &format!("worker fatal error: {msg}"), None) {
+                        self.worker.kill();
+                        self.killed = true;
+                        return;
+                    }
                     self.report(eng, "crash", &format!("worker fatal error: {msg}"), None);
                     self.kill("fatal error");
                 } else {
@@ -2067,28 +2228,29 @@ impl Run {
         }
     }
 
-    fn on_result_file(&mut self, eng: &mut Engine, kind: &str, v: &Value, out_dir: &str) {
+    /// A result file a worker announced (from `out_dir`, `floor`: that worker's `x-gen` floor) -> its floor from now on.
+    fn on_result_file(&mut self, eng: &mut Engine, kind: &str, v: &Value, out_dir: &str, floor: Option<u64>) -> Option<u64> {
         let Some(path) = v.get("path").and_then(Value::as_str) else {
             log::warn!("lease {}: {kind} without a path", self.id());
-            return;
+            return floor;
         };
         let rel = match check_rel_path(path) {
             Ok(r) => r,
             Err(_) => {
                 log::error!("lease {}: worker announced an unsafe path {path:?}", self.id());
-                return;
+                return floor;
             }
         };
         let src = self.work.join(out_dir).join(rel);
         if !src.is_file() {
             log::error!("lease {}: announced result {path} does not exist", self.id());
-            return;
+            return floor;
         }
         // x-gen (self-play only): the oldest generation in the chunk. Games that started before a
         // checkpoint switch finish on the old net, so until the next chunk the floor is the old gen.
         let selfplay = self.lease.kind == "selfplay";
-        let gen = if selfplay { v.get("gen").and_then(Value::as_u64).or(self.gen_floor) } else { None };
-        self.gen_floor = self.prep.ckpt.as_ref().map(|(c, _)| c.gen).or(self.gen_floor);
+        let gen = if selfplay { v.get("gen").and_then(Value::as_u64).or(floor) } else { None };
+        let floor = self.prep.ckpt.as_ref().map(|(c, _)| c.gen).or(floor);
         let meta = ResultMeta {
             kind: kind.to_string(),
             games: v.get("games").and_then(Value::as_u64).unwrap_or(0),
@@ -2097,6 +2259,7 @@ impl Run {
             ..Default::default()
         };
         self.store(eng, meta, Source::File(&src));
+        floor
     }
 
     fn store(&mut self, eng: &Engine, meta: ResultMeta, src: Source) {
@@ -2267,8 +2430,9 @@ impl Run {
         }
         // rev 15 (PROTOCOL 10.6): a rolling job's memory per game measured over the lease, remembered when more than
         // it was planned with
-        if let (Some(r), Some(conc)) = (self.roll.as_ref().filter(|r| r.active && r.peak_mb > 0), self.conc) {
-            let per = crate::rolling::measured_per_game(r.peak_mb, conc, r.mem.cost);
+        // (rev 19, PROTOCOL 13.5: the most any worker of the crew committed per game)
+        if let (Some(r), Some(conc)) = (self.roll.as_ref().filter(|r| r.active && (r.peak_mb > 0 || r.per_game_max > 0)), self.conc) {
+            let per = crate::rolling::measured_per_game(r.peak_mb, conc, r.mem.cost).max(r.per_game_max);
             if per > r.mem.cost.per_game_mb && Learned::raise(&eng.cfg.layout, self.lease.run.as_deref().unwrap_or(""), r.gpu, per) {
                 log::info!("lease {id}: the worker committed up to {} MB with {conc} games in flight: remembering {per} MB per game for this run", r.peak_mb);
             }
@@ -2305,29 +2469,83 @@ impl Run {
 
 /// rev 19 (PROTOCOL 13): tuning a rolling CPU job's layout inside the lease - measurements of fresh workers, layout
 /// handoffs (the main worker finishes its games beside the next one, as memory allows), and the workers that finish
-/// their games meanwhile.
+/// their games meanwhile. 13.5: the crew - several workers serving one lease, each on a closed range of its released
+/// ids but the main one (the tail, which gets the `extend`s).
 impl Run {
+    /// The next worker generation (`Ev::Worker`).
+    fn next_gen(&mut self) -> u32 {
+        self.gens += 1;
+        self.gens
+    }
+
+    /// The crew's size wanted now: the layout's workers, at most what this lease may still run; 1 without tuning.
+    fn crew_target(&self) -> u32 {
+        self.tuning.as_ref().map_or(1, |t| t.current.workers.min(t.crew_cap).max(1))
+    }
+
+    /// The workers playing new games now: the main one (unless it is finishing for a handoff, a restart or the lease's
+    /// end) and the crew's members playing their ranges.
+    fn crew_active(&self) -> usize {
+        let main_on = self.main_exit.is_none()
+            && self.tuning.as_ref().is_none_or(|t| t.handoff.is_none())
+            && self.roll.as_ref().is_none_or(|r| !r.finishing && r.restart.is_none());
+        usize::from(main_on) + self.mates.iter().filter(|m| m.active()).count()
+    }
+
+    fn crew_complete(&self) -> bool {
+        self.crew_active() >= self.crew_target() as usize
+    }
+
+    /// One worker's memory limit: its part of the job's (the layout's workers share it, PROTOCOL 13.5).
+    fn worker_limit(&self) -> u64 {
+        let n = self.tuning.as_ref().map_or(1, |t| t.current.workers.max(1)) as u64;
+        if self.lease_limit_mb == 0 {
+            0
+        } else {
+            (self.lease_limit_mb / n).max(256)
+        }
+    }
+
+    /// The crew's games in flight (an extension asks for about twice them): the main worker's for every worker wanted.
+    fn crew_conc(&self) -> u64 {
+        self.conc.unwrap_or(1) * self.crew_target() as u64
+    }
+
+    /// The main worker's own layout (its job line's tuning fields).
+    fn main_layout(&self) -> Layout {
+        let (iw, it) = self.infer.unwrap_or((1, self.threads));
+        Layout { workers: 1, threads: self.threads, infer_workers: iw, infer_threads: it, groups: self.groups.unwrap_or(1), conc: self.conc.unwrap_or(1) }
+    }
+
     /// The tray's and `ZeroFarm status`'s tuning line.
     fn show_tuning(&self, eng: &Engine) {
-        let finishing: u64 = self.drainers.iter().filter_map(|d| d.in_flight).sum();
+        let finishing: u64 = self.mates.iter().filter(|m| m.finishing).filter_map(|m| m.in_flight).sum();
         let beside = if finishing > 0 { format!(" ({finishing} games of the previous layout finishing)") } else { String::new() };
-        let line = self.tuning.as_ref().map(|t| match &t.probe {
-            Some(_) => format!("measuring {} - {}{beside}", t.current.describe(), t.entry.describe()),
-            None if t.current != t.entry.wanted(&t.space) => format!("running {} - {}{beside}", t.current.describe(), t.entry.describe()),
-            None => format!("{}{beside}", t.entry.describe()),
+        let (active, target) = (self.crew_active(), self.crew_target() as usize);
+        let building = if target > 1 && active < target { format!(" ({active} of {target} workers running)") } else { String::new() };
+        let line = self.tuning.as_ref().map(|t| {
+            if t.fixed {
+                return format!("{} (workers {} set, autotune off){building}{beside}", t.current.describe(), t.current.workers);
+            }
+            match &t.probe {
+                Some(_) => format!("measuring {} - {}{building}{beside}", t.current.describe(), t.entry.describe()),
+                None if t.current != t.entry.wanted(&t.space) => format!("running {} - {}{building}{beside}", t.current.describe(), t.entry.describe()),
+                None => format!("{}{building}{beside}", t.entry.describe()),
+            }
         });
         crate::status::set(&eng.status, |s| s.tuning = line);
     }
 
     fn save_tuning(&self, eng: &Engine) {
-        if let Some(t) = &self.tuning {
+        if let Some(t) = self.tuning.as_ref().filter(|t| !t.fixed) {
             let mut c = tune::Cache::load(&eng.cfg.layout);
             c.put(t.entry.clone());
             c.save(&eng.cfg.layout);
         }
     }
 
-    /// The main worker's `status`: a measurement's sample, or a handoff's read of where the old worker's ids stop.
+    /// The main worker's `status`: its counters (a measurement's sample, where its ids stand for the crew), or a
+    /// handoff's read of where the old worker's ids stop.
     fn tune_status(&mut self, eng: &mut Engine, s: &Stats) {
         let id = self.lease.lease_id.clone();
         let Some(t) = self.tuning.as_mut() else { return };
@@ -2339,12 +2557,36 @@ impl Run {
             return;
         }
         let (Some(leaves), Some(games), Some(started)) = (s.get("leaves").and_then(Value::as_u64), s.get("games").and_then(Value::as_u64), started) else {
-            // a worker that doesn't count its leaves and games can't be measured: not tuned this lease
+            // a worker that doesn't count its leaves and games can't be measured (nor run as a crew): not tuned this lease
             log::info!("lease {id}: the worker reports no leaves / games started: its layout isn't tuned");
             self.tuning = None;
             crate::status::set(&eng.status, |s| s.tuning = None);
             return;
         };
+        self.counters = Some((leaves, games, started));
+        self.counters_at = Some(Instant::now());
+        self.probe_sample(eng);
+    }
+
+    /// A measurement's sample: the crew's counters summed (the main worker's and every member's playing its range); one
+    /// that left the crew discards it.
+    fn probe_sample(&mut self, eng: &mut Engine) {
+        if self.tuning.as_ref().is_none_or(|t| t.probe.is_none()) {
+            return;
+        }
+        let mut members = vec![self.wgen];
+        let (mut leaves, mut games, mut started) = self.counters.unwrap_or((0, 0, 0));
+        for m in self.mates.iter().filter(|m| m.active()) {
+            members.push(m.wgen);
+            if let Some((l, g, s)) = m.counters {
+                (leaves, games, started) = (leaves + l, games + g, started + s);
+            }
+        }
+        let t = self.tuning.as_mut().expect("checked");
+        if t.probe_members.iter().any(|w| !members.contains(w)) {
+            return self.end_probe(eng, Err("a worker of the crew left during the trial".into()));
+        }
+        t.probe_members = members;
         let Some((probe, since)) = t.probe.as_mut() else { return };
         match probe.sample(since.elapsed().as_secs_f64(), leaves, games, started) {
             Verdict::Pending => {}
@@ -2361,6 +2603,7 @@ impl Run {
         if t.probe.take().is_none() {
             return;
         }
+        t.probe_members.clear();
         let now = zerofarm_common::now_unix();
         let l = t.current;
         match r {
@@ -2391,7 +2634,7 @@ impl Run {
             return;
         }
         let (idle_ms, total_ms) = crate::worker::sys_cpu_ms();
-        let ours_ms = self.worker.cpu_ms() + self.drainers.iter().map(|d| d.worker.cpu_ms()).sum::<u64>();
+        let ours_ms = self.worker.cpu_ms() + self.mates.iter().map(|d| d.worker.cpu_ms()).sum::<u64>();
         let now = LoadMark { idle_ms, total_ms, ours_ms };
         let tu = self.tuning.as_mut().expect("checked");
         if let Some((_, prev)) = tu.load {
@@ -2402,7 +2645,7 @@ impl Run {
 
     /// Each tick: a measurement holds only while a trial may run (else it is discarded); a handoff goes on; else the
     /// next layout to measure (when a trial may run) or the incumbent (when the main worker runs another) is handed
-    /// over to.
+    /// over to. A fixed layout (`autotune` off) runs no trial.
     fn tune_tick(&mut self, eng: &mut Engine, t: &crate::Timings, must_pause: bool) {
         if self.tuning.is_none() {
             return;
@@ -2431,9 +2674,15 @@ impl Run {
                 Some(w) => self.end_probe(eng, Err(w)),
                 None => {
                     let tu = self.tuning.as_mut().expect("checked");
-                    if self.job_sent && tu.last_ping.elapsed() >= t.tune_ping {
+                    if tu.last_ping.elapsed() >= t.tune_ping {
                         tu.last_ping = Instant::now();
-                        self.send(json!({"op": "ping"}));
+                        // (every worker the measurement counts: their counters are summed)
+                        if self.job_sent {
+                            self.send(json!({"op": "ping"}));
+                        }
+                        for m in self.mates.iter_mut().filter(|m| m.active() && m.job_sent && !m.worker.is_suspended()) {
+                            let _ = m.worker.send(&json!({"op": "ping"}));
+                        }
                     }
                 }
             }
@@ -2452,9 +2701,16 @@ impl Run {
             self.handoff_tick(eng, t, strict);
             return;
         }
+        if self.tuning.as_ref().is_some_and(|x| x.fixed) {
+            return;
+        }
         let running = matches!(self.state, WState::Running) && self.job_sent && self.after.is_none() && !eng.quitting();
-        // (a worker runs a while before it is replaced; at most MAX_DRAINERS finish their games beside it)
-        if !running || !rolling_ok || self.drainers.len() >= MAX_DRAINERS || self.started.elapsed() < t.tune_warm {
+        // (a worker runs a while before it is replaced; at most MAX_DRAINERS per worker finish their games beside the
+        // crew; a crew is handed over only once it is complete and settled)
+        let finishing = self.mates.iter().filter(|m| m.finishing).count();
+        let target = self.crew_target() as usize;
+        let settled = self.crew_complete() && self.crew_changed.elapsed() >= t.tune_warm;
+        if !running || !rolling_ok || finishing >= MAX_DRAINERS * target || self.started.elapsed() < t.tune_warm || !settled {
             return;
         }
         let tu = self.tuning.as_ref().expect("checked");
@@ -2468,8 +2724,9 @@ impl Run {
         self.start_handoff(eng, target, measure);
     }
 
-    /// A layout handoff starts: the main worker starts no new game (`finish`); once it says where its ids stop, the
-    /// next worker starts beside it with the rest (as memory allows; else after it ended).
+    /// A layout handoff starts: the main worker - and every member of the crew - starts no new game (`finish`); once
+    /// the main worker says where its ids stop, the next worker starts beside it with the rest (as memory allows; else
+    /// after it ended); the members' unstarted ids go to the spare ranges as they say where theirs stop.
     fn start_handoff(&mut self, eng: &Engine, next: Layout, measure: bool) {
         let line = format!("handing the job over to {} ({})", next.describe(), if measure { "a measured trial" } else { "the incumbent, not measured" });
         log::info!("lease {}: {line}", self.lease.lease_id);
@@ -2478,13 +2735,27 @@ impl Run {
         if let Some(r) = self.roll.as_mut() {
             r.want_more = false;
         }
+        let mut spare = Vec::new();
+        for m in self.mates.iter_mut().filter(|m| m.active()) {
+            m.finishing = true;
+            if m.job_sent {
+                let _ = m.worker.send(&json!({"op": "finish"}));
+                m.reclaim = Some(Reclaim { since: Instant::now(), reads: Vec::new(), last_ping: None });
+            } else {
+                // (no job yet: none of its ids started)
+                let _ = m.worker.send(&json!({"op": "quit"}));
+                spare.push((m.offset, m.end));
+            }
+        }
+        self.spare.extend(spare);
+        self.crew_changed = Instant::now();
         let tu = self.tuning.as_mut().expect("tuning");
         tu.handoff = Some(Handoff { next, measure, since: Instant::now(), reads: Vec::new(), last_ping: None });
     }
 
     /// A handoff waits for the old worker's id count (two equal reads after `finish`, else after `10 x tune_settle` the
-    /// next worker takes fresh ids), then for room: the old worker and the drainers' memory plus the next worker's plan
-    /// within `PLAN_SHARE` of the job's limit.
+    /// next worker takes fresh ids), then for room: every worker's memory plus the next worker's plan (a measured
+    /// crew's: every one of its workers') within `PLAN_SHARE` of the job's limit.
     fn handoff_tick(&mut self, eng: &mut Engine, t: &crate::Timings, strict: bool) {
         let tu = self.tuning.as_mut().expect("tuning");
         let wanted = tu.entry.wanted(&tu.space);
@@ -2510,13 +2781,15 @@ impl Run {
         } else {
             return;
         };
-        let limit = self.worker.mem_limit_mb;
+        let limit = self.lease_limit_mb;
         let Some(cost) = self.roll.as_ref().map(|r| r.mem.cost) else { return };
         let mut held = self.worker.commit_mb().unwrap_or(0);
-        for d in &mut self.drainers {
+        for d in &mut self.mates {
             held += d.worker.commit_mb().unwrap_or(0);
         }
-        let plan_mb = cost.base_mb + h.next.conc * cost.per_game_mb;
+        // (a measured crew starts together: room for all of it; otherwise its workers join as memory allows)
+        let workers = if h.measure { h.next.workers.max(1) as u64 } else { 1 };
+        let plan_mb = workers * (cost.base_mb + h.next.conc * cost.per_game_mb);
         if limit > 0 && (held + plan_mb) as f64 > limit as f64 * crate::rolling::PLAN_SHARE {
             // (no room yet: the old worker finishes its games, and the next one starts after it)
             return;
@@ -2524,9 +2797,10 @@ impl Run {
         self.spawn_beside(eng, h.next, h.measure, tail);
     }
 
-    /// The next worker of a handoff starts beside the old one, which becomes a drainer (stopped while the next one is
+    /// The next worker of a handoff starts beside the old one, which becomes a drainer (stopped while the next crew is
     /// measured). Its ids: the old worker's unstarted tail and on (`started`: the old worker's games started, from
-    /// its own first id), else fresh ids after the released ones.
+    /// its own first id), else fresh ids after the released ones. `next` is the whole layout (a crew's other workers
+    /// join as `add_member` allows).
     fn spawn_beside(&mut self, eng: &mut Engine, next: Layout, measure: bool, started: Option<u64>) {
         let id = self.lease.lease_id.clone();
         let Some((lo, released, offset)) = self.roll.as_ref().map(|r| (r.setup.lo, r.released, r.offset)) else { return };
@@ -2539,8 +2813,9 @@ impl Run {
             }
             return;
         }
-        let gen = self.wgen + 1;
-        let w = match self.spawn.spawn(gen, self.tx.clone()) {
+        let gen = self.next_gen();
+        let limit = if self.lease_limit_mb == 0 { 0 } else { (self.lease_limit_mb / next.workers.max(1) as u64).max(256) };
+        let w = match self.spawn.spawn(gen, self.tx.clone(), limit) {
             Ok(w) => w,
             Err(e) => {
                 // (the old worker finishes its games; the lease ends with it)
@@ -2552,42 +2827,54 @@ impl Run {
             }
         };
         log::info!(
-            "lease {id}: worker pid {} started with layout {} (ids from {}{}); pid {} finishes its games beside it",
+            "lease {id}: worker pid {} started with layout {} (ids from {}{}, memory limit {limit} MB); pid {} finishes its games beside it",
             w.pid,
             next.describe(),
             first,
             if started.is_none() { ", fresh: the old worker's id count is unknown" } else { "" },
             self.worker.pid
         );
-        self.wgen = gen;
+        let old_layout = self.main_layout();
+        let old_gen = std::mem::replace(&mut self.wgen, gen);
         self.spawns += 1;
         let old = std::mem::replace(&mut self.worker, w);
         let old_dir = std::mem::replace(&mut self.out_dir, dir);
-        let mut d = Drainer {
+        let (old_offset, old_peak) = self.roll.as_ref().map_or((0, 0), |r| (r.offset, r.peak_mb));
+        self.mates.push(Mate {
             worker: old,
-            wgen: gen - 1,
+            wgen: old_gen,
             out_dir: old_dir,
             end_ev: self.end_ev.take(),
             eof: std::mem::take(&mut self.eof),
             last_msg: Instant::now(),
             in_flight: None,
             tail: started.map(|_| first),
-        };
-        if measure {
-            d.worker.suspend();
-        }
-        self.drainers.push(d);
+            finishing: true,
+            offset: old_offset,
+            end: first - lo,
+            layout: old_layout,
+            job_sent: true,
+            spawned: self.started,
+            pinged: false,
+            pinged_at: None,
+            counters: self.counters.take(),
+            reclaim: None,
+            gen_floor: self.gen_floor,
+            peak_mb: old_peak,
+            fatal: None,
+        });
         if let Some(r) = self.roll.as_mut() {
             r.offset = first - lo;
             r.want_more = false;
             r.next_extend = Instant::now();
             r.peak_mb = 0;
         }
-        self.conc = Some(next.conc);
-        self.groups = Some(next.groups);
-        self.threads = next.threads;
-        self.infer = Some((next.infer_workers, next.infer_threads));
-        self.batch_rows = next.batch();
+        let per = next.per_worker();
+        self.conc = Some(per.conc);
+        self.groups = Some(per.groups);
+        self.threads = per.threads;
+        self.infer = Some((per.infer_workers, per.infer_threads));
+        self.batch_rows = per.batch();
         self.state = WState::Starting;
         self.started = Instant::now();
         self.last_msg = Instant::now();
@@ -2595,6 +2882,8 @@ impl Run {
         self.job_sent = false;
         self.killed = false;
         self.stall_since = None;
+        self.counters_at = None;
+        self.crew_changed = Instant::now();
         self.mark = CpuMark::take(&self.worker);
         self.sample = (self.mark, Instant::now());
         let (warm, window) = (eng.cfg.timings.tune_warm.as_secs_f64(), eng.cfg.timings.tune_window.as_secs_f64());
@@ -2605,7 +2894,8 @@ impl Run {
             if next == t.entry.wanted(&t.space) {
                 t.revert_due = false;
             }
-            t.probe = measure.then(|| (Probe::new(next.conc, t.entry.phase, warm, window), Instant::now()));
+            t.probe = measure.then(|| (Probe::new(next.total_conc(), t.entry.phase, warm, window), Instant::now()));
+            t.probe_members.clear();
         }
         self.show_tuning(eng);
     }
@@ -2619,123 +2909,325 @@ impl Run {
         }
     }
 
-    /// A line of a worker finishing its games after a handoff: its games and results count as any; nothing else is
-    /// asked of it.
-    fn on_drainer(&mut self, eng: &mut Engine, g: u32, m: WorkerMsg) {
-        let Some(i) = self.drainers.iter().position(|d| d.wgen == g) else { return };
+    /// A line of a worker beside the main one: a crew member gets its job line at `hello`, its counters feed a
+    /// measurement; a finishing one's games and results count as any, and after `finish` its counters say where its ids
+    /// stop.
+    fn on_mate(&mut self, eng: &mut Engine, g: u32, m: WorkerMsg) {
+        let Some(i) = self.mates.iter().position(|d| d.wgen == g) else { return };
         let v = match m {
             WorkerMsg::Eof => {
-                self.drainers[i].eof = true;
+                self.mates[i].eof = true;
                 return;
             }
             WorkerMsg::BadLine(s) => {
-                log::warn!("lease {}: a worker finishing its games wrote a non-JSON line: {s}", self.id());
+                log::warn!("lease {}: worker pid {} wrote a non-JSON line: {s}", self.id(), self.mates[i].worker.pid);
                 return;
             }
             WorkerMsg::Line(v) => v,
         };
-        self.drainers[i].last_msg = Instant::now();
+        self.mates[i].last_msg = Instant::now();
+        self.mates[i].pinged = false;
+        let settle = eng.cfg.timings.tune_settle;
         match v.get("ev").and_then(Value::as_str).unwrap_or("") {
+            "hello" if !self.mates[i].job_sent => {
+                let aw = v.get("aw").and_then(Value::as_u64);
+                let bid = v.get("build_id").and_then(Value::as_str).unwrap_or("");
+                let rolling = v.get("features").and_then(Value::as_array).is_some_and(|f| f.iter().any(|x| x.as_str() == Some(crate::rolling::WORKER_FEATURE)));
+                if aw != Some(zerofarm_common::AW_VERSION as u64) || bid != self.prep.build.build_id || !rolling {
+                    let m = &mut self.mates[i];
+                    log::error!("lease {}: worker pid {} says aw {aw:?}, build {bid}, rolling {rolling}: not a member of this crew", self.lease.lease_id, m.worker.pid);
+                    m.fatal = Some(format!("worker says aw {aw:?}, build {bid}"));
+                    m.worker.kill();
+                    return;
+                }
+                if self.mates[i].finishing {
+                    // (handed off before its job: none of its ids started)
+                    let _ = self.mates[i].worker.send(&json!({"op": "quit"}));
+                    return;
+                }
+                let m = &self.mates[i];
+                let l = m.layout;
+                let line = self.job_line_with(l.threads, Some(l.conc), Some(l.groups), Some((l.infer_workers, l.infer_threads)), &m.out_dir, Some((m.offset, m.end - m.offset)));
+                let m = &mut self.mates[i];
+                if let Err(e) = m.worker.send(&line) {
+                    log::warn!("lease {}: write to worker pid {} failed: {e}", self.lease.lease_id, m.worker.pid);
+                }
+                m.job_sent = true;
+            }
             "fin" => {
                 let n = v.get("n").and_then(Value::as_u64).unwrap_or(0);
                 self.games_done += n;
                 eng.add_games(n);
             }
             k @ ("shard" | "records" | "evals") => {
-                let dir = self.drainers[i].out_dir.clone();
-                self.on_result_file(eng, k, &v, &dir);
+                let (dir, floor) = (self.mates[i].out_dir.clone(), self.mates[i].gen_floor);
+                let floor = self.on_result_file(eng, k, &v, &dir, floor);
+                self.mates[i].gen_floor = floor;
             }
             "status" => {
                 let s = v.get("stats");
                 let n = |k: &str| s.and_then(|s| s.get(k)).and_then(Value::as_u64);
+                let m = &mut self.mates[i];
                 if let (Some(st), Some(g)) = (n("games_started"), n("games")) {
-                    self.drainers[i].in_flight = Some(st.saturating_sub(g));
+                    m.in_flight = Some(st.saturating_sub(g));
+                }
+                if let (Some(rc), Some(st)) = (m.reclaim.as_mut(), n("games_started")) {
+                    if rc.since.elapsed() >= settle {
+                        rc.reads.push(st);
+                    }
+                }
+                if let (Some(l), Some(g), Some(st)) = (n("leaves"), n("games"), n("games_started")) {
+                    m.counters = Some((l, g, st));
+                }
+                if m.active() {
+                    self.probe_sample(eng);
                 }
             }
-            "end" => self.drainers[i].end_ev = Some(v),
+            "selftest" => {
+                let gen = v.get("gen").and_then(Value::as_u64).or_else(|| self.prep.ckpt.as_ref().map(|(c, _)| c.gen));
+                let ok = v.get("ok").and_then(Value::as_bool).unwrap_or(false);
+                let mut t = Map::new();
+                for k in ["provider", "max_abs", "ok"] {
+                    t.insert(k.into(), v.get(k).cloned().unwrap_or(Value::Null));
+                }
+                self.selftests.insert(gen.map(|g| g.to_string()).unwrap_or_else(|| "model".into()), Value::Object(t));
+                if !ok {
+                    log::error!("lease {}: network {gen:?} failed its self-test in worker pid {}: {v}", self.id(), self.mates[i].worker.pid);
+                    self.selftest_failed = true;
+                }
+            }
+            "end" => self.mates[i].end_ev = Some(v),
             "error" if v.get("fatal").and_then(Value::as_bool) == Some(true) => {
-                log::warn!("lease {}: a worker finishing its games failed: {}", self.id(), v.get("message").and_then(Value::as_str).unwrap_or(""));
+                let msg = v.get("message").and_then(Value::as_str).unwrap_or("").to_string();
+                log::warn!("lease {}: worker pid {} failed: {msg}", self.id(), self.mates[i].worker.pid);
+                self.mates[i].fatal = Some(msg);
             }
             _ => {}
         }
     }
 
-    /// Drainers that exited: their last lines, then gone (the next worker's ids were taken from their unstarted tail:
-    /// checked against their `end`).
-    fn reap_drainers(&mut self, eng: &mut Engine) {
+    /// Workers beside the main one that exited: their last lines, then gone. A finishing one ended as expected (the next
+    /// worker's ids were taken from its unstarted tail: checked against its `end`; one that ended before it said where
+    /// its ids stop gives its unstarted ids to the spare ranges); a crew member that exited while playing its range
+    /// failed (`mate_failed`).
+    fn reap_mates(&mut self, eng: &mut Engine) {
         let mut i = 0;
-        while i < self.drainers.len() {
-            let Some(code) = self.drainers[i].worker.try_wait() else {
+        while i < self.mates.len() {
+            let Some(code) = self.mates[i].worker.try_wait() else {
                 i += 1;
                 continue;
             };
             let until = Instant::now() + Duration::from_secs(2);
-            while !self.drainers[i].eof && Instant::now() < until {
+            while !self.mates[i].eof && Instant::now() < until {
                 if let Ok(ev) = self.rx.recv_timeout(Duration::from_millis(50)) {
                     self.on_event(eng, ev);
                 }
             }
-            let d = self.drainers.remove(i);
+            let d = self.mates.remove(i);
+            let lo = self.roll.as_ref().map_or(0, |r| r.setup.lo);
             let reason = d.end_ev.as_ref().and_then(|e| e.get("reason")).and_then(Value::as_str).map(String::from);
-            log::info!(
-                "lease {}: worker pid {} of the previous layout ended ({})",
-                self.id(),
-                d.worker.pid,
-                reason.unwrap_or_else(|| format!("exit code {code}, its games in flight lost"))
-            );
-            // where its unstarted ids really began (its `end`: the released ids it never finished, its tail last)
-            let real = d.end_ev.as_ref().and_then(|e| e.get("unfinished")).and_then(|u| u.get("gids")).map(crate::util::parse_ranges).and_then(|g| g.last().map(|r| r.0));
-            if let (Some(est), Some(real)) = (d.tail, real) {
-                if est != real {
-                    log::warn!("lease {}: the next worker's ids started at {est}, the old worker's unstarted ones at {real}", self.id());
+            if d.finishing || reason.is_some() {
+                log::info!(
+                    "lease {}: worker pid {} {} ended ({})",
+                    self.id(),
+                    d.worker.pid,
+                    if d.finishing { "finishing its games" } else { "of the crew" },
+                    reason.clone().unwrap_or_else(|| format!("exit code {code}, its games in flight lost"))
+                );
+                // (one that died finishing its games - not told to quit - failed: reported once per lease)
+                let stopping = matches!(self.state, WState::Stopping(_)) || self.after.is_some() || eng.quitting();
+                if reason.is_none() && !stopping && !self.crash_reported {
+                    self.crash_reported = true;
+                    let tail = d.worker.stderr_tail();
+                    let kind = if tail.contains("panicked at") { "panic" } else { "crash" };
+                    let why = d.fatal.clone().unwrap_or_else(|| format!("exit code {code} without `end`"));
+                    self.report_with(eng, kind, &format!("worker finishing its games failed: {why}; its games in flight are lost"), &tail, Some(code as i64));
                 }
+                // where its unstarted ids really began (its `end`: the released ids it never finished, its tail last)
+                let gids = d.end_ev.as_ref().and_then(|e| e.get("unfinished")).and_then(|u| u.get("gids")).map(crate::util::parse_ranges);
+                let real = gids.as_ref().and_then(|g| g.last().map(|r| r.0));
+                if let (Some(est), Some(real)) = (d.tail, real) {
+                    if est != real {
+                        log::warn!("lease {}: the next worker's ids started at {est}, the old worker's unstarted ones at {real}", self.id());
+                    }
+                }
+                // (its ids not read yet: a `finish` end's unfinished ids were never started - they are spare)
+                if let (Some(_), Some("finish"), Some(g)) = (&d.reclaim, reason.as_deref(), gids) {
+                    for (a, b) in g {
+                        let (a, b) = (a.saturating_sub(lo).max(d.offset), b.saturating_sub(lo).min(d.end));
+                        if a < b {
+                            self.spare.push((a, b));
+                        }
+                    }
+                }
+            } else {
+                self.mate_failed(eng, d, code);
             }
+            self.crew_changed = Instant::now();
             if let Some(t) = self.tuning.as_mut() {
                 t.load = None;
+            }
+            self.show_tuning(eng);
+        }
+    }
+
+    /// rev 19 (PROTOCOL 13.5): a crew member exited while playing its range: its games in flight are lost (its ids go
+    /// back with `done`'s worked-out unfinished ids). One that ran into its memory limit shrinks the next members (the
+    /// cost per game remembered); any other failure is reported once per lease. A replacement joins (as `add_member`
+    /// allows) while restarts are left; then the crew runs smaller.
+    fn mate_failed(&mut self, eng: &mut Engine, d: Mate, code: i32) {
+        let id = self.lease.lease_id.clone();
+        let stopping = matches!(self.state, WState::Stopping(_)) || self.after.is_some() || eng.quitting();
+        let limit = d.worker.mem_limit_mb;
+        let peak = d.worker.job_peak_mb().unwrap_or(0).max(d.peak_mb);
+        let tail = d.worker.stderr_tail();
+        let why = d.fatal.clone().unwrap_or_else(|| format!("exit code {code} without `end`"));
+        let hit = (limit > 0 && peak as f64 >= limit as f64 * crate::rolling::HIT_SHARE) || alloc_failure(&why) || alloc_failure(&tail);
+        log::warn!("lease {id}: worker pid {} of the crew failed ({why}); its games in flight are lost", d.worker.pid);
+        let Some(r) = self.roll.as_mut().filter(|r| !r.finishing && !stopping) else { return };
+        let others = self.mates.iter().filter(|m| m.active()).count() + 1;
+        let restart_left = r.restarts < crate::rolling::MAX_RESTARTS && !self.selftest_failed;
+        if hit {
+            let per = crate::rolling::measured_per_game(peak.max(limit), d.layout.conc, r.mem.cost);
+            if Learned::raise(&eng.cfg.layout, self.lease.run.as_deref().unwrap_or(""), r.gpu, per) {
+                log::info!("lease {id}: remembering {per} MB per game in flight for this run");
+            }
+            let cost = crate::rolling::MemCost { per_game_mb: r.mem.cost.per_game_mb.max(per), ..r.mem.cost };
+            match crate::rolling::restart_games(d.layout.conc, limit, cost).filter(|_| restart_left) {
+                Some(n) => {
+                    r.restarts += 1;
+                    self.shrink_members(n);
+                }
+                None => self.cap_crew(others as u32),
+            }
+            if !self.crash_reported {
+                self.crash_reported = true;
+                let msg = format!("crew worker ran into its {limit} MB memory limit (peak {peak} MB) with {} games in flight: {why}", d.layout.conc);
+                self.report_with(eng, "crash", &msg, &tail, Some(code as i64));
+            }
+        } else {
+            if restart_left {
+                r.restarts += 1;
+            } else {
+                self.cap_crew(others as u32);
+            }
+            if !self.crash_reported {
+                self.crash_reported = true;
+                let kind = if tail.contains("panicked at") { "panic" } else { "crash" };
+                self.report_with(eng, kind, &format!("crew worker failed: {why}; the other workers go on"), &tail, Some(code as i64));
             }
         }
     }
 
-    /// Drainers are stopped while work is paused and while the main worker is measured, and killed when silent too long.
-    fn drainers_tick(&mut self, t: &crate::Timings, must_pause: bool) {
-        let stop = must_pause || self.tuning.as_ref().is_some_and(|x| x.probe.is_some());
+    /// A crash report with another worker's stderr (a crew member's).
+    fn report_with(&self, eng: &Engine, kind: &str, message: &str, tail: &str, exit_code: Option<i64>) {
+        eng.report_crash(CrashReq {
+            build_id: Some(self.lease.build.build_id.clone()),
+            kind: kind.into(),
+            message: format!("{message}{}", self.selftest_note()),
+            backtrace: Some(tail.to_string()).filter(|s| !s.is_empty()),
+            lease_id: Some(self.lease.lease_id.clone()),
+            exit_code,
+            agent: None,
+            os_error: None,
+        });
+    }
+
+    /// The crew's next members run `n` games in flight each (a memory failure): the layouts of this lease keep within it.
+    fn shrink_members(&mut self, n: u64) {
+        if let Some(t) = self.tuning.as_mut() {
+            t.current.conc = t.current.conc.min(n).max(1);
+            t.space.conc_max = t.space.conc_max.min(t.current.total_conc());
+            t.space.conc_min = t.space.conc_min.min(t.space.conc_max);
+            log::info!("lease {}: the crew's next workers run {} games in flight each", self.lease.lease_id, t.current.conc);
+        }
+    }
+
+    /// The crew runs at most `n` workers for the rest of the lease (a member failed with no restart left).
+    fn cap_crew(&mut self, n: u32) {
+        if let Some(t) = self.tuning.as_mut() {
+            t.crew_cap = t.crew_cap.min(n.max(1));
+            log::warn!("lease {}: no restart left: the crew runs at most {} workers", self.lease.lease_id, t.crew_cap);
+        }
+    }
+
+    /// rev 19 (PROTOCOL 13.5): the main worker failed (not of memory: a fatal error or an exit without `end`) while
+    /// crew members play their ranges: it is replaced (a new tail after every released id; its games in flight lost),
+    /// reported once per lease, and the others go on. -> true when a restart is due (else the lease fails as before).
+    fn crew_crash(&mut self, eng: &Engine, why: &str, code: Option<i64>) -> bool {
+        let stopping = matches!(self.state, WState::Stopping(_)) || self.after.is_some() || eng.quitting();
+        let crew = self.mates.iter().any(|m| m.active());
+        let layout = self.tuning.as_ref().map_or(self.main_layout(), |t| t.current);
+        let selftest_failed = self.selftest_failed;
+        let Some(r) = self.roll.as_mut().filter(|r| r.active && !r.finishing && r.restart.is_none()) else { return false };
+        if !crew || stopping || selftest_failed || r.restarts >= crate::rolling::MAX_RESTARTS {
+            return false;
+        }
+        r.restart = Some(Restart { conc: layout.conc, burn: true, layout: Some(layout), count: true, measure: false });
+        log::warn!("lease {}: the crew's main worker failed ({why}); starting another, the others go on", self.lease.lease_id);
+        if !self.crash_reported {
+            let kind = if self.worker.stderr_tail().contains("panicked at") { "panic" } else { "crash" };
+            self.report(eng, kind, &format!("crew main worker failed: {why}; replaced (the other workers go on)"), code);
+        }
+        true
+    }
+
+    /// Workers beside the main one are stopped while work is paused (all of them, with the main worker) and the finishing
+    /// ones while the next crew is measured; any is killed when silent too long (or with no `hello` in time); a crew
+    /// member silent past `ping_after` is pinged.
+    fn mates_tick(&mut self, t: &crate::Timings, must_pause: bool) {
+        let measuring = self.tuning.as_ref().is_some_and(|x| x.probe.is_some()) && self.crew_complete();
         let id = self.lease.lease_id.clone();
-        for d in &mut self.drainers {
+        for d in &mut self.mates {
+            let stop = must_pause || (d.finishing && measuring);
             if stop && !d.worker.is_suspended() {
                 d.worker.suspend();
             } else if !stop && d.worker.is_suspended() {
                 d.worker.resume();
                 d.last_msg = Instant::now();
             }
-            if !d.worker.is_suspended() && d.last_msg.elapsed() > t.hang_after {
-                log::warn!("lease {id}: a worker finishing its games was silent for {} s: killing it", d.last_msg.elapsed().as_secs());
+            if d.worker.is_suspended() {
+                continue;
+            }
+            let quiet = d.last_msg.elapsed();
+            if !d.job_sent && !d.finishing && d.spawned.elapsed() > t.hello {
+                log::warn!("lease {id}: worker pid {} sent no hello within {} s: killing it", d.worker.pid, t.hello.as_secs());
+                d.fatal = Some(format!("no hello within {} s", t.hello.as_secs()));
+                d.worker.kill();
+            } else if quiet > t.hang_after {
+                log::warn!("lease {id}: worker pid {} was silent for {} s: killing it", d.worker.pid, quiet.as_secs());
+                d.fatal.get_or_insert_with(|| format!("silent for {} s", quiet.as_secs()));
                 d.worker.kill();
                 d.last_msg = Instant::now();
+            } else if d.active() && d.job_sent && quiet > t.ping_after && !d.pinged {
+                d.pinged = true;
+                let _ = d.worker.send(&json!({"op": "ping"}));
             }
         }
     }
 
-    /// Every drainer is told to quit (finished games flushed, then `end`), once.
-    fn quit_drainers(&mut self) {
-        for d in &mut self.drainers {
+    /// Every worker beside the main one is told to quit (finished games flushed, then `end`), once.
+    fn quit_mates(&mut self) {
+        for d in &mut self.mates {
             if d.worker.is_suspended() {
                 d.worker.resume();
             }
             if d.end_ev.is_none() {
                 let _ = d.worker.send(&json!({"op": "quit"}));
             }
+            d.finishing = true;
             d.last_msg = Instant::now();
         }
     }
 
-    /// The main worker is gone and drainers still finish their games: beats, pauses, quits and the slack as for any
-    /// lease.
+    /// The main worker is gone and workers beside it still finish their games (or play the rest of their ranges):
+    /// beats, pauses, quits and the slack as for any lease.
     fn wind_down(&mut self, eng: &mut Engine) {
         let t = eng.cfg.timings.clone();
         eng.maybe_send_saved_crashes();
         if eng.quitting() && !matches!(self.after, Some(After::Quit)) {
             self.after = Some(After::Quit);
-            self.quit_drainers();
+            self.quit_mates();
         }
         let d = eng.decide(None);
         let pause = !d.work;
@@ -2744,13 +3236,347 @@ impl Run {
             if since.elapsed() > Duration::from_secs(self.lease.slack_s) && self.after.is_none() {
                 log::info!("lease {}: paused longer than slack ({} s); giving it back", self.id(), self.lease.slack_s);
                 self.after = Some(After::GiveBack("paused longer than slack".into()));
-                self.quit_drainers();
+                self.quit_mates();
             }
         } else {
             self.stall_since = None;
         }
-        self.drainers_tick(&t, pause && self.after.is_none());
+        self.mates_tick(&t, pause && self.after.is_none());
+        self.retire_mates(eng, &t);
         self.maybe_beat(eng, pause);
+    }
+
+    /// rev 19 (PROTOCOL 13.5), each tick: the finishing workers' reads, the members that started all of their ids
+    /// retired, the crew's memory, and a new member when the crew is short of the layout's workers.
+    fn crew_tick(&mut self, eng: &mut Engine, t: &crate::Timings, must_pause: bool) {
+        self.reclaim_tick(t);
+        self.retire_mates(eng, t);
+        if self.tuning.is_none() || self.mates.is_empty() && self.crew_target() <= 1 {
+            return;
+        }
+        self.crew_mem_check(eng);
+        self.add_member(eng, t, must_pause);
+    }
+
+    /// A worker told `finish` early (a handoff, its memory) is pinged until two of its `games_started` agree: the ids
+    /// of its range from there were never started and go to the spare ranges (none read within `10 x tune_settle`: they
+    /// go back with the lease's unfinished ids).
+    fn reclaim_tick(&mut self, t: &crate::Timings) {
+        let id = self.lease.lease_id.clone();
+        let mut spare = Vec::new();
+        for m in &mut self.mates {
+            let Some(rc) = m.reclaim.as_mut() else { continue };
+            if m.worker.is_suspended() {
+                // (a stopped worker answers nothing: the reads start again once it runs)
+                rc.since = Instant::now();
+                rc.reads.clear();
+                continue;
+            }
+            if rc.since.elapsed() < t.tune_settle {
+                continue;
+            }
+            if rc.last_ping.is_none_or(|p| p.elapsed() >= t.tune_settle) {
+                rc.last_ping = Some(Instant::now());
+                let _ = m.worker.send(&json!({"op": "ping"}));
+            }
+            let n = rc.reads.len();
+            if n >= 2 && rc.reads[n - 1] == rc.reads[n - 2] {
+                let first = (m.offset + rc.reads[n - 1]).min(m.end);
+                if first < m.end {
+                    log::info!("lease {id}: worker pid {} never started ids [{first}, {}) of its range (relative): spare for the next workers", m.worker.pid, m.end);
+                    spare.push((first, m.end));
+                }
+                m.reclaim = None;
+            } else if rc.since.elapsed() > t.tune_settle * 10 {
+                log::info!("lease {id}: worker pid {} didn't say where its ids stop: its unstarted ids go back with the lease", m.worker.pid);
+                m.reclaim = None;
+            }
+        }
+        self.spare.extend(spare);
+    }
+
+    /// Crew members that started every id of their range finish their games (`finish`); the crew is refilled by
+    /// `add_member`. Near the end of its range a member is pinged for fresh counters.
+    fn retire_mates(&mut self, eng: &Engine, t: &crate::Timings) {
+        let id = self.lease.lease_id.clone();
+        let mut changed = false;
+        for m in self.mates.iter_mut().filter(|m| m.active() && m.job_sent) {
+            let Some((_, _, started)) = m.counters else { continue };
+            let len = m.end - m.offset;
+            if started >= len {
+                let _ = m.worker.send(&json!({"op": "finish"}));
+                m.finishing = true;
+                changed = true;
+                let line = format!("worker pid {} started every id of its range ({len} games from its first): it finishes its games, a new worker takes its place", m.worker.pid);
+                log::info!("lease {id}: {line}");
+                eng.worker_log.write_line(&format!("crew [{id}]: {line}"));
+            } else if len - started < m.layout.conc.max(1) && !m.worker.is_suspended() && m.pinged_at.is_none_or(|p| p.elapsed() >= t.tune_ping) {
+                m.pinged_at = Some(Instant::now());
+                let _ = m.worker.send(&json!({"op": "ping"}));
+            }
+        }
+        if changed {
+            self.crew_changed = Instant::now();
+            self.show_tuning(eng);
+        }
+    }
+
+    /// The crew's memory (PROTOCOL 13.5): each member within its part of the job's limit (`HIGH_SHARE` of it: it
+    /// finishes its games, the next members run fewer), and all of them within the job's limit (at `HIGH_SHARE`, with
+    /// nothing finishing to free memory, the biggest gives way the same way).
+    fn crew_mem_check(&mut self, eng: &Engine) {
+        if self.tuning.as_ref().is_some_and(|t| t.handoff.is_some()) || self.after.is_some() {
+            return;
+        }
+        let Some(cost) = self.roll.as_ref().filter(|r| r.active && !r.finishing && r.restart.is_none()).map(|r| r.mem.cost) else { return };
+        let main_mb = self.worker.commit_mb().unwrap_or(0);
+        let mut sum = main_mb;
+        let mut high = None;
+        let mut biggest: Option<(usize, u64)> = None;
+        let mut per_max = 0;
+        for (i, m) in self.mates.iter_mut().enumerate() {
+            let Some(c) = m.worker.commit_mb() else { continue };
+            m.peak_mb = m.peak_mb.max(c);
+            sum += c;
+            if !m.active() || !m.job_sent {
+                continue;
+            }
+            per_max = per_max.max(crate::rolling::measured_per_game(c, m.layout.conc, cost));
+            let lim = m.worker.mem_limit_mb;
+            if high.is_none() && lim > 0 && c as f64 >= lim as f64 * crate::rolling::HIGH_SHARE {
+                high = Some((i, c));
+            }
+            if biggest.is_none_or(|(_, b)| c > b) {
+                biggest = Some((i, c));
+            }
+        }
+        if let Some(r) = self.roll.as_mut() {
+            r.per_game_max = r.per_game_max.max(per_max);
+        }
+        if let Some((i, c)) = high {
+            return self.mate_memory_high(eng, i, c);
+        }
+        let limit = self.lease_limit_mb;
+        if biggest.is_none() || limit == 0 || self.mates.iter().any(|m| m.finishing) || (sum as f64) < limit as f64 * crate::rolling::HIGH_SHARE {
+            return;
+        }
+        log::warn!("lease {}: the crew commits {sum} MB of the job's {limit} MB limit", self.lease.lease_id);
+        match biggest {
+            Some((i, c)) if c >= main_mb => self.mate_memory_high(eng, i, c),
+            _ if matches!(self.state, WState::Running | WState::Resuming(_)) => self.primary_memory_high(eng, main_mb),
+            _ => {}
+        }
+    }
+
+    /// A crew member near its memory limit (`now` MB): it finishes its games (the ids it never started become spare),
+    /// the cost per game is remembered, and the next members run fewer games (while restarts are left; then the crew
+    /// runs without it).
+    fn mate_memory_high(&mut self, eng: &Engine, i: usize, now: u64) {
+        let id = self.lease.lease_id.clone();
+        let Some(r) = self.roll.as_mut() else { return };
+        let m = &mut self.mates[i];
+        let (conc, limit) = (m.layout.conc, m.worker.mem_limit_mb);
+        let per = crate::rolling::measured_per_game(now, conc, r.mem.cost);
+        if Learned::raise(&eng.cfg.layout, self.lease.run.as_deref().unwrap_or(""), r.gpu, per) {
+            log::info!("lease {id}: remembering {per} MB per game in flight for this run");
+        }
+        let cost = crate::rolling::MemCost { per_game_mb: r.mem.cost.per_game_mb.max(per), ..r.mem.cost };
+        log::warn!("lease {id}: worker pid {} commits {now} MB of its {limit} MB limit with {conc} games in flight; it finishes them", m.worker.pid);
+        let _ = m.worker.send(&json!({"op": "finish"}));
+        m.finishing = true;
+        m.reclaim = Some(Reclaim { since: Instant::now(), reads: Vec::new(), last_ping: None });
+        let others = self.mates.iter().filter(|m| m.active()).count() + 1;
+        match crate::rolling::restart_games(conc, limit, cost).filter(|_| r.restarts < crate::rolling::MAX_RESTARTS) {
+            Some(n) => {
+                r.restarts += 1;
+                self.shrink_members(n);
+            }
+            None => self.cap_crew(others as u32),
+        }
+        self.crew_changed = Instant::now();
+    }
+
+    /// A new member when the crew is short of the layout's workers (at the lease's start, after a retirement or a
+    /// failure), one at a time, while work runs and memory allows (every worker's commit plus its plan within
+    /// `PLAN_SHARE` of the job's limit): it plays a spare range that fills its games in flight, else it takes the tail's
+    /// place - the main worker keeps its range (at least `RUNWAY_INFLIGHTS` x its games in flight unstarted; else more
+    /// ids are asked for first) and the new worker gets the ids released from then on.
+    fn add_member(&mut self, eng: &mut Engine, t: &crate::Timings, must_pause: bool) {
+        let Some(tu) = self.tuning.as_ref() else { return };
+        if tu.handoff.is_some() || must_pause || self.after.is_some() || eng.quitting() || self.main_exit.is_some() {
+            return;
+        }
+        if !matches!(self.state, WState::Running) || !self.job_sent {
+            return;
+        }
+        let Some(r) = self.roll.as_ref().filter(|r| r.active && !r.finishing && r.restart.is_none()) else { return };
+        if self.crew_complete() || self.mates.iter().any(|m| m.active() && !m.job_sent) {
+            return;
+        }
+        let per = tu.current.per_worker();
+        let (cost, released, offset) = (r.mem.cost, r.released, r.offset);
+        let limit = self.worker_limit();
+        let mut held = self.worker.commit_mb().unwrap_or(0);
+        for m in &mut self.mates {
+            held += m.worker.commit_mb().unwrap_or(0);
+        }
+        let plan = cost.base_mb + per.conc * cost.per_game_mb;
+        if self.lease_limit_mb > 0 && (held + plan) as f64 > self.lease_limit_mb as f64 * crate::rolling::PLAN_SHARE {
+            return;
+        }
+        // a spare range that fills its games in flight
+        if let Some(k) = self.spare.iter().position(|&(a, b)| b - a >= per.conc.max(1)) {
+            let range = self.spare.remove(k);
+            return self.spawn_mate(eng, per, range, limit);
+        }
+        // else the tail's place: fresh counters of the main worker first
+        let fresh = t.tune_ping * 3;
+        let Some((_, _, started)) = self.counters.filter(|_| self.counters_at.is_some_and(|at| at.elapsed() <= fresh)) else {
+            if self.last_counter_ping.is_none_or(|p| p.elapsed() >= t.tune_ping) {
+                self.last_counter_ping = Some(Instant::now());
+                self.send(json!({"op": "ping"}));
+            }
+            return;
+        };
+        let unstarted = (released - offset).saturating_sub(started);
+        if unstarted < RUNWAY_INFLIGHTS * self.conc.unwrap_or(1).max(1) {
+            // (more ids first: the main worker would be left with a short range)
+            if let Some(r) = self.roll.as_mut().filter(|r| !r.extend_inflight) {
+                r.want_more = true;
+            }
+            return;
+        }
+        self.spawn_tail(eng, per, limit);
+    }
+
+    /// A new member of the crew on a spare range `[a, b)` (relative), closed: its job line goes out at its `hello`.
+    fn spawn_mate(&mut self, eng: &mut Engine, per: Layout, (a, b): (u64, u64), limit: u64) {
+        let id = self.lease.lease_id.clone();
+        let lo = self.roll.as_ref().map_or(0, |r| r.setup.lo);
+        let dir = format!("out-w{}", self.spawns + 1);
+        let gen = self.next_gen();
+        let w = match std::fs::create_dir_all(self.work.join(&dir)).and_then(|_| self.spawn.spawn(gen, self.tx.clone(), limit)) {
+            Ok(w) => w,
+            Err(e) => {
+                log::error!("lease {id}: cannot start a worker of the crew: {e}");
+                self.spare.push((a, b));
+                let n = self.crew_active() as u32;
+                self.cap_crew(n);
+                return;
+            }
+        };
+        let line = format!("worker pid {} joins the crew with ids [{}, {}) ({}, memory limit {limit} MB)", w.pid, lo + a, lo + b, per.describe());
+        log::info!("lease {id}: {line}");
+        eng.worker_log.write_line(&format!("crew [{id}]: {line}"));
+        self.spawns += 1;
+        self.mates.push(Mate {
+            worker: w,
+            wgen: gen,
+            out_dir: dir,
+            end_ev: None,
+            eof: false,
+            last_msg: Instant::now(),
+            in_flight: None,
+            tail: None,
+            finishing: false,
+            offset: a,
+            end: b,
+            layout: per,
+            job_sent: false,
+            spawned: Instant::now(),
+            pinged: false,
+            pinged_at: None,
+            counters: None,
+            reclaim: None,
+            gen_floor: self.prep.ckpt.as_ref().map(|(c, _)| c.gen).or(self.gen_floor),
+            peak_mb: 0,
+            fatal: None,
+        });
+        self.crew_changed = Instant::now();
+        self.show_tuning(eng);
+    }
+
+    /// A new member takes the tail's place: the main worker becomes a member keeping its range (every id released so
+    /// far from its first), and the new worker - the main one from now on - starts at the end of the released ids with
+    /// none (its `low` asks for them) and gets the `extend`s.
+    fn spawn_tail(&mut self, eng: &mut Engine, per: Layout, limit: u64) {
+        let id = self.lease.lease_id.clone();
+        let Some((lo, released, offset, peak)) = self.roll.as_ref().map(|r| (r.setup.lo, r.released, r.offset, r.peak_mb)) else { return };
+        let dir = format!("out-w{}", self.spawns + 1);
+        let gen = self.next_gen();
+        let w = match std::fs::create_dir_all(self.work.join(&dir)).and_then(|_| self.spawn.spawn(gen, self.tx.clone(), limit)) {
+            Ok(w) => w,
+            Err(e) => {
+                log::error!("lease {id}: cannot start a worker of the crew: {e}");
+                let n = self.crew_active() as u32;
+                self.cap_crew(n);
+                return;
+            }
+        };
+        let line = format!(
+            "worker pid {} joins the crew as its tail, ids from {} ({}, memory limit {limit} MB); pid {} keeps ids [{}, {})",
+            w.pid,
+            lo + released,
+            per.describe(),
+            self.worker.pid,
+            lo + offset,
+            lo + released
+        );
+        log::info!("lease {id}: {line}");
+        eng.worker_log.write_line(&format!("crew [{id}]: {line}"));
+        let old_layout = self.main_layout();
+        let old_gen = std::mem::replace(&mut self.wgen, gen);
+        self.spawns += 1;
+        let old = std::mem::replace(&mut self.worker, w);
+        let old_dir = std::mem::replace(&mut self.out_dir, dir);
+        let counters = self.counters.take();
+        self.mates.push(Mate {
+            worker: old,
+            wgen: old_gen,
+            out_dir: old_dir,
+            end_ev: self.end_ev.take(),
+            eof: std::mem::take(&mut self.eof),
+            last_msg: self.last_msg,
+            in_flight: counters.map(|(_, g, s)| s.saturating_sub(g)),
+            tail: None,
+            finishing: false,
+            offset,
+            end: released,
+            layout: old_layout,
+            job_sent: true,
+            spawned: self.started,
+            pinged: self.pinged,
+            pinged_at: None,
+            counters,
+            reclaim: None,
+            gen_floor: self.gen_floor,
+            peak_mb: peak,
+            fatal: None,
+        });
+        if let Some(r) = self.roll.as_mut() {
+            r.offset = released;
+            r.want_more = false;
+            r.next_extend = Instant::now();
+            r.peak_mb = 0;
+        }
+        self.conc = Some(per.conc);
+        self.groups = Some(per.groups);
+        self.threads = per.threads;
+        self.infer = Some((per.infer_workers, per.infer_threads));
+        self.batch_rows = per.batch();
+        self.state = WState::Starting;
+        self.started = Instant::now();
+        self.last_msg = Instant::now();
+        self.pinged = false;
+        self.job_sent = false;
+        self.killed = false;
+        self.stall_since = None;
+        self.counters_at = None;
+        self.gen_floor = self.prep.ckpt.as_ref().map(|(c, _)| c.gen).or(self.gen_floor);
+        self.crew_changed = Instant::now();
+        self.mark = CpuMark::take(&self.worker);
+        self.sample = (self.mark, Instant::now());
+        self.show_tuning(eng);
     }
 }
 

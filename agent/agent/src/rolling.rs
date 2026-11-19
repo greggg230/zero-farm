@@ -39,7 +39,7 @@ pub const GPU_ONE_GROUP_FROM: u64 = 256;
 /// What a rolling job's worker commits (the memory its job's limit counts, MB): `base_mb` before any game (the
 /// network's session, the runtime, the process), and `per_game_mb` for each game in flight (its search trees, its
 /// positions and records so far, its share of the evaluation cache and of the runtime's buffers).
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MemCost {
     pub base_mb: u64,
     pub per_game_mb: u64,

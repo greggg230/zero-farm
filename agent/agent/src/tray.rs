@@ -258,9 +258,12 @@ impl Tray {
             if let Some(g) = &st.gpu_note {
                 add(MF_STRING | MF_GRAYED, 4, g);
             }
-            // rev 19 (PROTOCOL 13): the job's CPU layout (a menu item doesn't wrap: at most ~100 characters)
+            // rev 19 (PROTOCOL 13): the job's CPU layout - with several workers (13.5) their count and each one's layout - (a
+            // menu item doesn't wrap: lines of at most ~100 characters, at most 3)
             if let Some(t) = &st.tuning {
-                add(MF_STRING | MF_GRAYED, 7, &t.chars().take(100).collect::<String>());
+                for line in crate::status::wrap_menu(t, 100, 3) {
+                    add(MF_STRING | MF_GRAYED, 7, &line);
+                }
             }
             if let Pause::Until { t } = s.pause {
                 if t > now {

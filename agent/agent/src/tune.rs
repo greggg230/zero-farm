@@ -26,6 +26,18 @@
 //!
 //! **Remembered** per (worker build, runtime pack, network fingerprint, hardware, OS, tuner version); a key not seen
 //! is searched again; a tuned key is re-checked weekly (the runner-up against the incumbent, both measured afresh).
+//!
+//! **Several workers** (PROTOCOL 13.5). The layout's first coordinate is the number of worker processes serving the
+//! lease (`workers`, 1 to `MAX_WORKERS`), each with the rest of the layout (search threads, sessions, groups and games
+//! in flight are per worker; the games in flight of the job are `workers` x `conc`). The M4 Max, 2026-11-18, clean
+//! windows: one native worker at best ~12.6k leaves/s (old export) - every extra thread inside one process hurt -,
+//! two processes of (12 search + 4 x 3 inference threads, 1,152 games in flight in 6 groups) 16.4k (+30 %; the fast
+//! export ~18.0k, the owner's SSH self-play's parity), three 16.1k, four 15.2k. Contention inside one process (its
+//! search threads and evaluator share one tree arena, one cache, one runtime) is what costs, not the thread total, so
+//! the thread caps are per worker: one worker keeps the caps of before (search and inference threads each at most the
+//! cores), and N > 1 workers share `THREAD_BUDGET_MULTI` x the cores per kind (2 x 12 on 16 cores, the measured
+//! best). Worker counts stay within the cores and the RAM (`CORES_PER_WORKER`, `RAM_MB_PER_WORKER`) and within the
+//! memory plan (each worker's base plus its games in flight, PROTOCOL 10.6, at most `PLAN_SHARE` of the job's limit).
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -36,8 +48,18 @@ use zerofarm_common::layout::Layout as Paths;
 pub const FEATURES: [&str; 1] = ["tuning"];
 /// A worker whose `hello` lists this honours the job line's `infer_workers` (macOS builds always do: `Defaults`).
 pub const WORKER_FEATURE: &str = "infer_workers";
-/// Bumped when the search or the measurement changes: every key is searched again.
-pub const TUNER_VERSION: u32 = 1;
+/// Bumped when the search or the measurement changes: every key is searched again. (2: the worker count, 13.5.)
+pub const TUNER_VERSION: u32 = 2;
+/// Worker processes a lease's job may run (searched and set) at most; a hint or a report may say up to `MAX_WORKERS_JSON`.
+pub const MAX_WORKERS: u32 = 3;
+pub const MAX_WORKERS_JSON: u32 = 8;
+/// N > 1 workers share this many times the cores per kind of thread (search, inference): per worker
+/// `cap x THREAD_BUDGET_MULTI / N` (the M4 Max's best: 2 x 12 on 16 cores). One worker keeps `cap`.
+pub const THREAD_BUDGET_MULTI: f64 = 1.5;
+/// A worker per this many physical cores at most ...
+pub const CORES_PER_WORKER: u32 = 4;
+/// ... and per this much RAM (MB): a 64 GB M4 Max 3 at most, a 32 GB machine 2, 16 GB 1.
+pub const RAM_MB_PER_WORKER: u64 = 16 * 1024;
 /// A layout replaces the incumbent only when it is at least this much faster (noise guard).
 pub const GAIN: f64 = 1.03;
 /// Candidate trials per search at most (the final re-measure of the incumbent comes on top).
@@ -60,16 +82,23 @@ pub const REFILL_SHARE: f64 = 0.98;
 pub const MAX_THREADS: u32 = 512;
 pub const MAX_SESSIONS: u32 = 64;
 
-/// A CPU job's layout: the job line's `threads` (search), `infer_workers` (ONNX Runtime sessions, each on an evaluator
-/// thread of its own), `infer_threads` (threads per session), `groups` (batches in turn: rows per batch = conc /
-/// groups) and `conc` (games in flight).
+/// A CPU job's layout: `workers` (worker processes serving the lease, PROTOCOL 13.5) and each one's job line:
+/// `threads` (search), `infer_workers` (ONNX Runtime sessions, each on an evaluator thread of its own),
+/// `infer_threads` (threads per session), `groups` (batches in turn: rows per batch = conc / groups) and `conc` (its
+/// games in flight; the job's are `workers` x `conc`).
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Layout {
+    #[serde(default = "one_worker")]
+    pub workers: u32,
     pub threads: u32,
     pub infer_workers: u32,
     pub infer_threads: u32,
     pub groups: u64,
     pub conc: u64,
+}
+
+fn one_worker() -> u32 {
+    1
 }
 
 impl Layout {
@@ -83,9 +112,18 @@ impl Layout {
     pub fn batch(&self) -> u64 {
         self.conc.div_ceil(self.groups.max(1))
     }
-    /// "8 search + 4 x 2 inference threads, 2,304 games in flight in 6 groups (384 rows)".
+    /// The job's games in flight: every worker's.
+    pub fn total_conc(&self) -> u64 {
+        self.workers.max(1) as u64 * self.conc
+    }
+    /// One worker's part of it (its job line).
+    pub fn per_worker(&self) -> Layout {
+        Layout { workers: 1, ..*self }
+    }
+    /// "8 search + 4 x 2 inference threads, 2,304 games in flight in 6 groups (384 rows)"; several workers: "2 workers x
+    /// (12 search + 4 x 3 inference threads, 1,152 games in flight in 6 groups (192 rows))".
     pub fn describe(&self) -> String {
-        format!(
+        let one = format!(
             "{} search + {} x {} inference threads, {} games in flight in {} groups ({} rows)",
             self.threads,
             self.infer_workers,
@@ -93,15 +131,26 @@ impl Layout {
             thousands(self.conc),
             self.groups,
             self.batch()
-        )
+        );
+        if self.workers > 1 {
+            format!("{} workers x ({one})", self.workers)
+        } else {
+            one
+        }
     }
     pub fn to_json(&self) -> Value {
         serde_json::to_value(self).expect("json")
     }
-    /// A layout from JSON (a coordinator hint): every field present and within bounds, else None.
+    /// A layout from JSON (a coordinator hint): every field present and within bounds (`workers` may be left out: 1),
+    /// else None.
     pub fn from_json(v: &Value) -> Option<Layout> {
         let n = |k: &str, max: u64| v.get(k).and_then(Value::as_u64).filter(|x| (1..=max).contains(x));
+        let workers = match v.get("workers") {
+            None | Some(Value::Null) => 1,
+            Some(_) => n("workers", MAX_WORKERS_JSON as u64)? as u32,
+        };
         let l = Layout {
+            workers,
             threads: n("threads", MAX_THREADS as u64)? as u32,
             infer_workers: n("infer_workers", MAX_SESSIONS as u64)? as u32,
             infer_threads: n("infer_threads", MAX_THREADS as u64)? as u32,
@@ -133,6 +182,8 @@ pub struct Hw {
     pub logical: u32,
     pub perf: u32,
     pub eff: u32,
+    /// Installed RAM (MB).
+    pub ram_mb: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,12 +205,15 @@ impl Platform {
 /// The starting point and the bounds per platform (the only per-platform part of tuning).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Defaults {
-    /// The start's search threads, sessions and threads per session.
+    /// rev 19 (PROTOCOL 13.5): the start's worker processes, and the most the cores and RAM allow (`max_workers`).
+    pub workers: u32,
+    pub max_workers: u32,
+    /// The start's search threads, sessions and threads per session (per worker, for `workers`).
     pub threads: u32,
     pub infer_workers: u32,
     pub infer_threads: u32,
-    /// Search threads at most, and inference threads (sessions x threads per session) at most: never searched upward
-    /// (the owner's `cpu_threads` replaces both).
+    /// One worker's search threads at most, and inference threads (sessions x threads per session) at most: never
+    /// searched upward (the owner's `cpu_threads` replaces both); N > 1 workers share `THREAD_BUDGET_MULTI` x them.
     pub max_search: u32,
     pub max_infer: u32,
     /// Rows per batch within these bounds (`groups` = games in flight / rows; the start's groups are 10.6's "auto").
@@ -167,26 +221,68 @@ pub struct Defaults {
     pub batch_max: u64,
     /// Every worker build of the platform honours `infer_workers` (else only one whose `hello` lists the feature).
     pub sessions_always: bool,
+    /// The start's inference is in sessions of this many threads (0: one session of all of them).
+    pub session_threads: u32,
+}
+
+/// Per-worker threads of one kind for `n` workers within a cap: the cap for one worker, else `THREAD_BUDGET_MULTI` x the
+/// cap shared by `n` (at least 1).
+pub fn budget(cap: u32, n: u32) -> u32 {
+    if n <= 1 {
+        cap.max(1)
+    } else {
+        ((cap.max(1) as f64 * THREAD_BUDGET_MULTI / n as f64).floor() as u32).max(1)
+    }
+}
+
+impl Defaults {
+    /// The platform's per-worker (search threads, sessions, threads per session) for `n` workers: search threads at the
+    /// budget, inference at the budget in sessions of `session_threads` (one session under two of them).
+    pub fn threads_for(&self, n: u32) -> (u32, u32, u32) {
+        let (s, i) = (budget(self.max_search, n), budget(self.max_infer, n));
+        let st = self.session_threads;
+        if st > 0 && i >= 2 * st {
+            (s, i / st, st)
+        } else {
+            (s, 1, i)
+        }
+    }
+
+    /// The start's layout for `n` workers serving `conc` games in flight in `groups` groups in all (10.6's choice): each
+    /// worker the platform's threads for `n`, `conc` / `n` games in flight (a multiple of 32 from 32) in groups of the
+    /// same rows per batch.
+    pub fn layout_for(&self, n: u32, conc: u64, groups: u64) -> Layout {
+        let n = n.max(1);
+        let (threads, infer_workers, infer_threads) = self.threads_for(n);
+        let batch = conc.div_ceil(groups.max(1)).max(1);
+        let per = if n > 1 { crate::rolling::round_games(conc / n as u64) } else { conc.max(1) };
+        Layout { workers: n, threads, infer_workers, infer_threads, groups: per.div_ceil(batch).max(1), conc: per }
+    }
 }
 
 /// The starting point for `hw` on `p`.
 ///
-/// Windows: today's layout - one search thread per physical core, one inference session with as many threads (the
-/// worker's own default) -, which is also each one's cap (never more threads than before); batches of at least
-/// `MIN_BATCH` rows.
+/// Windows: today's layout - one worker, one search thread per physical core, one inference session with as many
+/// threads (the worker's own default) -, which is also each one's cap (never more threads than before); batches of at
+/// least `MIN_BATCH` rows.
 ///
 /// macOS (Apple silicon), from the M4 Max's clean windows of 2026-11-18 (legacy-meta3-r1's gen-398 network, leaves/s;
-/// the owner's 3-process setup 19,035-20,034, 19,504 in a later control): the layout agent 0.3.0 ships - one search
-/// thread per core, inference in sessions of 3 threads (16 cores: 16 + 5 x 3), 2,304 games in flight in 12 groups of
-/// 192 rows - is the best measured region: 10,977-11,086 (fused-attention export 12,292); 6 groups (384-450 rows)
-/// 11,155 (12,560); 4 groups (~675 rows) 8,970 (load 46 %: too few groups starve the search); 4 x 4 inference threads
-/// 6,596; 24 + 8 x 2 7,707; 36 + 12 x 3 3,475 - more threads in any form hurt, and inference cost per row is about flat
-/// in the batch size. So the search stays narrow around it: search and inference threads each at most the cores,
-/// batches of 192-384 rows.
+/// the owner's 3-process setup 19,035-20,034, 19,504 in a later control): in one worker the layout agent 0.3.0 ships -
+/// one search thread per core, inference in sessions of 3 threads (16 cores: 16 + 5 x 3), 2,304 games in flight in 12
+/// groups of 192 rows - is the best measured region: 10,977-11,086 (fused-attention export 12,292); 6 groups (384-450
+/// rows) 11,155 (12,560); 4 groups (~675 rows) 8,970 (load 46 %: too few groups starve the search); 4 x 4 inference
+/// threads 6,596; 24 + 8 x 2 7,707; 36 + 12 x 3 3,475 - more threads in any form hurt, and inference cost per row is
+/// about flat in the batch size. So the search stays narrow around it: search and inference threads each at most the
+/// cores per worker, batches of 192-384 rows. Two workers of (12 + 4 x 3, 1,152 games in flight in 6 groups) played
+/// 16.4k (fast export ~18.0k, three 16.1k, four 15.2k): a Mac with at least 12 cores and 32 GB starts with two
+/// (PROTOCOL 13.5).
 pub fn defaults(p: Platform, hw: &Hw) -> Defaults {
     let cores = hw.cores.max(1);
-    match p {
+    let max_workers = MAX_WORKERS.min(cores / CORES_PER_WORKER).min((hw.ram_mb / RAM_MB_PER_WORKER) as u32).max(1);
+    let mut d = match p {
         Platform::Windows => Defaults {
+            workers: 1,
+            max_workers,
             threads: cores,
             infer_workers: 1,
             infer_threads: cores,
@@ -195,49 +291,87 @@ pub fn defaults(p: Platform, hw: &Hw) -> Defaults {
             batch_min: MIN_BATCH,
             batch_max: crate::rolling::MAX_INFLIGHT,
             sessions_always: false,
+            session_threads: 0,
         },
-        Platform::MacOs => {
-            // (the worker's own split, docs/az.md 62.1: sessions of 3 threads; under 6 cores one session)
-            let (workers, per) = if cores >= 6 { (cores / 3, 3) } else { (1, cores) };
-            Defaults {
-                threads: cores,
-                infer_workers: workers,
-                infer_threads: per,
-                max_search: cores,
-                max_infer: cores,
-                batch_min: crate::rolling::MACOS_CPU_BATCH,
-                batch_max: 2 * crate::rolling::MACOS_CPU_BATCH,
-                sessions_always: true,
-            }
-        }
-    }
+        Platform::MacOs => Defaults {
+            workers: if cores >= 12 && hw.ram_mb >= 32 * 1024 { 2 } else { 1 },
+            max_workers,
+            threads: cores,
+            infer_workers: 1,
+            infer_threads: cores,
+            max_search: cores,
+            max_infer: cores,
+            batch_min: crate::rolling::MACOS_CPU_BATCH,
+            batch_max: 2 * crate::rolling::MACOS_CPU_BATCH,
+            sessions_always: true,
+            // (the worker's own split, docs/az.md 62.1: sessions of 3 threads; under 6 threads one session)
+            session_threads: 3,
+        },
+    };
+    d.workers = d.workers.min(d.max_workers);
+    (d.threads, d.infer_workers, d.infer_threads) = d.threads_for(d.workers);
+    d
 }
 
 /// What a search may vary for one job.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Space {
-    /// Search threads at most, inference threads at most.
+    /// One worker's search threads at most, inference threads at most (N > 1 workers: `budget` of them).
     pub max_search: u32,
     pub max_infer: u32,
     /// The worker honours `infer_workers` (else one session).
     pub sessions: bool,
-    /// Games in flight within these bounds (equal: the run's number, fixed).
+    /// The job's games in flight (all workers') within these bounds (equal: the run's number, fixed).
     pub conc_min: u64,
     pub conc_max: u64,
     /// Rows per batch within these bounds where the games in flight allow.
     pub batch_min: u64,
     pub batch_max: u64,
+    /// Worker processes within these bounds (equal: fixed).
+    pub workers_min: u32,
+    pub workers_max: u32,
+    /// The job's memory plan (PROTOCOL 10.6): its limit (MB) and cost; each worker's base and games in flight together
+    /// at most `PLAN_SHARE` of the limit. None: no limit.
+    pub mem: Option<(u64, crate::rolling::MemCost)>,
 }
 
 impl Space {
     /// The space of a job on a platform: its bounds (the owner's `cpu_threads` caps search and inference threads each,
-    /// as the worker's default `infer_threads` = `threads` always did), whether sessions vary, the games in flight.
-    pub fn new(d: &Defaults, cpu_threads: Option<u32>, conc_min: u64, conc_max: u64) -> Space {
+    /// as the worker's default `infer_threads` = `threads` always did), whether sessions vary, the games in flight in
+    /// all, the worker processes (the owner's `workers`, else 1 to what the cores, the RAM and the memory plan allow).
+    pub fn new(d: &Defaults, cpu_threads: Option<u32>, workers: Option<u32>, conc_min: u64, conc_max: u64, mem: Option<(u64, crate::rolling::MemCost)>) -> Space {
         let (max_search, max_infer) = match cpu_threads {
             Some(n) => (n.max(1), n.max(1)),
             None => (d.max_search.max(1), d.max_infer.max(1)),
         };
-        Space { max_search, max_infer, sessions: d.sessions_always, conc_min, conc_max, batch_min: d.batch_min.max(1), batch_max: d.batch_max.max(d.batch_min).max(1) }
+        let mut s = Space {
+            max_search,
+            max_infer,
+            sessions: d.sessions_always,
+            conc_min,
+            conc_max,
+            batch_min: d.batch_min.max(1),
+            batch_max: d.batch_max.max(d.batch_min).max(1),
+            workers_min: 1,
+            workers_max: 1,
+            mem,
+        };
+        // as many workers as the memory plan holds with the fewest games in flight allowed (each worker its own base)
+        let fits = (1..=MAX_WORKERS_JSON).take_while(|&n| s.mem_room(n).is_none_or(|room| room as u128 * n as u128 >= conc_min.max(n as u64) as u128)).last().unwrap_or(1);
+        let (lo, hi) = match workers {
+            Some(n) => (n.clamp(1, MAX_WORKERS).min(fits), n.clamp(1, MAX_WORKERS).min(fits)),
+            None => (1, d.max_workers.clamp(1, MAX_WORKERS).min(fits)),
+        };
+        (s.workers_min, s.workers_max) = (lo.max(1), hi.max(1));
+        s
+    }
+
+    /// The games in flight one of `n` workers may run under the memory plan (None: no limit): (`PLAN_SHARE` x the
+    /// limit / `n` - base) / per game, at least 1.
+    pub fn mem_room(&self, n: u32) -> Option<u64> {
+        let (limit, cost) = self.mem?;
+        let share = (limit as f64 * crate::rolling::PLAN_SHARE / n.max(1) as f64) as u64;
+        Some((share.saturating_sub(cost.base_mb) / cost.per_game_mb.max(1)).max(1))
     }
 
     /// The groups the games in flight allow: batches within the bounds where possible, at least one, at most one per
@@ -248,18 +382,28 @@ impl Space {
         (lo.min(hi), hi)
     }
 
-    /// A layout made valid: at least 1 of everything, one session without the feature, search threads and inference
-    /// threads within their caps (inference gives threads per session before sessions), the games in flight within
-    /// bounds, the batches within bounds where the games in flight allow.
+    /// A layout made valid: the workers within bounds; at least 1 of everything, one session without the feature, search
+    /// threads and inference threads within their caps per worker (`budget`; inference gives threads per session
+    /// before sessions), each worker's games in flight within its part of the job's bounds and the memory plan, the
+    /// batches within bounds where the games in flight allow.
     pub fn fit(&self, l: Layout) -> Layout {
+        let workers = l.workers.clamp(self.workers_min.max(1), self.workers_max.max(self.workers_min).max(1));
+        let (max_search, max_infer) = (budget(self.max_search.clamp(1, MAX_THREADS), workers), budget(self.max_infer.max(1), workers));
+        let n = workers as u64;
+        let (cmin, cmax) = (self.conc_min.max(1).div_ceil(n), (self.conc_max.max(self.conc_min).max(1) / n).max(1));
+        let mut conc = l.conc.clamp(cmin.min(cmax), cmax);
+        if let Some(room) = self.mem_room(workers) {
+            conc = conc.min(room);
+        }
         let mut l = Layout {
-            threads: l.threads.clamp(1, self.max_search.clamp(1, MAX_THREADS)),
+            workers,
+            threads: l.threads.clamp(1, max_search),
             infer_workers: if self.sessions { l.infer_workers.clamp(1, MAX_SESSIONS) } else { 1 },
             infer_threads: l.infer_threads.clamp(1, MAX_THREADS),
             groups: l.groups.max(1),
-            conc: l.conc.clamp(self.conc_min.max(1), self.conc_max.max(self.conc_min).max(1)),
+            conc: conc.max(1),
         };
-        while l.infer_total() > self.max_infer.max(1) {
+        while l.infer_total() > max_infer {
             if l.infer_threads > 1 {
                 l.infer_threads -= 1;
             } else {
@@ -275,6 +419,9 @@ impl Space {
 /// The coordinates of the search, in the order they are tried.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Coord {
+    /// rev 19 (PROTOCOL 13.5): worker processes (one; the job's games in flight and rows per batch kept, each kind of
+    /// thread scaled with its budget for the new count).
+    Workers,
     /// Rows per batch (`up`: bigger: two thirds of the groups; else half again as many).
     Batch,
     /// Search threads (an eighth of their cap, at least 1).
@@ -287,14 +434,33 @@ pub enum Coord {
     Conc,
 }
 
-pub const COORDS: [Coord; 5] = [Coord::Batch, Coord::Search, Coord::InferThreads, Coord::Sessions, Coord::Conc];
+pub const COORDS: [Coord; 6] = [Coord::Workers, Coord::Batch, Coord::Search, Coord::InferThreads, Coord::Sessions, Coord::Conc];
 
 /// `l`'s neighbour along `c`, valid in `s`; None when there is none (a bound, or the same layout). Thread moves past a
-/// cap are no neighbours (never cut back into another shape); batch and games-in-flight moves are kept within bounds.
+/// cap are no neighbours (never cut back into another shape); batch, games-in-flight and worker moves are kept within
+/// bounds (a worker move rescales each worker's threads to the new count's budget).
 pub fn neighbour(l: &Layout, c: Coord, up: bool, s: &Space) -> Option<Layout> {
     let l = s.fit(*l);
     let mut n = l;
     match c {
+        Coord::Workers => {
+            let w = if up { l.workers + 1 } else { l.workers.checked_sub(1).filter(|&w| w >= 1)? };
+            if w < s.workers_min || w > s.workers_max {
+                return None;
+            }
+            // the job's games in flight and rows per batch kept; each kind of thread keeps its share of its budget
+            let scale = |v: u32, cap: u32| ((v as f64 * budget(cap, w) as f64 / budget(cap, l.workers) as f64).round() as u32).max(1);
+            n.workers = w;
+            n.conc = (l.total_conc() / w as u64).max(1);
+            n.groups = n.conc.div_ceil(l.batch().max(1)).max(1);
+            n.threads = scale(l.threads, s.max_search);
+            let infer = scale(l.infer_total(), s.max_infer);
+            if s.sessions {
+                n.infer_workers = ((infer as f64 / l.infer_threads.max(1) as f64).round() as u32).max(1);
+            } else {
+                n.infer_threads = infer;
+            }
+        }
         Coord::Batch => n.groups = if up { (l.groups * 2 / 3).max(1) } else { (l.groups * 3).div_ceil(2) },
         Coord::Search => {
             let step = (s.max_search / 8).max(1);
@@ -746,9 +912,14 @@ impl Probe {
         let conc = self.conc as f64;
         let prev = self.last.replace((t, leaves));
         if let Some((pt, pl)) = prev {
-            if t <= pt || leaves < pl {
+            if leaves < pl {
                 // a counter that went back: not the same worker's
                 return Verdict::Invalid("the worker's counters went back".into());
+            }
+            if t <= pt {
+                // (a crew's samples at the same instant: the first counts)
+                self.last = prev;
+                return Verdict::Pending;
             }
         }
         if self.refill.is_none() && started.saturating_sub(games) as f64 >= (REFILL_SHARE * conc).floor().max(1.0) {
@@ -829,11 +1000,11 @@ mod tests {
 
     /// The M4 Max's space: search and inference threads at most 16, sessions, 1,152-2,304 games in flight, 192-384 rows.
     fn space() -> Space {
-        Space { max_search: 16, max_infer: 16, sessions: true, conc_min: 1152, conc_max: 2304, batch_min: 192, batch_max: 384 }
+        Space { max_search: 16, max_infer: 16, sessions: true, conc_min: 1152, conc_max: 2304, batch_min: 192, batch_max: 384, workers_min: 1, workers_max: 1, mem: None }
     }
 
     fn lay(threads: u32, w: u32, t: u32, groups: u64, conc: u64) -> Layout {
-        Layout { threads, infer_workers: w, infer_threads: t, groups, conc }
+        Layout { workers: 1, threads, infer_workers: w, infer_threads: t, groups, conc }
     }
 
     /// The shipped macOS layout on the M4 Max: the measured best region.
@@ -860,12 +1031,12 @@ mod tests {
         // never 0 of anything
         assert_eq!(Space { max_search: 0, max_infer: 0, ..s }.fit(lay(0, 0, 0, 0, 0)), lay(1, 1, 1, 3, 1152), "1,152 games: 3 groups of 384 rows at least");
         // Windows: batches from MIN_BATCH rows to all games in flight
-        let win = Space::new(&defaults(Platform::Windows, &Hw { cores: 8, logical: 16, perf: 8, eff: 0 }), None, 16, 32);
+        let win = Space::new(&defaults(Platform::Windows, &Hw { cores: 8, logical: 16, perf: 8, eff: 0, ram_mb: 16384 }), None, None, 16, 32, None);
         assert_eq!(win.fit(lay(8, 1, 8, 4, 32)), lay(8, 1, 8, 4, 32));
         assert_eq!(win.fit(lay(8, 1, 8, 9, 32)).groups, 4, "at least 8 rows");
         assert_eq!(win.fit(lay(9, 1, 17, 4, 32)), lay(8, 1, 8, 4, 32), "search and inference threads each at most the cores");
         // the owner's cpu_threads caps search and inference threads each
-        let owner = Space::new(&defaults(Platform::MacOs, &Hw { cores: 16, logical: 16, perf: 12, eff: 4 }), Some(8), 2304, 2304);
+        let owner = Space::new(&defaults(Platform::MacOs, &Hw { cores: 16, logical: 16, perf: 12, eff: 4, ram_mb: 16384 }), Some(8), None, 2304, 2304, None);
         assert_eq!(owner.fit(shipped()), lay(8, 5, 1, 12, 2304));
     }
 
@@ -966,7 +1137,7 @@ mod tests {
         let fewer = neighbour(&start, Coord::Search, false, &s).unwrap();
         e.record(fewer, 11_000.0, None, &s, 0);
         assert_eq!(e.incumbent, fewer);
-        assert_eq!(e.momentum, Some((1, false)));
+        assert_eq!(e.momentum, Some((2, false)), "Search is the third coordinate");
         assert_eq!(e.plan(&s), neighbour(&fewer, Coord::Search, false, &s));
     }
 
@@ -1102,25 +1273,147 @@ mod tests {
     fn defaults_per_platform() {
         // macOS: the shipped layout (the M4 Max's measured best region), search and inference threads each at most
         // the cores, 192-384 rows per batch, sessions always
-        let m4max = Hw { cores: 16, logical: 16, perf: 12, eff: 4 };
+        let m4max = Hw { cores: 16, logical: 16, perf: 12, eff: 4, ram_mb: 16384 };
         let d = defaults(Platform::MacOs, &m4max);
         assert_eq!((d.threads, d.infer_workers, d.infer_threads, d.max_search, d.max_infer, d.batch_min, d.batch_max), (16, 5, 3, 16, 16, 192, 384));
         assert!(d.sessions_always);
-        let air = defaults(Platform::MacOs, &Hw { cores: 8, logical: 8, perf: 4, eff: 4 });
+        let air = defaults(Platform::MacOs, &Hw { cores: 8, logical: 8, perf: 4, eff: 4, ram_mb: 16384 });
         assert_eq!((air.threads, air.infer_workers, air.infer_threads), (8, 2, 3));
-        let tiny = defaults(Platform::MacOs, &Hw { cores: 4, logical: 4, perf: 4, eff: 0 });
+        let tiny = defaults(Platform::MacOs, &Hw { cores: 4, logical: 4, perf: 4, eff: 0, ram_mb: 16384 });
         assert_eq!((tiny.infer_workers, tiny.infer_threads), (1, 4), "under 6 cores one session");
         // Windows: today's layout (one search thread per core, one session of as many threads)
-        let i9 = defaults(Platform::Windows, &Hw { cores: 8, logical: 16, perf: 8, eff: 0 });
+        let i9 = defaults(Platform::Windows, &Hw { cores: 8, logical: 16, perf: 8, eff: 0, ram_mb: 16384 });
         assert_eq!((i9.threads, i9.infer_workers, i9.infer_threads, i9.max_search, i9.max_infer, i9.sessions_always), (8, 1, 8, 8, 8, false));
         assert_eq!((i9.batch_min, i9.batch_max), (MIN_BATCH, crate::rolling::MAX_INFLIGHT));
         // either way the start is valid in its own space
-        for (p, hw) in [(Platform::MacOs, m4max), (Platform::Windows, Hw { cores: 6, logical: 6, perf: 6, eff: 0 })] {
+        for (p, hw) in [(Platform::MacOs, m4max), (Platform::Windows, Hw { cores: 6, logical: 6, perf: 6, eff: 0, ram_mb: 16384 })] {
             let d = defaults(p, &hw);
-            let s = Space::new(&d, None, 32, 2304);
-            let start = Layout { threads: d.threads, infer_workers: d.infer_workers, infer_threads: d.infer_threads, groups: 12, conc: 2304 };
+            let s = Space::new(&d, None, Some(1), 32, 2304, None);
+            let start = Layout { workers: 1, threads: d.threads, infer_workers: d.infer_workers, infer_threads: d.infer_threads, groups: 12, conc: 2304 };
             assert_eq!(s.fit(start), start, "{p:?}");
         }
+    }
+
+    /// The M4 Max as the profile sees it (64 GB).
+    fn m4max() -> Hw {
+        Hw { cores: 16, logical: 16, perf: 12, eff: 4, ram_mb: 65_536 }
+    }
+
+    #[test]
+    fn a_big_mac_starts_with_two_workers_of_the_measured_best_layout() {
+        let d = defaults(Platform::MacOs, &m4max());
+        assert_eq!((d.workers, d.max_workers), (2, 3), "16 cores / 4, 64 GB / 16 GB, at most 3");
+        assert_eq!((d.threads, d.infer_workers, d.infer_threads), (12, 4, 3), "2 x 12 on 16 cores");
+        // 10.6 / 11.5's choice for the job: 2,304 games in flight in 12 groups of 192
+        assert_eq!(d.layout_for(d.workers, 2304, 12), Layout { workers: 2, threads: 12, infer_workers: 4, infer_threads: 3, groups: 6, conc: 1152 });
+        assert_eq!(d.layout_for(1, 2304, 12), lay(16, 5, 3, 12, 2304), "one worker: the layout of before");
+        // a 12-core 32 GB Mac starts with two; less RAM or fewer cores: one
+        assert_eq!(defaults(Platform::MacOs, &Hw { cores: 12, logical: 12, perf: 8, eff: 4, ram_mb: 32_768 }).workers, 2);
+        assert_eq!(defaults(Platform::MacOs, &Hw { cores: 12, logical: 12, perf: 8, eff: 4, ram_mb: 24_576 }).workers, 1);
+        assert_eq!(defaults(Platform::MacOs, &Hw { cores: 10, logical: 10, perf: 4, eff: 6, ram_mb: 65_536 }).workers, 1);
+        let air = defaults(Platform::MacOs, &Hw { cores: 8, logical: 8, perf: 4, eff: 4, ram_mb: 16_384 });
+        assert_eq!((air.workers, air.max_workers), (1, 1), "a small machine stays at one process");
+        // Windows starts with one whatever the machine; the search may try more where the cores and RAM allow
+        let ws = defaults(Platform::Windows, &Hw { cores: 16, logical: 32, perf: 16, eff: 0, ram_mb: 65_536 });
+        assert_eq!((ws.workers, ws.max_workers, ws.threads, ws.infer_workers, ws.infer_threads), (1, 3, 16, 1, 16));
+    }
+
+    #[test]
+    fn thread_budgets_per_worker_count() {
+        assert_eq!((budget(16, 1), budget(16, 2), budget(16, 3)), (16, 12, 8));
+        assert_eq!((budget(8, 1), budget(8, 2), budget(8, 3)), (8, 6, 4));
+        assert_eq!(budget(1, 3), 1, "never 0");
+    }
+
+    /// The M4 Max's space for 1 to 3 workers, 1,152-2,304 games in flight in all, no memory limit.
+    fn crew_space() -> Space {
+        Space { workers_min: 1, workers_max: 3, ..space() }
+    }
+
+    #[test]
+    fn worker_bounds_come_from_the_setting_cores_ram_and_memory() {
+        let d = defaults(Platform::MacOs, &m4max());
+        let cost = crate::rolling::MemCost { base_mb: 1024, per_game_mb: 9 };
+        let s = Space::new(&d, None, None, 1152, 2304, Some((32_768, cost)));
+        assert_eq!((s.workers_min, s.workers_max), (1, 3), "auto: 1 to what the cores and RAM allow");
+        let s = Space::new(&d, None, Some(2), 1152, 2304, Some((32_768, cost)));
+        assert_eq!((s.workers_min, s.workers_max), (2, 2), "the owner's number");
+        assert_eq!(Space::new(&d, None, Some(9), 1152, 2304, None).workers_max, MAX_WORKERS);
+        // a small memory limit: (0.85 x 6,000 - 1,024) / 9 = 452 games for one worker, 169 each for two - fewer than the
+        // 1,152 the job needs at least: one worker only
+        let small = Space::new(&d, None, None, 1152, 2304, Some((6000, cost)));
+        assert_eq!(small.workers_max, 1);
+        assert_eq!(Space::new(&d, None, Some(3), 1152, 2304, Some((6000, cost))).workers_max, 1, "never more than the memory holds");
+    }
+
+    #[test]
+    fn crews_fit_their_budgets_and_memory() {
+        let s = crew_space();
+        // two workers: threads within 12 each, each worker 576-1,152 games in flight
+        assert_eq!(s.fit(Layout { workers: 2, ..shipped() }), Layout { workers: 2, threads: 12, infer_workers: 5, infer_threads: 2, groups: 6, conc: 1152 });
+        assert_eq!(s.fit(Layout { workers: 3, threads: 12, infer_workers: 4, infer_threads: 3, groups: 4, conc: 768 }).infer_total(), 8);
+        assert_eq!(s.fit(Layout { workers: 5, ..shipped() }).workers, 3);
+        // memory: (0.85 x 20,000 / 2 - 1,024) / 9 = 830 a worker
+        let m = Space { mem: Some((20_000, crate::rolling::MemCost { base_mb: 1024, per_game_mb: 9 })), ..s };
+        assert_eq!(m.fit(Layout { workers: 2, threads: 12, infer_workers: 4, infer_threads: 3, groups: 6, conc: 1152 }).conc, 830);
+    }
+
+    #[test]
+    fn worker_moves_keep_the_jobs_games_and_batches_and_rescale_threads() {
+        let s = crew_space();
+        let one = shipped();
+        let two = neighbour(&one, Coord::Workers, true, &s).unwrap();
+        assert_eq!(two, Layout { workers: 2, threads: 12, infer_workers: 4, infer_threads: 3, groups: 6, conc: 1152 }, "one worker -> the measured best");
+        assert_eq!(neighbour(&two, Coord::Workers, false, &s), Some(one), "and back");
+        let three = neighbour(&two, Coord::Workers, true, &s).unwrap();
+        assert_eq!((three.workers, three.threads, three.conc, three.groups), (3, 8, 768, 4));
+        assert!(three.infer_total() <= 8);
+        assert_eq!(neighbour(&three, Coord::Workers, true, &s), None, "at most 3");
+        assert_eq!(neighbour(&one, Coord::Workers, false, &s), None);
+        assert_eq!(neighbour(&one, Coord::Workers, true, &space()), None, "a fixed worker count");
+        // Windows (no sessions): 8 + 1 x 8 with 32 games in flight in 4 groups -> 2 x (6 + 1 x 6), 16 in 2 groups
+        let w = Space::new(&defaults(Platform::Windows, &Hw { cores: 8, logical: 16, perf: 8, eff: 0, ram_mb: 32_768 }), None, None, 16, 32, None);
+        assert_eq!(w.workers_max, 2);
+        let n = neighbour(&lay(8, 1, 8, 4, 32), Coord::Workers, true, &w).unwrap();
+        assert_eq!(n, Layout { workers: 2, threads: 6, infer_workers: 1, infer_threads: 6, groups: 2, conc: 16 });
+    }
+
+    #[test]
+    fn the_search_finds_more_workers_when_they_pay() {
+        // a peak at the M4 Max's measured best: two workers 30 % over one, three slightly less
+        let s = crew_space();
+        let best = Layout { workers: 2, threads: 12, infer_workers: 4, infer_threads: 3, groups: 6, conc: 1152 };
+        let mut fake = Fake { best: best.per_worker(), noise: 0.0, n: 1 };
+        let crew = [1.0, 1.3, 1.25];
+        let mut rate = |l: &Layout| fake.rate(&l.per_worker()) * crew[l.workers as usize - 1];
+        let mut e = Entry::new(key(), "r", shipped(), false, 0);
+        let mut seen = vec![];
+        while let Some(l) = e.plan(&s) {
+            seen.push(l);
+            e.record(l, rate(&l), None, &s, 0);
+            assert!(seen.len() < 30);
+        }
+        assert_eq!(seen[1].workers, 2, "the worker count is the first coordinate: {seen:?}");
+        assert_eq!(e.incumbent, best, "{seen:?}");
+        assert!(seen.iter().all(|l| l.workers <= 3 && l.threads <= budget(16, l.workers) && l.infer_total() <= budget(16, l.workers)), "{seen:?}");
+    }
+
+    #[test]
+    fn layouts_without_a_worker_count_are_one_worker() {
+        let old: Layout = serde_json::from_value(json!({"threads": 8, "infer_workers": 1, "infer_threads": 8, "groups": 4, "conc": 32})).unwrap();
+        assert_eq!(old.workers, 1);
+        assert_eq!(Layout::from_json(&json!({"threads": 8, "infer_workers": 1, "infer_threads": 8, "groups": 4, "conc": 32})).unwrap().workers, 1);
+        assert_eq!(Layout::from_json(&json!({"workers": 2, "threads": 8, "infer_workers": 1, "infer_threads": 8, "groups": 4, "conc": 32})).unwrap().workers, 2);
+        assert_eq!(Layout::from_json(&json!({"workers": 0, "threads": 8, "infer_workers": 1, "infer_threads": 8, "groups": 4, "conc": 32})), None);
+        assert_eq!(Layout::from_json(&json!({"workers": 99, "threads": 8, "infer_workers": 1, "infer_threads": 8, "groups": 4, "conc": 32})), None);
+        let two = Layout { workers: 2, threads: 12, infer_workers: 4, infer_threads: 3, groups: 6, conc: 1152 };
+        assert_eq!(two.total_conc(), 2304);
+        assert_eq!(two.to_json()["workers"], 2);
+        assert!(two.describe().starts_with("2 workers x (12 search + 4 x 3 inference threads, 1,152 games in flight in 6 groups (192 rows))"), "{}", two.describe());
+        // a hint for two workers fits this machine's bounds
+        let hint = json!({"layout": two.to_json()});
+        assert_eq!(hint_layout(Some(&hint), &crew_space()), Some(two));
+        assert_eq!(hint_layout(Some(&hint), &space()).map(|l| l.workers), Some(1), "a machine held to one worker");
     }
 
     #[test]
