@@ -205,8 +205,10 @@ struct Tuning {
     fixed: bool,
     /// The most workers this lease may still run (lowered when a member fails with no restart left).
     crew_cap: u32,
-    /// The workers a measurement counts (their generations): one that leaves discards it.
-    probe_members: Vec<u32>,
+    /// rev 19 (PROTOCOL 13.5): the workers a measurement counts (generation, last counters): every member of the crew
+    /// since it started - one that finished its range stays counted until it ends, then with its last counters (a
+    /// rotation is the crew's normal work); one that fails discards it.
+    probe_members: Vec<(u32, (u64, u64, u64))>,
 }
 
 /// rev 19: a layout handoff in progress, before the next worker starts: the main worker was told `finish`.
@@ -2568,25 +2570,28 @@ impl Run {
         self.probe_sample(eng);
     }
 
-    /// A measurement's sample: the crew's counters summed (the main worker's and every member's playing its range); one
-    /// that left the crew discards it.
+    /// A measurement's sample: the crew's counters summed - the main worker's, every member's playing its range, and those
+    /// of members that finished their ranges since the measurement started (until they end, then their last counters):
+    /// the sum only grows, through rotations.
     fn probe_sample(&mut self, eng: &mut Engine) {
         if self.tuning.as_ref().is_none_or(|t| t.probe.is_none()) {
             return;
         }
-        let mut members = vec![self.wgen];
-        let (mut leaves, mut games, mut started) = self.counters.unwrap_or((0, 0, 0));
-        for m in self.mates.iter().filter(|m| m.active()) {
-            members.push(m.wgen);
-            if let Some((l, g, s)) = m.counters {
-                (leaves, games, started) = (leaves + l, games + g, started + s);
+        let mut now = vec![(self.wgen, self.counters.unwrap_or((0, 0, 0)))];
+        let t = self.tuning.as_ref().expect("checked");
+        for m in &self.mates {
+            if m.active() || t.probe_members.iter().any(|(w, _)| *w == m.wgen) {
+                now.push((m.wgen, m.counters.unwrap_or((0, 0, 0))));
             }
         }
         let t = self.tuning.as_mut().expect("checked");
-        if t.probe_members.iter().any(|w| !members.contains(w)) {
-            return self.end_probe(eng, Err("a worker of the crew left during the trial".into()));
+        for (w, c) in now {
+            match t.probe_members.iter_mut().find(|(x, _)| *x == w) {
+                Some((_, last)) => *last = c,
+                None => t.probe_members.push((w, c)),
+            }
         }
-        t.probe_members = members;
+        let (leaves, games, started) = t.probe_members.iter().fold((0, 0, 0), |(l, g, s), (_, (a, b, c))| (l + a, g + b, s + c));
         let Some((probe, since)) = t.probe.as_mut() else { return };
         match probe.sample(since.elapsed().as_secs_f64(), leaves, games, started) {
             Verdict::Pending => {}
@@ -3084,6 +3089,9 @@ impl Run {
         let why = d.fatal.clone().unwrap_or_else(|| format!("exit code {code} without `end`"));
         let hit = (limit > 0 && peak as f64 >= limit as f64 * crate::rolling::HIT_SHARE) || alloc_failure(&why) || alloc_failure(&tail);
         log::warn!("lease {id}: worker pid {} of the crew failed ({why}); its games in flight are lost", d.worker.pid);
+        if self.tuning.as_ref().is_some_and(|t| t.probe.is_some()) {
+            self.end_probe(eng, Err("a worker of the crew failed during the trial".into()));
+        }
         let Some(r) = self.roll.as_mut().filter(|r| !r.finishing && !stopping) else { return };
         let others = self.mates.iter().filter(|m| m.active()).count() + 1;
         let restart_left = r.restarts < crate::rolling::MAX_RESTARTS && !self.selftest_failed;
@@ -3154,7 +3162,7 @@ impl Run {
     /// rev 19 (PROTOCOL 13.5): the main worker failed (not of memory: a fatal error or an exit without `end`) while
     /// crew members play their ranges: it is replaced (a new tail after every released id; its games in flight lost),
     /// reported once per lease, and the others go on. -> true when a restart is due (else the lease fails as before).
-    fn crew_crash(&mut self, eng: &Engine, why: &str, code: Option<i64>) -> bool {
+    fn crew_crash(&mut self, eng: &mut Engine, why: &str, code: Option<i64>) -> bool {
         let stopping = matches!(self.state, WState::Stopping(_)) || self.after.is_some() || eng.quitting();
         let crew = self.mates.iter().any(|m| m.active());
         let layout = self.tuning.as_ref().map_or(self.main_layout(), |t| t.current);
@@ -3165,6 +3173,9 @@ impl Run {
         }
         r.restart = Some(Restart { conc: layout.conc, burn: true, layout: Some(layout), count: true, measure: false });
         log::warn!("lease {}: the crew's main worker failed ({why}); starting another, the others go on", self.lease.lease_id);
+        if self.tuning.as_ref().is_some_and(|t| t.probe.is_some()) {
+            self.end_probe(eng, Err("the crew's main worker failed during the trial".into()));
+        }
         if !self.crash_reported {
             let kind = if self.worker.stderr_tail().contains("panicked at") { "panic" } else { "crash" };
             self.report(eng, kind, &format!("crew main worker failed: {why}; replaced (the other workers go on)"), code);
@@ -3424,8 +3435,8 @@ impl Run {
         if self.lease_limit_mb > 0 && (held + plan) as f64 > self.lease_limit_mb as f64 * crate::rolling::PLAN_SHARE {
             return;
         }
-        // a spare range that fills its games in flight
-        if let Some(k) = self.spare.iter().position(|&(a, b)| b - a >= per.conc.max(1)) {
+        // a spare range that holds RUNWAY_INFLIGHTS x its games in flight (a shorter one goes back with the lease)
+        if let Some(k) = self.spare.iter().position(|&(a, b)| b - a >= RUNWAY_INFLIGHTS * per.conc.max(1)) {
             let range = self.spare.remove(k);
             return self.spawn_mate(eng, per, range, limit);
         }

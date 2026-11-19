@@ -225,8 +225,8 @@ the members beside the main worker.
   plays a **closed** range of released ids. A new member takes the tail's place (the main worker becomes a member and
   keeps every id released so far from its first - at least 2 x its games in flight unstarted, else more ids are asked
   for first - and the new worker starts at the end of the released ids with none: its `low` asks) or plays a **spare**
-  range that fills its games in flight (ids a worker told `finish` early never started: its frozen `games_started` read
-  twice, as in a handoff, or its `finish` end's `unfinished`). A member that started all of its ids is told `finish`
+  range that holds 2 x its games in flight (ids a worker told `finish` early never started: its frozen `games_started`
+  read twice, as in a handoff, or its `finish` end's `unfinished`). A member that started all of its ids is told `finish`
   and a new one joins (memory permitting: every worker's commit plus the new one's plan within 85 % of the job's
   limit). Extensions ask for 2 x the crew's games in flight (the same ids in hand as one worker with all of them). No
   coordinator change, no extra lease: the coordinator sees one lease, its released ids and its extensions.
@@ -247,8 +247,8 @@ the members beside the main worker.
 - **Tuner.** `workers` 1..3 within physical cores / 4, RAM / 16 GB and the memory plan, or the owner's `workers`; thread
   caps per worker: one worker the caps of before, N > 1 workers 1.5 x the cores per kind between them (2 x 12 on 16
   cores); a worker move keeps the job's games in flight and rows per batch and rescales each kind of thread to its
-  budget. Trials measure the crew's summed counters (a member leaving discards it) and start only with memory for the
-  whole crew. A Mac with >= 12 cores and >= 32 GB starts at 2 x (12 + 4 x 3, 1,152 in 6 groups); everything else at 1.
+  budget. Trials measure the crew's summed counters through rotations (a member that finished its range counts until
+  it ends; a member failing discards the trial) and start only with memory for the whole crew. A Mac with >= 12 cores and >= 32 GB starts at 2 x (12 + 4 x 3, 1,152 in 6 groups); everything else at 1.
   `autotune off` with `workers N` (N > 1) runs that crew fixed; `autotune off` with `workers auto` is one worker, the
   rules of before. The tray and `ZeroFarm status` show "2 workers x (...)" and how many are running.
 - **Cost.** Rotations: a member's closed range lasts between one and a few game lengths of its own (about 1-3 h on the

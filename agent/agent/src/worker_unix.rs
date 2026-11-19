@@ -308,12 +308,11 @@ mod tests {
         std::fs::create_dir_all(&lease).unwrap();
         let mut kids = Vec::new();
         for _ in 0..2 {
-            let mut c = Command::new("sleep").arg("30").process_group(0).spawn().unwrap();
+            let c = Command::new("sleep").arg("30").process_group(0).spawn().unwrap();
             let pid = c.id();
             let (s, us) = crate::macos::proc_start(pid as i32).expect("start time");
             std::fs::write(lease.join(format!("{RECORD}-{pid}")), format!("{pid} {s} {us}")).unwrap();
             kids.push(c);
-            let _ = &mut kids;
         }
         assert_eq!(kill_orphans(work.path()), 2);
         for mut c in kids {

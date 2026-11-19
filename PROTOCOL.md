@@ -1625,8 +1625,9 @@ feature, a coordinator before rev 19, eval, fuzz, classic and GPU jobs are uncha
   the lease closes (`done`) once every worker ended, its `unfinished` worked out from the credited ids (as after a
   restart).
 - **Measurement.** Only of workers that started fresh with the layout (a lease's first worker is one: when a trial
-  may run then, it is the next layout to measure; with several workers their counters are summed - every member that
-  plays new games -, and a member leaving the crew during the trial discards it). Leaves per second from its `status` (pinged every 2 s), over a window
+  may run then, it is the next layout to measure; with several workers their counters are summed - every member of the
+  crew since the measurement started, one that finished its range until it ends (a rotation is the crew's normal work,
+  13.5) -, and a member failing during the trial discards it). Leaves per second from its `status` (pinged every 2 s), over a window
   at the same **game progress** for every layout: from `p0` to `p1` leaves per game in flight, interpolated between
   samples. The search's first measurement sets the window: once the games in flight refilled (`games_started` - `games`
   >= 98 % of `conc`), 20 s more, then 75 s. Why not a fixed time: a fresh worker starts every game at once and slows down
@@ -1703,7 +1704,7 @@ extra lease: the coordinator sees one lease, its released ids, its extensions an
     with `games` 0 (its `low` asks for ids) and gets the extensions from then on.
   - Or it plays a **spare** range: released ids a worker told `finish` early never started (where its ids stop: two
     equal `games_started` reads after `finish`, as in a layout handoff, 13.2; or the `unfinished` of its `finish` end),
-    when the range holds its games in flight.
+    when the range holds 2 x its games in flight (a shorter one goes back with the lease).
   - A member whose `games_started` reached its range's length is told `finish` (it starts no game; its games in flight
     complete) and a new member joins, when every worker's committed memory plus the new one's plan (10.6's base + its
     games in flight x the cost per game) fit 85 % of the job's limit. One member joins at a time (after the previous
@@ -1734,8 +1735,9 @@ extra lease: the coordinator sees one lease, its released ids, its extensions an
   and as many as the memory plan holds (each worker's base and the fewest games in flight allowed), or the owner's
   `workers`. Per worker each kind of thread (search, inference) has floor(1.5 x the cap / `workers`) for N > 1, the cap
   for one (2 x 12 on 16 cores). A trial of a crew starts only with memory for all of it; its workers join one after
-  the other. A layout handoff (13.2) tells every member `finish` with the main worker; the next crew's first worker
-  takes the main worker's unstarted ids and the others' become spare.
+  the other; the measurement sums every member's counters through rotations (13.2). A layout handoff (13.2) tells
+  every member `finish` with the main worker; the next crew's first worker takes the main worker's unstarted ids and
+  the others' become spare.
 - **Cost.** A member's closed range lasts one to a few game lengths of its own (about 1-3 h on the M4 Max at the start's
   layout), then it finishes its games beside its successor. A worker op handing a running worker a new range would let
   every member run as long as the lease (an aw/1 change); not needed for the measured gain.
