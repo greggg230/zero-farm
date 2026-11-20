@@ -1767,7 +1767,8 @@ before rev 19, eval, fuzz and classic jobs are unchanged; GPU jobs are tuned fro
   on **AC power** and not in battery saver / Low Power Mode (whatever `on_battery` says), with **no fullscreen app**
   (whatever `respect_fullscreen` says), nothing else blocking work (paused, outside the hours, low memory) - the
   owner's rule, strict -, and **quiet**: other programs used at most 10 % of the CPUs on average over the last trial
-  length (`tune_warm` + `tune_window`, 95 s; the system's CPU time minus the agent's workers', sampled every 2 s; agents
+  length (`tune_warm` + `tune_window`, 95 s; the system's CPU time minus the agent's workers' - agents from 0.3.9 also
+  minus the agent's own, from 0.3.10 minus the system's interrupt and DPC time (Windows) -, sampled every 2 s; agents
   from 0.3.3 - 0.3.1-0.3.2 judged every sample, and a Mac's bursty background daemons, a sync daemon at ~55 % of a core
   and syncthing at ~90 %, discarded every trial within seconds) and the worker isn't starved. Real work may go on
   outside that (an owner's `work_when active`, `on_battery`); trials don't, and the job runs the incumbent layout.
@@ -2112,6 +2113,11 @@ set the run's alternate's `model` (the CUDA alternate: `"model": "gpu"`) and the
 it: GPU machines play its default model.
 
 ## Changes
+- v1 rev 20, agent 0.3.10 (2026-11-20; no wire change): the tuner's "other programs" load (13.2 **quiet**) leaves out the
+  system's interrupt and DPC time (Windows, `NtQuerySystemInformation` processor performance: drivers' work, no program's) - on the
+  idle 4070 Ti PC a GPU crew's own batches drove 6-11 % of it, 11 % with two groups of small batches, so its trials were
+  discarded at the 10 % bar (13.2) -; a steady reading is never planned under itself rounded up to a whole MB (10.6: 1.1
+  MB x 1.2 rounded to 1 was raised to 2 again at once).
 - v1 rev 20, agent 0.3.9 (2026-11-20; no wire change): the memory plan's cost per game from KB readings, rounded once
   (10.6 **Early reading**), a GPU worker's base reading plus 400 MB (10.6 **The base, measured**) - the 4070 Ti PC's 2.6 MB a
   game planned at 3 instead of 4 over a ~2.0 GB base -, and the agent's own CPU time (its uploads) counted as the job's,

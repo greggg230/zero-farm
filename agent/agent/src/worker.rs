@@ -31,7 +31,7 @@ use zerofarm_common::rotlog::RotatingFile;
 #[path = "worker_unix.rs"]
 mod unix;
 #[cfg(unix)]
-pub use unix::{kill_orphans, self_cpu_ms, sys_cpu_ms, CpuMark, WorkerProc};
+pub use unix::{kill_orphans, self_cpu_ms, sys_cpu_ms, sys_dpc_ms, CpuMark, WorkerProc};
 
 /// Longest stdout line accepted from a worker.
 pub const MAX_LINE: usize = 1 << 20;
@@ -355,6 +355,26 @@ pub fn self_cpu_ms() -> u64 {
     (ft(&k) + ft(&u)) / 10_000
 }
 
+/// agent 0.3.10: the system's interrupt and DPC time so far over all processors, ms (part of `sys_cpu_ms`'s busy time):
+/// drivers' work, no program's (`tune::LoadMark`). 0 when Windows doesn't say.
+#[cfg(windows)]
+pub fn sys_dpc_ms() -> u64 {
+    use windows_sys::Wdk::System::SystemInformation::{NtQuerySystemInformation, SystemProcessorPerformanceInformation};
+    use windows_sys::Win32::System::WindowsProgramming::SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION;
+    // (one entry per processor of the caller's group: 64 at most)
+    let mut buf = [SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION::default(); 64];
+    let size = std::mem::size_of_val(&buf) as u32;
+    let mut got = 0u32;
+    let st = unsafe { NtQuerySystemInformation(SystemProcessorPerformanceInformation, buf.as_mut_ptr().cast(), size, &mut got) };
+    if st < 0 {
+        return 0;
+    }
+    let n = (got as usize / std::mem::size_of::<SYSTEM_PROCESSOR_PERFORMANCE_INFORMATION>()).min(buf.len());
+    // (`Reserved1` is the DPC time and the interrupt time, 100 ns units - ntexapi.h's DpcTime, InterruptTime)
+    let t: i64 = buf[..n].iter().map(|p| p.Reserved1[0].max(0) + p.Reserved1[1].max(0)).sum();
+    (t.max(0) as u64) / 10_000
+}
+
 /// rev 19 (PROTOCOL 13): the system's CPU time so far over all CPUs, ms: (idle, total).
 #[cfg(windows)]
 pub fn sys_cpu_ms() -> (u64, u64) {
@@ -465,4 +485,24 @@ fn read_lines(stdout: impl Read, on_msg: impl Fn(WorkerMsg)) {
         }
     }
     on_msg(WorkerMsg::Eof);
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    #[test]
+    fn interrupt_and_dpc_time_is_read_and_part_of_the_busy_time() {
+        let (i0, t0) = super::sys_cpu_ms();
+        let d0 = super::sys_dpc_ms();
+        // some work, so time passes on every clock
+        let mut x = 0u64;
+        for k in 0..20_000_000u64 {
+            x = x.wrapping_mul(31).wrapping_add(k);
+        }
+        std::hint::black_box(x);
+        let (i1, t1) = super::sys_cpu_ms();
+        let d1 = super::sys_dpc_ms();
+        assert!(d0 > 0, "Windows counts some interrupt / DPC time since boot");
+        assert!(d1 >= d0, "it only grows");
+        assert!(d0 < t0 && d1 - d0 <= (t1 - t0) - (i1 - i0) + 50, "within the busy time ({d0} of {t0})");
+    }
 }

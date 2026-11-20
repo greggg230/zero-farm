@@ -416,7 +416,9 @@ impl Learned {
     /// up to a whole MB and the product up again; at least 1) when that is less than what is planned with now (the stored
     /// value, else the default) -> the new value when it was lowered. Rises go through `raise`, at once.
     pub fn steady(layout: &Layout, run: &str, build: &str, gpu: bool, reading_kb: u64) -> Option<u64> {
-        let v = ((reading_kb as f64 * LEARN_MARGIN / 1024.0).round() as u64).max(1);
+        // (never under the reading rounded up - what `raise` compares with: 1.1 MB x 1.2 rounds to 1, and the next
+        // reading's 2 would raise it again at once)
+        let v = ((reading_kb as f64 * LEARN_MARGIN / 1024.0).round() as u64).max(reading_kb.div_ceil(1024)).max(1);
         Self::lower_key(layout, Self::key(run, build, gpu), Self::default_cost(gpu).per_game_mb, v)
     }
 
@@ -742,6 +744,8 @@ mod tests {
         assert_eq!(Learned::early(&layout, "r", "gpu-build2", true, 1024), Some(2), "a reading under the base counts 1 MB (lease.rs): 2");
         // agent 0.3.9: a steady reading of 2.6 MB a game (KB) x 1.2 = 3.1: planned at 3 (0.3.3-0.3.8: 3 x 1.2 rounded up, 4)
         assert_eq!(Learned::steady(&layout, "r", "gpu-build", true, 2662), Some(3));
+        // never under the reading rounded up: 1.1 MB x 1.2 = 1.3 -> 2, not 1 (a reading of 2 would raise 1 at once)
+        assert_eq!(Learned::steady(&layout, "r", "small", true, 1126), Some(2));
         assert_eq!(measured_per_game_kb(3540, 575, MemCost { base_mb: 2059, per_game_mb: 4 }), 2638, "1,481 MB over 575 games, rounded up");
         assert_eq!(measured_per_game(3540, 575, MemCost { base_mb: 2059, per_game_mb: 4 }), 3);
         // agent 0.3.6: the base, measured - only lower, by more than 5 %; planned with

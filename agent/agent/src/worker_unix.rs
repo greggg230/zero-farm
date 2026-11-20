@@ -269,6 +269,11 @@ pub fn self_cpu_ms() -> u64 {
     crate::macos::proc_cpu_ms(std::process::id() as i32).unwrap_or(0)
 }
 
+/// agent 0.3.10: the system's interrupt time so far, ms - not told apart on macOS: 0 (`tune::LoadMark`).
+pub fn sys_dpc_ms() -> u64 {
+    0
+}
+
 /// rev 19 (PROTOCOL 13): the system's CPU time so far over all cores, ms: (idle, total).
 pub fn sys_cpu_ms() -> (u64, u64) {
     let (idle, total) = crate::macos::cpu_ticks();

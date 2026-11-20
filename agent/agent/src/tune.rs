@@ -1166,12 +1166,15 @@ impl Cache {
 }
 
 /// CPU time at a point: the system's (idle, total over all CPUs) and our workers', ms. Two of them give the share of
-/// the CPUs other programs used in between (a trial needs a quiet machine).
+/// the CPUs other programs used in between (a trial needs a quiet machine). agent 0.3.10: and the system's interrupt and
+/// DPC time (`dpc_ms`, Windows; 0 elsewhere) - drivers' work, no program's: a GPU crew's own batches drive the GPU
+/// driver's, which read as 6-11 % "other programs" on the idle 4070 Ti PC, two groups of small batches the most.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct LoadMark {
     pub idle_ms: u64,
     pub total_ms: u64,
     pub ours_ms: u64,
+    pub dpc_ms: u64,
 }
 
 impl LoadMark {
@@ -1183,7 +1186,8 @@ impl LoadMark {
         }
         let busy = total.saturating_sub(now.idle_ms.saturating_sub(self.idle_ms));
         let ours = now.ours_ms.saturating_sub(self.ours_ms);
-        (busy.saturating_sub(ours) as f64 / total as f64).clamp(0.0, 1.0)
+        let drivers = now.dpc_ms.saturating_sub(self.dpc_ms);
+        (busy.saturating_sub(ours).saturating_sub(drivers) as f64 / total as f64).clamp(0.0, 1.0)
     }
 }
 
@@ -2180,13 +2184,16 @@ mod tests {
 
     #[test]
     fn other_programs_load() {
-        let a = LoadMark { idle_ms: 1000, total_ms: 10_000, ours_ms: 500 };
+        let a = LoadMark { idle_ms: 1000, total_ms: 10_000, ours_ms: 500, dpc_ms: 100 };
         // 16,000 CPU-ms passed, 4,000 idle: 12,000 busy, 10,000 of them ours
-        let b = LoadMark { idle_ms: 5000, total_ms: 26_000, ours_ms: 10_500 };
+        let b = LoadMark { idle_ms: 5000, total_ms: 26_000, ours_ms: 10_500, dpc_ms: 100 };
         assert!((a.other_since(&b) - 0.125).abs() < 1e-9);
         assert_eq!(a.other_since(&a), 0.0);
         let ours_more = LoadMark { ours_ms: 99_999, ..b };
         assert_eq!(a.other_since(&ours_more), 0.0, "never below 0");
+        // agent 0.3.10: 800 of the 2,000 busy CPU-ms not ours were interrupts and DPCs (drivers): 1,200 other
+        let drivers = LoadMark { dpc_ms: 900, ..b };
+        assert!((a.other_since(&drivers) - 0.075).abs() < 1e-9);
     }
 
     #[test]

@@ -4,6 +4,13 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's: `agent-macos-v<version>`).
 
+## Unreleased (0.3.10)
+
+- **Timing setups on a graphics card no longer trips over the card's own driver.** The graphics driver's own processor
+  time, which a job on the card causes, counted as "other programs" - 6 to 11 % on an idle RTX 4070 Ti - so timing runs
+  were thrown away or never started. Zero Farm now leaves that driver time out.
+- A memory figure rounded just below what a job program really used could be raised again at once; it no longer is.
+
 ## Unreleased (0.3.9)
 
 - **Graphics cards hold more games at once.** Zero Farm planned about 4 MB of memory for each game on a graphics card

@@ -3092,7 +3092,7 @@ impl Run {
         // games an hour from a GPU crew; 0.3.8 counted it as another program's, and the idle 4070 Ti PC read 7-11 % "other
         // programs" during its GPU trials, at the 10 % bar)
         let ours_ms = crate::worker::self_cpu_ms() + self.worker.cpu_ms() + self.mates.iter().map(|d| d.worker.cpu_ms()).sum::<u64>();
-        let now = LoadMark { idle_ms, total_ms, ours_ms };
+        let now = LoadMark { idle_ms, total_ms, ours_ms, dpc_ms: crate::worker::sys_dpc_ms() };
         let tu = self.tuning.as_mut().expect("checked");
         if let Some((at, prev)) = tu.load {
             let share = eng.signals.other_load(prev.other_since(&now));
