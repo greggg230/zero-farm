@@ -324,6 +324,9 @@ only to a PC with an NVIDIA graphics card and a recent enough driver (527.41 or 
 GPU" is on and the disk limit has room, and only for jobs that run a network on the GPU; the app checks
 all of this again itself before downloading it, and a PC without an NVIDIA card never downloads it. If the
 pack's GPU test fails on a PC, the pack is removed again and not downloaded for that driver. AMD graphics
-cards are not used for farm work (from 0.2.11): PCs with only an AMD card run jobs on the processor.
+cards are used with DirectML only (from 0.3.11; 0.2.11-0.3.10 didn't use them at all): Zero Farm never runs AMD's own
+GPU programs (which misbehaved on a friend's PC in November), only Microsoft's DirectML, from a small runtime pack made
+for it, and only if its test passes on the PC. The project owner can turn GPU work on a brand of graphics card off
+again at any time without an update; the PC then runs jobs on the processor.
 Zero Farm's own code (this repo) is MIT-licensed (above); the job programs are signed builds of a
 private engine (MTG Zero).

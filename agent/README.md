@@ -591,6 +591,15 @@ Agent exit codes: 0 quit, 75 switch to `state\pending`, 76 hand over to the new 
   (`PROBE_PROVIDERS`), AMD adapters left out of the profile (`profile.rs` `GPU_VENDORS_OFF`, `split_off`; a probe
   is then pinned to a usable adapter, `pin_gpu`), the coordinator's evict list applied at start
   (`update.rs` `apply_evict`), and the launcher's session-end handling (`SESSION_END_CODES`, `SM_SHUTTINGDOWN`).
+- Rev 22 (PROTOCOL 9.8, agent 0.3.11): AMD adapters are reported again, DirectML only (`profile.rs` `VENDOR_PROVIDERS`,
+  `probe.rs` `allowed_on`): a probe or bench on a PC with an AMD adapter runs on one adapter (`probe.rs` `scope`: the
+  pack's vendor, NVIDIA, AMD, Intel; an AMD one with `--providers dml,cpu`, no `--ensure-ready`), a pack that ships
+  Windows ML's catalog never touches an AMD adapter (`PackGpu`, `pack_gpus`), the measured choice never puts another
+  provider there, older records of AMD adapters are ignored (`RULES`), and the guard refuses an `amd` pack that brings
+  more than `dml` or ships the catalog. The owner's `gpu_vendors_off` from `GET /v1/agent/latest` is kept in
+  `state\gpu_vendors_off.json` and applied at start and every update check (`update.rs` `apply_vendors_off`,
+  `profile.rs` `vendors_off` / `split_off`); a rolling GPU job on such an adapter is given back (`lease.rs`
+  `gpu_vendor_off`).
 - GPU work (phase 4, PROTOCOL 8) is built but not released: provider probes between leases
   (`probe.rs`: a cached worker build's `probe-providers` per runtime pack, results in
   `state\probes.json`, the readable report in the worker log), the profile's `providers` /

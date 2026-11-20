@@ -7,8 +7,8 @@ A change to anything here is a protocol change: bump the version it belongs to a
 bottom.
 
 Versions: HTTP API `v1` (path prefix), agent↔worker protocol `aw/1`, network files `zero-onnx/1`,
-manifests `manifest/1`. Current revision: v1 rev 21 (section 10.4, the in-flight limit of rolling leases; rev 20: section 14, model
-variants per generation; rev 19: section 13, layout tuning and
+manifests `manifest/1`. Current revision: v1 rev 22 (section 9.8, AMD GPUs with DirectML only and the owner's GPU vendors
+off; rev 21: section 10.4, the in-flight limit of rolling leases; rev 20: section 14, model variants per generation; rev 19: section 13, layout tuning and
 several workers per lease; rev 18: section 12, hardware routing; rev 17: section 11, platforms: macOS on Apple silicon).
 
 ## 1. Conventions
@@ -296,7 +296,10 @@ lease (else 400). `returned` is how many ids went back. Repeating `done` → 200
   send the channel they were enrolled on, which goes stale when `POST /v1/admin/machine/{id}` moves
   the machine; the machine's channel as the coordinator holds it is the one that counts. Rev 12:
   `"evict": ["<build_id>", ...]` (only when the owner's evict list is not empty, `POST /v1/admin/evict`):
-  agents from 0.2.11 delete those builds from their cache at once (section 9.8); older agents ignore the key.
+  agents from 0.2.11 delete those builds from their cache at once (section 9.8); older agents ignore the key. Rev 22:
+  `"gpu_vendors_off": ["amd"]` (only when the owner's list is not empty, `POST /v1/admin/gpu_vendors_off`): agents from
+  0.3.11 treat those vendors' adapters as unusable for GPU work, at start and after every check (section 9.8); older
+  agents ignore the key.
 - `POST /v1/presence` `{"reason": "user_active"}` → `{"ok": true}` (rev 16; migration 0012). An agent that may
   not work right now sends why, at most every 60 s: when the reason changes and every 5 min while it lasts, in
   the background (a failure changes nothing; a coordinator without it answers 404, which the agent ignores).
@@ -420,6 +423,7 @@ tools also send an Access service token (`CF-Access-Client-Id`, `CF-Access-Clien
 | `POST /v1/admin/pause` | `{"paused": true \| false}`: farm-wide, no new leases while paused |
 | `POST /v1/admin/routing` | rev 18: `{"on": bool, "eval_horizon_s": 0..604800, "eval_games_per_thread": 0..16}`, any of them; the others keep their values → `{"ok": true, "on", "eval_horizon_s", "eval_games_per_thread"}`. `GET /v1/admin/routing` → the same fields and `"stored"` (false: never set, the defaults). Section 12 |
 | `POST /v1/admin/evict` | rev 12: `{"builds": ["<build_id>", ...]}` (at most 64; `[]` clears it) replaces the evict list → `{"ok": true, "builds"}` (deduplicated). `GET /v1/admin/evict` → `{"builds"}`. It rides on every `GET /v1/agent/latest` (section 3) |
+| `POST /v1/admin/gpu_vendors_off` | rev 22: `{"vendors": ["amd"]}` (vendor names `[a-z0-9]{1,32}`, at most 8; `[]` clears it) replaces the list of GPU vendors the owner turned off → `{"ok": true, "vendors"}` (deduplicated); settings key `gpu_vendors_off`, no migration. `GET /v1/admin/gpu_vendors_off` → `{"vendors"}`. It rides on every `GET /v1/agent/latest` (section 3); what it does: section 9.8. Admin CLI: `npm run admin -- gpu-vendors-off [amd \| none]` |
 | `POST /v1/admin/diag` | `{"machine_id" \| "class", "kind": "sweep" \| "profile" \| "stability" \| "logs", "params"}` → `{"requests": [{"id", "machine_id"}]}`. `class` = a hardware class as the stats show it (`"<cpu> / <gpu or 'no gpu'>"`). `logs` goes out as `upload_diag`; the others become `diag` leases (`params.build_id` or `params.run` picks the build) |
 | `GET /v1/admin/diag?machine_id=` | requests, uploads and diag-lease results with their R2 keys |
 | `GET /v1/admin/stats` | aggregates for the dashboard (`/admin`); per machine also `idle_h_day`, `on_h_day`, `starved_s_24h`, `blocked` (rev 5: `[{"build_id", "until", "os_error", "message", "agent_version", "t"}]`); per run `eval` (the current batch's progress, rev 5); `eval_batches` (the 20 newest batches of all runs, with `run`); `releases` (latest per channel, `github_url`), `diag_uploads` (recent, `user`). Rev 6: `auth` (`{"via": "token" \| "access", "email"?, "common_name"?}`), `limits`, per run and campaign `definition` (current version, gens, jobs, builds and `problems`: why a job can't be leased), per machine `refused_24h`, `blocks` (every active block), `contributors` (farm PCs and external sources, below), `totals` (`farm`, `own`, `all`: self-play/eval games and fuzz seeds over 1 h and 24 h), `by_scope` |
@@ -1000,8 +1004,8 @@ numerically, missing parts 0; absent: any), and it adds `providers` (known provi
 provider). The coordinator never leases such a pack to an agent older than 0.2.10 or to a PC without such an
 adapter (default or alternate alike), and the agent refuses it (9.5). For the CUDA pack: NVIDIA, 527.41 (cuDNN
 9.28's Windows minimum for CUDA 12.x, above CUDA 12's own minor-version minimum of 525; Blackwell cards need
-570.65+, which every driver that supports them is), `["cuda"]`. A pack without `gpu` (CPU, Windows ML) loads
-anywhere.
+570.65+, which every driver that supports them is), `["cuda"]`. For the DirectML-only pack (rev 22, 9.8): AMD, no
+minimum, exactly `["dml"]`. A pack without `gpu` (CPU, Windows ML) loads anywhere.
 
 ### 9.3 Compressed build files (`files[].zst`)
 
@@ -1027,11 +1031,13 @@ plain sizes plus the largest compressed object (one at a time is unpacked and th
 migration 0009 `runs.alternates`). Checks (400): `build_id` a registered worker build whose manifest's
 `requires_runtime` is `runtime`; `runtime` a registered runtime build; `when.vendor` a vendor name, and equal to
 the pack's `gpu.vendor` when the pack has one (it defaults to it); `when.min_driver` optional (the stricter of it
-and the pack's applies); no alternate equal to the default (`build_id`, `runtime`) or to another alternate; rev 12:
-`when.vendor` not a vendor the farm never uses (`GPU_VENDORS_OFF`: `amd`, section 9.8), and an alternate of such a
-vendor stored before rev 12 is never offered. `GET
+and the pack's applies); no alternate equal to the default (`build_id`, `runtime`) or to another alternate; rev 22
+(9.8): an alternate for `amd` only with a DirectML-only pack - `gpu` naming `amd` and exactly `["dml"]`, no Windows
+ML catalog DLL among its files - (rev 12-21 refused every `amd` alternate; one stored before rev 12 is never offered).
+An alternate of a vendor the owner turned off (`gpu_vendors_off`, 9.8) is accepted and not offered. `GET
 /v1/admin/run/{run}` and the stats show them, with `problems` per alternate when the current definition doesn't
-authorize it. Rev 20: an alternate may name a model variant (`"model": "<name>"`, section 14.3) that its machines play
+authorize it (rev 22: also when its vendor is off or its pack breaks the vendor's rule; an `amd` alternate adds
+`gpu_notes`, 9.8). Rev 20: an alternate may name a model variant (`"model": "<name>"`, section 14.3) that its machines play
 instead of each gen's default model.
 
 For a run's self-play or eval job and an agent of at least `ALT_RUNTIME_AGENT`, the coordinator puts the **first
@@ -1041,7 +1047,8 @@ machine qualifies when all hold:
    provider has passed a probe yet; else `caps.gpu`);
 2. its profile lists an adapter of `when.vendor` with a driver at least the minimum (9.2);
 3. the job's `providers` allowlist (section 8) allows one of the pack's `gpu.providers` (a pack without `gpu`: any
-   GPU provider);
+   GPU provider; rev 22: any that can serve `when.vendor` - its own vendor's, or `dml`, which serves every vendor -,
+   never `amdgpu` or `migraphx`);
 4. its profile's `runtime_providers` has no entry for the pack (never probed here: the first lease probes it), or
    one listing a provider of 3 (an entry without one means the pack failed here: never offered again for these
    adapters and drivers);
@@ -1049,7 +1056,9 @@ machine qualifies when all hold:
 6. neither build is blocked for this machine (`/v1/crash` `blocked`), both are registered, and their `min_agent` is
    at most the agent's;
 7. the run's current definition authorizes it (section 7, rev 11: the build is in `builds` and the runtime is the
-   definition's or the build's `requires_runtime`).
+   definition's or the build's `requires_runtime`);
+8. rev 22 (9.8): `when.vendor` is not one the owner turned off (`gpu_vendors_off`); an `amd` alternate also needs an
+   agent of at least `AMD_DML_AGENT` (Worker var, default 0.3.11) and its DirectML-only pack (above).
 Otherwise the lease carries the default. Fuzz (campaigns) and diag leases never carry an alternate. For GPU
 routing (section 8) a machine counts as GPU-eligible for an alternate it qualifies for while condition 4 is "no
 entry" (it probes the pack before its first job line, 9.6).
@@ -1136,9 +1145,9 @@ meanwhile), a provider that failed its self-test in a bench stays failed for tha
 |---|---|---|
 | any (default) | the CPU pack (ONNX Runtime 1.31.1 CPU), or the Windows ML pack (DirectML, Windows ML's catalog) | the run's `runtime` |
 | NVIDIA | the **CUDA pack** (`farm_build.py --runtime --pack cuda`): ONNX Runtime 1.24.4 (the last CUDA 12 build; 1.27+ need CUDA 13, driver 580+) with the CUDA provider, the CUDA 12.8 runtime, cuBLAS and cuBLASLt, cuFFT (a load-time import of ONNX Runtime's CUDA provider), cuDNN 9.28 (`cudnn64_9`, `cudnn_graph64_9`, `cudnn_ops64_9`: the only cuDNN libraries our graphs load), the MSVC runtime; `gpu` NVIDIA 527.41 `["cuda"]` | a run alternate, `when.vendor` `nvidia` |
-| AMD | none (rev 12: no GPU work on AMD GPUs, 9.8) | AMD PCs run CPU work on the run's default pack |
+| AMD | the **DirectML-only pack** (rev 22, 9.8): ONNX Runtime with DirectML, `DirectML.dll` and license files, no Windows ML catalog DLL; `gpu` AMD `["dml"]` (rev 12-21: none, no GPU work on AMD GPUs) | a run alternate, `when.vendor` `amd` (the pack's), agents from `AMD_DML_AGENT`; never AMD's own providers |
 
-### 9.8 Probes the PC never finished, GPU vendors off, the evict list (rev 12, agents from 0.2.11)
+### 9.8 Probes the PC never finished, GPU vendors off, the evict list (rev 12, agents from 0.2.11; rev 22: AMD GPUs with DirectML only, agents from 0.3.11)
 
 **The in-progress marker.** Before a built-in probe or a bench (9.6) starts its worker, the agent writes
 `state\probe-inflight.json` `{"kind": "probe" | "bench", "runtime", "adapters" (the probe key: vendor, name and
@@ -1157,15 +1166,66 @@ the start).
 
 **What a probe may load.** The built-in probe and the bench pass `--providers tensorrt_rtx,cuda,openvino,dml,cpu`:
 never AMD's providers (`amdgpu`, `migraphx`), and the measured choice never picks them, even from a bench an older
-agent kept. On a PC with an adapter of a vendor that is off (below) they also pass `--gpu <LUID>` of one usable
-adapter (NVIDIA first, then Intel), so the worker doesn't enumerate the others.
+agent kept. On a PC with an AMD adapter, or with an adapter of a vendor that is off (below), they also pass `--gpu
+<LUID>` of one adapter the pack may use, so the worker doesn't enumerate the others: agents from 0.3.11 an adapter of
+the pack's own `gpu.vendor` first, then NVIDIA, AMD, Intel, any other, and of one vendor the one with the most
+dedicated video memory (a discrete GPU before an integrated one); 0.2.11-0.3.10 NVIDIA first, then Intel. One pinned to
+an AMD adapter passes `--providers dml,cpu` and no `--ensure-ready` (Windows ML installs nothing for it). A PC with
+neither probes every adapter with every provider above, as before.
 
-**GPU vendors off.** The owner's decision of 2026-11-13: the farm runs no GPU work on AMD GPUs (the AMD providers
-failed on a farm PC's AMD GPU and a driver fault mid-probe could take a PC down). Agents from 0.2.11 leave AMD
-adapters (`vendor: "amd"`, PCI vendor 0x1002 / 0x1022) out of the profile's `gpus` altogether: no probe, bench or
-GPU job touches them, `caps.gpu` and `caps.gpu_allowed` stay false when they are a PC's only GPUs, and no
-alternate can match them (9.4). The coordinator refuses and skips AMD alternates (9.4). The choice itself (9.6)
-stays vendor-neutral among the adapters that are left.
+**AMD GPUs with DirectML only (rev 22, agents from 0.3.11).** The owner's decision of 2026-11-20: AMD GPUs run farm work
+with DirectML (`dml`) only, never with AMD's own Windows ML providers. On 2026-11-13 those (`amdgpu`, `migraphx`)
+failed on a farm PC's AMD GPU, and a diagnostic probe that ran dozens of failing sessions on them very likely took that
+PC down twice, so rev 12 turned AMD GPUs off altogether (below); DirectML had run on that GPU without trouble, and on
+2026-11-20 it reached ~0.43x of CUDA on the same NVIDIA card with that day's graphs.
+- Agents report AMD adapters in `gpus` again (`vendor: "amd"`, PCI vendor 0x1002 / 0x1022). A per-vendor table
+  (`profile::VENDOR_PROVIDERS`: `amd` → `["dml"]`) governs every step: a probe or bench on an AMD adapter loads `dml`
+  and the CPU only (above); the measured choice (9.6) never puts another provider on an AMD adapter, whatever a probe
+  or bench record says passed there; probe and bench records of AMD adapters that older agents made (without `rules`)
+  are not used, so those adapters are probed again under this rule.
+- A runtime pack that ships Windows ML's catalog (`Microsoft.Windows.AI.MachineLearning.dll`, anywhere among its
+  files: the Windows ML pack of section 8), which can register the vendors' catalog providers, never does GPU work on
+  an AMD adapter: its probe and bench leave AMD adapters out (an AMD-only PC doesn't probe it, and its jobs run on the
+  CPU), and the measured choice never picks an AMD adapter for it.
+- The **DirectML-only pack** (zero-core `farm_build.py`: ONNX Runtime with DirectML, `DirectML.dll`, license files, no
+  catalog DLL) is signed with `gpu` `{"vendor": "amd", "providers": ["dml"]}` (no `min_driver`) and `min_agent` 0.2.10
+  or newer, and a run lists it as an alternate (`{"build_id", "runtime": <the pack>, "model": "<variant>"?}`;
+  `when.vendor` comes from the pack). The agent's guard (9.5) refuses a pack whose `gpu` names `amd` with any provider
+  but `dml`, or that ships the catalog DLL (`refused: "runtime"`). The same pack signed for another vendor (e.g.
+  `{"vendor": "nvidia", "providers": ["dml"]}`) is an ordinary pack: nothing beyond 9.2-9.6 applies to it.
+- The coordinator (9.4): `PUT /v1/admin/run` refuses (400) an `amd` alternate whose pack has no `gpu`, a `gpu` of
+  another vendor, `providers` other than exactly `["dml"]`, or the catalog DLL among its files; a lease carries an
+  `amd` alternate only with such a pack (an `amd` alternate stored before rev 12 has none: never offered) and only to
+  agents of at least `AMD_DML_AGENT` (Worker var, default 0.3.11; older agents leave AMD adapters out of their profiles
+  anyway). `GET /v1/admin/run` and the stats show an `amd` alternate with `gpu_notes` (`"amd GPUs run dml only;
+  offered to agents from 0.3.11"`) and, in its `problems`, why it isn't offered when it isn't; the admin page lists each
+  run's GPU alternates.
+- The rest of a GPU lease is vendor-neutral and holds on an AMD GPU without NVML: the GPU busy gate (PDH, section 8);
+  the temperature rule (D3DKMT; a driver that reports none has no temperature rule: the busy gate and the driver's own
+  thermal limits still apply, and GPU work is never blocked for want of a reading); the adapter's dedicated memory
+  (DXGI) and its use (Windows' GPU memory counters, 10.6 **Video memory**); crews and the tuner (13.1: a GPU other than
+  NVIDIA starts with one worker, the tuner tries more); a DirectML worker out of video memory (`E_OUTOFMEMORY`, 10.6);
+  `caps.gpu` and `caps.gpu_allowed` (an AMD-only PC asks with `gpu_allowed` now); the hardware class (its biggest GPU,
+  section 4).
+
+**GPU vendors off.** Agents 0.2.11-0.3.10 (rev 12, the owner's decision of 2026-11-13) ran no GPU work on AMD GPUs:
+they left AMD adapters out of the profile's `gpus` altogether - no probe, bench or GPU job touched them, `caps.gpu` and
+`caps.gpu_allowed` stayed false when they were a PC's only GPUs, no alternate could match them - and the coordinator
+refused and skipped AMD alternates. Rev 22 replaces that built-in rule with the owner's **kill switch**, for any vendor
+and without an agent release: `POST /v1/admin/gpu_vendors_off` `{"vendors": ["amd"]}` (section 4; `[]` clears it).
+The list rides on `GET /v1/agent/latest` as `gpu_vendors_off` (section 3; absent while empty). Agents from 0.3.11 keep
+it (`state\gpu_vendors_off.json`, so it holds through restarts while the coordinator can't be reached) and apply it at
+start, before any probe (the update check is the main loop's first step), and at every update check (every 6 hours,
+a rolling lease's own check included): the adapters of a listed vendor leave the profile's `gpus` as 0.2.11 left
+AMD's (CPU work only on them; a probe or bench is pinned to another adapter, above), a GPU job running on such an
+adapter is given back at once (`given_back: true`, its GPU released), and the guard (9.5) refuses a pack whose `gpu`
+names that vendor. Absent or empty: nothing off (also what an older coordinator's answer means). While a vendor is
+listed the coordinator offers none of its alternates, to any agent (older agents don't read the list but never get
+such an alternate), nor a default pack whose `gpu` names it, and such an alternate is not the run's GPU version
+(12.1); `GET /v1/admin/run` and the stats say so in the alternate's `problems`, the stats add `gpu_vendors_off`, the
+admin page shows a "GPU off" tile. A vendor-neutral default pack (DirectML in the Windows ML pack) on an older agent's
+adapters is beyond the switch: those agents keep 0.2.11-0.3.10's rules. The choice itself (9.6) stays vendor-neutral
+among the adapters that are left.
 
 **The evict list.** `GET /v1/agent/latest` carries the owner's `evict` list (section 3, `POST /v1/admin/evict`).
 Agents from 0.2.11 delete each listed build from `cache\builds\` (and its LRU entry) when they get it: at start,
@@ -1670,8 +1730,9 @@ order of rev 17 exactly), `eval_horizon_s` (default 1800), `eval_games_per_threa
 
 ### 12.1 CPU self-play is the last resort while the run has a GPU version
 
-A run **has a GPU version** when it lists an alternate (section 9.4) for a GPU vendor the farm uses, or its default
-runtime pack requires a GPU (`gpu` in its manifest, section 9.2). A default pack that only *may* use a GPU (DirectML)
+A run **has a GPU version** when it lists an alternate (section 9.4) for a GPU vendor the farm uses (rev 22: not one the
+owner turned off; an `amd` alternate with its DirectML-only pack, 9.8), or its default runtime pack requires a GPU
+(`gpu` in its manifest, section 9.2). A default pack that only *may* use a GPU (DirectML)
 counts by its alternates alone. A CPU alternate (rev 17, section 11.4: no `when.vendor`, e.g. a macOS build) is not a GPU version.
 
 A PC **plays a run's self-play on its GPU** when its candidate is a GPU lease (an alternate it qualifies for, or a GPU
@@ -2140,6 +2201,20 @@ set the run's alternate's `model` (the CUDA alternate: `"model": "gpu"`) and the
 it: GPU machines play its default model.
 
 ## Changes
+- v1 rev 22 (2026-11-20; agent 0.3.11, canary first; coordinator var `AMD_DML_AGENT`, no migration): **AMD GPUs with
+  DirectML only, and the owner's GPU vendors off** (section 9.8). Agents report AMD adapters again and run only `dml` on
+  them: a probe or bench on a PC with an AMD adapter is pinned to one adapter (the pack's vendor, then NVIDIA, AMD,
+  Intel; the most video memory), an AMD one with `--providers dml,cpu` and no `--ensure-ready`; a pack that ships
+  Windows ML's catalog DLL never does GPU work on an AMD adapter; the measured choice never puts another provider on
+  one, and older agents' probe and bench records of AMD adapters are not used. The DirectML-only pack (`gpu`
+  `{"vendor": "amd", "providers": ["dml"]}`, no catalog DLL) is a run alternate; the coordinator refuses any other pack
+  for `amd` (400 at `PUT /v1/admin/run`, skipped at lease time) and offers `amd` alternates only to agents from
+  `AMD_DML_AGENT` (0.3.11); a pack without `gpu` serves an alternate only with providers that can serve its vendor
+  (9.4 condition 3). The kill switch, for any vendor: `POST`/`GET /v1/admin/gpu_vendors_off` (settings), `gpu_vendors_off`
+  on `GET /v1/agent/latest`, applied by agents from 0.3.11 at start and at every update check (a GPU job on such an
+  adapter is given back); no alternate of a listed vendor is offered. It replaces rev 12's built-in "no GPU work on
+  AMD GPUs". Why: only AMD's own providers failed (and very likely crashed a farm PC) in November; DirectML ran on that
+  AMD GPU without trouble and reaches ~0.43x of CUDA on the same NVIDIA card with today's graphs.
 - v1 rev 21 (2026-11-20; coordinator only, every agent version; no migration): **the in-flight limit of rolling leases**
   (10.4). An extension releases ids only while the lease's unfinished ids stay within its games in flight (twice that for
   a crew) plus a reporting buffer, else `wait_s` 20 with `reason` `inflight`; ids past a lease's batch take only the
