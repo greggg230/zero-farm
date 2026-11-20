@@ -4,6 +4,14 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's: `agent-macos-v<version>`).
 
+## Unreleased (0.3.11)
+
+- **AMD graphics cards can help again, through DirectML only.** Since 0.2.11 Zero Farm left AMD cards alone, because
+  AMD's own GPU programs misbehaved on a PC in November. From 0.3.11 an AMD card runs jobs with Microsoft's DirectML -
+  never AMD's own GPU programs - from a small runtime pack made for it, and only after its self-test passes on the PC;
+  a run uses it only when it publishes a graph DirectML can play. The project owner can turn GPU work on a brand of
+  graphics card off again at any time without an update; the PC then runs its jobs on the processor.
+
 ## Unreleased (0.3.10)
 
 - **Timing setups on a graphics card no longer trips over the card's own driver.** The graphics driver's own processor
