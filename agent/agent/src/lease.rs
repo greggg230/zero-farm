@@ -234,6 +234,10 @@ impl Mate {
 /// games in flight in unstarted ids (the member that takes the tail's place leaves it a closed range that long).
 const RUNWAY_INFLIGHTS: u64 = 2;
 
+/// agent 0.3.7: a GPU job's trials wait for its memory plan to be measured at most this long from the lease's start:
+/// then they run on the plan as it is.
+const GPU_TRIAL_WAIT: Duration = Duration::from_secs(15 * 60);
+
 /// rev 19 (PROTOCOL 13): the tuning of a rolling lease's CPU job.
 struct Tuning {
     space: tune::Space,
@@ -274,9 +278,6 @@ struct Tuning {
     /// agent 0.3.5: a trial may run now (the last tick's verdict: idle, quiet, not paused) - checked again when a trial's
     /// worker starts, not while it waits for room.
     strict: bool,
-    /// agent 0.3.5: trials postponed because their workers didn't fit beside the running ones: they count against
-    /// `tune::MAX_HANDOFFS` per `tune_handoff_window` for trials, with the handoffs.
-    postponed: Vec<Instant>,
     /// rev 19 (PROTOCOL 13.5): the workers a measurement counts (generation, last counters): every member of the crew
     /// since it started - one that finished its range stays counted until it ends, then with its last counters (a
     /// rotation is the crew's normal work); one that fails discards it.
@@ -1223,7 +1224,6 @@ impl Engine {
             gpu: false,
             gpu_start: (false, 0),
             strict: false,
-            postponed: Vec::new(),
         };
         (t, next.is_some())
     }
@@ -1332,7 +1332,6 @@ impl Engine {
             gpu: true,
             gpu_start: (g.vendor.eq_ignore_ascii_case("nvidia"), batch),
             strict: false,
-            postponed: Vec::new(),
         };
         (t, next.is_some())
     }
@@ -3276,17 +3275,22 @@ impl Run {
         if !running || !rolling_ok || self.draining() || self.started.elapsed() < t.tune_warm || !settled {
             return;
         }
+        // agent 0.3.7: a GPU job's trials wait for its memory plan's early reading (`calibrate`; a cost remembered from an
+        // earlier lease counts): the start is picked again for the measured plan (the crew it holds), and trials under the
+        // platform's default cost would measure single workers of ~140 games that the plan then drops - each trial's fresh
+        // worker restarting the reading. A worker whose commit can't be read never gives one; and at most `GPU_TRIAL_WAIT`.
+        // (0.3.5-0.3.6 postponed every trial that didn't fit beside the running worker, which kept it for the reading.)
+        let lease_age = self.tuning.as_ref().map_or(Duration::ZERO, |x| x.origin.elapsed());
+        let readable = self.worker.commit_mb().is_some();
+        let uncalibrated = self.gpu_lease() && readable && self.roll.as_ref().is_some_and(|r| !r.mem.measured && !r.early_done) && lease_age < GPU_TRIAL_WAIT;
         let tu = self.tuning.as_mut().expect("checked");
         tu.handoffs.retain(|at| at.elapsed() < t.tune_handoff_window);
-        tu.postponed.retain(|at| at.elapsed() < t.tune_handoff_window);
         if tu.handoffs.len() >= tune::MAX_HANDOFFS {
             // (the safety net: the next handoff waits until the oldest of these leaves the window)
             return;
         }
         let wanted = tu.entry.wanted(&tu.space);
-        // (agent 0.3.5: postponed trials count against the cap for trials too)
-        let trials_capped = tu.handoffs.len() + tu.postponed.len() >= tune::MAX_HANDOFFS;
-        let next = if !fixed && strict && !tu.revert_due && !trials_capped && Instant::now() >= tu.no_trial_before { tu.entry.plan(&tu.space) } else { None };
+        let next = if !fixed && strict && !uncalibrated && !tu.revert_due && Instant::now() >= tu.no_trial_before { tu.entry.plan(&tu.space) } else { None };
         let (target, measure) = match next {
             Some(l) => (l, true),
             None if tu.current != wanted && (!fixed || wanted.conc > tu.current.conc) => (wanted, strict && !fixed),
@@ -3296,59 +3300,13 @@ impl Run {
         if target == tu.current && !measure {
             return;
         }
-        // agent 0.3.5: a GPU job's measured trial starts only when its workers fit beside the running ones (all of them then
-        // finishing their games, at what they commit): one that would wait for a whole drain doesn't start - a GPU drain
-        // ends in its last games at a few rows a batch, and the 4070 Ti PC's old worker drained alone for 6-8 minutes,
-        // starting no game, before each trial (0.3.4). The layout wanted runs unmeasured instead when its first worker fits
-        // (its others join as memory allows; its first worker after the drain when even that doesn't fit beside); any other
-        // trial is postponed, counted as that layout's discard (skipped after
-        // `tune::MAX_DISCARDS`) and against the cap. A handoff no trial measures - to the layout wanted, after calibration or
-        // a discarded trial - starts as before (its first worker after the drain when it doesn't fit beside), and so does a
-        // CPU job's trial (its drain overlaps the next crew as memory allows, PROTOCOL 13.2).
-        if measure && self.gpu_lease() && !self.room_beside(target.workers.max(1) as u64, &target.per_worker()) {
-            let retry = 2 * (t.tune_warm + t.tune_window);
-            let id = self.lease.lease_id.clone();
-            let gpu = self.gpu_lease();
-            let tu = self.tuning.as_mut().expect("checked");
-            tu.postponed.push(Instant::now());
-            tu.no_trial_before = Instant::now() + retry;
-            // (the layout wanted - the start picked again after calibration, the incumbent - runs anyway: its first worker
-            // beside the old ones when it fits, else after their drain)
-            if target == wanted && target != tu.current {
-                let line = format!("the layout wanted, {}, doesn't fit beside the running workers to be measured: running it unmeasured", target.describe_on(gpu));
-                log::info!("lease {id}: {line}");
-                eng.worker_log.write_line(&format!("tuning [{id}]: {line}"));
-                self.start_handoff(eng, target, false);
-                return;
-            }
-            let line = format!("the trial of {} is postponed: its workers don't fit beside the running ones (memory)", target.describe_on(gpu));
-            log::info!("lease {id}: {line}");
-            eng.worker_log.write_line(&format!("tuning [{id}]: {line}"));
-            tu.entry.discard(target, &tu.space, zerofarm_common::now_unix());
-            self.save_tuning(eng);
-            self.show_tuning(eng);
-            return;
-        }
+        // agent 0.3.7: every measured trial is handed over to - a GPU job's too, its workers after the old ones' drain when
+        // they don't fit beside them (as a CPU job's, PROTOCOL 13.2). 0.3.5-0.3.6 postponed a GPU trial that didn't fit
+        // beside, because a GPU drain then took 6-8 minutes; 0.3.6 ends a drain's last games after `Timings::drain_tail`
+        // (their ids go back with the lease). Postponed, a memory-tight PC's GPU job could measure nothing: the 4070 Ti PC's
+        // crew of 3 x 575 used its whole limit, its own re-measurement (the incumbent, handed over to unmeasured) never fit
+        // beside it, and its tuning stayed at 0 trials for the lease.
         self.start_handoff(eng, target, measure);
-    }
-
-    /// agent 0.3.5: `n` new workers of layout `l` fit beside the lease's workers as a handoff leaves them - every one
-    /// finishing its games, at what it commits (and its video memory as read) -, within `PLAN_SHARE` of the job's limit
-    /// and the video memory budget.
-    fn room_beside(&mut self, n: u64, l: &Layout) -> bool {
-        let limit = self.lease_limit_mb;
-        let main = if self.main_exit.is_none() { self.worker.commit_mb().unwrap_or(0) } else { 0 };
-        let held = main + self.mates.iter_mut().map(|m| m.worker.commit_mb().unwrap_or(0)).sum::<u64>();
-        let host = limit == 0 || (held + n * self.plan_mb(l.conc)) as f64 <= limit as f64 * crate::rolling::PLAN_SHARE;
-        let vram = match self.roll.as_ref().and_then(|r| r.vram.as_ref()) {
-            None => true,
-            Some(v) => {
-                let ours = self.vram_mb + self.mates.iter().map(|m| m.vram_mb).sum::<u64>();
-                let budget = v.budget_mb.min(crate::rolling::vram_budget(v.total_mb, v.adapter_used_mb.saturating_sub(ours)));
-                ours + n * v.cost.plan_mb(l.batch()) <= budget
-            }
-        };
-        host && vram
     }
 
     /// A layout handoff starts: the main worker - and every member of the crew - starts no new game (`finish`); once
@@ -3756,7 +3714,13 @@ impl Run {
         // (agent 0.3.4: a GPU job's member that ran out of video memory, not of its memory)
         let vram_hit = self.vram_failed(&why, &tail, peak, limit);
         let hit = !vram_hit && ((limit > 0 && peak as f64 >= limit as f64 * crate::rolling::HIT_SHARE) || alloc_failure(&why) || alloc_failure(&tail));
-        log::warn!("lease {id}: worker pid {} of the crew failed ({why}); its games in flight are lost", d.worker.pid);
+        if stopping && self.killed {
+            // (agent 0.3.7: killed with the lease - cancelled, stopped, the agent quitting -: no failure; 0.3.6 warned
+            // "failed (exit code 57005 without `end`)" for every member of a cancelled crew)
+            log::info!("lease {id}: worker pid {} of the crew stopped with the lease ({why}); its games in flight end here", d.worker.pid);
+        } else {
+            log::warn!("lease {id}: worker pid {} of the crew failed ({why}); its games in flight are lost", d.worker.pid);
+        }
         if self.tuning.as_ref().is_some_and(|t| t.probe.is_some()) {
             self.end_probe(eng, Err("a worker of the crew failed during the trial".into()));
         }

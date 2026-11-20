@@ -693,7 +693,7 @@ pub fn notification_state() -> Notification {
     if unsafe { SHQueryUserNotificationState(&mut st) } != 0 {
         return Notification::Unknown;
     }
-    match st {
+    let n = match st {
         1 => Notification::NotPresent,
         2 => Notification::Busy,
         3 => Notification::D3dFullscreen,
@@ -702,7 +702,49 @@ pub fn notification_state() -> Notification {
         6 => Notification::QuietTime,
         7 => Notification::App,
         _ => Notification::Unknown,
+    };
+    // agent 0.3.7: "busy" (a fullscreen app) and "app" (a fullscreen Store app) count only while a foreground window
+    // covers its whole monitor. The 4070 Ti canary PC reported a fullscreen app on 2026-11-20 with its last input ~4.5
+    // days old and no foreground window at all; a Direct3D fullscreen game and presentation mode stay as Windows says.
+    if matches!(n, Notification::Busy | Notification::App) && !foreground_fullscreen() {
+        return Notification::AcceptsNotifications;
     }
+    n
+}
+
+/// agent 0.3.7: a foreground window covers its whole monitor (not the desktop's own window). When Windows can't say
+/// where the window or its monitor is, yes (Windows' own "fullscreen" answer stands).
+#[cfg(windows)]
+fn foreground_fullscreen() -> bool {
+    use windows_sys::Win32::Foundation::RECT;
+    use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromWindow, MONITORINFO, MONITOR_DEFAULTTONULL};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetShellWindow, GetWindowRect};
+    let w = unsafe { GetForegroundWindow() };
+    if w.is_null() || w == unsafe { GetShellWindow() } {
+        return false;
+    }
+    let mut r: RECT = unsafe { std::mem::zeroed() };
+    if unsafe { GetWindowRect(w, &mut r) } == 0 {
+        return true;
+    }
+    let m = unsafe { MonitorFromWindow(w, MONITOR_DEFAULTTONULL) };
+    if m.is_null() {
+        return false;
+    }
+    let mut mi: MONITORINFO = unsafe { std::mem::zeroed() };
+    mi.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    if unsafe { GetMonitorInfoW(m, &mut mi) } == 0 {
+        return true;
+    }
+    let rect = |x: &RECT| (x.left, x.top, x.right, x.bottom);
+    covers(rect(&r), rect(&mi.rcMonitor))
+}
+
+/// agent 0.3.7: a window's rectangle `w` covers the monitor's `m` (left, top, right, bottom): a fullscreen window does;
+/// a maximized one stops at the taskbar.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn covers(w: (i32, i32, i32, i32), m: (i32, i32, i32, i32)) -> bool {
+    w.0 <= m.0 && w.1 <= m.1 && w.2 >= m.2 && w.3 >= m.3
 }
 
 #[cfg(windows)]
@@ -956,6 +998,18 @@ mod tests {
         assert_eq!(gpu_signal(&[r(LUID_A, 5, Some(61)), r(LUID_B, 30, None)]), GpuSignal { other_util_pct: 30, temp_c: Some(61) });
         assert_eq!(gpu_signal(&[r(LUID_A, 0, None), r(LUID_B, 0, None)]), GpuSignal { other_util_pct: 0, temp_c: None });
         assert_eq!(gpu_signal(&[r(LUID_A, 0, Some(70)), r(LUID_B, 0, Some(84))]).temp_c, Some(84));
+    }
+
+    #[test]
+    fn a_fullscreen_window_covers_its_monitor_a_maximized_one_does_not() {
+        let monitor = (0, 0, 2560, 1440);
+        assert!(covers((0, 0, 2560, 1440), monitor), "fullscreen");
+        assert!(covers((-8, -8, 2568, 1448), monitor), "past the edges (a frame)");
+        assert!(!covers((-8, -8, 2568, 1400), monitor), "maximized: stops at the taskbar");
+        assert!(!covers((100, 100, 900, 700), monitor), "a window");
+        // a second monitor to the right
+        assert!(covers((2560, 0, 4480, 1080), (2560, 0, 4480, 1080)));
+        assert!(!covers((0, 0, 2560, 1440), (2560, 0, 4480, 1080)));
     }
 
     #[test]

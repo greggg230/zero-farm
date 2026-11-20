@@ -517,10 +517,19 @@ impl MemPlan {
     }
 }
 
+/// agent 0.3.7: a GPU worker of at least twice this many games in flight runs them in two groups, even when one batch
+/// would hold them all: its search threads play one group while the other is on the GPU. With one group they wait for
+/// every batch - the 4070 Ti PC of 2026-11-20 (fp16 network, 5-minute windows, leaves/s): a crew of 3 x 575 in one group
+/// 22.3k (search threads ~60 % idle, GPU 56 % busy), 3 x 768 in two groups 24.6k, 3 x 1,150 in two groups 28.0k (GPU 75
+/// %), 2 x 1,536 in two groups 27.0k; the trainer's own path there 32.8k.
+pub const GPU_SPLIT_MIN_ROWS: u64 = 256;
+
 /// agent 0.3.4: the groups of a GPU worker of `conc` games in flight whose full batch is `batch` rows: as many as make
-/// batches of at most `batch` rows, at most `GPU_MAX_GROUPS`, at most one per game.
+/// batches of at most `batch` rows, at most `GPU_MAX_GROUPS`, at most one per game; agent 0.3.7: two once each keeps
+/// `GPU_SPLIT_MIN_ROWS` rows.
 pub fn gpu_groups(conc: u64, batch: u64) -> u64 {
-    conc.div_ceil(batch.max(1)).clamp(1, GPU_MAX_GROUPS).min(conc.max(1))
+    let split = if conc >= 2 * GPU_SPLIT_MIN_ROWS { 2 } else { 1 };
+    conc.div_ceil(batch.max(1)).max(split).clamp(1, GPU_MAX_GROUPS).min(conc.max(1))
 }
 
 /// agent 0.3.4: the bench's full batch on a GPU (rows): among `GPU_BATCH_STEPS` the batch after which doubling gains
@@ -799,6 +808,9 @@ mod tests {
         assert_eq!(gpu_shape(Inflight::Auto, &canary, 1, plan(9_500, 1800, 45, false)), (128, 1));
         assert_eq!(gpu_shape(Inflight::Auto, &canary, 1, plan(9_500, 1800, 4, true)), (1024, 2));
         assert_eq!((gpu_groups(384, 512), gpu_groups(1024, 512), gpu_groups(4096, 512), gpu_groups(1, 512)), (1, 2, 2, 1));
+        // agent 0.3.7: two groups once each keeps 256 rows, even under a bigger batch (the 4070 Ti PC's crew of 3 x 575
+        // under its 1,024-row batch: two groups of 288 rows, not one of 575)
+        assert_eq!((gpu_groups(575, 1024), gpu_groups(511, 1024), gpu_groups(512, 1024)), (2, 1, 2));
     }
 
     #[test]

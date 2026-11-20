@@ -117,6 +117,8 @@ pub struct Engine {
     /// agent 0.3.6: at the last `decide`, nobody had used the PC for `idle_minutes` (the job's memory limit keeps an eighth
     /// of RAM free then, else a quarter: `caps`).
     pub(crate) pc_idle: bool,
+    /// agent 0.3.7: the block of the last `decide` that was logged (None: none yet) - each change is logged once.
+    block_logged: Option<Option<Block>>,
 }
 
 impl Engine {
@@ -177,6 +179,7 @@ impl Engine {
             presence_sending: Arc::new(AtomicBool::new(false)),
             tune_ok: false,
             pc_idle: false,
+            block_logged: None,
             cfg,
         })
     }
@@ -201,6 +204,17 @@ impl Engine {
         self.tune_ok = crate::policy::tuning_allowed(&s, &cfg);
         self.pc_idle = crate::policy::pc_idle(&s, &cfg);
         self.avail.record(crate::availability::now_ms(), &crate::util::local_now().0, d.work);
+        // agent 0.3.7: what holds work back, logged as it changes (0.3.6 showed it in the status only: a PC that reported a
+        // fullscreen app while nobody had used it for days left no trace of when or how often)
+        if self.block_logged != Some(d.block) {
+            match d.block {
+                Some(Block::Fullscreen) => log::info!("work held back: {} (Windows: {:?})", Block::Fullscreen.describe(), s.notification),
+                Some(b) => log::info!("work held back: {}", b.describe()),
+                None if self.block_logged.is_some() => log::info!("work allowed again"),
+                None => {}
+            }
+            self.block_logged = Some(d.block);
+        }
         d
     }
 

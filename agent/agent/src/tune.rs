@@ -389,8 +389,9 @@ pub struct Space {
 /// workers: 384 each, as measured).
 pub const GPU_CONC_STEP: u64 = 64;
 /// agent 0.3.4: a GPU job's games in flight in all may go this far over its target (the tuner's games-in-flight moves; a
-/// crew's rounded-up shares): 1,536 for a target of 1,024.
-pub const GPU_CONC_OVER: f64 = 1.5;
+/// crew's rounded-up shares): agent 0.3.7: 2,048 for a target of 1,024 (0.3.4-0.3.6: 1.5 times) - the 4070 Ti PC's
+/// fastest crew of 2026-11-20 ran 3 x 1,150 in two groups, 1.7 times its target of 2,048 (`rolling::GPU_SPLIT_MIN_ROWS`).
+pub const GPU_CONC_OVER: f64 = 2.0;
 /// agent 0.3.5: a GPU crew starts when it holds at least this share of the target in all (two workers of 506 on the 4070
 /// Ti PC at a 9.0 GB cap: 1,012 of 1,024; 0.3.4 asked for all of it and fell back to one worker).
 pub const GPU_START_SHARE: f64 = 0.8;
@@ -1886,12 +1887,13 @@ mod tests {
         // half of 32 GB, 4 MB a game measured, the 4070 Ti's 9,939 MB: three workers of 384 in one group, 2 search threads
         // each - the bench's best (14,154 leaves/s)
         let s = gpu_space(16_384, 4, 9_939, None);
-        assert_eq!((s.workers_min, s.workers_max, s.conc_min, s.conc_max), (1, 3, 512, 1536));
+        assert_eq!((s.workers_min, s.workers_max, s.conc_min, s.conc_max), (1, 3, 512, 2048), "agent 0.3.7: up to twice the target (0.3.4-0.3.6: 1.5 times)");
         assert_eq!(s.gpu_start(true, 512), glay(3, 2, 1, 384));
         assert_eq!((s.target_conc(1), s.target_conc(2), s.target_conc(3)), (1024, 512, 384));
-        // a ~9.5 GB limit: three workers hold 3 x 222 in all, 65 % of 1,024 - two of 512, 3 search threads each
+        // a ~9.5 GB limit: three workers hold 3 x 222 in all, 65 % of 1,024 - two of 512, 3 search threads each (agent 0.3.7:
+        // in two groups of 256 rows)
         let s = gpu_space(9_500, 4, 9_939, None);
-        assert_eq!(s.gpu_start(true, 512), glay(2, 3, 1, 512));
+        assert_eq!(s.gpu_start(true, 512), glay(2, 3, 2, 512));
         // a 9.0 GB limit: two hold 2 x 506 = 1,012, 99 % of the target (0.3.4: one worker of 1,024)
         assert_eq!(gpu_space(9_000, 4, 9_939, None).gpu_start(true, 512), glay(2, 3, 1, 506));
         // at the default 45 MB a game: one worker, (8,075 - 1,800) / 45 = 139 games in flight (0.3.3's plan: 128)
@@ -1901,12 +1903,27 @@ mod tests {
         // not NVIDIA: one worker of 1,024 in two groups of 512 (the tuner tries more)
         assert_eq!(gpu_space(16_384, 4, 9_939, None).gpu_start(false, 512), glay(1, 6, 2, 1024));
         // the owner's two workers; `autotune` off without them: one
-        assert_eq!(gpu_space(16_384, 4, 9_939, Some(2)).gpu_start(true, 512), glay(2, 3, 1, 512));
+        assert_eq!(gpu_space(16_384, 4, 9_939, Some(2)).gpu_start(true, 512), glay(2, 3, 2, 512));
         assert_eq!(gpu_space(16_384, 4, 9_939, Some(1)).gpu_start(true, 512), glay(1, 6, 2, 1024));
         // a run's number: fixed games in flight in all
         let fixed = Space::new_gpu(6, None, 3, 600, true, None, Some((9_939, crate::rolling::GPU_VRAM)));
         assert_eq!((fixed.conc_min, fixed.conc_max), (600, 600));
         assert_eq!(fixed.gpu_start(true, 512).total_conc(), 3 * 200);
+    }
+
+    /// agent 0.3.7: the 4070 Ti PC's 0.3.6 canary lease of 2026-11-20 (a 13,973 MB limit, a measured base of 1,659 MB, 4 MB
+    /// a game planned, 9,831 MB of video memory for the job, the bench's 1,024-row batch: a target of 2,048): the crew of 3 x
+    /// 575 starts in two groups of 288 rows each (0.3.6: one group of 575, its search threads ~60 % idle); the tuner's
+    /// batch move tries the one group, its worker move two workers of 862.
+    #[test]
+    fn a_gpu_crew_starts_in_two_groups() {
+        let mem = crate::rolling::MemCost { base_mb: 1659, per_game_mb: 4 };
+        let s = Space::new_gpu(6, None, 3, 2048, false, Some((13_973, mem)), Some((9_831, crate::rolling::GPU_VRAM)));
+        let start = s.gpu_start(true, 1024);
+        assert_eq!(start, glay(3, 2, 2, 575));
+        assert_eq!(start.batch(), 288);
+        assert_eq!(neighbour(&start, Coord::Batch, true, &s), Some(glay(3, 2, 1, 575)), "the 0.3.6 layout is a trial away");
+        assert_eq!(neighbour(&start, Coord::Workers, false, &s), Some(glay(2, 3, 2, 862)));
     }
 
     #[test]
@@ -1945,8 +1962,9 @@ mod tests {
         // one or two groups
         assert_eq!(neighbour(&three, Coord::Batch, false, &s), Some(glay(3, 2, 2, 384)));
         assert_eq!(neighbour(&three, Coord::Batch, true, &s), None);
-        // games in flight per worker: up to 1,536 / 3, down to 512 / 3 (0.3.3 clamped them to the job's bounds)
-        assert_eq!(neighbour(&three, Coord::Conc, true, &s), Some(glay(3, 2, 2, 512)));
+        // games in flight per worker: up to 2,048 / 3 (agent 0.3.7; 0.3.4-0.3.6: 1,536 / 3), down to 512 / 3 (0.3.3 clamped
+        // them to the job's bounds)
+        assert_eq!(neighbour(&three, Coord::Conc, true, &s), Some(glay(3, 2, 2, 682)));
         assert_eq!(neighbour(&three, Coord::Conc, false, &s), Some(glay(3, 2, 1, 192)));
         let one = glay(1, 6, 2, 1024);
         assert_eq!(neighbour(&one, Coord::Workers, true, &s), Some(glay(2, 3, 1, 512)), "one worker -> two of 512 (2 groups of 512 rows: 1 group each)");
@@ -1969,7 +1987,7 @@ mod tests {
         assert_eq!(e.wanted(&new), glay(1, 6, 1, 1024));
         assert_eq!(new.top_conc(3), 222, "three workers: the memory plan's 222 each");
         // (agent 0.3.5: lease.rs `calibrate` picks a start nothing else beat again for the new plan: two of 512)
-        assert_eq!(new.gpu_start(true, 512), glay(2, 3, 1, 512));
+        assert_eq!(new.gpu_start(true, 512), glay(2, 3, 2, 512));
         // a tuner's choice of fewer games than the old plan held stays
         let roomy = gpu_space(9_500, 10, 9_939, None);
         assert_eq!(roomy.top_conc(1), 627);

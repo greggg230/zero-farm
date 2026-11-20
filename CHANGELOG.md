@@ -4,6 +4,20 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's: `agent-macos-v<version>`).
 
+## Unreleased (0.3.7)
+
+- **Graphics cards find their fastest setup.** When the job programs sharing a graphics card filled the memory Zero Farm
+  may use, version 0.3.6 could never try another setup (or even time the one it was running), so it kept its first
+  guess. Zero Farm now winds the running setup down (at most two minutes, the unfinished games going back to the farm)
+  and times each candidate, once it has measured how much memory the job really needs.
+- **More work from the same graphics card.** Each job program now plays its games in two halves, so its share of the
+  processor keeps working while the other half waits for the card: in a test on an RTX 4070 Ti, three job programs went
+  from about 22,000 to as many as 28,000 positions per second, depending on how many games fit in memory.
+- **No more "fullscreen app" on an idle computer.** Windows sometimes says a fullscreen app is running when nothing is on
+  the screen at all; Zero Farm now checks that a window really covers the screen before it holds back, and notes in its
+  log each time it pauses or resumes work and why.
+- Job programs stopped together with a cancelled job are no longer logged as failures.
+
 ## Unreleased (0.3.6)
 
 - **Graphics cards get their crew of job programs.** Zero Farm 0.3.5 counted 1.8 GB for each job program's own start-up

@@ -299,7 +299,8 @@ lease (else 400). `returned` is how many ids went back. Repeating `done` → 200
 - `POST /v1/presence` `{"reason": "user_active"}` → `{"ok": true}` (rev 16; migration 0012). An agent that may
   not work right now sends why, at most every 60 s: when the reason changes and every 5 min while it lasts, in
   the background (a failure changes nothing; a coordinator without it answers 404, which the agent ignores).
-  Reasons (agent policy `Block`): `user_active` (input within the idle threshold), `fullscreen`, `outside_hours`,
+  Reasons (agent policy `Block`): `user_active` (input within the idle threshold), `fullscreen` (agents from 0.3.7:
+  Windows' "busy" / "app" states only while a foreground window covers its monitor), `outside_hours`,
   `on_battery`, `battery_saver`, `low_memory`, `paused` (paused from the tray). Any slug
   `[a-z][a-z0-9_]{0,31}` is stored, so a newer agent's reason needs no coordinator change. The coordinator
   keeps it on the machine (`presence`, `presence_t`) and moves `last_seen`, so an agent that is on but not
@@ -1725,7 +1726,11 @@ before rev 19, eval, fuzz and classic jobs are unchanged; GPU jobs are tuned fro
   allowed; search threads: the owner's `cpu_threads`, else 1.5 per physical core (at most the logical processors), shared:
   each of N workers gets 1/N of them (the 4-core PC: 6; one worker 6, two 3, three 2, as measured; the trainer's own torch
   path there found 6 faster than 8); games in flight (all workers'): `"auto"` from half 10.6's target (two full batches)
-  to 1.5 times it, a run's number kept; batches up to 2,048 rows. **Start** (no coordinator hint: a report doesn't say
+  to 1.5 times it (agents from 0.3.7: twice it), a run's number kept; batches up to 2,048 rows. **Agents from 0.3.7:** a
+  worker of at least 512 games in flight runs them in two groups even when one batch would hold them all (its search
+  threads play one group while the other is on the GPU; with one group they waited for every batch): the 4070 Ti PC
+  (fp16 network, 2026-11-20, leaves/s) - 3 x 575 in one group 22.3k (search threads ~60 % idle), 3 x 768 in two 24.6k,
+  3 x 1,150 in two 28.0k, 2 x 1,536 in two 27.0k; the trainer's own path there 32.8k. **Start** (no coordinator hint: a report doesn't say
   whether its layout ran on the GPU or the CPU of the same build and pack): on an NVIDIA GPU the most workers within the bounds whose start holds the target in all
   (each its share rounded up to a multiple of 64 - 1,024: 1 x 1,024 in two groups of 512, 2 x 512, 3 x 384 - in batches
   of at most the full batch, and its share of the search threads), else one; on other GPUs one (the tuner tries more). A
@@ -1792,6 +1797,14 @@ before rev 19, eval, fuzz and classic jobs are unchanged; GPU jobs are tuned fro
   crew, the second waiting for its memory all along (a safety net; 0.3.2 handed a job over to the same layout 3 times
   in 7 minutes). A trial that can't be measured any more when its worker would start (the machine got busy or used):
   a candidate gives way to the incumbent; the incumbent's own measurement starts unmeasured and counts as discarded.
+  **Agents from 0.3.7:** a GPU job's measured trial is handed over to as a CPU job's - its workers after the old
+  workers' drain when they don't fit beside them (0.3.6 bounds that drain) -, nothing is postponed: postponed, a
+  memory-tight PC measured nothing (the 4070 Ti PC's crew of 3 x 575 held its whole limit; its own measurement - the
+  incumbent, handed over to unmeasured - never fit beside it, 0 trials for the lease). Its trials wait for the memory
+  plan's early reading (10.6; a cost remembered from an earlier lease counts), at most 15 minutes from the lease's start
+  (a worker whose commit can't be read: no wait): trials under the platform's default cost measured single workers of
+  ~140 games, each restarting the reading. A crew member killed with its lease (cancelled, stopped) is logged as
+  stopped, not failed.
   The lease closes (`done`) once every worker ended, its `unfinished` worked out from the credited ids (as after a
   restart).
 - **Measurement.** Only of workers that started fresh with the layout (a lease's first worker is one: when a trial
@@ -2089,6 +2102,12 @@ set the run's alternate's `model` (the CUDA alternate: `"model": "gpu"`) and the
 it: GPU machines play its default model.
 
 ## Changes
+- v1 rev 20, agent 0.3.7 (2026-11-20; no wire change): **GPU layouts measured and split**, from a bench on the owner's
+  4070 Ti PC: a GPU worker of 512+ games in flight runs two groups, games in flight up to twice the target (13.1); a GPU
+  job's measured trials run after the drain when they don't fit beside, after the memory plan's early reading (13.2);
+  Windows' fullscreen states "busy" and "app" hold work back only while a foreground window covers its monitor, and
+  each change of what holds work back is logged (section 3's presence reasons; the PC reported a fullscreen app with no
+  foreground window and its last input days old).
 - v1 rev 20, agent 0.3.6 (2026-11-20; no wire change): **GPU crews form where memory allows**, from the owner's 4070 Ti
   PC's 0.3.5 lease (one worker of 1,024, ~9.7k leaves/s, its crew never fitting a 9.3 GB limit): a GPU worker's base is
   measured and planned with (10.6), the job's memory limit keeps an eighth of the RAM free while the PC is idle, a

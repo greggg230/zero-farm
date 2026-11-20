@@ -458,8 +458,9 @@ fn handoffs(h: &H, id: &str) -> (Vec<String>, Vec<String>) {
 /// while the memory-fixed worker commits ~2 MB a game; and the tuner handed the job over to a trial whose worker didn't
 /// fit beside the old one, which then drained alone for minutes, again and again. Now an early reading (half the games in
 /// flight finished) plans ~4 MB a game within the first minutes, the start is picked again for the plan - a crew of two
-/// of 512 there -, the crew starts beside the old worker as memory allows, and trials that would wait for a whole drain
-/// are postponed (counted), never looping.
+/// of 512 there -, the crew starts beside the old worker as memory allows, and no trial loops. Agent 0.3.7: trials wait
+/// for the early reading, then run after the old crew's drain when they don't fit beside it (0.3.5-0.3.6 postponed them,
+/// so a memory-tight PC measured nothing) - each layout measured once.
 #[test]
 fn an_uncalibrated_gpu_start_reaches_the_target_within_minutes_and_never_loops() {
     let (mut h, g) = harness(12_282, None, true);
@@ -488,15 +489,17 @@ fn an_uncalibrated_gpu_start_reaches_the_target_within_minutes_and_never_loops()
     assert!(log.contains("early in their games"), "an early reading planned the job: {}", crew_log(&h));
     let per = learned(&h)[format!("{RUN}/{}/gpu", g.alt)].as_u64().unwrap();
     assert!((2..=6).contains(&per), "~2 MB a game measured, planned x 2: {per}");
-    // the tuner runs on, without a handoff loop: trials that don't fit beside the crew are postponed
+    // the tuner runs on, without a handoff loop: each trial (after the drain when it doesn't fit beside) measured once
     std::thread::sleep(Duration::from_secs(12));
     let (all, measured) = handoffs(&h, "l_GE");
-    assert!(all.len() <= 3, "a handoff loop: {all:#?}\n{}", crew_log(&h));
+    assert!(all.len() <= 6, "a handoff loop: {all:#?}\n{}", crew_log(&h));
     let distinct: BTreeSet<&String> = measured.iter().collect();
     assert_eq!(distinct.len(), measured.len(), "a trial handed over to twice: {measured:#?}");
     assert!(!log.contains("drained alone"), "no full-drain trial");
+    assert!(!h.agent_log().contains("is postponed"), "agent 0.3.7: no trial is postponed");
+    // (the start, then at most a crew of three per handoff)
     let lines = job_lines(&h);
-    assert!(lines.len() <= 4, "workers started: {}\n{}", lines.len(), crew_log(&h));
+    assert!(lines.len() <= 1 + 3 * all.len(), "workers started: {} for {} handoffs\n{}", lines.len(), all.len(), crew_log(&h));
     h.stop();
     let done = h.wait_done("l_GE");
     ids_accounted(&h, "l_GE", &done);
