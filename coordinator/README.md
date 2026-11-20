@@ -245,6 +245,17 @@ the feature `tuning`: nothing changes for them. Agents that list it get `tuning_
 machine of their hardware class and platform reported a layout for the lease's build and runtime. The admin page's
 "Tuned layouts by hardware class / by machine" and the stats' `tuning` show what agents chose.
 
+### Deploy notes: rev 20 (model variants per generation)
+
+Migration `0016_variants.sql` adds `checkpoints.variants` and `leases.variant`; the code reads and writes them, so the
+migration goes first (`npm run deploy` does that). New var `VARIANT_AGENT` (`0.3.5`, in `wrangler.jsonc`). Nothing
+changes for a run without variants. Order for a run that wants them (PROTOCOL 14): agent 0.3.5 on canary, validated,
+then stable; the run's `min_agent` to 0.3.5 and its alternate's `"model": "<name>"` (`PUT /v1/admin/run`); then each gen
+registered with `variants` (`npm run admin -- checkpoint <run> <gen> model.onnx reference.npz --variants gpu=model-gpu.onnx`)
+and signed in the next definition (`checkpoints[gen].variants`). A run whose current definition signs a variant counts
+as `min_agent` 0.3.5 whatever its own setting. The admin page's "Signed definitions" shows each run's variants and the
+gens that lease the default model in their place (`variant_notes` per alternate in GET run and the stats).
+
 ### Cloudflare Access (security review H1)
 
 Access protects only the dashboard page, `/admin`. `/v1/admin` stays outside Access, so the CLI,

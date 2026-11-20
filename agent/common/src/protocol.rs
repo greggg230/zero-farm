@@ -155,6 +155,10 @@ pub struct CheckpointRef {
     pub reference: Option<String>,
     #[serde(default)]
     pub reference_sha256: Option<String>,
+    /// rev 20 (PROTOCOL 14.3): `model` and `sha256` are this model variant's (the definition signs it under the gen's
+    /// `variants`); the reference stays the gen's. Absent: the gen's default model.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variant: Option<String>,
 }
 
 /// rev 15 (PROTOCOL 10.3): what makes a self-play lease rolling. Every field but `block` has a default, so a

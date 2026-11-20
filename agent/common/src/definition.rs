@@ -29,6 +29,25 @@ pub const MAX_GAMES: u64 = 100_000;
 pub const MAX_SEEDS: u64 = 100_000_000;
 /// Game ids and seeds stay below 2^53 (exact in JSON numbers everywhere).
 pub const MAX_ID: u64 = 1 << 53;
+/// rev 20 (PROTOCOL 14.1): most model variants per gen.
+pub const MAX_VARIANTS: usize = 8;
+
+/// rev 20 (PROTOCOL 14): a model variant's name, `[a-z0-9][a-z0-9-]{0,31}` (it names a file in the cache).
+pub fn is_variant_name(s: &str) -> bool {
+    let b = s.as_bytes();
+    (1..=32).contains(&b.len())
+        && (b[0].is_ascii_lowercase() || b[0].is_ascii_digit())
+        && b.iter().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == b'-')
+}
+
+/// rev 20 (PROTOCOL 14.1): another model file of a gen (the same network exported another way, e.g. a fixed-shape GPU
+/// graph). It has no reference set of its own: the gen's serves every variant.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct VariantDef {
+    pub model_sha256: String,
+    pub model_size: u64,
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -39,6 +58,28 @@ pub struct CheckpointDef {
     pub reference_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reference_size: Option<u64>,
+    /// rev 20 (PROTOCOL 14.1): the gen's model variants by name (absent: none; present, never empty). Agents before
+    /// 0.3.5 refuse a definition with this key (unknown field).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub variants: Option<BTreeMap<String, VariantDef>>,
+}
+
+impl CheckpointDef {
+    /// What a lease's checkpoint of this gen is checked against: the default model, or the named variant's file with
+    /// the gen's reference set. None: the definition doesn't sign that variant.
+    pub fn for_variant(&self, variant: Option<&str>) -> Option<CheckpointDef> {
+        let Some(name) = variant else {
+            return Some(CheckpointDef { variants: None, ..self.clone() });
+        };
+        let v = self.variants.as_ref()?.get(name)?;
+        Some(CheckpointDef {
+            model_sha256: v.model_sha256.clone(),
+            model_size: v.model_size,
+            reference_sha256: self.reference_sha256.clone(),
+            reference_size: self.reference_size,
+            variants: None,
+        })
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
@@ -184,6 +225,17 @@ impl Definition {
                 (Some(h), Some(n)) => check_file(&format!("checkpoint {gen} reference"), h, n)?,
                 (None, None) => {}
                 _ => return Err(format!("checkpoint {gen}: reference_sha256 and reference_size go together")),
+            }
+            if let Some(vs) = &c.variants {
+                if vs.is_empty() || vs.len() > MAX_VARIANTS {
+                    return Err(format!("checkpoint {gen}: variants must name 1 to {MAX_VARIANTS} variants (leave it out for none)"));
+                }
+                for (name, v) in vs {
+                    if !is_variant_name(name) {
+                        return Err(format!("checkpoint {gen}: {:?} is not a variant name ([a-z0-9][a-z0-9-]{{0,31}})", shorten(name)));
+                    }
+                    check_file(&format!("checkpoint {gen} variant {name}"), &v.model_sha256, v.model_size)?;
+                }
             }
         }
         let allowed = job_kinds(&self.kind);
@@ -494,6 +546,39 @@ mod tests {
         bad(&|v| v["jobs"]["eval"]["seats"] = json!([{"net": 80}, {"bot": "ext:evil"}]), "built-in");
         bad(&|v| v["jobs"]["eval"]["seats"] = json!([{"net": 80}]), "2 to 16");
         bad(&|v| v["jobs"]["eval"]["paired"] = json!("yes"), "paired");
+        // rev 20 (PROTOCOL 14.1): variants
+        bad(&|v| v["checkpoints"]["80"]["variants"] = json!({}), "1 to 8 variants");
+        bad(&|v| v["checkpoints"]["80"]["variants"] = json!({"GPU": {"model_sha256": "c".repeat(64), "model_size": 5}}), "variant name");
+        bad(&|v| v["checkpoints"]["80"]["variants"] = json!({"../x": {"model_sha256": "c".repeat(64), "model_size": 5}}), "variant name");
+        bad(&|v| v["checkpoints"]["80"]["variants"] = json!({"gpu": {"model_sha256": "c".repeat(64), "model_size": 0}}), "size");
+        bad(&|v| v["checkpoints"]["80"]["variants"] = json!({"gpu": {"model_sha256": "C".repeat(64), "model_size": 5}}), "sha256");
+        bad(&|v| v["checkpoints"]["80"]["variants"] = json!({"gpu": {"model_sha256": "c".repeat(64), "model_size": 5, "reference_sha256": "d".repeat(64)}}), "unknown field");
+        bad(
+            &|v| v["checkpoints"]["80"]["variants"] = Value::Object((0..9).map(|i| (format!("v{i}"), json!({"model_sha256": "c".repeat(64), "model_size": 5}))).collect()),
+            "1 to 8 variants",
+        );
+    }
+
+    #[test]
+    fn variants_parse_and_stand_in_for_the_model() {
+        let mut v = run_def();
+        v["checkpoints"]["80"]["variants"] = json!({"gpu": {"model_sha256": "c".repeat(64), "model_size": 2000}, "fp16-fixed": {"model_size": 500, "model_sha256": "d".repeat(64)}});
+        let d = parse(&v).unwrap();
+        let c = d.checkpoint(80).unwrap();
+        let g = c.for_variant(Some("gpu")).unwrap();
+        assert_eq!((g.model_sha256.as_str(), g.model_size), ("c".repeat(64).as_str(), 2000));
+        assert_eq!((g.reference_sha256.clone(), g.reference_size, g.variants.clone()), (Some("b".repeat(64)), Some(10), None), "the gen's reference set");
+        assert_eq!(c.for_variant(None).unwrap().model_sha256, "a".repeat(64));
+        assert!(c.for_variant(Some("cpu")).is_none(), "a variant it doesn't sign");
+        assert!(parse(&run_def()).unwrap().checkpoint(80).unwrap().for_variant(Some("gpu")).is_none());
+        // a definition without variants serializes as before (no `variants` key)
+        assert!(!serde_json::to_string(&parse(&run_def()).unwrap()).unwrap().contains("variants"));
+        for n in ["gpu", "fp16-fixed", "0", &"a".repeat(32)] {
+            assert!(is_variant_name(n), "{n}");
+        }
+        for n in ["", "-gpu", "GPU", "a_b", "a.b", "a/b", "..", &"a".repeat(33)] {
+            assert!(!is_variant_name(n), "{n}");
+        }
     }
 
     #[test]

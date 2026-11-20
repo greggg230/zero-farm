@@ -40,16 +40,18 @@ pub struct Plan {
 }
 
 impl Plan {
-    /// The declared sizes of a checkpoint the plan's definition names (None: legacy).
-    pub fn declared(&self, gen: u64) -> Option<&CheckpointDef> {
-        self.def.as_ref().and_then(|d| d.checkpoint(gen))
+    /// The declared sizes of a checkpoint the plan's definition names (None: legacy): its gen's, or (rev 20) the
+    /// variant's model with the gen's reference set.
+    pub fn declared(&self, c: &CheckpointRef) -> Option<CheckpointDef> {
+        self.def.as_ref().and_then(|d| d.checkpoint(c.gen)).and_then(|e| e.for_variant(c.variant.as_deref()))
     }
 
     /// A checkpoint a beat offers mid-lease (self-play): with a definition, only a gen it names,
-    /// with its hashes.
+    /// with its hashes (rev 20: a variant it signs for that gen).
     pub fn check_new_checkpoint(&self, c: &CheckpointRef) -> Result<Option<CheckpointDef>, String> {
         match &self.def {
-            Some(d) => match_checkpoint(d, c).map(|x| Some(x.clone())),
+            Some(d) => match_checkpoint(d, c).map(Some),
+            None if c.variant.is_some() => Err(format!("checkpoint {}: a model variant needs a definition", c.gen)),
             None => Ok(None),
         }
     }
@@ -98,11 +100,23 @@ impl SeenVersions {
 }
 
 /// A lease's checkpoint against its definition: the gen is listed and the lease's hashes are the
-/// definition's (the files are then fetched with the definition's sizes and hashes).
-pub fn match_checkpoint<'a>(d: &'a Definition, c: &CheckpointRef) -> Result<&'a CheckpointDef, String> {
-    let want = d.checkpoint(c.gen).ok_or_else(|| format!("checkpoint {} is not in definition {} version {}", c.gen, d.scope(), d.version))?;
+/// definition's (the files are then fetched with the definition's sizes and hashes). Rev 20 (PROTOCOL 14.4): a checkpoint
+/// naming a model `variant` is checked against that variant of its gen (the reference stays the gen's). Returns what the
+/// files are checked against.
+pub fn match_checkpoint(d: &Definition, c: &CheckpointRef) -> Result<CheckpointDef, String> {
+    let gen = d.checkpoint(c.gen).ok_or_else(|| format!("checkpoint {} is not in definition {} version {}", c.gen, d.scope(), d.version))?;
+    if let Some(v) = c.variant.as_deref().filter(|v| !def::is_variant_name(v)) {
+        return Err(format!("checkpoint {}: {:?} is not a variant name", c.gen, v.chars().take(40).collect::<String>()));
+    }
+    let want = gen.for_variant(c.variant.as_deref()).ok_or_else(|| {
+        format!("checkpoint {}: definition {} version {} doesn't sign variant {}", c.gen, d.scope(), d.version, c.variant.as_deref().unwrap_or(""))
+    })?;
     if c.sha256 != want.model_sha256 {
-        return Err(format!("checkpoint {}: the lease's model sha256 is not the definition's", c.gen));
+        return Err(format!(
+            "checkpoint {}: the lease's {} sha256 is not the definition's",
+            c.gen,
+            c.variant.as_deref().map_or("model".to_string(), |v| format!("variant {v}"))
+        ));
     }
     if c.reference_sha256 != want.reference_sha256 || c.reference.is_some() != want.reference_sha256.is_some() {
         return Err(format!("checkpoint {}: the lease's reference is not the definition's", c.gen));
@@ -407,6 +421,10 @@ fn plan_legacy(lease: &Lease) -> Result<Plan, PlanError> {
     }
     def::check_template(kind, &template).map_err(PlanError::Refused)?;
     check_lease_checkpoints(lease, &template).map_err(PlanError::Refused)?;
+    // rev 20 (PROTOCOL 14.4): a model variant is only ever one a definition signs
+    if lease.checkpoint.iter().chain(lease.checkpoints.iter().flatten()).any(|c| c.variant.is_some()) {
+        return refused("a model variant without a definition");
+    }
     let paired = template.get("paired").and_then(Value::as_bool).unwrap_or(false);
     let mut job = template;
     job.extend(def::lease_fields(kind, &lease.job, paired).map_err(PlanError::Refused)?);
@@ -450,12 +468,49 @@ mod tests {
         // Eval checkpoints must be exactly the seats' networks.
         let mut l = lease("eval", json!({"gid_base": 0, "games": 2, "seed": 1, "paired": false, "settings": {}, "seats": [{"net": 1}, {"net": 2}]}));
         assert!(refused(l.clone()), "no checkpoints");
-        l.checkpoints = Some(vec![CheckpointRef { gen: 1, model: "ckpt/r/1/model.onnx".into(), sha256: "a".repeat(64), reference: None, reference_sha256: None }]);
+        l.checkpoints = Some(vec![CheckpointRef { gen: 1, model: "ckpt/r/1/model.onnx".into(), sha256: "a".repeat(64), reference: None, reference_sha256: None, variant: None }]);
         assert!(refused(l.clone()), "one missing");
         let mut c2 = l.checkpoints.as_ref().unwrap()[0].clone();
         c2.gen = 2;
         l.checkpoints.as_mut().unwrap().push(c2);
         assert!(plan_legacy(&l).is_ok());
+        // rev 20: a model variant needs a definition
+        l.checkpoints.as_mut().unwrap()[1].variant = Some("gpu".into());
+        assert!(refused(l.clone()), "a variant on a legacy lease");
+    }
+
+    #[test]
+    fn checkpoints_match_the_definitions_model_or_variant() {
+        let d = Definition::parse(
+            &serde_json::to_vec(&json!({
+                "definition": 1, "kind": "run", "id": "r", "version": 1, "created": 5, "game": "mtg", "builds": ["0123456789abcdef01234567"],
+                "checkpoints": {"1": {"model_sha256": "a".repeat(64), "model_size": 10, "reference_sha256": "b".repeat(64), "reference_size": 4,
+                                      "variants": {"gpu": {"model_sha256": "c".repeat(64), "model_size": 12}}},
+                                "2": {"model_sha256": "e".repeat(64), "model_size": 11}},
+                "jobs": {"selfplay": {"settings": {}}}
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let ck = |gen: u64, sha: char, variant: Option<&str>, reference: bool| CheckpointRef {
+            gen,
+            model: format!("ckpt/r/{gen}/model.onnx"),
+            sha256: sha.to_string().repeat(64),
+            reference: reference.then(|| format!("ckpt/r/{gen}/reference.npz")),
+            reference_sha256: reference.then(|| "b".repeat(64)),
+            variant: variant.map(String::from),
+        };
+        let m = match_checkpoint(&d, &ck(1, 'a', None, true)).unwrap();
+        assert_eq!((m.model_size, m.reference_size), (10, Some(4)));
+        let v = match_checkpoint(&d, &ck(1, 'c', Some("gpu"), true)).unwrap();
+        assert_eq!((v.model_sha256, v.model_size, v.reference_size), ("c".repeat(64), 12, Some(4)), "the variant's file, the gen's reference");
+        let e = |c: CheckpointRef| match_checkpoint(&d, &c).unwrap_err();
+        assert!(e(ck(1, 'a', Some("gpu"), true)).contains("variant gpu sha256"), "the default's hash under the variant's name");
+        assert!(e(ck(1, 'c', None, true)).contains("model sha256"), "the variant's hash as the default");
+        assert!(e(ck(1, 'c', Some("fp16"), true)).contains("doesn't sign variant fp16"));
+        assert!(e(ck(2, 'e', Some("gpu"), false)).contains("doesn't sign variant gpu"));
+        assert!(e(ck(1, 'c', Some("..\\x"), true)).contains("not a variant name"));
+        assert!(e(ck(1, 'c', Some("gpu"), false)).contains("reference"), "the reference is still checked");
     }
 
     #[test]

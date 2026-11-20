@@ -717,13 +717,17 @@ pub struct Key {
 
 /// The network's fingerprint: the job template the worker plays (its settings: search, network and game options; the
 /// per-lease fields left out) and the model file's size in MiB (the network's shape; its generations keep it). A new
-/// generation of the same run keeps it; another architecture or other settings change it.
-pub fn net_fingerprint(template: &Map<String, Value>, model_size: Option<u64>) -> String {
+/// generation of the same run keeps it; another architecture or other settings change it. Rev 20 (PROTOCOL 14.4): a model
+/// variant's name too (a variant graph is laid out apart from the default graph; without one the fingerprint is as before).
+pub fn net_fingerprint(template: &Map<String, Value>, model_size: Option<u64>, variant: Option<&str>) -> String {
     let mut t = template.clone();
     for k in ["gid_base", "games", "seed", "first", "count"] {
         t.remove(k);
     }
-    let text = format!("{}|{}", zerofarm_common::protocol::canonical_json(&Value::Object(t)), model_size.map_or(-1, |s| (s >> 20) as i64));
+    let mut text = format!("{}|{}", zerofarm_common::protocol::canonical_json(&Value::Object(t)), model_size.map_or(-1, |s| (s >> 20) as i64));
+    if let Some(v) = variant {
+        text.push_str(&format!("|variant:{v}"));
+    }
     zerofarm_common::hash::sha256_hex(text.as_bytes())[..16].to_string()
 }
 
@@ -2065,10 +2069,14 @@ mod tests {
     #[test]
     fn fingerprints() {
         let t = |v: Value| v.as_object().unwrap().clone();
-        let a = net_fingerprint(&t(json!({"settings": {"sims": 8}, "gid_base": 1, "games": 4, "seed": 9})), Some(40 << 20));
-        assert_eq!(a, net_fingerprint(&t(json!({"settings": {"sims": 8}, "gid_base": 77, "games": 1, "seed": 3})), Some((40 << 20) + 5)), "per-lease fields and a few bytes don't count");
-        assert_ne!(a, net_fingerprint(&t(json!({"settings": {"sims": 16}})), Some(40 << 20)), "settings do");
-        assert_ne!(a, net_fingerprint(&t(json!({"settings": {"sims": 8}})), Some(80 << 20)), "the network's size does");
+        let a = net_fingerprint(&t(json!({"settings": {"sims": 8}, "gid_base": 1, "games": 4, "seed": 9})), Some(40 << 20), None);
+        assert_eq!(a, net_fingerprint(&t(json!({"settings": {"sims": 8}, "gid_base": 77, "games": 1, "seed": 3})), Some((40 << 20) + 5), None), "per-lease fields and a few bytes don't count");
+        assert_ne!(a, net_fingerprint(&t(json!({"settings": {"sims": 16}})), Some(40 << 20), None), "settings do");
+        assert_ne!(a, net_fingerprint(&t(json!({"settings": {"sims": 8}})), Some(80 << 20), None), "the network's size does");
+        // rev 20: a model variant of the same size is a network of its own; none keeps the fingerprint of before
+        assert_ne!(a, net_fingerprint(&t(json!({"settings": {"sims": 8}})), Some(40 << 20), Some("gpu")), "a variant does");
+        let before = format!("{}|{}", zerofarm_common::protocol::canonical_json(&json!({"settings": {"sims": 8}})), 40);
+        assert_eq!(a, zerofarm_common::hash::sha256_hex(before.as_bytes())[..16], "the fingerprint of before rev 20");
         assert_eq!(a.len(), 16);
     }
 

@@ -4,6 +4,15 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's: `agent-macos-v<version>`).
 
+## Unreleased (0.3.5)
+
+- **Graphics cards can get a network made for them.** A farm run can now publish, for each network, a second copy built
+  for graphics cards (for example a fixed-size version that NVIDIA cards run faster). Zero Farm 0.3.5 downloads that copy
+  when the farm sends your computer the graphics-card version of a job, checks it against the run's signed description
+  exactly like the normal network (and refuses anything else), keeps it next to the normal one, and hands it to the job
+  program. Computers without a suitable graphics card, and Macs, keep the normal network. Runs that use this need Zero
+  Farm 0.3.5: older versions are asked to update first.
+
 ## Unreleased (0.3.4)
 
 - **Graphics cards are used properly for long jobs.** On a computer that plays the farm's long self-play jobs on its

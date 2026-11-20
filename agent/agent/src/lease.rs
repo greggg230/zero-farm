@@ -799,7 +799,7 @@ impl Engine {
             let ckpt = match &lease.checkpoint {
                 Some(c) => {
                     let run = lease.run.as_deref().ok_or_else(|| CacheError::Bad("checkpoint without a run".into()))?;
-                    Some((c.clone(), self.cache.ensure_checkpoint(&self.client, run, c, plan.declared(c.gen), cap, &keep, &stop)?))
+                    Some((c.clone(), self.cache.ensure_checkpoint(&self.client, run, c, plan.declared(c).as_ref(), cap, &keep, &stop)?))
                 }
                 None => None,
             };
@@ -809,7 +809,7 @@ impl Engine {
                 if models.iter().any(|(m, _): &(CheckpointRef, CkptFiles)| m.gen == c.gen) {
                     return Err(CacheError::Bad(format!("checkpoint {} is listed twice", c.gen)));
                 }
-                models.push((c.clone(), self.cache.ensure_checkpoint(&self.client, run, c, plan.declared(c.gen), cap, &keep, &stop)?));
+                models.push((c.clone(), self.cache.ensure_checkpoint(&self.client, run, c, plan.declared(c).as_ref(), cap, &keep, &stop)?));
             }
             Ok(Prepared { build, runtime, ckpt, models })
         })();
@@ -1144,7 +1144,7 @@ impl Engine {
         let key = tune::Key {
             build: lease.build.build_id.clone(),
             runtime: lease.runtime.as_ref().map(|r| r.build_id.clone()),
-            net: tune::net_fingerprint(&plan.job, prep.ckpt.as_ref().and_then(|(_, f)| f.model_size)),
+            net: tune::net_fingerprint(&plan.job, prep.ckpt.as_ref().and_then(|(_, f)| f.model_size), prep.ckpt.as_ref().and_then(|(c, _)| c.variant.as_deref())),
             // (an owner's fixed worker count is searched apart from "auto")
             hw: match settings.workers {
                 Some(n) => format!("{} | workers {n}", tune::hw_fingerprint(p)),
@@ -1260,7 +1260,7 @@ impl Engine {
         let key = tune::Key {
             build: lease.build.build_id.clone(),
             runtime: lease.runtime.as_ref().map(|r| r.build_id.clone()),
-            net: tune::net_fingerprint(&plan.job, prep.ckpt.as_ref().and_then(|(_, f)| f.model_size)),
+            net: tune::net_fingerprint(&plan.job, prep.ckpt.as_ref().and_then(|(_, f)| f.model_size), prep.ckpt.as_ref().and_then(|(c, _)| c.variant.as_deref())),
             hw: match settings.workers {
                 Some(n) => format!("{hw} | workers {n}"),
                 None => hw,

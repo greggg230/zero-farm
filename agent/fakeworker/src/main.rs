@@ -448,6 +448,9 @@ impl W {
     /// A new network: in a rolling job self-tested first (`selftest` with `gen`), then played.
     fn checkpoint(&mut self, op: &Value) {
         let gen = op.get("gen").and_then(Value::as_u64);
+        // (rev 20: which file the agent handed over - a model variant's or the default model - for the tests)
+        let file = op.get("model").and_then(Value::as_str).and_then(|p| std::path::Path::new(p).file_name()).map(|n| n.to_string_lossy().to_string());
+        eprintln!("fakeworker: checkpoint {gen:?} model file {}", file.as_deref().unwrap_or("none"));
         if self.rolling {
             let sha = op.get("sha256").and_then(Value::as_str);
             let file_ok = op

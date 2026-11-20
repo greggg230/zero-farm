@@ -14,7 +14,7 @@ use zerofarm_common::manifest::{
     check_rel_path, verify_dir, verify_manifest_bytes, Expect, Kind, ManifestError, VerifiedBuild, MANIFEST_FILE,
     MAX_MANIFEST_BYTES, MAX_SIG_BYTES, SIG_FILE,
 };
-use zerofarm_common::definition::CheckpointDef;
+use zerofarm_common::definition::{is_variant_name, CheckpointDef};
 use zerofarm_common::protocol::{ArtifactRef, CheckpointRef};
 
 /// Keep at least this much free on the volume regardless of the cap.
@@ -226,7 +226,8 @@ impl Cache {
         self.layout.cache().join(key.replace('/', std::path::MAIN_SEPARATOR_STR))
     }
 
-    /// Cached build ids and checkpoints (`<run>/<gen>`) for the lease request.
+    /// Cached build ids and checkpoints (`<run>/<gen>`) for the lease request; rev 20 (PROTOCOL 14.3): each cached model
+    /// variant as `<run>/<gen>/<name>` too.
     pub fn cached(&self) -> (Vec<String>, Vec<String>) {
         let mut builds: Vec<String> = std::fs::read_dir(self.layout.cache_builds())
             .map(|rd| {
@@ -246,6 +247,12 @@ impl Cache {
                         let gen = g.file_name().to_string_lossy().to_string();
                         if g.path().join("model.onnx").exists() {
                             ckpts.push(format!("{run}/{gen}"));
+                        }
+                        for f in std::fs::read_dir(g.path()).into_iter().flatten().flatten() {
+                            let name = f.file_name().to_string_lossy().to_string();
+                            if let Some(v) = name.strip_prefix("model-").and_then(|n| n.strip_suffix(".onnx")).filter(|v| is_variant_name(v)) {
+                                ckpts.push(format!("{run}/{gen}/{v}"));
+                            }
                         }
                     }
                 }
@@ -340,9 +347,19 @@ impl Cache {
         format!("ckpt/{run}/{gen}")
     }
 
+    /// The file a checkpoint's model is cached as in its gen's directory: `model.onnx`, or (rev 20, PROTOCOL 14.4) a
+    /// variant's `model-<name>.onnx`, next to the gen's reference set.
+    pub fn model_file(variant: Option<&str>) -> Result<String, CacheError> {
+        match variant {
+            None => Ok("model.onnx".into()),
+            Some(v) if is_variant_name(v) => Ok(format!("model-{v}.onnx")),
+            Some(v) => Err(CacheError::Bad(format!("bad model variant name {:?}", v.chars().take(40).collect::<String>()))),
+        }
+    }
+
     /// Verified checkpoint files (downloading if needed). The sha256 comes from the lease, which
     /// the caller checked against the definition; `declared` (the definition's entry) adds the
-    /// sizes.
+    /// sizes. Rev 20: a checkpoint naming a model variant is cached per (run, gen, variant).
     #[allow(clippy::too_many_arguments)]
     pub fn ensure_checkpoint(
         &self,
@@ -362,7 +379,7 @@ impl Cache {
         }
         let key = Self::ckpt_key(run, ck.gen);
         let dir = self.entry_dir(&key);
-        let model = dir.join("model.onnx");
+        let model = dir.join(Self::model_file(ck.variant.as_deref())?);
         let model_size = declared.map(|d| d.model_size);
         let reference_size = declared.and_then(|d| d.reference_size);
         self.ensure_file(client, &ck.model, &model, &ck.sha256, model_size, cap, keep, stop)?;
@@ -442,5 +459,26 @@ mod tests {
         assert!(!c.entry_dir("ckpt/eoe2/81").exists());
         // Nothing evictable left: refuse.
         assert!(matches!(c.ensure_space(10_000, c.usage() + 1, &keep), Err(CacheError::NoSpace { .. })));
+    }
+
+    #[test]
+    fn model_variants_are_files_of_their_gen_and_listed_apart() {
+        let d = tempfile::tempdir().unwrap();
+        let c = Cache::new(Layout::new(d.path()), TrustedKeys::default());
+        assert_eq!(Cache::model_file(None).unwrap(), "model.onnx");
+        assert_eq!(Cache::model_file(Some("gpu")).unwrap(), "model-gpu.onnx");
+        for bad in [r"..\x", "a/b", "GPU", ""] {
+            assert!(matches!(Cache::model_file(Some(bad)), Err(CacheError::Bad(_))), "{bad}");
+        }
+        // gen 1: the default model and a variant; gen 2: only a variant (a GPU PC never fetched the default graph)
+        for (gen, files) in [("1", &["model.onnx", "model-gpu.onnx", "reference.npz"][..]), ("2", &["model-gpu.onnx", "model-NOPE.onnx"][..])] {
+            let dir = c.entry_dir(&format!("ckpt/eoe2/{gen}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            for f in files {
+                std::fs::write(dir.join(f), b"x").unwrap();
+            }
+        }
+        let (_, ckpts) = c.cached();
+        assert_eq!(ckpts, ["eoe2/1", "eoe2/1/gpu", "eoe2/2/gpu"], "a file that isn't a variant name is not listed");
     }
 }

@@ -798,6 +798,42 @@ fn define_refuses_bad_definitions_and_the_wrong_keys() {
     assert!(!o.status.success() && text(&o).contains("is a data key"), "{}", text(&o));
 }
 
+/// rev 20 (PROTOCOL 14.1): `define` signs a definition whose gens carry model variants, and refuses malformed ones.
+#[test]
+fn define_takes_model_variants() {
+    let t = tempfile::tempdir().unwrap();
+    let dk = t.path().join("data.key");
+    let data = farm_release::keygen(&dk).unwrap();
+    let env = [(TEST_DATA_KEYS_ENV, data.public_b64())];
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    let file = t.path().join("v.json");
+    let define = || cli(&["define", file.to_str().unwrap(), "--key", dk.to_str().unwrap()], &env);
+    let with = |variants: serde_json::Value| {
+        let mut v = definition_json("eoe2", 3);
+        v["checkpoints"]["81"]["variants"] = variants;
+        std::fs::write(&file, serde_json::to_vec_pretty(&v).unwrap()).unwrap();
+    };
+    for (variants, why) in [
+        (serde_json::json!({}), "1 to 8 variants"),
+        (serde_json::json!({"GPU": {"model_sha256": "c".repeat(64), "model_size": 9}}), "not a variant name"),
+        (serde_json::json!({"gpu": {"model_sha256": "c".repeat(64), "model_size": 9, "reference_size": 3}}), "unknown field"),
+        (serde_json::json!({"gpu": {"model_sha256": "c".repeat(64), "model_size": 0}}), "size"),
+    ] {
+        with(variants);
+        let o = define();
+        assert!(!o.status.success() && text(&o).contains(why), "{why}: {}", text(&o));
+        assert!(!t.path().join("v.json.minisig").exists(), "nothing signed");
+    }
+    with(serde_json::json!({"gpu": {"model_sha256": "c".repeat(64), "model_size": 14680064}}));
+    let o = define();
+    assert!(o.status.success(), "{}", text(&o));
+    let bytes = std::fs::read(&file).unwrap();
+    let sig = std::fs::read_to_string(t.path().join("v.json.minisig")).unwrap();
+    let d = zerofarm_common::definition::verify(&TrustedKeys::parse(&[data.public_b64()]).unwrap(), &bytes, &sig).unwrap();
+    let g = d.checkpoint(81).unwrap().for_variant(Some("gpu")).unwrap();
+    assert_eq!((g.model_size, g.reference_size), (14680064, Some(412000)));
+}
+
 // ---------- rev 17 (PROTOCOL 11.2): a macOS agent release from Mac-built binaries ----------
 
 /// A stand-in for a Mac-built release binary: an arm64 Mach-O header, the version marker and the trusted keys as
