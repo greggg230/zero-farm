@@ -1349,6 +1349,20 @@ A rolling lease is a self-play lease (section 3) plus
     0.3.4 lease, 2026-11-20: a CUDA build not measured there was planned at the default 45 MB a game - 139 in flight
     under its 9.5 GB cap, 5,179 leaves/s - while the memory-fixed worker commits ~2 MB a game; two turnovers of 139 take
     ~4 minutes there. An early reading at or under the base counts 1 MB a game.
+  - **The base, measured** (agents from 0.3.6; a GPU job). A worker's commit at its first `status` after its sessions
+    exist (it names a provider) with games started and none finished is a base reading: the runtime and the network,
+    its games barely begun. The lease's lowest reading is remembered per run, worker build and provider class (key
+    `<run>/<build_id>/gpu_base`) when more than 5 % below what is planned with (the default's 1,800 MB, or what is
+    stored; never raised - a reading holds the games' first memory too, more with more games in flight, and a base above
+    the default is in the cost per game measured over it), and planned with at once, as a lower cost per game is (the
+    worker bounds, the layouts held back, the start). The 4070 Ti PC's 0.3.5 lease (round 5, 2026-11-20): planned at
+    1,800 MB + 4 MB a game per worker under a 9.3 GB limit, a crew of two never fitted beside the running worker.
+- **The job's memory limit** (`caps.ram_mb`; agents from 0.3.6). The owner's `max_ram_mb`, else half the RAM, and never
+  more than the free memory less what is kept for the owner: an eighth of the RAM while the PC is idle (no input for
+  `idle_minutes`), a quarter else, at least 4 GB either way (`policy::mem_floor_now`). Free memory below that floor blocks
+  work (`low_memory`), and a paused lease is given back, its memory freed - so when the owner comes back, the quarter
+  applies again. 0.2.0-0.3.5 kept a quarter whatever: the 4070 Ti PC (32 GB, its WSL servers holding ~15 GB, ~17 GB
+  free) got 9.3 GB, idle; it gets ~12.9 GB now.
   - No wire change: the coordinator sees one lease, its released ids and its extensions as before.
 - **Video memory** (agents from 0.3.4; a GPU job). 0.2.13-0.3.3 planned none: one worker of at most 512 games in flight
   never came near a GPU's. A GPU job's workers (13.5) are planned within it:
@@ -1719,7 +1733,10 @@ before rev 19, eval, fuzz and classic jobs are unchanged; GPU jobs are tuned fro
   start's groups are the rule's for the games in flight the memory plans leave (139: one batch of 139; 0.3.4 kept the
   target's 2 groups, 70 rows), and while a search measured nothing but the start (no trial yet) a calibration that
   changes the plan (10.6) picks the start again - the 4070 Ti PC: one worker of 139 at 45 MB a game, two of 512 at 4 -,
-  and a crew starts when it holds 80 % of the target in all (two of 506 at a 9.0 GB cap; 0.3.4 asked for all of it). `autotune` off: the start
+  and a crew starts when it holds 80 % of the target in all (two of 506 at a 9.0 GB cap; 0.3.4 asked for all of it).
+  Agents from 0.3.6 also pick the start again when the new plan holds more workers than the layout wanted has (the
+  search then goes on from it, its measurements kept): the PC's 0.3.5 lease had measured a one-worker candidate first
+  and stayed one worker of 1,024. `autotune` off: the start
   for the owner's `workers` (else one), fixed (handed over only when the memory plan holds more, 10.6). A CPU job on a
   GPU runtime pack takes no hint either (the hint for that build and pack is most likely a GPU layout).
 - **The owner's settings** `autotune` (default on; Windows `machine.json`, macOS `ZeroFarm set autotune on|off`) and
@@ -1766,7 +1783,13 @@ before rev 19, eval, fuzz and classic jobs are unchanged; GPU jobs are tuned fro
   layout it was (0.3.4 swapped a candidate for the incumbent at any tick of the wait and counted nothing: the same
   candidate was handed over to again 20 s later, three times, measuring nothing - CPU and GPU jobs alike; a CPU job's
   trial still starts after the drain when it doesn't fit beside); nothing is written to a worker that
-  ended (a handoff's ping after a drainer's `end` failed with "the pipe is being closed") (a safety net; 0.3.2 handed a job over to the same layout 3 times
+  ended (a handoff's ping after a drainer's `end` failed with "the pipe is being closed"). **Agents from 0.3.6:** a
+  worker finishing its games whose memory the next worker waits for - a handoff's next worker, a restart, a crew's next
+  member, when it would fit without the workers finishing theirs - ends its last games (`quit`) once it has finished
+  for 2 minutes or only an eighth of its games in flight (at most 4) are left; their ids go back with the lease (`done`'s
+  unfinished ids are worked out from the credited ones: each id credited or returned, none played twice). A drain ends
+  in its longest games at a few rows a batch: the 4070 Ti PC's start drained for 303 s beside the first member of its
+  crew, the second waiting for its memory all along (a safety net; 0.3.2 handed a job over to the same layout 3 times
   in 7 minutes). A trial that can't be measured any more when its worker would start (the machine got busy or used):
   a candidate gives way to the incumbent; the incumbent's own measurement starts unmeasured and counts as discarded.
   The lease closes (`done`) once every worker ended, its `unfinished` worked out from the credited ids (as after a
@@ -2066,6 +2089,11 @@ set the run's alternate's `model` (the CUDA alternate: `"model": "gpu"`) and the
 it: GPU machines play its default model.
 
 ## Changes
+- v1 rev 20, agent 0.3.6 (2026-11-20; no wire change): **GPU crews form where memory allows**, from the owner's 4070 Ti
+  PC's 0.3.5 lease (one worker of 1,024, ~9.7k leaves/s, its crew never fitting a 9.3 GB limit): a GPU worker's base is
+  measured and planned with (10.6), the job's memory limit keeps an eighth of the RAM free while the PC is idle, a
+  quarter else (10.6), the start is picked again when the plan holds more workers (13.1), and a drainer the next worker
+  waits for ends its last games, their ids returned (13.2).
 - v1 rev 20, agent 0.3.5, GPU fixes (2026-11-20; no wire change): from a real lease on the owner's 4070 Ti PC with
   0.3.4 (139 games in flight planned at the default 45 MB a game for a build not measured there, 5,179 leaves/s; the
   tuner handing over to the same trial again and again while the old worker drained for minutes): a GPU job's early

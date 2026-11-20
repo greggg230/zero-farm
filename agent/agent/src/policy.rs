@@ -161,14 +161,37 @@ pub const GPU_HOT_C: u32 = 83;
 pub const GPU_COOL_C: u32 = 78;
 pub const MEM_FLOOR_MB: u64 = 4096;
 
-/// Free memory to keep: 4 GB or 25 % of RAM, whichever is larger.
+/// Free memory to keep while the PC may be in use: 4 GB or 25 % of RAM, whichever is larger.
 pub fn mem_floor_mb(total_mb: u64) -> u64 {
     MEM_FLOOR_MB.max(total_mb / 4)
 }
 
+/// agent 0.3.6: free memory to keep while nobody uses the PC (no input for `idle_minutes`): 4 GB or 12.5 % of RAM. A job's
+/// memory limit is worked out from the free memory less this (`Engine::caps`); when the owner comes back the 25 % floor
+/// applies again - memory below it blocks work and a paused lease is given back, its memory freed. 0.3.5 kept 25 %
+/// whatever: the 4070 Ti PC (32 GB, its WSL servers holding ~15 GB) got a 9.3 GB limit, too little for a crew of GPU
+/// workers.
+pub fn idle_mem_floor_mb(total_mb: u64) -> u64 {
+    MEM_FLOOR_MB.max(total_mb / 8)
+}
+
+/// agent 0.3.6: no input for `idle_minutes` (whatever `work_when` says).
+pub fn pc_idle(s: &Signals, cfg: &Settings) -> bool {
+    s.idle_s >= cfg.idle_minutes as u64 * 60
+}
+
+/// agent 0.3.6: the free memory to keep now: `idle_mem_floor_mb` while the PC is idle, else `mem_floor_mb`.
+pub fn mem_floor_now(s: &Signals, cfg: &Settings) -> u64 {
+    if pc_idle(s, cfg) {
+        idle_mem_floor_mb(s.mem_total_mb)
+    } else {
+        mem_floor_mb(s.mem_total_mb)
+    }
+}
+
 pub fn decide(st: &mut PolicyState, s: &Signals, cfg: &Settings) -> Decision {
     let gpu_state = update_gpu_state(st, s);
-    let mem_pressure = s.mem_avail_mb < mem_floor_mb(s.mem_total_mb);
+    let mem_pressure = s.mem_avail_mb < mem_floor_now(s, cfg);
     let block = if cfg.paused(s.now) {
         Some(Block::Paused)
     } else if cfg.hours.is_some_and(|h| !h.contains(s.local_min)) {
@@ -339,17 +362,31 @@ mod tests {
     }
 
     #[test]
-    fn memory_floor_is_4gb_or_quarter() {
+    fn memory_floor_is_4gb_or_quarter_and_an_eighth_while_idle() {
         assert_eq!(mem_floor_mb(8192), 4096);
         assert_eq!(mem_floor_mb(65536), 16384);
+        assert_eq!((idle_mem_floor_mb(8192), idle_mem_floor_mb(32_768), idle_mem_floor_mb(65536)), (4096, 4096, 8192));
         let mut s = Signals::all_clear(0);
         s.mem_total_mb = 65536;
-        s.mem_avail_mb = 16000;
+        s.mem_avail_mb = 8000;
+        // idle (all_clear): an eighth
         let r = d(&s, &Settings::default());
         assert_eq!(r.block, Some(Block::LowMemory));
         assert!(r.mem_pressure);
+        s.mem_avail_mb = 16000;
+        assert!(d(&s, &Settings::default()).work, "idle: 16 GB free of 64 is above an eighth");
+        // the owner is back: a quarter (memory below it: a paused lease is given back)
+        s.idle_s = 0;
+        let owner = Settings { mode: Mode::Always, ..Settings::default() };
+        let r = d(&s, &owner);
+        assert_eq!(r.block, Some(Block::LowMemory));
+        assert!(r.mem_pressure);
         s.mem_avail_mb = 16384;
-        assert!(d(&s, &Settings::default()).work);
+        assert!(d(&s, &owner).work);
+        // the 4070 Ti PC (32 GB, ~17 GB free): a quarter kept 8.2 GB, an eighth 4 GB
+        let mut pc = Signals::all_clear(0);
+        (pc.mem_total_mb, pc.mem_avail_mb) = (32_698, 17_029);
+        assert_eq!(mem_floor_now(&pc, &Settings::default()), 4096);
     }
 
     #[test]

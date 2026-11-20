@@ -109,6 +109,9 @@ pub struct Timings {
     /// agent 0.3.5: a GPU job's worker gives an early memory reading (`rolling::early_reading`) no sooner than this after
     /// it started.
     pub early_calibration: Duration,
+    /// agent 0.3.6: a worker finishing its games whose memory the next worker waits for ends its last games after this
+    /// long (`lease.rs` `tail_tick`).
+    pub drain_tail: Duration,
 }
 
 impl Default for Timings {
@@ -141,6 +144,7 @@ impl Default for Timings {
             tune_settle: Duration::from_secs(1),
             tune_handoff_window: Duration::from_secs(3600),
             early_calibration: Duration::from_secs(90),
+            drain_tail: Duration::from_secs(120),
         }
     }
 }

@@ -531,3 +531,51 @@ fn a_trial_that_cant_run_when_its_worker_starts_counts_as_discarded() {
     let done = h.wait_done("l_GD");
     ids_accounted(&h, "l_GD", &done);
 }
+
+/// Agent 0.3.6, the 4070 Ti PC's 0.3.5 lease (round 5, 2026-11-20): the early reading planned 4 MB a game, but the plan's
+/// fixed 1,800 MB base per worker and its 9.3 GB cap kept a crew from ever fitting beside the running worker, and the
+/// lease stayed one worker of 1,024 (~9.7k leaves/s; a crew of two measured 12.4k there); and in the hand run of the same
+/// day the start's drain (its last games at a few rows a batch, 5 minutes) kept the crew's second member out. Now the
+/// base is measured too (a worker's commit before its games grow), the start is picked again when the new plan holds
+/// more workers, and a worker finishing its games that the next one waits for ends its last games. Here: a 9.3 GB cap,
+/// workers of 1.5 GB and 2 MB a game: a crew forms within seconds (minutes on a real PC), every id credited or returned.
+#[test]
+fn a_gpu_crew_forms_under_a_tight_cap_with_the_measured_base_and_no_drain_tail() {
+    let (mut h, g) = harness(12_282, None, true);
+    h.machine.lock().unwrap().settings.max_ram_mb = Some(9_300);
+    // the memory-fixed worker: 1.5 GB of runtime at once, ~2 MB a game in flight as its games grow (over 2 s here)
+    let mut fk = fake(40, json!([1.0, 1.25, 1.4]));
+    (fk["mem_base_mb"], fk["mem_per_game_mb"], fk["mem_ramp_ms"]) = (json!(1500), json!(2), json!(2000));
+    h.push(gpu_lease(&h, &g, "l_GB", &fk, json!("auto"), 10_000_000));
+    let t0 = Instant::now();
+    h.start();
+    let beat = |h: &H| h.mock.with(|s| s.beats.iter().filter(|(l, _)| l == "l_GB").map(|(_, b)| b["stats"].clone()).next_back());
+    let crew = |b: &Value| b["workers"].as_u64().unwrap_or(1) >= 2 && b["inflight"].as_u64().unwrap_or(0) as f64 >= 0.8 * 1024.0;
+    assert!(
+        mockcoord::testkit::wait_until(Duration::from_secs(60), || beat(&h).is_some_and(|b| crew(&b))),
+        "no crew after {:?}: {:?}\n{}\n{:?}",
+        t0.elapsed(),
+        beat(&h),
+        crew_log(&h),
+        learned(&h)
+    );
+    eprintln!("crew after {:?}: {:?}", t0.elapsed(), beat(&h).map(|b| (b["workers"].clone(), b["inflight"].clone())));
+    let log = h.agent_log();
+    assert!(log.contains("before its games grow: planning a base of"), "the base measured: {}", crew_log(&h));
+    // (the crew's last member waits for the draining start's memory: the start's last games end - their ids returned)
+    assert!(log.contains("ends its last") && log.contains("the next worker waits for its memory"), "{}", crew_log(&h));
+    let m = learned(&h);
+    let base = m[format!("{RUN}/{}/gpu_base", g.alt)].as_u64().unwrap();
+    assert!((1500..1650).contains(&base), "~1.5 GB measured: {m}");
+    // the crew stays (no loop), and ends cleanly: every id credited or returned, also those of ended drain tails
+    std::thread::sleep(Duration::from_secs(8));
+    let (all, measured) = handoffs(&h, "l_GB");
+    assert!(all.len() <= 4, "{all:#?}\n{}", crew_log(&h));
+    let distinct: BTreeSet<&String> = measured.iter().collect();
+    assert_eq!(distinct.len(), measured.len(), "a trial handed over to twice: {measured:#?}");
+    h.stop();
+    let done = h.wait_done("l_GB");
+    ids_accounted(&h, "l_GB", &done);
+    assert!(h.crashes().is_empty(), "{:?}", h.crashes());
+}
+

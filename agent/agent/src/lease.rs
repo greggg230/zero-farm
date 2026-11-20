@@ -105,6 +105,10 @@ struct Roll {
     /// agent 0.3.5: a GPU job's early reading (`rolling::early_reading`; 0: none yet), and whether `calibrate` acted on it.
     early_per_game: u64,
     early_done: bool,
+    /// agent 0.3.6: the lowest base reading of the lease's workers (`rolling::base_reading`; 0: none yet), and the one
+    /// `calibrate` acted on.
+    base_min: u64,
+    base_applied: u64,
     /// The current worker's ids start at `lo + offset` (0 until a restart; a restart's worker gets the ids after
     /// the ones its predecessor started).
     offset: u64,
@@ -207,6 +211,9 @@ struct Mate {
     want_stop: bool,
     vram_mb: u64,
     stats_vram: u64,
+    /// agent 0.3.6: since when it finishes its games, and whether its last ones were ended (`tail_tick`).
+    finishing_since: Option<Instant>,
+    tail_quit: bool,
 }
 
 /// rev 19 (PROTOCOL 13.5): where a finishing worker's ids stop: its `games_started` after `finish`, read until two agree.
@@ -1100,6 +1107,8 @@ impl Engine {
                 raised: 0,
                 early_per_game: 0,
                 early_done: false,
+                base_min: 0,
+                base_applied: 0,
                 offset: 0,
                 restarts: 0,
                 restart: None,
@@ -1127,6 +1136,8 @@ impl Engine {
             last_counter_ping: None,
             vram_mb: 0,
             stats_vram: 0,
+            finish_sent: None,
+            tail_quit: false,
         };
         run.show_tuning(self);
         run.go(self)
@@ -1471,6 +1482,10 @@ struct Run {
     /// `vram_mb`.
     vram_mb: u64,
     stats_vram: u64,
+    /// agent 0.3.6: when the main worker was told `finish` (a handoff, a restart, giving way), and whether its last games
+    /// were ended (`tail_tick`).
+    finish_sent: Option<Instant>,
+    tail_quit: bool,
 }
 
 impl Run {
@@ -1555,6 +1570,9 @@ impl Run {
         // a handoff's ping came after a drainer's `end`)
         if self.end_ev.is_some() || self.eof {
             return;
+        }
+        if v.get("op").and_then(Value::as_str) == Some("finish") {
+            self.finish_sent.get_or_insert_with(Instant::now);
         }
         if let Err(e) = self.worker.send(&v) {
             log::warn!("lease {}: write to worker failed: {e}", self.id());
@@ -1775,6 +1793,7 @@ impl Run {
         self.mates_tick(&t, must_pause);
         self.tune_tick(eng, &t, must_pause);
         self.crew_tick(eng, &t, must_pause);
+        self.tail_tick(eng, &t, must_pause);
     }
 
     /// A beat when one is due (on its own thread; the answer comes back as an event).
@@ -2031,6 +2050,8 @@ impl Run {
             Ok(w) => {
                 self.counters = None;
                 self.progress = None;
+                (self.finish_sent, self.tail_quit) = (None, false);
+        (self.finish_sent, self.tail_quit) = (None, false);
                 self.crew_changed = Instant::now();
                 match rs.layout {
                     Some(l) => log::info!("lease {id}: worker pid {} started with layout {} (ids from {}, memory limit {limit} MB)", w.pid, l.per_worker().describe_on(gpu), lo + offset),
@@ -2507,6 +2528,13 @@ impl Run {
                 }
                 // (agent 0.3.4: a worker that reports its video memory)
                 self.stats_vram = s.get("vram_mb").and_then(Value::as_u64).unwrap_or(0);
+                // (agent 0.3.6: a GPU job's worker's base reading - sessions built, games started, none finished)
+                let named = s.get("provider").and_then(Value::as_str).is_some_and(|p| !p.is_empty());
+                if self.gpu_lease() && self.progress.is_some_and(|(g, st)| crate::rolling::base_reading(named, g, st)) {
+                    if let (Some(c), Some(r)) = (self.worker.commit_mb(), self.roll.as_mut()) {
+                        r.base_min = if r.base_min == 0 { c } else { r.base_min.min(c) };
+                    }
+                }
                 self.tune_status(eng, &s);
                 self.stats = s;
             }
@@ -3464,6 +3492,8 @@ impl Run {
             want_stop: false,
             vram_mb: std::mem::take(&mut self.vram_mb),
             stats_vram: std::mem::take(&mut self.stats_vram),
+            finishing_since: None,
+            tail_quit: std::mem::take(&mut self.tail_quit),
         });
         if let Some(r) = self.roll.as_mut() {
             r.offset = first - lo;
@@ -3486,6 +3516,7 @@ impl Run {
         self.stall_since = None;
         self.counters_at = None;
         self.progress = None;
+        (self.finish_sent, self.tail_quit) = (None, false);
         self.crew_changed = Instant::now();
         self.mark = CpuMark::take(&self.worker);
         self.sample = (self.mark, Instant::now());
@@ -3812,27 +3843,48 @@ impl Run {
         let groups = Engine::job_shape(&self.plan).2;
         let limit = self.lease_limit_mb;
         let Some(r) = self.roll.as_mut().filter(|r| r.active && !r.finishing) else { return };
+        let mut changed = Vec::new();
+        // (agent 0.3.6: the base, from the workers' base readings - lower than planned: planned with at once)
+        if r.base_min > 0 && r.base_min != r.base_applied {
+            r.base_applied = r.base_min;
+            if let Some(b) = Learned::set_base(&eng.cfg.layout, &run, &build, r.gpu, r.base_min) {
+                let was = r.mem.cost.base_mb;
+                if (b as f64) < was as f64 * (1.0 - crate::rolling::BASE_TOLERANCE) {
+                    let line = format!("a worker commits {} MB before its games grow: planning a base of {b} MB (was {was})", r.base_min);
+                    log::info!("lease {id}: {line}");
+                    eng.worker_log.write_line(&format!("tuning [{id}]: {line}"));
+                    r.mem.cost.base_mb = b;
+                    changed.push(format!("a base of {b} MB from now on (was {was})"));
+                }
+            }
+        }
         // (agent 0.3.5: a GPU job's early reading first - once -, then the steady ones)
-        let (reading, early) = if r.steady_per_game > 0 && r.steady_per_game != r.calibrated {
+        let reading = if r.steady_per_game > 0 && r.steady_per_game != r.calibrated {
             r.calibrated = r.steady_per_game;
-            (r.steady_per_game, false)
+            Some((r.steady_per_game, false))
         } else if r.early_per_game > 0 && !r.early_done && r.steady_per_game == 0 {
             r.early_done = true;
-            (r.early_per_game, true)
+            Some((r.early_per_game, true))
         } else {
-            return;
+            None
         };
-        let learned = if early { Learned::early(&eng.cfg.layout, &run, &build, r.gpu, reading) } else { Learned::steady(&eng.cfg.layout, &run, &build, r.gpu, reading) };
-        let Some(v) = learned else { return };
-        let was = r.mem.cost.per_game_mb;
-        let when = if early { "early in their games (planned x 2)" } else { "at their steady state" };
-        log::info!("lease {id}: its workers commit {reading} MB per game in flight {when} (planned {was}): remembering {v} MB for this run and worker build");
-        eng.worker_log.write_line(&format!("tuning [{id}]: the workers commit {reading} MB per game in flight {when}: planning {v} MB (was {was})"));
-        if v as f64 > was as f64 * crate::rolling::RAISE_INFLIGHT_SHARE {
+        if let Some((reading, early)) = reading {
+            let learned = if early { Learned::early(&eng.cfg.layout, &run, &build, r.gpu, reading) } else { Learned::steady(&eng.cfg.layout, &run, &build, r.gpu, reading) };
+            if let Some(v) = learned {
+                let was = r.mem.cost.per_game_mb;
+                let when = if early { "early in their games (planned x 2)" } else { "at their steady state" };
+                log::info!("lease {id}: its workers commit {reading} MB per game in flight {when} (planned {was}): remembering {v} MB for this run and worker build");
+                eng.worker_log.write_line(&format!("tuning [{id}]: the workers commit {reading} MB per game in flight {when}: planning {v} MB (was {was})"));
+                if v as f64 <= was as f64 * crate::rolling::RAISE_INFLIGHT_SHARE {
+                    r.mem.cost.per_game_mb = v;
+                    r.mem.measured = true;
+                    changed.push(format!("{v} MB per game in flight from now on (was {was})"));
+                }
+            }
+        }
+        if changed.is_empty() {
             return;
         }
-        r.mem.cost.per_game_mb = v;
-        r.mem.measured = true;
         let (cost, setting) = (r.mem.cost, r.setup.cpu);
         let Some(t) = self.tuning.as_mut().filter(|t| t.space.mem.is_some()) else { return };
         let old = t.space;
@@ -3851,17 +3903,25 @@ impl Run {
         t.space.bound_workers(set, max);
         t.entry.lift_conc(&old, &t.space);
         // (agent 0.3.5: a GPU job's start was picked under the old plan - an uncalibrated 45 MB a game held the 4070 Ti PC
-        // to one worker of 139 -: picked again while nothing else won, so the job goes to the crew the plan now holds)
-        if t.gpu && t.entry.incumbent == t.entry.start && t.entry.state == tune::State::Searching && t.entry.trials == 0 {
+        // to one worker of 139 -: picked again while nothing else won, so the job goes to the crew the plan now holds;
+        // agent 0.3.6: also when the old plan held the job to fewer workers than the new start has - the PC's second 0.3.5
+        // lease measured a one-worker candidate first and stayed with one worker of 1,024, its crew never measured)
+        if t.gpu {
             let (nvidia, batch) = t.gpu_start;
             let s = t.space.gpu_start(nvidia, batch);
-            if s != t.entry.wanted(&t.space) {
+            let fresh = t.entry.incumbent == t.entry.start && t.entry.state == tune::State::Searching && t.entry.trials == 0;
+            let held_back = old.workers_max < t.space.workers_max && t.entry.wanted(&t.space).workers < s.workers;
+            if (fresh || held_back) && s != t.entry.wanted(&t.space) {
                 t.entry.start = s;
                 t.entry.incumbent = s;
+                if held_back {
+                    // (a search under the old plan: searched again from the new start, its measurements kept)
+                    (t.entry.state, t.entry.trials, t.entry.momentum) = (tune::State::Searching, 0, None);
+                }
             }
         }
         let wanted = t.entry.wanted(&t.space);
-        let line = format!("planning {v} MB per game in flight from now on (was {was}): the layout wanted is {}", wanted.describe_on(t.gpu));
+        let line = format!("planning {}: the layout wanted is {}", changed.join(" and "), wanted.describe_on(t.gpu));
         log::info!("lease {id}: {line}");
         eng.worker_log.write_line(&format!("tuning [{id}]: {line}"));
         self.save_tuning(eng);
@@ -3932,6 +3992,9 @@ impl Run {
         for d in &mut self.mates {
             let stop = must_pause || (d.finishing && measuring);
             d.want_stop = stop;
+            if d.finishing && d.finishing_since.is_none() {
+                d.finishing_since = Some(Instant::now());
+            }
             // agent 0.3.4: a GPU job's worker gives its video memory back for a pause first, as the main worker does
             // (`yield`; stopped once it said `yielded`, killed when it doesn't within `yield_answer`) - a stopped worker
             // would hold it while another program needs the GPU
@@ -4021,6 +4084,7 @@ impl Run {
         }
         self.mates_tick(&t, pause && self.after.is_none());
         self.retire_mates(eng, &t);
+        self.tail_tick(eng, &t, pause);
         self.maybe_beat(eng, pause);
     }
 
@@ -4218,6 +4282,76 @@ impl Run {
         if let Some(t) = self.tuning.as_mut() {
             t.space.vram = Some((budget, cost));
         }
+    }
+
+    /// agent 0.3.6 (PROTOCOL 13.2, 13.5): a worker finishing its games whose memory the next worker waits for - a crew's
+    /// next member, a restart, a handoff's next worker - ends its last games (`quit`) once it has finished for
+    /// `Timings::drain_tail` or only an eighth of its games in flight (at most 4) are left: their ids go back with the lease
+    /// (`done`'s unfinished ids are worked out from the credited ones), none is played twice. A drain ends in its longest
+    /// games at a few rows a batch: the 4070 Ti PC's start drained for 303 s beside the first member of its crew, the second
+    /// waiting for its memory all along.
+    fn tail_tick(&mut self, eng: &mut Engine, t: &crate::Timings, must_pause: bool) {
+        if must_pause || self.after.is_some() || eng.quitting() || !self.roll.as_ref().is_some_and(|r| r.active && !r.finishing) {
+            return;
+        }
+        let id = self.lease.lease_id.clone();
+        let small = |n: Option<u64>, conc: u64| n.is_some_and(|n| n <= (conc / 8).max(4));
+        // the main worker finishing for a handoff whose next worker hasn't started yet, or for a restart
+        let handoff_waits = self.tuning.as_ref().and_then(|tu| tu.handoff.as_ref()).is_some_and(|h| h.since.elapsed() >= t.tune_settle * 10);
+        let restart_runs = self.main_exit.is_none() && self.restart_pending();
+        if self.main_exit.is_none() && !self.tail_quit && (handoff_waits || restart_runs) {
+            let in_flight = self.progress.map(|(g, st)| st.saturating_sub(g));
+            let long = self.finish_sent.is_some_and(|at| at.elapsed() >= t.drain_tail);
+            if long || small(in_flight, self.conc.unwrap_or(1)) {
+                let line = format!("worker pid {} ends its last {} games now: the next worker waits for its memory (their ids go back with the lease)", self.worker.pid, in_flight.map_or("?".into(), |n| n.to_string()));
+                log::info!("lease {id}: {line}");
+                eng.worker_log.write_line(&format!("crew [{id}]: {line}"));
+                self.tail_quit = true;
+                self.send(json!({"op": "quit"}));
+            }
+        }
+        // workers beside it finishing their games while a crew's member, a restart or a handoff waits for room - room their
+        // memory is what is missing (not other programs' video memory, say)
+        let next = match (self.restart_pending(), self.tuning.as_ref()) {
+            (true, _) => self.roll.as_ref().and_then(|r| r.restart.as_ref()).map(|rs| rs.layout.map(|l| l.per_worker()).unwrap_or(Layout { conc: rs.conc, ..self.main_layout() })),
+            (false, Some(tu)) => Some(tu.handoff.as_ref().map_or(tu.current, |h| h.next).per_worker()),
+            (false, None) => None,
+        };
+        let Some(next) = next else { return };
+        let crew_waits = self.main_exit.is_none() && matches!(self.state, WState::Running) && self.job_sent && !self.crew_complete() && !self.room_for(1, &next);
+        let restart_waits = self.main_exit.is_some() && self.restart_pending() && !self.restart_room();
+        if !(crew_waits || restart_waits || handoff_waits) || !self.room_without_drainers(&next) {
+            return;
+        }
+        for m in self.mates.iter_mut().filter(|m| m.finishing && m.job_sent && !m.tail_quit && m.end_ev.is_none() && !m.worker.is_suspended()) {
+            let long = m.finishing_since.is_some_and(|at| at.elapsed() >= t.drain_tail);
+            if long || small(m.in_flight, m.layout.conc) {
+                let line = format!("worker pid {} ends its last {} games now: the next worker waits for its memory (their ids go back with the lease)", m.worker.pid, m.in_flight.map_or("?".into(), |n| n.to_string()));
+                log::info!("lease {id}: {line}");
+                eng.worker_log.write_line(&format!("crew [{id}]: {line}"));
+                m.tail_quit = true;
+                let _ = m.worker.send(&json!({"op": "quit"}));
+            }
+        }
+    }
+
+    /// agent 0.3.6: one worker of layout `l` would fit if the workers finishing their games were gone: what the others hold
+    /// or will hold (`reserved_mb`, `vram_reserved`) less the drainers', within `PLAN_SHARE` of the job's limit and the video
+    /// memory budget.
+    fn room_without_drainers(&mut self, l: &Layout) -> bool {
+        let limit = self.lease_limit_mb;
+        let drain_mb: u64 = self.mates.iter_mut().filter(|m| m.finishing).map(|m| m.worker.commit_mb().unwrap_or(0)).sum();
+        let host = limit == 0 || (self.reserved_mb(true).saturating_sub(drain_mb) + self.plan_mb(l.conc)) as f64 <= limit as f64 * crate::rolling::PLAN_SHARE;
+        let vram = match self.roll.as_ref().and_then(|r| r.vram.as_ref()) {
+            None => true,
+            Some(v) => {
+                let ours = self.vram_mb + self.mates.iter().map(|m| m.vram_mb).sum::<u64>();
+                let drain_vram: u64 = self.mates.iter().filter(|m| m.finishing).map(|m| m.vram_mb).sum();
+                let budget = v.budget_mb.min(crate::rolling::vram_budget(v.total_mb, v.adapter_used_mb.saturating_sub(ours)));
+                self.vram_reserved(true).saturating_sub(drain_vram) + v.cost.plan_mb(l.batch()) <= budget
+            }
+        };
+        host && vram
     }
 
     /// The crew's memory (PROTOCOL 13.5): each member within its part of the job's limit (`HIGH_SHARE` of it: it
@@ -4447,6 +4581,8 @@ impl Run {
             want_stop: false,
             vram_mb: 0,
             stats_vram: 0,
+            finishing_since: None,
+            tail_quit: false,
         });
         self.crew_changed = Instant::now();
         self.show_tuning(eng);
@@ -4513,6 +4649,8 @@ impl Run {
             want_stop: false,
             vram_mb: std::mem::take(&mut self.vram_mb),
             stats_vram: std::mem::take(&mut self.stats_vram),
+            finishing_since: None,
+            tail_quit: std::mem::take(&mut self.tail_quit),
         });
         if let Some(r) = self.roll.as_mut() {
             r.offset = released;
@@ -4534,6 +4672,7 @@ impl Run {
         self.stall_since = None;
         self.counters_at = None;
         self.progress = None;
+        (self.finish_sent, self.tail_quit) = (None, false);
         self.gen_floor = self.prep.ckpt.as_ref().map(|(c, _)| c.gen).or(self.gen_floor);
         self.crew_changed = Instant::now();
         self.mark = CpuMark::take(&self.worker);

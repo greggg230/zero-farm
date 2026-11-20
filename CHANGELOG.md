@@ -4,6 +4,17 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's: `agent-macos-v<version>`).
 
+## Unreleased (0.3.6)
+
+- **Graphics cards get their crew of job programs.** Zero Farm 0.3.5 counted 1.8 GB for each job program's own start-up
+  memory and, on a computer whose other programs held half of its memory, gave the job less than a third of the RAM,
+  so a 4070 Ti kept a single job program. Zero Farm now measures how much a job program really needs before its games
+  grow, and while you're away it leaves an eighth of your memory free instead of a quarter (a quarter again as soon as
+  you're back, and the job steps aside if memory gets tight): two or three job programs then share the card.
+- **Switching setups no longer waits for the last slow games.** When a job program winding down held memory the next one
+  needed, its last few games could take five minutes; they now end after two minutes and go back to the farm, which
+  plays them again.
+
 ## Unreleased (0.3.5)
 
 - **Graphics cards can get a network made for them.** A farm run can now publish, for each network, a second copy built

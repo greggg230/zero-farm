@@ -351,12 +351,40 @@ impl Learned {
         }
     }
 
-    /// What a job of `run` with worker build `build` is planned with: the default's base and the measured per-game cost
-    /// (the default's when there is none), and whether there was a measurement.
+    /// What a job of `run` with worker build `build` is planned with: the measured base (agent 0.3.6; the default's when
+    /// there is none) and the measured per-game cost (the default's when there is none), and whether the per-game cost was
+    /// measured.
     pub fn plan(layout: &Layout, run: &str, build: &str, gpu: bool, ram_mb: u64) -> MemPlan {
         let d = Self::default_cost(gpu);
         let m = Self::get(layout, run, build, gpu);
-        MemPlan { ram_mb, cost: MemCost { per_game_mb: m.unwrap_or(d.per_game_mb).max(1), ..d }, measured: m.is_some() }
+        let base = Self::base(layout, run, build, gpu).unwrap_or(d.base_mb);
+        MemPlan { ram_mb, cost: MemCost { base_mb: base, per_game_mb: m.unwrap_or(d.per_game_mb).max(1) }, measured: m.is_some() }
+    }
+
+    fn base_key(run: &str, build: &str, gpu: bool) -> String {
+        format!("{run}/{build}/{}_base", if gpu { "gpu" } else { "cpu" })
+    }
+
+    /// agent 0.3.6: the worker's measured base (MB) for `run` / `build` on the CPU or a GPU (None: not measured here).
+    pub fn base(layout: &Layout, run: &str, build: &str, gpu: bool) -> Option<u64> {
+        Self::load(layout).get(&Self::base_key(run, build, gpu)).copied()
+    }
+
+    /// agent 0.3.6: a base reading (`base_reading`): remembered when it is lower than what is planned with (the stored
+    /// value, else the default) by more than `BASE_TOLERANCE` -> the value planned with from now on. Only lower: a reading
+    /// holds the games' first memory too (more with more games in flight), and a base above the default is in the cost
+    /// per game measured over it.
+    pub fn set_base(layout: &Layout, run: &str, build: &str, gpu: bool, reading_mb: u64) -> Option<u64> {
+        let mut m = Self::load(layout);
+        let k = Self::base_key(run, build, gpu);
+        let now = m.get(&k).copied().unwrap_or(Self::default_cost(gpu).base_mb);
+        let v = reading_mb.max(MIN_BASE_MB);
+        if v as f64 >= now as f64 * (1.0 - BASE_TOLERANCE) {
+            return None;
+        }
+        m.insert(k, v);
+        Self::save(layout, &m);
+        Some(v)
     }
 
     /// Records `per_game_mb` for `run` / `build` when it is more than what is planned with now (the stored value, else
@@ -440,6 +468,18 @@ impl Learned {
         }
     }
 }
+
+/// agent 0.3.6: a worker's **base reading** is its commit at its first `status` after its sessions exist (it names a
+/// provider) with games started and none finished: the runtime and the network, its games barely begun - the base the
+/// plan counts per worker (each worker of a crew its own). 0.2.14-0.3.5 planned a fixed base (1,800 MB with a GPU, 600
+/// on Windows' CPU, 1,024 on a Mac) and measured the cost per game over it.
+pub fn base_reading(provider_named: bool, games: u64, started: u64) -> bool {
+    provider_named && games == 0 && started > 0
+}
+/// A base reading is remembered when it differs from the stored one by more than this share.
+pub const BASE_TOLERANCE: f64 = 0.05;
+/// A base reading counts at least this much (MB).
+pub const MIN_BASE_MB: u64 = 256;
 
 /// agent 0.3.5: a GPU job's worker's reading counts as an early one: it finished `EARLY_TURNOVER` of its `conc` games in
 /// flight, its games in flight full (as `steady_reading`).
@@ -666,6 +706,15 @@ mod tests {
         assert_eq!(Learned::early(&layout, "r", "gpu-build", true, 2), Some(4), "2 MB a game early: planned at 4 (default 45)");
         assert_eq!(Learned::early(&layout, "r", "gpu-build", true, 3), None, "6 is no lower than 4");
         assert_eq!(Learned::early(&layout, "r", "gpu-build2", true, 0), Some(2), "a reading under the base counts 1");
+        // agent 0.3.6: the base, measured - only lower, by more than 5 %; planned with
+        assert!(base_reading(true, 0, 139) && !base_reading(false, 0, 139) && !base_reading(true, 1, 139) && !base_reading(true, 0, 0));
+        assert_eq!(Learned::set_base(&layout, "r", "g", true, 1750), None, "within 5 % of the default 1,800");
+        assert_eq!(Learned::set_base(&layout, "r", "g", true, 1500), Some(1500));
+        assert_eq!(Learned::set_base(&layout, "r", "g", true, 1900), None, "never raised: a reading holds the games' first memory too");
+        assert_eq!(Learned::set_base(&layout, "r", "g", true, 100), Some(MIN_BASE_MB));
+        let p = Learned::plan(&layout, "r", "g", true, 9_300);
+        assert_eq!((p.cost.base_mb, p.cost.per_game_mb), (MIN_BASE_MB, GPU_COST.per_game_mb));
+        assert_eq!(Learned::base(&layout, "r", "g", false), None, "per provider class");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

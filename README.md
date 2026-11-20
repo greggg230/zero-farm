@@ -20,7 +20,8 @@ networks play each other (below). Self-play training games and GPU work come lat
 - after **5 minutes** without keyboard or mouse input;
 - **never** while a fullscreen game or app, a presentation or Windows' "busy" state is on;
 - **never** on battery or battery saver;
-- only while at least **4 GB or 25 % of your RAM** (whichever is larger) stays free;
+- only while at least **4 GB or 25 % of your RAM** (whichever is larger) stays free - 12.5 % while you're away (from
+  0.3.6; the job gives its memory back when you return and memory is tight);
 - not while paused (tray menu: 1 hour, until tomorrow, until you resume), and only within your
   chosen hours if you set some.
 
@@ -37,7 +38,7 @@ of CPU for more than about 10 minutes is handed back to the farm.
 |---|---|
 | Priority | Windows' lowest (`IDLE_PRIORITY_CLASS`) plus EcoQoS: anything you run comes first, fans stay quiet |
 | CPU | as many threads as the processor has physical cores by default; adjustable in the tray |
-| RAM | the job's memory is capped by Windows (a job object): half your RAM by default, never more than what is free above the 4 GB / 25 % floor |
+| RAM | the job's memory is capped by Windows (a job object): half your RAM by default, never more than what is free above the floor (4 GB or 12.5 % of your RAM while you're away, 25 % while you use the PC) |
 | Disk | everything lives in `%LOCALAPPDATA%\ZeroFarm`, hard cap 3 GB including logs (20 MB) and caches; nothing else on the disk is written |
 | Network | HTTPS only, to `farm.greggg230.com`; no open ports, no remote access |
 

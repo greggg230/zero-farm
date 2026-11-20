@@ -114,6 +114,9 @@ pub struct Engine {
     /// rev 19 (PROTOCOL 13): at the last `decide`, a tuning trial was allowed (idle, on AC, no fullscreen, no block:
     /// `policy::tuning_allowed`).
     pub(crate) tune_ok: bool,
+    /// agent 0.3.6: at the last `decide`, nobody had used the PC for `idle_minutes` (the job's memory limit keeps an eighth
+    /// of RAM free then, else a quarter: `caps`).
+    pub(crate) pc_idle: bool,
 }
 
 impl Engine {
@@ -173,6 +176,7 @@ impl Engine {
             presence_sent: None,
             presence_sending: Arc::new(AtomicBool::new(false)),
             tune_ok: false,
+            pc_idle: false,
             cfg,
         })
     }
@@ -195,6 +199,7 @@ impl Engine {
         let cfg = self.settings();
         let d = decide(&mut self.policy, &s, &cfg);
         self.tune_ok = crate::policy::tuning_allowed(&s, &cfg);
+        self.pc_idle = crate::policy::pc_idle(&s, &cfg);
         self.avail.record(crate::availability::now_ms(), &crate::util::local_now().0, d.work);
         d
     }
@@ -385,7 +390,10 @@ impl Engine {
         let s = self.settings();
         // (the memory the signal source sees: the PC's, or the tests' own)
         let (avail, total) = self.signals.memory_mb();
-        let ram_free = avail.saturating_sub(mem_floor_mb(total));
+        // (agent 0.3.6: the free memory less what is kept for the owner - an eighth of RAM while the PC is idle, a quarter
+        // else, at least 4 GB: `policy::mem_floor_now`)
+        let floor = if self.pc_idle { crate::policy::idle_mem_floor_mb(total) } else { mem_floor_mb(total) };
+        let ram_free = avail.saturating_sub(floor);
         Caps {
             threads: s.threads(self.profile.cores, self.profile.threads),
             ram_mb: s.ram_cap_mb(self.profile.ram_mb).min(if total > 0 { ram_free } else { u64::MAX }),
