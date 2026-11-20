@@ -13,6 +13,11 @@
 //! only when a GPU provider passed; and a job line's `providers` and `gpu` (`plan_providers`).
 //! Only provider names, adapter names and timings are kept; the readable report goes to the worker
 //! log (what "Send diagnostics" uploads, redacted).
+//!
+//! Agent 0.3.11 (PROTOCOL 9.8): an AMD adapter runs DirectML only (`profile::VENDOR_PROVIDERS`). A probe or bench on a PC
+//! with one is pinned to a single adapter ([`scope`]: NVIDIA first, then AMD, then Intel), an AMD one gets `--providers
+//! dml,cpu` and no `--ensure-ready`, a pack that ships Windows ML's catalog ([`WINML_CATALOG_DLL`]) never touches it, and
+//! the measured choice never puts another provider on it - not even from a record an older agent kept.
 
 use crate::worker::{SpawnOpts, WorkerMsg, WorkerProc};
 use serde::{Deserialize, Serialize};
@@ -76,35 +81,123 @@ pub struct Probe {
     /// ... and these GPU providers passed there.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub real: Vec<String>,
+    /// agent 0.3.11: the probe rules it was made under ([`RULES`]); 0: an older agent's. A record of adapters with a
+    /// provider restriction (an AMD GPU) made before [`RULES`] is not used ([`load`]): such a GPU is probed again, with
+    /// DirectML only.
+    #[serde(default)]
+    pub rules: u32,
 }
 
 impl Probe {
-    /// Providers that passed here: the built-in probe's and those that passed on a job's network.
+    /// Providers that passed here: the built-in probe's and those that passed on a job's network (never one a probe may
+    /// not load: an older record's AMD providers don't count).
     pub fn passed(&self) -> Vec<String> {
-        ordered(self.providers.iter().chain(self.real.iter()).cloned())
+        ordered(self.providers.iter().chain(self.real.iter()).filter(|p| PROBE_PROVIDERS.contains(&p.as_str())).cloned())
     }
 }
 
 // ---------- 0.2.11: what a probe may load, where it runs, and probes the PC never finished ----------
 
 /// The providers the built-in probe and the bench may load (`--providers`): all the worker knows but AMD's (`amdgpu`,
-/// `migraphx`; profile::GPU_VENDORS_OFF). Every worker with `probe-providers` knows these names. (The AMD session's
-/// diagnostic variants ignore `--providers` by design: the in-progress marker below is what protects there.)
+/// `migraphx`: never, for anyone). Every worker with `probe-providers` knows these names. (The AMD session's diagnostic
+/// variants ignore `--providers` by design: the in-progress marker below is what protects there.)
 pub const PROBE_PROVIDERS: [&str; 5] = ["tensorrt_rtx", "cuda", "openvino", "dml", "cpu"];
 
-/// `--gpu <LUID>` for a probe or bench on a PC with adapters this agent never uses (`off`): one usable adapter
-/// (NVIDIA first, then Intel, then any), so the worker doesn't enumerate the others. None: no adapter is off (the
-/// worker probes every adapter, as before), or none is usable (nothing runs then).
-pub fn pin_gpu(gpus: &[Gpu], off: &[Gpu]) -> Option<String> {
-    if off.is_empty() {
+/// agent 0.3.11: the probe rules records are made under (`Probe::rules`, `Bench::rules`): 1 = an adapter of a vendor with a
+/// provider restriction (`profile::VENDOR_PROVIDERS`: an AMD GPU, DirectML only) is probed and benched alone, with its
+/// providers only.
+pub const RULES: u32 = 1;
+
+/// Windows ML's execution-provider catalog (PROTOCOL 8, the Windows ML pack): a pack that ships it can register the GPU
+/// vendors' catalog providers - AMD's `amdgpu` and `migraphx` among them -, so it never does GPU work on an adapter with a
+/// provider restriction (agent 0.3.11, PROTOCOL 9.8). The DirectML-only pack doesn't ship it.
+pub const WINML_CATALOG_DLL: &str = "Microsoft.Windows.AI.MachineLearning.dll";
+
+/// Whether `provider` may run on an adapter of `vendor`: the CPU always; a GPU provider only if a probe may load it
+/// ([`PROBE_PROVIDERS`]) and the vendor has no restriction that leaves it out (`profile::VENDOR_PROVIDERS`: an AMD GPU
+/// runs `dml` only).
+pub fn allowed_on(vendor: &str, provider: &str) -> bool {
+    provider == "cpu" || (PROBE_PROVIDERS.contains(&provider) && crate::profile::vendor_providers(vendor).is_none_or(|ps| ps.contains(&provider)))
+}
+
+/// What a runtime pack's signed manifest says about GPU work with it (agent 0.3.11).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PackGpu {
+    /// It ships [`WINML_CATALOG_DLL`] (anywhere in the pack).
+    pub catalog: bool,
+    /// Its `gpu` requirement's vendor (PROTOCOL 9.2), if it has one.
+    pub vendor: Option<String>,
+}
+
+impl PackGpu {
+    pub fn of(m: &zerofarm_common::manifest::Manifest) -> PackGpu {
+        let catalog = m.files.iter().any(|f| f.path.rsplit('/').next().is_some_and(|n| n.eq_ignore_ascii_case(WINML_CATALOG_DLL)));
+        PackGpu { catalog, vendor: m.gpu.as_ref().map(|g| g.vendor.clone()) }
+    }
+
+    /// The pack in a verified build directory (its manifest only: the caller verified the files); unreadable: one with
+    /// the catalog (the cautious reading: no GPU work on a restricted adapter).
+    pub fn of_dir(dir: &Path) -> PackGpu {
+        match std::fs::read(dir.join(zerofarm_common::manifest::MANIFEST_FILE)).ok().and_then(|b| zerofarm_common::manifest::Manifest::parse(&b).ok()) {
+            Some(m) => PackGpu::of(&m),
+            None => PackGpu { catalog: true, vendor: None },
+        }
+    }
+}
+
+/// The adapters a pack's GPU work may use (agent 0.3.11): every usable one, but an adapter of a vendor with a provider
+/// restriction (an AMD GPU) only with a pack that can't register Windows ML's catalog providers.
+pub fn pack_gpus(gpus: &[Gpu], pack: &PackGpu) -> Vec<Gpu> {
+    gpus.iter().filter(|g| !(pack.catalog && crate::profile::vendor_providers(&g.vendor).is_some())).cloned().collect()
+}
+
+/// What a probe or bench of a pack may touch on this PC (agent 0.3.11, PROTOCOL 9.8).
+#[derive(Clone, Debug, PartialEq)]
+pub struct Scope {
+    /// `--gpu <LUID>`: the one adapter it runs on. None: every adapter (a PC with no adapter left out and none with a
+    /// provider restriction, as before 0.2.11).
+    pub pin: Option<String>,
+    /// `--providers`: [`PROBE_PROVIDERS`], or the pinned adapter's own (`dml`) and the CPU.
+    pub providers: Vec<String>,
+    /// `--ensure-ready` (Windows ML may download and install catalog providers): never on an adapter with a restriction.
+    pub ensure_ready: bool,
+}
+
+/// Where a probe or bench of a pack runs ([`Scope`]), or None: no adapter it may use (nothing runs; its jobs run on the
+/// CPU). `gpus`: the usable adapters (the profile's), `off`: those of a vendor that is off (`profile::vendors_off`).
+/// Pinned to one adapter when any is left out (off, or one with a restriction that the pack's catalog keeps out) or any
+/// has a provider restriction (an AMD GPU): the pack's own vendor first (its `gpu` requirement), then NVIDIA, AMD, Intel,
+/// any other, and of one vendor the one with the most video memory (a discrete GPU before an integrated one).
+pub fn scope(gpus: &[Gpu], off: &[Gpu], pack: &PackGpu) -> Option<Scope> {
+    let usable = pack_gpus(gpus, pack);
+    let all = || Scope { pin: None, providers: PROBE_PROVIDERS.iter().map(|p| p.to_string()).collect(), ensure_ready: true };
+    let restricted = |g: &Gpu| crate::profile::vendor_providers(&g.vendor).is_some();
+    if usable.is_empty() {
         return None;
     }
-    let rank = |g: &&Gpu| match g.vendor.as_str() {
-        "nvidia" => 0,
-        "intel" => 1,
-        _ => 2,
+    if off.is_empty() && usable.len() == gpus.len() && !usable.iter().any(restricted) {
+        return Some(all());
+    }
+    let rank = |g: &&Gpu| {
+        let v = g.vendor.to_ascii_lowercase();
+        let own = pack.vendor.as_deref().is_some_and(|p| p.eq_ignore_ascii_case(&v));
+        let vendor = match v.as_str() {
+            "nvidia" => 0,
+            "amd" => 1,
+            "intel" => 2,
+            _ => 3,
+        };
+        (!own, vendor, std::cmp::Reverse(g.vram_mb))
     };
-    gpus.iter().filter(|g| g.luid.is_some()).min_by_key(rank).and_then(|g| g.luid.clone())
+    let g = usable.iter().filter(|g| g.luid.is_some()).min_by_key(rank)?;
+    Some(match crate::profile::vendor_providers(&g.vendor) {
+        Some(own) => Scope {
+            pin: g.luid.clone(),
+            providers: ordered(own.iter().filter(|p| PROBE_PROVIDERS.contains(p)).map(|p| p.to_string())),
+            ensure_ready: false,
+        },
+        None => Scope { pin: g.luid.clone(), ..all() },
+    })
 }
 
 /// A probe or bench running now (`state\probe-inflight.json`, written through to disk before its worker starts and
@@ -238,8 +331,16 @@ fn path(layout: &Layout) -> PathBuf {
     layout.state().join("probes.json")
 }
 
+/// Whether a probe key (`adapters_key`) holds an adapter of a vendor with a provider restriction (an AMD GPU).
+fn key_restricted(adapters: &str) -> bool {
+    adapters.split(';').any(|a| a.split('|').next().is_some_and(|v| crate::profile::vendor_providers(v).is_some()))
+}
+
+/// The probes kept here. agent 0.3.11: a record of adapters with a provider restriction (an AMD GPU) made under older
+/// rules (an older agent probed every provider there) is left out: those adapters are probed again, DirectML only.
 pub fn load(layout: &Layout) -> Vec<Probe> {
-    std::fs::read(path(layout)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    let v: Vec<Probe> = std::fs::read(path(layout)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    v.into_iter().filter(|p| p.rules >= RULES || !key_restricted(&p.adapters)).collect()
 }
 
 fn save(layout: &Layout, v: &[Probe]) {
@@ -251,6 +352,7 @@ fn save(layout: &Layout, v: &[Probe]) {
 pub fn record(layout: &Layout, p: Probe) {
     let mut v = load(layout);
     let mut p = p;
+    p.rules = RULES;
     // a real network's verdict for the same pack and adapters outlives a re-probe of the built-in graph (9.6)
     if let Some(old) = v.iter().find(|x| x.runtime == p.runtime && x.adapters == p.adapters) {
         p.benched |= old.benched;
@@ -406,6 +508,10 @@ pub struct Bench {
     /// worked out by [`choose`] with the job's `groups`; None: no GPU provider pays at any size.
     #[serde(default)]
     pub gpu_games: Option<u64>,
+    /// agent 0.3.11: the probe rules it was made under ([`RULES`]); one of adapters with a provider restriction made
+    /// before is not used ([`load_benches`]).
+    #[serde(default)]
+    pub rules: u32,
 }
 
 fn bench_path(layout: &Layout) -> PathBuf {
@@ -413,12 +519,15 @@ fn bench_path(layout: &Layout) -> PathBuf {
 }
 
 pub fn load_benches(layout: &Layout) -> Vec<Bench> {
-    std::fs::read(bench_path(layout)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
+    let v: Vec<Bench> = std::fs::read(bench_path(layout)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    v.into_iter().filter(|b| b.rules >= RULES || !key_restricted(&b.adapters)).collect()
 }
 
 /// Records `b`, replacing the bench of the same (runtime, adapters, run); at most 32 kept (newest).
 pub fn record_bench(layout: &Layout, b: Bench) {
     let mut v = load_benches(layout);
+    let mut b = b;
+    b.rules = RULES;
     v.retain(|x| !(x.runtime == b.runtime && x.adapters == b.adapters && x.run == b.run));
     v.push(b);
     v.sort_by_key(|x| std::cmp::Reverse(x.t));
@@ -447,7 +556,7 @@ pub fn bench_from_report(v: &Value, runtime: &str, adapters: &str, run: &str, wo
             rows,
         });
     }
-    Bench { runtime: runtime.into(), adapters: adapters.into(), run: run.into(), worker: worker.into(), t, threads, results, error: v["error"].as_str().map(String::from), gpu_games: None }
+    Bench { runtime: runtime.into(), adapters: adapters.into(), run: run.into(), worker: worker.into(), t, threads, results, error: v["error"].as_str().map(String::from), gpu_games: None, rules: RULES }
 }
 
 /// Rows per second at `b` rows from a bench's sizes: log-log interpolation between the two nearest sizes, the
@@ -556,13 +665,15 @@ fn choose_shaped(
         return c;
     };
     c.rows_per_s.insert("cpu".into(), cpu.round());
-    // (0.2.11: never a provider a probe may not load - AMD's - even from a bench an older agent kept)
+    // (0.2.11: never a provider a probe may not load - AMD's - even from a bench an older agent kept; agent 0.3.11: never
+    // one its adapter's vendor may not run - an AMD GPU runs DirectML only -, whatever a bench says)
     let allowed = |p: &str| p != "cpu" && PROBE_PROVIDERS.contains(&p) && allow.is_none_or(|a| a.iter().any(|x| x == p));
+    let adapter_of = |r: &BenchRow| gpus.iter().find(|g| Some(g.name.as_str()) == r.adapter.as_deref()).filter(|g| allowed_on(&g.vendor, &r.provider));
     // (row, adapter, rows/s, its (conc, groups), its batch rows)
     type Best<'a> = (&'a BenchRow, &'a Gpu, f64, (u64, u64), u64);
     let mut best: Option<Best> = None;
     for r in b.results.iter().filter(|r| r.ok && allowed(&r.provider)) {
-        let Some(g) = gpus.iter().find(|g| Some(g.name.as_str()) == r.adapter.as_deref()) else { continue };
+        let Some(g) = adapter_of(r) else { continue };
         let shape = gpu_shape(r);
         let gpu_b = batch_rows(shape.0, games, shape.1);
         let Some(rate) = rate_at(&r.rows, gpu_b) else { continue };
@@ -575,8 +686,7 @@ fn choose_shaped(
     // The fewest games per lease at which a GPU pays (PROTOCOL 9.4): the smallest batch where one reaches 2x the CPU,
     // else GPU_MARGIN times, with `games_groups` batches in turn.
     let cpu_rows = &b.results.iter().find(|r| r.ok && r.provider == "cpu").expect("checked above").rows;
-    let gpu_rows: Vec<&BenchRow> =
-        b.results.iter().filter(|r| r.ok && allowed(&r.provider) && gpus.iter().any(|g| Some(g.name.as_str()) == r.adapter.as_deref())).collect();
+    let gpu_rows: Vec<&BenchRow> = b.results.iter().filter(|r| r.ok && allowed(&r.provider) && adapter_of(r).is_some()).collect();
     let pays_at = |ratio: f64| {
         let mut n = 1u64;
         while n <= 1024 {
@@ -626,19 +736,25 @@ pub fn plan_providers(probe: Option<&Probe>, gpus: &[Gpu], allow: Option<&[Strin
         return cpu_only;
     }
     let allowed = |prov: &str| prov != "cpu" && allow.is_none_or(|a| a.iter().any(|x| x == prov));
-    let passed_on = |name: &str| -> Vec<String> {
-        ORDER.iter().filter(|q| allowed(q) && p.results.iter().any(|r| r.ok && r.provider == **q && r.adapter.as_deref() == Some(name))).map(|s| s.to_string()).collect()
+    // (agent 0.3.11: only providers the adapter's vendor may run - an AMD GPU: DirectML)
+    let passed_on = |g: &Gpu| -> Vec<String> {
+        ORDER
+            .iter()
+            .filter(|q| allowed(q) && allowed_on(&g.vendor, q) && p.results.iter().any(|r| r.ok && r.provider == **q && r.adapter.as_deref() == Some(g.name.as_str())))
+            .map(|s| s.to_string())
+            .collect()
     };
-    let best = gpus.iter().filter(|g| !passed_on(&g.name).is_empty()).max_by_key(|g| g.vram_mb);
+    let best = gpus.iter().filter(|g| !passed_on(g).is_empty()).max_by_key(|g| g.vram_mb);
     let Some(g) = best else { return cpu_only };
-    let mut list = passed_on(&g.name);
+    let mut list = passed_on(g);
     list.push("cpu".into());
     (list, json!({"luid": g.luid.clone().unwrap_or_default(), "vendor": g.vendor, "name": g.name}))
 }
 
-/// What to probe now: (worker build dir + entry, runtime build id, runtime dir) of a cached pair without
-/// a fresh result for these adapters, newest worker first.
-pub fn next_probe(layout: &Layout, keys: &zerofarm_common::keys::TrustedKeys, gpus: &[Gpu], now: i64) -> Option<(PathBuf, String, String, PathBuf)> {
+/// What to probe now: (worker build dir + entry, worker build id, runtime build id, runtime dir, where it runs) of a
+/// cached pair without a fresh result for these adapters, newest worker first. A pack with no adapter it may use here
+/// ([`scope`]: an AMD-only PC and a pack that ships Windows ML's catalog) is never probed.
+pub fn next_probe(layout: &Layout, keys: &zerofarm_common::keys::TrustedKeys, gpus: &[Gpu], off: &[Gpu], now: i64) -> Option<(PathBuf, String, String, PathBuf, Scope)> {
     use zerofarm_common::manifest::{verify_dir, Expect, Kind};
     let key = adapters_key(gpus);
     let probes = load(layout);
@@ -669,11 +785,11 @@ pub fn next_probe(layout: &Layout, keys: &zerofarm_common::keys::TrustedKeys, gp
             }
         }
         let rdir = layout.cache_builds().join(&rt);
-        if verify_dir(&rdir, keys, &Expect { build_id: Some(&rt), kind: Some(Kind::Runtime), version: None }).is_err() {
-            continue;
-        }
+        let Ok(rv) = verify_dir(&rdir, keys, &Expect { build_id: Some(&rt), kind: Some(Kind::Runtime), version: None }) else { continue };
+        // agent 0.3.11: no adapter this pack may use here (an AMD GPU and Windows ML's catalog): nothing to probe
+        let Some(sc) = scope(gpus, off, &PackGpu::of(&rv.manifest)) else { continue };
         let entry = w.entry_path()?;
-        return Some((entry, w.build_id.clone(), rt, rdir));
+        return Some((entry, w.build_id.clone(), rt, rdir, sc));
     }
     None
 }
@@ -705,11 +821,13 @@ pub fn from_report(v: &Value, runtime: &str, adapters: &str, worker: &str, t: i6
         need: None,
         benched: false,
         real: vec![],
+        rules: RULES,
     }
 }
 
 /// Runs one probe (in a job object, below-normal priority, the runtime pack first on the DLL path),
-/// at most `timeout`; the readable report goes to the worker log.
+/// at most `timeout`; the readable report goes to the worker log. `sc`: where it runs ([`scope`]: pinned to one adapter,
+/// its providers; agent 0.3.11).
 #[allow(clippy::too_many_arguments)]
 pub fn run(
     layout: &Layout,
@@ -718,7 +836,7 @@ pub fn run(
     runtime: &str,
     rdir: &Path,
     gpus: &[Gpu],
-    off: &[Gpu],
+    sc: &Scope,
     log: Arc<RotatingFile>,
     timeout: Duration,
     stop: &dyn Fn() -> bool,
@@ -726,14 +844,30 @@ pub fn run(
     let now = zerofarm_common::now_unix();
     let akey = adapters_key(gpus);
     let rdir_s = rdir.to_string_lossy().to_string();
-    let provs = PROBE_PROVIDERS.join(",");
-    let pin = pin_gpu(gpus, off);
-    let mut args = vec!["probe-providers", "--runtime-dir", rdir_s.as_str(), "--ensure-ready", "--threads", "2", "--reps", "2"];
+    // (0.2.11: never AMD's providers; agent 0.3.11: an AMD GPU alone, DirectML only, no catalog download)
+    let provs = sc.providers.join(",");
+    let mut args = vec!["probe-providers", "--runtime-dir", rdir_s.as_str()];
+    if sc.ensure_ready {
+        args.push("--ensure-ready");
+    }
+    args.extend(["--threads", "2", "--reps", "2"]);
     args.extend(["--providers", provs.as_str()]);
-    if let Some(l) = &pin {
+    if let Some(l) = &sc.pin {
         args.extend(["--gpu", l.as_str()]);
     }
-    let failed = |e: String| Probe { runtime: runtime.into(), adapters: akey.clone(), worker: worker.into(), t: now, providers: vec!["cpu".into()], results: vec![], error: Some(e), need: None, benched: false, real: vec![] };
+    let failed = |e: String| Probe {
+        runtime: runtime.into(),
+        adapters: akey.clone(),
+        worker: worker.into(),
+        t: now,
+        providers: vec!["cpu".into()],
+        results: vec![],
+        error: Some(e),
+        need: None,
+        benched: false,
+        real: vec![],
+        rules: RULES,
+    };
     let m = Inflight { kind: "probe".into(), runtime: runtime.into(), adapters: akey.clone(), worker: worker.into(), run: None, t: now };
     if let Err(e) = mark(layout, &m) {
         return failed(e);
@@ -799,7 +933,7 @@ pub struct BenchSpec<'a> {
 
 /// Benches the job's network on a pack (PROTOCOL 9.6): `probe-providers --model --reference --bench-rows ...
 /// --providers <those that passed the pack's built-in probe>`, a record of its own next to that probe (which stays
-/// the built-in one). `Err("stopped")` when the agent is quitting (nothing to record).
+/// the built-in one). `Err("stopped")` when the agent is quitting (nothing to record). `sc`: where it runs ([`scope`]).
 #[allow(clippy::too_many_arguments)]
 pub fn run_bench(
     layout: &Layout,
@@ -808,7 +942,7 @@ pub fn run_bench(
     runtime: &str,
     rdir: &Path,
     gpus: &[Gpu],
-    off: &[Gpu],
+    sc: &Scope,
     log: Arc<RotatingFile>,
     timeout: Duration,
     stop: &dyn Fn() -> bool,
@@ -819,15 +953,26 @@ pub fn run_bench(
     let (rdir_s, model, reference, threads) =
         (rdir.to_string_lossy().to_string(), spec.model.to_string_lossy().to_string(), spec.reference.to_string_lossy().to_string(), spec.threads.max(1).to_string());
     let rows = BENCH_ROWS.iter().map(|n| n.to_string()).collect::<Vec<_>>().join(",");
-    // 0.2.11: never AMD's providers (PROBE_PROVIDERS), and the CPU always (the baseline)
-    let provs = ordered(spec.providers.iter().filter(|p| PROBE_PROVIDERS.contains(&p.as_str())).cloned()).join(",");
-    let pin = pin_gpu(gpus, off);
+    // 0.2.11: never AMD's providers (PROBE_PROVIDERS), and the CPU always (the baseline); agent 0.3.11: only the scope's
+    // (an AMD GPU: DirectML)
+    let provs = ordered(spec.providers.iter().filter(|p| PROBE_PROVIDERS.contains(&p.as_str()) && sc.providers.contains(p)).cloned()).join(",");
     let mut args = vec!["probe-providers", "--runtime-dir", rdir_s.as_str(), "--model", model.as_str(), "--reference", reference.as_str()];
     args.extend(["--threads", threads.as_str(), "--reps", "3", "--bench-rows", rows.as_str(), "--providers", provs.as_str()]);
-    if let Some(l) = &pin {
+    if let Some(l) = &sc.pin {
         args.extend(["--gpu", l.as_str()]);
     }
-    let failed = |e: String| Bench { runtime: runtime.into(), adapters: akey.clone(), run: spec.run.into(), worker: worker.into(), t: now, threads: spec.threads, results: vec![], error: Some(e), gpu_games: None };
+    let failed = |e: String| Bench {
+        runtime: runtime.into(),
+        adapters: akey.clone(),
+        run: spec.run.into(),
+        worker: worker.into(),
+        t: now,
+        threads: spec.threads,
+        results: vec![],
+        error: Some(e),
+        gpu_games: None,
+        rules: RULES,
+    };
     let m = Inflight { kind: "bench".into(), runtime: runtime.into(), adapters: akey.clone(), worker: worker.into(), run: Some(spec.run.into()), t: now };
     if let Err(e) = mark(layout, &m) {
         return Ok(failed(e));
@@ -868,10 +1013,13 @@ mod tests {
             need: None,
             benched: false,
             real: vec![],
+            rules: RULES,
         };
+        // (agent 0.3.11: an AMD GPU runs DirectML only, whatever a record says passed there)
         let (list, gpu) = plan_providers(Some(&p), &gpus, None, true);
-        assert_eq!(list, vec!["amdgpu", "dml", "cpu"]);
+        assert_eq!(list, vec!["dml", "cpu"]);
         assert_eq!(gpu["luid"], "00000000000000a1");
+        assert_eq!(p.passed(), vec!["dml", "cpu"], "AMD's providers never count as passed");
         let allow = vec!["dml".to_string(), "cpu".to_string()];
         let (list, gpu) = plan_providers(Some(&p), &gpus, Some(&allow), true);
         assert_eq!((list, gpu["name"].as_str()), (vec!["dml".to_string(), "cpu".to_string()], Some("RX 9070 XT")));
@@ -892,7 +1040,13 @@ mod tests {
         let layout = Layout::new(d.path());
         let gpus = crate::profile::gpus(None);
         let log = Arc::new(RotatingFile::new(d.path().join("worker.log"), 1 << 20, 1));
-        let p = run(&layout, Path::new(&exe), "w", "rt", Path::new(&rt), &gpus, &[], log, Duration::from_secs(600), &|| false);
+        // (a PC without a GPU probes the CPU alone; one whose adapters this pack may not use, nothing)
+        let sc = match scope(&gpus, &[], &PackGpu::of_dir(Path::new(&rt))) {
+            Some(sc) => sc,
+            None if gpus.is_empty() => Scope { pin: None, providers: vec!["cpu".into()], ensure_ready: false },
+            None => return,
+        };
+        let p = run(&layout, Path::new(&exe), "w", "rt", Path::new(&rt), &gpus, &sc, log, Duration::from_secs(600), &|| false);
         let report = std::fs::read_to_string(d.path().join("worker.log")).unwrap_or_default();
         assert!(p.error.is_none(), "{p:?}
 {report}");
@@ -918,6 +1072,7 @@ mod tests {
                 .collect(),
             error: None,
             gpu_games: None,
+            rules: RULES,
         }
     }
 
@@ -997,6 +1152,7 @@ mod tests {
             need: need.map(|n| n.iter().map(|x| x.to_string()).collect()),
             benched: false,
             real: vec![],
+            rules: RULES,
         }
     }
 
@@ -1170,47 +1326,115 @@ mod tests {
         // (no cached builds here: next_probe finds nothing either way; the rule itself)
         assert!(held(&load_unfinished(&layout), "rt1", &key, 11));
         let keys = zerofarm_common::keys::TrustedKeys::default();
-        assert!(next_probe(&layout, &keys, &gpus, 11).is_none());
+        assert!(next_probe(&layout, &keys, &gpus, &[], 11).is_none());
     }
 
     #[test]
-    fn amd_providers_are_never_probed_benched_or_chosen() {
+    fn amd_providers_are_never_probed_benched_or_chosen_and_an_amd_gpu_runs_directml_only() {
         assert!(!PROBE_PROVIDERS.contains(&"amdgpu") && !PROBE_PROVIDERS.contains(&"migraphx"));
         assert!(PROBE_PROVIDERS.iter().all(|p| ORDER.contains(p)));
-        // a bench an older agent kept with an AMD provider "passing": never chosen
+        for p in ["amdgpu", "migraphx", "cuda", "tensorrt_rtx", "openvino"] {
+            assert!(!allowed_on("amd", p), "{p} on an AMD GPU");
+        }
+        assert!(allowed_on("amd", "dml") && allowed_on("amd", "cpu"));
+        assert!(allowed_on("nvidia", "cuda") && allowed_on("intel", "openvino") && allowed_on("nvidia", "dml"));
+        assert!(!allowed_on("nvidia", "migraphx") && !allowed_on("nvidia", "amdgpu"));
+        // a bench (an older agent's, or one gone wrong) with every provider "passing" on the AMD GPU: only DirectML is
+        // ever chosen there
         let gpus = [gpu("RX 9070 XT", "amd", "00000000000000a1")];
-        let mut rows = BTreeMap::new();
-        rows.insert("64".to_string(), 1e6);
-        let mut cpu_rows = BTreeMap::new();
-        cpu_rows.insert("64".to_string(), 10.0);
-        let b = Bench {
-            runtime: "rt".into(),
-            adapters: adapters_key(&gpus),
-            run: "r".into(),
-            worker: "w".into(),
-            t: 1,
-            threads: 2,
-            results: vec![
-                BenchRow { provider: "cpu".into(), adapter: None, ok: true, rows: cpu_rows },
-                BenchRow { provider: "amdgpu".into(), adapter: Some("RX 9070 XT".into()), ok: true, rows: rows.clone() },
-                BenchRow { provider: "migraphx".into(), adapter: Some("RX 9070 XT".into()), ok: true, rows },
-            ],
-            error: None,
-            gpu_games: None,
-        };
+        let fast: &[(u64, f64)] = &[(64, 1e6)];
+        let slow: &[(u64, f64)] = &[(64, 10.0)];
+        let mut b = bench(&[("cpu", None, slow), ("amdgpu", Some("RX 9070 XT"), fast), ("migraphx", Some("RX 9070 XT"), fast), ("cuda", Some("RX 9070 XT"), fast)]);
+        b.adapters = adapters_key(&gpus);
         let c = choose(Some(&b), &gpus, None, true, 128, 128, 2);
         assert_eq!(c.providers, vec!["cpu"], "{c:?}");
+        assert_eq!(c.gpu_games, None, "no provider an AMD GPU may run pays there");
+        assert!(!c.rows_per_s.contains_key("cuda") && !c.rows_per_s.contains_key("amdgpu"));
+        // DirectML on it, when it pays: chosen, with the AMD GPU's LUID
+        let dml: &[(u64, f64)] = &[(64, 500.0)];
+        b.results.push(BenchRow { provider: "dml".into(), adapter: Some("RX 9070 XT".into()), ok: true, rows: dml.iter().map(|(n, v)| (n.to_string(), *v)).collect() });
+        let c = choose(Some(&b), &gpus, None, true, 128, 128, 2);
+        assert_eq!((c.providers.clone(), c.gpu["luid"].as_str(), c.gpu["vendor"].as_str()), (vec!["dml".to_string(), "cpu".to_string()], Some("00000000000000a1"), Some("amd")), "{}", c.why);
+        assert!(c.gpu_games.is_some());
+        // a rolling lease's choice follows the same rule
+        let r = choose_rolling(Some(&b), &gpus, None, true, (32, 4), &|_: &BenchRow| (512, 2), 4);
+        assert_eq!(r.providers, vec!["dml", "cpu"]);
+        b.results.pop();
+        let r = choose_rolling(Some(&b), &gpus, None, true, (32, 4), &|_: &BenchRow| (512, 2), 4);
+        assert_eq!(r.providers, vec!["cpu"]);
     }
 
     #[test]
-    fn probes_are_pinned_to_a_usable_adapter_when_one_is_off() {
+    fn probes_and_benches_run_on_one_adapter_with_its_own_providers() {
         let nv = gpu("RTX 4080", "nvidia", "00000000000000b1");
         let intel = gpu("UHD 770", "intel", "00000000000000b2");
-        let amd = gpu("RX 9070 XT", "amd", "00000000000000a1");
-        let (both, off) = (vec![intel.clone(), nv], vec![amd]);
-        assert_eq!(pin_gpu(&both, &[]), None, "nothing off: every adapter, as before");
-        assert_eq!(pin_gpu(&both, &off).as_deref(), Some("00000000000000b1"), "NVIDIA first");
-        assert_eq!(pin_gpu(std::slice::from_ref(&intel), &off).as_deref(), Some("00000000000000b2"));
-        assert_eq!(pin_gpu(&[], &off), None, "an AMD-only PC: nothing runs at all");
+        let mut amd = gpu("RX 9070 XT", "amd", "00000000000000a1");
+        amd.vram_mb = 16304;
+        let mut amd_igpu = gpu("AMD Radeon(TM) Graphics", "amd", "00000000000000a2");
+        amd_igpu.vram_mb = 512;
+        let dml_pack = PackGpu::default();
+        let catalog = PackGpu { catalog: true, vendor: None };
+        let every: Vec<String> = PROBE_PROVIDERS.iter().map(|p| p.to_string()).collect();
+        let dml_only = vec!["dml".to_string(), "cpu".to_string()];
+        let pinned = |pin: &str, providers: &[String], ensure_ready: bool| Some(Scope { pin: Some(pin.into()), providers: providers.to_vec(), ensure_ready });
+        // nothing off, no AMD GPU: every adapter, every provider a probe may load, Windows ML may install its providers (as
+        // before)
+        assert_eq!(scope(&[intel.clone(), nv.clone()], &[], &catalog), Some(Scope { pin: None, providers: every.clone(), ensure_ready: true }));
+        assert_eq!(scope(&[], &[], &dml_pack).map(|s| s.pin), None, "no adapter: nothing to run on");
+        // an AMD-only PC: its AMD GPU alone, DirectML only, nothing downloaded
+        assert_eq!(scope(std::slice::from_ref(&amd), &[], &dml_pack), pinned("00000000000000a1", &dml_only, false));
+        // ... never with a pack that ships Windows ML's catalog (it could register AMD's providers): no probe at all
+        assert_eq!(scope(std::slice::from_ref(&amd), &[], &catalog), None);
+        assert!(pack_gpus(std::slice::from_ref(&amd), &catalog).is_empty());
+        // an AMD GPU and an Intel iGPU: the AMD GPU (DirectML); with the catalog pack the Intel one (every provider)
+        assert_eq!(scope(&[intel.clone(), amd.clone()], &[], &dml_pack), pinned("00000000000000a1", &dml_only, false));
+        assert_eq!(scope(&[intel.clone(), amd.clone()], &[], &catalog), pinned("00000000000000b2", &every, true));
+        // NVIDIA before AMD; an AMD-vendor pack (its `gpu` names AMD) on its AMD GPU
+        assert_eq!(scope(&[amd.clone(), nv.clone(), intel.clone()], &[], &dml_pack), pinned("00000000000000b1", &every, true));
+        let amd_pack = PackGpu { catalog: false, vendor: Some("amd".into()) };
+        assert_eq!(scope(&[amd.clone(), nv.clone()], &[], &amd_pack), pinned("00000000000000a1", &dml_only, false));
+        // of one vendor the one with the most video memory (the discrete GPU, not the APU's)
+        assert_eq!(scope(&[amd_igpu.clone(), amd.clone()], &[], &dml_pack), pinned("00000000000000a1", &dml_only, false));
+        // the owner turned AMD off (gpu_vendors_off): its adapters are not in `gpus` but in `off` - as 0.2.11 did
+        assert_eq!(scope(&[intel.clone(), nv.clone()], std::slice::from_ref(&amd), &catalog), pinned("00000000000000b1", &every, true));
+        assert_eq!(scope(std::slice::from_ref(&intel), std::slice::from_ref(&amd), &catalog), pinned("00000000000000b2", &every, true));
+        assert_eq!(scope(&[], std::slice::from_ref(&amd), &dml_pack), None, "an AMD-only PC with AMD off: nothing runs at all");
+        // an adapter without a LUID can't be pinned: nothing runs rather than every adapter
+        let mut no_luid = amd.clone();
+        no_luid.luid = None;
+        assert_eq!(scope(&[no_luid], &[], &dml_pack), None);
+        // the pack's manifest: the catalog DLL anywhere in it
+        let file = format!(r#"{{"path": "onnxruntime.dll", "sha256": "{}", "size": 1}}"#, "0".repeat(64));
+        let text = format!(r#"{{"manifest": 1, "kind": "runtime", "version": "x", "created": 1, "files": [{file}]}}"#);
+        let mut m = zerofarm_common::manifest::Manifest::parse(text.as_bytes()).unwrap();
+        assert_eq!(PackGpu::of(&m), PackGpu { catalog: false, vendor: None });
+        m.files.push(zerofarm_common::manifest::FileEntry { path: "winml/microsoft.windows.ai.machinelearning.dll".into(), sha256: "0".repeat(64), size: 1, zst: None });
+        m.gpu = Some(zerofarm_common::manifest::GpuNeed { vendor: "amd".into(), min_driver: None, providers: vec!["dml".into()] });
+        assert_eq!(PackGpu::of(&m), PackGpu { catalog: true, vendor: Some("amd".into()) });
+        assert!(PackGpu::of_dir(Path::new("no such dir")).catalog, "unreadable: the cautious reading");
+    }
+
+    #[test]
+    fn an_older_agents_records_of_an_amd_gpu_are_not_used() {
+        let d = tempfile::tempdir().unwrap();
+        let layout = Layout::new(d.path());
+        let gpus = [gpu("RX 9070 XT", "amd", "00000000000000a1"), gpu("UHD 770", "intel", "00000000000000b2")];
+        let key = adapters_key(&gpus);
+        let intel_key = adapters_key(&gpus[1..]);
+        // probes.json and bench.json as agents before 0.3.11 left them (no `rules`): one of the AMD GPU, one of the Intel
+        let old = |k: &str| serde_json::json!({"runtime": "rt", "adapters": k, "worker": "w", "t": 1, "providers": ["amdgpu", "cpu"], "results": []});
+        std::fs::create_dir_all(layout.state()).unwrap();
+        std::fs::write(path(&layout), serde_json::to_vec(&vec![old(&key), old(&intel_key)]).unwrap()).unwrap();
+        let ob = |k: &str| serde_json::json!({"runtime": "rt", "adapters": k, "run": "r", "worker": "w", "t": 1, "threads": 2, "results": []});
+        std::fs::write(bench_path(&layout), serde_json::to_vec(&vec![ob(&key), ob(&intel_key)]).unwrap()).unwrap();
+        let probes = load(&layout);
+        assert_eq!(probes.iter().map(|p| p.adapters.clone()).collect::<Vec<_>>(), vec![intel_key.clone()], "the AMD GPU is probed again, DirectML only");
+        assert_eq!(probes[0].passed(), vec!["cpu"], "and an older record's AMD provider never counts");
+        assert_eq!(load_benches(&layout).len(), 1);
+        // what this agent records is used
+        record(&layout, probe_rec("rt", &key, 2, &["dml", "cpu"], None, None));
+        assert!(find(&load(&layout), "rt", &key).is_some_and(|p| p.rules == RULES));
+        record_bench(&layout, Bench { adapters: key.clone(), ..bench(&[("cpu", None, CPU)]) });
+        assert!(load_benches(&layout).iter().any(|b| b.adapters == key && b.rules == RULES));
     }
 }

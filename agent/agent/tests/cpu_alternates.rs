@@ -88,7 +88,7 @@ fn a_cpu_alternate_is_cpu_work_where_gpu_work_isnt_allowed() {
     let akey = farm_agent::probe::adapters_key(&h.gpus);
     farm_agent::probe::record(
         &h.layout,
-        farm_agent::probe::Probe { runtime: pack.clone(), adapters: akey, worker: "w".into(), t: zerofarm_common::now_unix(), providers: vec!["cpu".into()], results: vec![], error: None, need: None, benched: true, real: vec![] },
+        farm_agent::probe::Probe { runtime: pack.clone(), adapters: akey, worker: "w".into(), t: zerofarm_common::now_unix(), providers: vec!["cpu".into()], results: vec![], error: None, need: None, benched: true, real: vec![], rules: farm_agent::probe::RULES },
     );
     h.push(l);
     h.start();

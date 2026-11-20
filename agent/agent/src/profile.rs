@@ -220,15 +220,83 @@ pub fn gpus(nvml: Option<&nvml_wrapper::Nvml>) -> Vec<Gpu> {
         .collect()
 }
 
-/// GPU vendors this agent never uses: the user's decision of 2026-11-13, after the AMD GPU probes (the AMD
-/// execution providers failed on the built-in graph, and a driver fault during a probe could take a PC down).
-/// PCs with only these GPUs run CPU work. The one vendor-specific rule: everything downstream (probes, benches, the
-/// measured choice, `caps`, the coordinator's routing) only ever sees the adapters that are left.
-pub const GPU_VENDORS_OFF: &[&str] = &["amd"];
+/// Agent 0.3.11 (PROTOCOL 9.8): GPU vendors whose adapters may run only some execution providers - the owner's decision
+/// of 2026-11-20: AMD GPUs with DirectML only, never AMD's own Windows ML providers (`amdgpu`, `migraphx`), which failed
+/// on a farm PC's AMD GPU and whose diagnostic probe very likely took that PC down (2026-11-13; agents 0.2.11-0.3.10 left
+/// AMD adapters out altogether). DirectML ran on that GPU without trouble. Probes, benches and the measured choice never
+/// put another provider on such an adapter, and a runtime pack that could register Windows ML's catalog providers
+/// (`probe::WINML_CATALOG_DLL`) never does GPU work there (probe.rs).
+pub const VENDOR_PROVIDERS: &[(&str, &[&str])] = &[("amd", &["dml"])];
 
-/// (usable adapters, adapters of a vendor in [`GPU_VENDORS_OFF`]).
-pub fn split_off(gpus: Vec<Gpu>) -> (Vec<Gpu>, Vec<Gpu>) {
-    gpus.into_iter().partition(|g| !GPU_VENDORS_OFF.contains(&g.vendor.as_str()))
+/// The GPU providers an adapter of `vendor` may run: the list of [`VENDOR_PROVIDERS`] for such a vendor, None: any (a
+/// probe's, `probe::PROBE_PROVIDERS`).
+pub fn vendor_providers(vendor: &str) -> Option<&'static [&'static str]> {
+    VENDOR_PROVIDERS.iter().find(|(v, _)| v.eq_ignore_ascii_case(vendor)).map(|(_, p)| *p)
+}
+
+/// GPU vendors this agent itself never uses (none since agent 0.3.11: AMD GPUs run DirectML only, above). The owner can
+/// turn a vendor off without an agent release (the coordinator's `gpu_vendors_off`, PROTOCOL 9.8: [`vendors_off`]).
+pub const GPU_VENDORS_OFF: &[&str] = &[];
+
+/// At most this many vendors in the coordinator's list (more are ignored).
+pub const MAX_VENDORS_OFF: usize = 8;
+
+fn vendors_off_path(layout: &zerofarm_common::layout::Layout) -> std::path::PathBuf {
+    layout.state().join("gpu_vendors_off.json")
+}
+
+/// A vendor name as the profile spells it (`nvidia`, `amd`, `intel`, `other`): 1-32 lowercase letters and digits.
+fn vendor_ok(v: &str) -> bool {
+    (1..=32).contains(&v.len()) && v.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// The coordinator's list as kept here (lowercase, deduplicated, at most [`MAX_VENDORS_OFF`]; malformed names dropped).
+fn clean_vendors(list: &[String]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for v in list.iter().map(|v| v.trim().to_ascii_lowercase()).filter(|v| vendor_ok(v)) {
+        if !out.contains(&v) && out.len() < MAX_VENDORS_OFF {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// Agent 0.3.11 (PROTOCOL 9.8): the GPU vendors that are off on this PC now - [`GPU_VENDORS_OFF`] and the coordinator's
+/// `gpu_vendors_off` as last received (`state\gpu_vendors_off.json`: it holds through restarts while the coordinator
+/// can't be reached). Adapters of these vendors are left out of the profile's `gpus` ([`split_off`]): no probe, bench or
+/// GPU job touches them, as 0.2.11-0.3.10 did with AMD's.
+pub fn vendors_off(layout: &zerofarm_common::layout::Layout) -> Vec<String> {
+    let stored: Vec<String> = std::fs::read(vendors_off_path(layout)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default();
+    let mut out: Vec<String> = GPU_VENDORS_OFF.iter().map(|v| v.to_string()).collect();
+    for v in clean_vendors(&stored) {
+        if !out.contains(&v) {
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// Keeps the coordinator's `gpu_vendors_off` (absent or empty: nothing off) for [`vendors_off`]. Returns whether the list
+/// changed (the profile is then detected again).
+pub fn store_vendors_off(layout: &zerofarm_common::layout::Layout, list: &[String]) -> bool {
+    let path = vendors_off_path(layout);
+    let new = clean_vendors(list);
+    let old: Vec<String> = std::fs::read(&path).ok().and_then(|b| serde_json::from_slice::<Vec<String>>(&b).ok()).map(|v| clean_vendors(&v)).unwrap_or_default();
+    if new == old {
+        return false;
+    }
+    let _ = std::fs::create_dir_all(layout.state());
+    if new.is_empty() {
+        let _ = std::fs::remove_file(&path);
+    } else if let Err(e) = zerofarm_common::fsutil::durable_write(&path, &serde_json::to_vec(&new).expect("json")) {
+        log::warn!("could not keep the coordinator's GPU vendors off ({e}); applied until the agent restarts");
+    }
+    true
+}
+
+/// (usable adapters, adapters of a vendor in `off`, [`vendors_off`]).
+pub fn split_off(gpus: Vec<Gpu>, off: &[String]) -> (Vec<Gpu>, Vec<Gpu>) {
+    gpus.into_iter().partition(|g| !off.iter().any(|v| v.eq_ignore_ascii_case(&g.vendor)))
 }
 
 /// The ONNX Runtime execution providers that passed this PC's probes (probe.rs, PROTOCOL 8) with
@@ -245,7 +313,8 @@ pub fn detect(root: &std::path::Path) -> Profile {
     // Rounded to 10 GB so the profile digest doesn't change with every download.
     let free_mb = crate::util::disk_free_bytes(root).map(|b| (b >> 20) / 10240 * 10240).unwrap_or(0);
     let avail = crate::availability::load(&zerofarm_common::layout::Layout::new(root)).means(&crate::util::local_now().0);
-    let (gpus, gpus_off) = split_off(gpus(nvml.as_ref()));
+    // (agent 0.3.11: AMD adapters are reported - DirectML only, probe.rs -; a vendor the owner turned off is not)
+    let (gpus, gpus_off) = split_off(gpus(nvml.as_ref()), &vendors_off(&zerofarm_common::layout::Layout::new(root)));
     let (providers, runtime_providers) = providers(root, &gpus);
     Profile {
         os: os_name(),
@@ -369,12 +438,33 @@ mod tests {
     }
 
     #[test]
-    fn amd_adapters_are_left_out() {
+    fn amd_adapters_are_reported_and_a_vendor_is_off_only_when_the_owner_says_so() {
         let g = |vendor: &str, name: &str| Gpu { vendor: vendor.into(), name: name.into(), vram_mb: 1, driver: "1".into(), luid: Some("a1".into()) };
-        let (usable, off) = split_off(vec![g("intel", "UHD 770"), g("amd", "RX 9070 XT"), g("nvidia", "RTX 4080")]);
-        assert_eq!(usable.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), ["UHD 770", "RTX 4080"]);
-        assert_eq!(off.iter().map(|x| x.name.as_str()).collect::<Vec<_>>(), ["RX 9070 XT"]);
-        let (usable, off) = split_off(vec![g("amd", "RX 9070 XT")]);
-        assert!(usable.is_empty() && off.len() == 1, "an AMD-only PC has no usable GPU");
+        let names = |v: &[Gpu]| v.iter().map(|x| x.name.clone()).collect::<Vec<_>>();
+        // agent 0.3.11: nothing is off by itself - an AMD adapter is reported (DirectML only: probe.rs)
+        let d = tempfile::tempdir().unwrap();
+        let layout = zerofarm_common::layout::Layout::new(d.path());
+        assert!(vendors_off(&layout).is_empty());
+        let all = vec![g("intel", "UHD 770"), g("amd", "RX 9070 XT"), g("nvidia", "RTX 4080")];
+        let (usable, off) = split_off(all.clone(), &vendors_off(&layout));
+        assert_eq!((names(&usable), off.len()), (vec!["UHD 770".to_string(), "RX 9070 XT".into(), "RTX 4080".into()], 0));
+        assert_eq!(vendor_providers("amd"), Some(&["dml"][..]));
+        assert_eq!(vendor_providers("AMD"), Some(&["dml"][..]));
+        assert_eq!(vendor_providers("nvidia"), None);
+        // the coordinator's kill switch: kept through restarts, applied as 0.2.11 applied its AMD rule
+        assert!(store_vendors_off(&layout, &["AMD".into(), "amd".into(), "../x".into(), "".into()]));
+        assert_eq!(vendors_off(&layout), vec!["amd"]);
+        assert!(!store_vendors_off(&layout, &["amd".into()]), "unchanged");
+        let (usable, off) = split_off(all.clone(), &vendors_off(&layout));
+        assert_eq!((names(&usable), names(&off)), (vec!["UHD 770".to_string(), "RTX 4080".into()], vec!["RX 9070 XT".to_string()]));
+        let (usable, off) = split_off(vec![g("amd", "RX 9070 XT")], &vendors_off(&layout));
+        assert!(usable.is_empty() && off.len() == 1, "an AMD-only PC has no usable GPU while AMD is off");
+        // cleared (absent or empty in the coordinator's answer): nothing off again
+        assert!(store_vendors_off(&layout, &[]));
+        assert!(vendors_off(&layout).is_empty());
+        assert!(!store_vendors_off(&layout, &[]));
+        let many: Vec<String> = (0..20).map(|i| format!("v{i}")).collect();
+        store_vendors_off(&layout, &many);
+        assert_eq!(vendors_off(&layout).len(), MAX_VENDORS_OFF);
     }
 }

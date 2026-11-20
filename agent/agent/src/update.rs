@@ -81,6 +81,7 @@ impl Engine {
     pub fn update_to_latest(&mut self, min_agent: Option<&str>) -> Result<(), String> {
         let Some(latest) = get_latest(&self.client, &self.cfg.channel)? else { return Ok(()) };
         self.apply_evict(&latest.evict);
+        self.apply_vendors_off(&latest.gpu_vendors_off);
         if let Some(min) = min_agent {
             if !is_newer(&latest.version, min) && parse_version(&latest.version) != parse_version(min) {
                 return Err(format!("latest agent {} is older than the required {min}", latest.version));
@@ -107,6 +108,25 @@ impl Engine {
                 self.cache.evict(&format!("builds/{id}"));
             }
         }
+    }
+
+    /// Rev 22 (PROTOCOL 9.8, agent 0.3.11): the owner's GPU vendors off (`gpu_vendors_off`; absent: none), kept in
+    /// `state\gpu_vendors_off.json` and applied at once: the profile is detected again, so those vendors' adapters leave
+    /// `gpus` (no probe, bench or GPU job; `caps.gpu` and `caps.gpu_allowed` false on a PC with no other GPU). It comes
+    /// with `latest`, at start before any probe and every 6 h after (a rolling lease's own check: the lease's GPU job on
+    /// such an adapter is given back, lease.rs).
+    pub(crate) fn apply_vendors_off(&mut self, vendors: &[String]) {
+        if !crate::profile::store_vendors_off(&self.cfg.layout, vendors) {
+            return;
+        }
+        let now = crate::profile::vendors_off(&self.cfg.layout);
+        if now.is_empty() {
+            log::info!("the coordinator turned GPU work on every vendor's GPUs back on");
+        } else {
+            log::warn!("the coordinator turned GPU work off on {} GPUs: CPU jobs only there", now.join(", "));
+        }
+        self.profile = (self.profile_fn)();
+        self.profile_refreshed = Instant::now();
     }
 }
 
@@ -168,7 +188,8 @@ pub(crate) fn prepare_version(client: &Client, keys: &TrustedKeys, layout: &Layo
 
 /// rev 15 (PROTOCOL 10.6): the update check of a rolling lease, which would otherwise never let the agent update
 /// (section 6): `latest`, and when it is a version to switch to, downloaded and verified (keeping what the lease
-/// uses). Returns the version now ready, if any, and the coordinator's evict list (applied once the lease ends).
+/// uses). Returns the version now ready, if any, the coordinator's evict list (applied once the lease ends) and its GPU
+/// vendors off (rev 22: applied at once).
 pub(crate) struct InLease {
     pub client: Client,
     pub keys: TrustedKeys,
@@ -181,15 +202,24 @@ pub(crate) struct InLease {
     pub running: String,
 }
 
+/// What a rolling lease's update check brought (`InLease::run`).
+pub(crate) struct News {
+    /// The agent version now downloaded and verified, ready to switch to.
+    pub ready: Option<String>,
+    pub evict: Vec<String>,
+    /// rev 22: `gpu_vendors_off` (empty: none; None: no answer to go by - nothing released on the channel).
+    pub vendors_off: Option<Vec<String>>,
+}
+
 impl InLease {
-    pub fn run(&self) -> Result<(Option<String>, Vec<String>), String> {
-        let Some(latest) = get_latest(&self.client, &self.channel)? else { return Ok((None, vec![])) };
+    pub fn run(&self) -> Result<News, String> {
+        let Some(latest) = get_latest(&self.client, &self.channel)? else { return Ok(News { ready: None, evict: vec![], vendors_off: None }) };
         if !wanted(&latest, &self.running, &self.layout)? {
-            return Ok((None, latest.evict));
+            return Ok(News { ready: None, evict: latest.evict, vendors_off: Some(latest.gpu_vendors_off) });
         }
         log::info!("agent {} available (running {}); downloading it during the lease", latest.version, self.running);
         prepare_version(&self.client, &self.keys, &self.layout, &self.cache, self.cap, &self.keep, &self.control, &latest)?;
-        Ok((Some(latest.version.clone()), latest.evict))
+        Ok(News { ready: Some(latest.version.clone()), evict: latest.evict, vendors_off: Some(latest.gpu_vendors_off) })
     }
 }
 

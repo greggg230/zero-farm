@@ -59,8 +59,9 @@ enum Ev {
     Extend(Result<ExtendResp, CallError>),
     /// rev 15 (PROTOCOL 10.6): a rolling lease's new definition, verified (or why not), with the checkpoint it came with.
     Def(Box<Result<(DefinitionRef, Definition, CheckpointRef), Recheck>>),
-    /// rev 15 (PROTOCOL 10.6): a rolling lease's update check: the agent version now ready, the evict list.
-    Update(Result<(Option<String>, Vec<String>), String>),
+    /// rev 15 (PROTOCOL 10.6): a rolling lease's update check: the agent version now ready, the evict list (rev 22: and
+    /// the GPU vendors off).
+    Update(Result<crate::update::News, String>),
 }
 
 /// rev 15 (PROTOCOL 10): a rolling lease while it runs.
@@ -609,8 +610,10 @@ impl Engine {
     /// requirement, and the pack neither failed here nor held (9.8); an alternate pack, GPU or not, needs room under the
     /// disk cap. A pack without `gpu` - the CPU pack, a CPU alternate's (11.4), Windows ML's - is not GPU work, default
     /// or alternate: none of the GPU conditions apply to it (its job runs on the CPU unless 9.6's probe and bench, which
-    /// run only while GPU work is allowed and the pack isn't held, pick a GPU provider for it). Returns the pack's
-    /// requirement.
+    /// run only while GPU work is allowed and the pack isn't held, pick a GPU provider for it). Agent 0.3.11 (PROTOCOL
+    /// 9.8): a pack for a vendor with a provider restriction (an AMD GPU: DirectML only) must bring only those providers
+    /// and must not ship Windows ML's catalog, and a pack for a vendor the owner turned off is refused. Returns the
+    /// pack's requirement.
     fn runtime_guard(&mut self, lease: &Lease, plan: &Plan) -> Result<Option<GpuNeed>, PlanError> {
         use zerofarm_common::manifest::Kind;
         let Some(rt) = &lease.runtime else { return Ok(None) };
@@ -626,6 +629,18 @@ impl Engine {
             }
             if !self.decide(&[]).gpu {
                 return no(format!("runtime pack {} is for GPU work, which isn't allowed here right now", rt.build_id));
+            }
+            // agent 0.3.11 (PROTOCOL 9.8): an AMD GPU runs DirectML only, never from a pack that ships Windows ML's catalog
+            if let Some(only) = crate::profile::vendor_providers(&n.vendor) {
+                if let Some(x) = n.providers.iter().find(|x| !only.contains(&x.as_str())) {
+                    return no(format!("runtime pack {} brings {x} for {} GPUs, which run {} only here", rt.build_id, n.vendor, only.join(", ")));
+                }
+                if crate::probe::PackGpu::of(&pack).catalog {
+                    return no(format!("runtime pack {} for {} GPUs ships {}, which could register other providers", rt.build_id, n.vendor, crate::probe::WINML_CATALOG_DLL));
+                }
+            }
+            if !self.profile.gpus.iter().any(|g| n.met_by(&g.vendor, &g.driver)) && self.profile.gpus_off.iter().any(|g| n.met_by(&g.vendor, &g.driver)) {
+                return no(format!("runtime pack {} is for {} GPUs, on which the owner turned GPU work off", rt.build_id, n.vendor));
             }
             if !self.profile.gpus.iter().any(|g| n.met_by(&g.vendor, &g.driver)) {
                 let have: Vec<String> = self.profile.gpus.iter().map(|g| format!("{} {} (driver {})", g.vendor, g.name, g.driver)).collect();
@@ -710,12 +725,19 @@ impl Engine {
         if held {
             log::warn!("lease {id}: runtime pack {} stopped this PC during a GPU check before: no probe or bench, the CPU only", rt.build_id);
         }
-        let gpu_ok = gpu_ok && !held;
-        if gpu_ok && !self.profile.gpus.is_empty() && crate::probe::find(&crate::probe::load(&self.cfg.layout), &rt.build_id, &akey).is_none() {
+        // agent 0.3.11 (PROTOCOL 9.8): where the pack's probe and bench run (one adapter on a PC with an AMD GPU, its own
+        // providers), and the adapters its GPU work may use (an AMD GPU never with a pack that ships Windows ML's catalog)
+        let pack = crate::probe::PackGpu::of(&rt.manifest);
+        let sc = crate::probe::scope(&self.profile.gpus, &self.profile.gpus_off, &pack);
+        if sc.is_none() && gpu_ok && !self.profile.gpus.is_empty() {
+            log::info!("lease {id}: runtime pack {} may use none of this PC's GPUs (an AMD GPU runs DirectML only, never with Windows ML's catalog): the CPU only", rt.build_id);
+        }
+        let gpu_ok = gpu_ok && !held && sc.is_some();
+        if let (true, Some(sc)) = (gpu_ok && !self.profile.gpus.is_empty() && crate::probe::find(&crate::probe::load(&self.cfg.layout), &rt.build_id, &akey).is_none(), sc.as_ref()) {
             log::info!("lease {id}: probing the execution providers of runtime pack {} (new here) with worker build {}", rt.build_id, prep.build.build_id);
             self.set_status(Phase::Working, "checking the GPU", Some(describe_job(lease)));
             let (stop_pump, pump) = self.beat_pump(lease);
-            let p = crate::probe::run(&self.cfg.layout, &entry, &prep.build.build_id, &rt.build_id, &rt.dir, &self.profile.gpus, &self.profile.gpus_off, self.worker_log.clone(), crate::probe::PROBE_TIMEOUT, &stop);
+            let p = crate::probe::run(&self.cfg.layout, &entry, &prep.build.build_id, &rt.build_id, &rt.dir, &self.profile.gpus, sc, self.worker_log.clone(), crate::probe::PROBE_TIMEOUT, &stop);
             stop_pump.store(true, Ordering::SeqCst);
             let _ = pump.join();
             if p.error.as_deref() != Some("stopped") {
@@ -729,6 +751,8 @@ impl Engine {
         }
         let gpus = self.profile.gpus.clone();
         let akey = crate::probe::adapters_key(&gpus);
+        // (agent 0.3.11: what the measured choice may pick from: the adapters this pack may use)
+        let pack_gpus = crate::probe::pack_gpus(&gpus, &pack);
         let now = zerofarm_common::now_unix();
         let probes = crate::probe::load(&self.cfg.layout);
         let probe = crate::probe::find(&probes, &rt.build_id, &akey).filter(|p| p.error.is_none());
@@ -745,12 +769,14 @@ impl Engine {
         }
         let candidates = crate::probe::ordered(candidates);
         let mut bench = crate::probe::find_bench(&crate::probe::load_benches(&self.cfg.layout), &rt.build_id, &akey, run, now).cloned();
-        if let (true, None, Some(reference)) = (gpu_ok && probe.is_some() && crate::probe::has_gpu_provider(&candidates), &bench, net.reference.as_ref()) {
+        // (agent 0.3.11: only the scope's providers - an AMD GPU: DirectML)
+        let candidates: Vec<String> = candidates.into_iter().filter(|p| p == "cpu" || sc.as_ref().is_some_and(|s| s.providers.contains(p))).collect();
+        if let (true, None, Some(reference), Some(sc)) = (gpu_ok && probe.is_some() && crate::probe::has_gpu_provider(&candidates), &bench, net.reference.as_ref(), sc.as_ref()) {
             log::info!("lease {id}: measuring {run}'s network on runtime pack {} ({})", rt.build_id, candidates.join(", "));
             self.set_status(Phase::Working, "checking the GPU", Some(describe_job(lease)));
             let (stop_pump, pump) = self.beat_pump(lease);
             let spec = crate::probe::BenchSpec { model: &net.model, reference, run, threads, providers: candidates.clone() };
-            let r = crate::probe::run_bench(&self.cfg.layout, &entry, &prep.build.build_id, &rt.build_id, &rt.dir, &gpus, &self.profile.gpus_off, self.worker_log.clone(), crate::probe::PROBE_TIMEOUT, &stop, &spec);
+            let r = crate::probe::run_bench(&self.cfg.layout, &entry, &prep.build.build_id, &rt.build_id, &rt.dir, &gpus, sc, self.worker_log.clone(), crate::probe::PROBE_TIMEOUT, &stop, &spec);
             stop_pump.store(true, Ordering::SeqCst);
             let _ = pump.join();
             match r {
@@ -793,7 +819,7 @@ impl Engine {
                 self.evict_after.push(format!("builds/{}", rt.build_id));
             }
         }
-        let c = Self::pick(bench.as_ref(), &gpus, lease, plan, gpu_ok, mem, roll);
+        let c = Self::pick(bench.as_ref(), &pack_gpus, lease, plan, gpu_ok, mem, roll);
         if let Some(mut b) = bench.filter(|b| b.error.is_none()) {
             // what the coordinator sizes this run's GPU leases by (PROTOCOL 9.4: caps.gpu_games)
             b.gpu_games = c.gpu_games;
@@ -1634,6 +1660,16 @@ impl Run {
         }
     }
 
+    /// rev 22 (PROTOCOL 9.8): the vendor of this GPU job's adapter (its job line's `gpu`) when the owner turned it off
+    /// (the profile lists the adapter under `gpus_off`); None for a CPU job or a vendor that is on.
+    fn gpu_vendor_off(&self, eng: &Engine) -> Option<String> {
+        if !self.gpu_job() {
+            return None;
+        }
+        let luid = self.providers.1.get("luid").and_then(Value::as_str)?;
+        eng.profile.gpus_off.iter().find(|g| g.luid.as_deref().is_some_and(|l| l.eq_ignore_ascii_case(luid))).map(|g| g.vendor.clone())
+    }
+
     /// A provider the worker reported (`selftest`, `status`): stored once it names one (`""`: no sessions yet).
     fn note_provider(&mut self, v: Option<&Value>) {
         if let Some(p) = v.and_then(Value::as_str).filter(|p| !p.is_empty()) {
@@ -1712,6 +1748,14 @@ impl Run {
         }
         let d = eng.decide(&self.worker_pids());
         let must_pause = !d.work || (self.gpu_job() && !d.gpu);
+        // rev 22 (PROTOCOL 9.8): the owner turned GPU work on this job's GPU's vendor off (a rolling lease's update check):
+        // the lease goes back at once, its GPU released
+        if let Some(v) = self.gpu_vendor_off(eng) {
+            if !matches!(self.state, WState::Stopping(_)) && self.after.is_none() {
+                log::warn!("lease {}: GPU work on {v} GPUs was turned off; giving the lease back", self.id());
+                self.stop(After::GiveBack(format!("GPU work on {v} GPUs was turned off")));
+            }
+        }
         self.sample_starvation(eng, &t);
         if let Some(since) = self.stall_since {
             if since.elapsed() > Duration::from_secs(self.lease.slack_s) && !matches!(self.state, WState::Stopping(_)) {
@@ -2306,13 +2350,18 @@ impl Run {
                     x.update_inflight = false;
                 }
                 match r {
-                    Ok((ready, evict)) => {
+                    Ok(crate::update::News { ready, evict, vendors_off }) => {
                         // the coordinator's evict list, applied once the lease ends (always between leases)
                         for b in evict.iter().take(64).filter(|b| zerofarm_common::is_build_id(b)) {
                             let key = format!("builds/{b}");
                             if eng.cfg.layout.cache_builds().join(b).exists() && !eng.evict_after.contains(&key) {
                                 eng.evict_after.push(key);
                             }
+                        }
+                        // rev 22 (PROTOCOL 9.8): the owner's GPU vendors off, at once (a GPU job on such an adapter is
+                        // given back at the next tick)
+                        if let Some(off) = vendors_off {
+                            eng.apply_vendors_off(&off);
                         }
                         if let Some(v) = ready {
                             log::info!("lease {}: agent {v} is ready; finishing this rolling lease to switch to it", self.id());

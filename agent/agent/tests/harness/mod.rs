@@ -177,10 +177,11 @@ impl H {
             Box::new(self.signals.clone()),
             self.control.clone(),
             {
-                let gpus = self.gpus.clone();
-                // as profile::detect: adapters of a vendor the agent never uses are left out (0.2.11)
+                let (gpus, layout) = (self.gpus.clone(), self.layout.clone());
+                // as profile::detect: adapters of a vendor that is off are left out (agent 0.3.11: the owner's
+                // gpu_vendors_off, kept in state; 0.2.11-0.3.10: AMD's)
                 Box::new(move || {
-                    let (gpus, gpus_off) = farm_agent::profile::split_off(gpus.clone());
+                    let (gpus, gpus_off) = farm_agent::profile::split_off(gpus.clone(), &farm_agent::profile::vendors_off(&layout));
                     Profile { gpus, gpus_off, ..fake_profile() }
                 })
             },

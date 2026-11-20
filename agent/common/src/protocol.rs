@@ -41,8 +41,9 @@ pub struct Profile {
     pub idle_h_day: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub on_h_day: Option<f64>,
-    /// 0.2.11: adapters of a vendor this agent never uses (`profile::GPU_VENDORS_OFF`), left out of `gpus`. Local only
-    /// (never sent): a probe or bench is then pinned to one usable adapter, so the worker doesn't touch these either.
+    /// 0.2.11: adapters of a vendor that is off (0.2.11-0.3.10: AMD's; agent 0.3.11: `profile::vendors_off`, the owner's
+    /// `gpu_vendors_off`), left out of `gpus`. Local only (never sent): a probe or bench is then pinned to one usable
+    /// adapter, so the worker doesn't touch these either.
     #[serde(skip)]
     pub gpus_off: Vec<Gpu>,
     /// rev 17 (PROTOCOL 11.1): the agent's platform, as its `x-farm-platform` header says (informational; the header
@@ -331,6 +332,11 @@ pub struct AgentLatest {
     /// build). Agents from 0.2.11 delete them at start, before any probe, and after every check; older agents ignore it.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evict: Vec<String>,
+    /// rev 22 (PROTOCOL 9.8): GPU vendors the owner turned off (e.g. `["amd"]`; absent or empty: none). Agents from 0.3.11
+    /// treat those vendors' adapters as unusable for GPU work (CPU work only there), at start and after every check;
+    /// older agents ignore it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gpu_vendors_off: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]

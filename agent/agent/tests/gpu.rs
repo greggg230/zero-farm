@@ -586,3 +586,28 @@ fn a_gpu_crew_forms_under_a_tight_cap_with_the_measured_base_and_no_drain_tail()
     assert!(h.crashes().is_empty(), "{:?}", h.crashes());
 }
 
+/// Rev 22 (PROTOCOL 9.8, agent 0.3.11): the owner turns GPU work on the job's GPU's vendor off while a rolling GPU lease
+/// runs (the lease's own update check brings `gpu_vendors_off`): the lease is given back at once, its GPU released, and the
+/// PC asks for work with no usable GPU until the owner lifts it.
+#[test]
+fn turning_the_gpus_vendor_off_gives_a_running_gpu_lease_back() {
+    let (mut h, g) = harness(12_282, Some(1), false);
+    h.version = "0.3.11".into();
+    h.timings.update_check = Duration::from_millis(400);
+    seed_memory(&h, &g, 4);
+    let latest = |off: Value| json!({"version": "0.3.11", "build_id": "a".repeat(24), "manifest": format!("builds/{}/manifest.json", "a".repeat(24)), "min_agent": "0.1.0", "gpu_vendors_off": off});
+    h.mock.with(|s| s.latest = Some(latest(json!([]))));
+    h.push(gpu_lease(&h, &g, "l_VO", &fake(30, json!([1.0])), json!(64), 1_000_000));
+    h.start();
+    assert!(wait(|| workers_uploading(&h, "l_VO") >= 1), "{}", crew_log(&h));
+    assert_eq!(job_lines(&h)[0]["providers"], json!(["cuda", "cpu"]));
+    h.mock.with(|s| s.latest = Some(latest(json!(["nvidia"]))));
+    let done = h.wait_done("l_VO");
+    assert_eq!(done["given_back"], true, "{done}");
+    ids_accounted(&h, "l_VO", &done);
+    assert!(wait(|| h.mock.with(|s| s.lease_requests.last().is_some_and(|r| r["caps"]["gpu_allowed"] == false && r["caps"]["gpu"] == false))));
+    // lifted: the GPU is usable again
+    h.mock.with(|s| s.latest = Some(latest(json!([]))));
+    assert!(wait(|| h.mock.with(|s| s.lease_requests.last().is_some_and(|r| r["caps"]["gpu_allowed"] == true))));
+    h.stop();
+}

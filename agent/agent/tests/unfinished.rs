@@ -1,6 +1,7 @@
 //! 0.2.11 with the real engine and the mock coordinator: a probe the PC never finished (its marker found at start)
 //! is reported and holds its pack; the coordinator's evict list (rev 12) empties cache entries at start, before any
-//! probe; an AMD-only PC is a CPU-only PC to everyone.
+//! probe. Agent 0.3.11 (rev 22): an AMD-only PC reports its GPU (DirectML only), and the owner's `gpu_vendors_off` makes
+//! it a CPU-only PC again, as 0.2.11-0.3.10 made every AMD PC.
 // GPU probes: Windows only (no GPU work on macOS in rev 17)
 #![cfg(windows)]
 
@@ -70,18 +71,49 @@ fn the_evict_list_empties_cache_entries_at_start() {
 }
 
 #[test]
-fn an_amd_only_pc_is_a_cpu_only_pc() {
+fn an_amd_only_pc_reports_its_gpu_and_may_be_offered_gpu_work() {
     let mut h = H::new();
-    h.version = "0.2.11".into();
+    h.version = "0.3.11".into();
     h.gpus = vec![amd()];
     h.signals.set(|s| s.gpu = Some(GpuSignal { other_util_pct: 0, temp_c: None }));
     h.start();
     assert!(wait(|| h.mock.with(|s| !s.lease_requests.is_empty())));
     let r = h.mock.with(|s| s.lease_requests.last().cloned().unwrap());
-    assert_eq!(r["caps"]["gpu"], false, "{r}");
-    assert!(r["caps"]["gpu_allowed"] != json!(true), "{r}");
+    assert_eq!(r["caps"]["gpu"], false, "nothing probed yet: {r}");
+    assert_eq!(r["caps"]["gpu_allowed"], true, "{r}");
     let p = h.mock.with(|s| s.lease_requests.iter().find(|r| !r["profile"].is_null()).cloned()).expect("a profile was sent");
-    assert_eq!(p["profile"]["gpus"], json!([]), "the AMD adapter is never reported");
-    assert!(!h.layout.state().join("probes.json").exists(), "nothing probed");
+    assert_eq!(p["profile"]["gpus"][0]["vendor"], "amd", "{p}");
+    assert_eq!(p["profile"]["gpus"][0]["luid"], "00000000000000a1");
+    h.stop();
+}
+
+#[test]
+fn the_owners_gpu_vendors_off_makes_an_amd_pc_cpu_only_until_it_is_lifted() {
+    let mut h = H::new();
+    h.version = "0.3.11".into();
+    h.gpus = vec![amd(), nvidia()];
+    h.timings.update_check = std::time::Duration::from_millis(300);
+    h.signals.set(|s| s.gpu = Some(GpuSignal { other_util_pct: 0, temp_c: None }));
+    latest(&h, json!({"gpu_vendors_off": ["amd"]}));
+    h.start();
+    // applied at start, before the first lease request: the AMD GPU is gone from the profile, the NVIDIA one stays
+    assert!(wait(|| h.mock.with(|s| s.lease_requests.iter().any(|r| !r["profile"].is_null()))));
+    let p = h.mock.with(|s| s.lease_requests.iter().find(|r| !r["profile"].is_null()).cloned().unwrap());
+    let vendors: Vec<&str> = p["profile"]["gpus"].as_array().unwrap().iter().filter_map(|g| g["vendor"].as_str()).collect();
+    assert_eq!(vendors, ["nvidia"], "{p}");
+    assert_eq!(farm_agent::profile::vendors_off(&h.layout), vec!["amd"], "kept through restarts");
+    h.stop();
+    // an AMD-only PC with AMD off: no usable GPU at all (it keeps the list while the coordinator can't be reached)
+    h.gpus = vec![amd()];
+    h.mock.with(|s| s.latest = None);
+    let n = h.mock.with(|s| s.lease_requests.len());
+    h.start();
+    assert!(wait(|| h.mock.with(|s| s.lease_requests.len() > n)));
+    let r = h.mock.with(|s| s.lease_requests.last().cloned().unwrap());
+    assert!(r["caps"]["gpu_allowed"] != json!(true) && r["caps"]["gpu"] == false, "{r}");
+    // lifted (the key absent from the coordinator's answer): reported again at the next update check
+    latest(&h, json!({}));
+    assert!(wait(|| farm_agent::profile::vendors_off(&h.layout).is_empty()));
+    assert!(wait(|| h.mock.with(|s| s.lease_requests.last().is_some_and(|r| r["caps"]["gpu_allowed"] == true))), "{:?}", h.mock.with(|s| s.lease_requests.last().cloned()));
     h.stop();
 }

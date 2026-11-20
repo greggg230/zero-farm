@@ -111,6 +111,11 @@ fn setup_with2(h: &H, probe: Option<&Value>, on_model: Option<&Value>, conc: u64
 /// `fake`: the jobs' fakeworker script.
 fn setup_with3(h: &H, probe: Option<&Value>, on_model: Option<&Value>, conc: u64, fake: Value) -> Setup {
     let (pack, big) = cuda_pack(&h.dir.path().join("pack"), &h.key.key);
+    setup_pack(h, pack, big, probe, on_model, conc, fake)
+}
+
+/// The run of `setup_with3` around a pack already signed into `h.dir/pack`.
+fn setup_pack(h: &H, pack: String, big: Vec<u8>, probe: Option<&Value>, on_model: Option<&Value>, conc: u64, fake: Value) -> Setup {
     h.mock.add_build_dir(&h.dir.path().join("pack"));
     let alt = worker_for2(&h.dir.path().join("wcuda"), &h.key.key, &pack, probe, on_model);
     h.mock.add_build_dir(&h.dir.path().join("wcuda"));
@@ -231,7 +236,7 @@ fn gpu_work_not_allowed_a_fuzz_job_or_a_failed_pack_refuse_it_too() {
     let akey = farm_agent::probe::adapters_key(&h.gpus);
     farm_agent::probe::record(
         &h.layout,
-        farm_agent::probe::Probe { runtime: s.pack.clone(), adapters: akey, worker: "w".into(), t: zerofarm_common::now_unix(), providers: vec!["cpu".into()], results: vec![], error: None, need: Some(vec!["cuda".into()]), benched: true, real: vec![] },
+        farm_agent::probe::Probe { runtime: s.pack.clone(), adapters: akey, worker: "w".into(), t: zerofarm_common::now_unix(), providers: vec!["cpu".into()], results: vec![], error: None, need: Some(vec!["cuda".into()]), benched: true, real: vec![], rules: farm_agent::probe::RULES },
     );
     h.push(alt_lease(&h, &s, "l_B3", "selfplay"));
     h.start();
@@ -419,4 +424,161 @@ fn an_older_runtime_rule_still_refuses_a_runtime_no_listed_build_requires() {
     h.stop();
     assert!(pack_file_gets(&h, &s.pack).is_empty());
     let _ = wait(|| true);
+}
+
+// ---------- agent 0.3.11 (PROTOCOL 9.8): AMD GPUs with DirectML only ----------
+
+/// A DirectML-only runtime pack (onnxruntime.dll and DirectML.dll; `extra` more files, e.g. Windows ML's catalog DLL),
+/// signed with `gpu` (none: a pack that may run anywhere) and `min_agent` 0.2.10.
+fn dml_pack(dir: &Path, key: &SigningKey, gpu: Option<GpuNeed>, extra: &[&str]) -> String {
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(dir.join("onnxruntime.dll"), b"a small dll").unwrap();
+    std::fs::write(dir.join("DirectML.dll"), b"directml").unwrap();
+    for f in extra {
+        std::fs::write(dir.join(f), b"another dll").unwrap();
+    }
+    let mut t = template(Kind::Runtime, "dml-test");
+    t.min_agent = Some("0.2.10".into());
+    t.gpu = gpu;
+    zerofarm_common::sign::sign_dir(dir, t, key).unwrap().0
+}
+
+fn amd_dml() -> Option<GpuNeed> {
+    Some(GpuNeed { vendor: "amd".into(), min_driver: None, providers: vec!["dml".into()] })
+}
+
+/// The probe report of an AMD GPU where DirectML passes (fast at big batches) beside the CPU's flat 1,000 rows/s.
+fn dml_passes() -> Value {
+    let rows = |v: [f64; 6]| json!({"1": v[0], "8": v[1], "32": v[2], "128": v[3], "512": v[4], "1024": v[5]});
+    json!({"probe": 1, "providers": ["dml", "cpu"], "error": null, "results": [
+        {"provider": "cpu", "gpu": null, "ok": true, "rows_per_s": 1000.0, "rows_per_s_by_batch": rows([1000.0; 6])},
+        {"provider": "dml", "gpu": {"name": "RX 9070 XT", "luid": "00000000000000a1"}, "ok": true, "rows_per_s": 9000.0,
+         "rows_per_s_by_batch": rows([100.0, 800.0, 3000.0, 8000.0, 12000.0, 12000.0])}]})
+}
+
+fn line_of<'a>(log: &'a str, what: &str) -> &'a str {
+    let at = log.find(what).unwrap_or_else(|| panic!("no {what:?} in\n{log}"));
+    log[at..].lines().next().unwrap()
+}
+
+#[test]
+fn an_amd_pc_probes_benches_and_plays_directml_alone_from_a_directml_pack() {
+    let mut h = H::new();
+    quick(&mut h);
+    h.version = "0.3.11".into();
+    h.gpus = vec![amd()];
+    gpu_signal(&h, true);
+    let pack = dml_pack(&h.dir.path().join("pack"), &h.key.key, amd_dml(), &[]);
+    let s = setup_pack(&h, pack, vec![], Some(&dml_passes()), None, 8, json!({"game_ms": 5, "shard_every": 8}));
+    h.push(alt_lease_n(&h, &s, "l_M1", "selfplay", 128));
+    h.start();
+    let done = h.wait_done("l_M1");
+    assert!(done.get("refused").is_none_or(Value::is_null), "{done}\n{}", h.agent_log());
+    let log = h.agent_log();
+    // the built-in probe: the AMD GPU alone, DirectML and the CPU only, nothing downloaded by Windows ML
+    let probe = line_of(&log, "fakeworker: probe-providers --runtime-dir");
+    assert!(probe.contains("--providers dml,cpu") && probe.contains("--gpu 00000000000000a1"), "{probe}");
+    assert!(!probe.contains("--ensure-ready") && !probe.contains("--model"), "{probe}");
+    // the bench of the job's network: the same
+    let bench = line_of(&log, "--bench-rows");
+    assert!(bench.contains("--providers dml,cpu") && bench.contains("--gpu 00000000000000a1"), "{bench}");
+    // DirectML pays at 128-row batches: the job plays on the AMD GPU with DirectML
+    let line = h.job_line();
+    assert_eq!(line["providers"], json!(["dml", "cpu"]), "{line}");
+    assert_eq!((line["gpu"]["luid"].as_str(), line["gpu"]["vendor"].as_str()), (Some("00000000000000a1"), Some("amd")), "{line}");
+    // recorded under this agent's rules, and the profile's providers say DirectML (the coordinator may offer the pack again)
+    let p = farm_agent::probe::find(&farm_agent::probe::load(&h.layout), &s.pack, &farm_agent::probe::adapters_key(&h.gpus)).cloned().unwrap();
+    assert_eq!((p.rules, p.passed()), (farm_agent::probe::RULES, vec!["dml".to_string(), "cpu".to_string()]));
+    let req = h.mock.with(|st| st.lease_requests.first().cloned().unwrap());
+    assert_eq!(req["caps"]["gpu_allowed"], true, "{req}");
+    h.stop();
+}
+
+#[test]
+fn an_amd_pack_with_another_provider_or_windows_mls_catalog_is_refused_and_so_is_one_whose_vendor_is_off() {
+    let cases: [(&str, Option<GpuNeed>, &[&str], &str); 3] = [
+        ("migraphx", Some(GpuNeed { vendor: "amd".into(), min_driver: None, providers: vec!["dml".into(), "migraphx".into()] }), &[], "brings migraphx"),
+        ("catalog", amd_dml(), &["Microsoft.Windows.AI.MachineLearning.dll"], "Microsoft.Windows.AI.MachineLearning.dll"),
+        ("off", amd_dml(), &[], "turned GPU work off"),
+    ];
+    for (name, gpu, extra, why) in cases {
+        let mut h = H::new();
+        quick(&mut h);
+        h.version = "0.3.11".into();
+        h.gpus = vec![amd()];
+        gpu_signal(&h, true);
+        if name == "off" {
+            // the owner's kill switch (rev 22), received with the update check at start
+            let l = json!({"version": "0.3.11", "build_id": "a".repeat(24), "manifest": format!("builds/{}/manifest.json", "a".repeat(24)), "min_agent": "0.1.0", "gpu_vendors_off": ["amd"]});
+            h.mock.with(|st| st.latest = Some(l));
+        }
+        let pack = dml_pack(&h.dir.path().join("pack"), &h.key.key, gpu, extra);
+        let s = setup_pack(&h, pack, vec![], Some(&dml_passes()), None, 8, json!({"game_ms": 5, "shard_every": 8}));
+        h.push(alt_lease(&h, &s, "l_M2", "selfplay"));
+        h.start();
+        let err = refused_runtime(&h, "l_M2");
+        assert!(err.contains(why), "{name}: {err}");
+        assert!(pack_file_gets(&h, &s.pack).is_empty(), "{name}: nothing of the pack downloaded");
+        assert!(!h.agent_log().contains("probe-providers"), "{name}: nothing probed");
+        h.stop();
+    }
+}
+
+#[test]
+fn a_pack_that_ships_windows_mls_catalog_never_touches_an_amd_gpu() {
+    // a run whose pack (no `gpu`: the Windows ML pack's kind) ships the catalog, on a PC with an AMD GPU and an Intel iGPU:
+    // its probe runs on the Intel GPU alone (as 0.2.11 did); on an AMD-only PC not at all, and its job runs on the CPU
+    for (name, gpus) in [("amd + intel", vec![amd(), intel()]), ("amd only", vec![amd()])] {
+        let mut h = H::new();
+        quick(&mut h);
+        h.version = "0.3.11".into();
+        h.gpus = gpus;
+        gpu_signal(&h, true);
+        let pack = dml_pack(&h.dir.path().join("pack"), &h.key.key, None, &["Microsoft.Windows.AI.MachineLearning.dll"]);
+        let s = setup_pack(&h, pack, vec![], Some(&dml_passes()), None, 8, json!({"game_ms": 5, "shard_every": 8}));
+        h.push(alt_lease_n(&h, &s, "l_M3", "selfplay", 128));
+        h.start();
+        let done = h.wait_done("l_M3");
+        assert!(done.get("refused").is_none_or(Value::is_null), "{name}: {done}\n{}", h.agent_log());
+        let log = h.agent_log();
+        if name == "amd only" {
+            assert!(!log.contains("probe-providers"), "{name}: nothing probed\n{log}");
+        } else {
+            let probe = line_of(&log, "fakeworker: probe-providers --runtime-dir");
+            assert!(probe.contains("--gpu 00000000000000b2") && probe.contains("--providers tensorrt_rtx,cuda,openvino,dml,cpu"), "{name}: {probe}");
+        }
+        // (the fake report's DirectML pass names the AMD GPU: never chosen from this pack)
+        assert_eq!(h.job_line()["providers"], json!(["cpu"]), "{name}");
+        h.stop();
+    }
+}
+
+#[test]
+fn the_directml_pack_signed_for_nvidia_runs_directml_on_an_nvidia_pc_as_any_pack_does() {
+    // the same DirectML-only pack signed with `gpu` {nvidia, [dml]} (an end-to-end test on an NVIDIA PC): no AMD rule
+    // applies - every adapter, every provider a probe may load, the measured choice picks DirectML when it pays
+    let mut h = H::new();
+    quick(&mut h);
+    h.version = "0.3.11".into();
+    h.gpus = vec![nvidia("560.94")];
+    gpu_signal(&h, true);
+    let pack = dml_pack(&h.dir.path().join("pack"), &h.key.key, Some(GpuNeed { vendor: "nvidia".into(), min_driver: None, providers: vec!["dml".into()] }), &[]);
+    let report = dml_passes().to_string().replace("RX 9070 XT", "RTX 4070 Ti").replace("00000000000000a1", "000000000000d1f3");
+    let s = setup_pack(&h, pack, vec![], Some(&serde_json::from_str(&report).unwrap()), None, 8, json!({"game_ms": 5, "shard_every": 8}));
+    h.push(alt_lease_n(&h, &s, "l_M4", "selfplay", 128));
+    h.start();
+    let done = h.wait_done("l_M4");
+    assert!(done.get("refused").is_none_or(Value::is_null), "{done}
+{}", h.agent_log());
+    let log = h.agent_log();
+    let probe = line_of(&log, "fakeworker: probe-providers --runtime-dir");
+    assert!(probe.contains("--ensure-ready") && probe.contains("--providers tensorrt_rtx,cuda,openvino,dml,cpu") && !probe.contains("--gpu"), "{probe}");
+    assert!(line_of(&log, "--bench-rows").contains("--providers dml,cpu"));
+    let line = h.job_line();
+    assert_eq!((line["providers"].clone(), line["gpu"]["luid"].as_str()), (json!(["dml", "cpu"]), Some("000000000000d1f3")), "{line}");
+    h.stop();
+}
+
+fn intel() -> Gpu {
+    Gpu { vendor: "intel".into(), name: "UHD 770".into(), vram_mb: 128, driver: "32.0.101.6078".into(), luid: Some("00000000000000b2".into()) }
 }

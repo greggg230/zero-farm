@@ -358,7 +358,12 @@ impl Engine {
         self.note_unfinished_probe();
         if !self.profile.gpus_off.is_empty() {
             let off: Vec<String> = self.profile.gpus_off.iter().map(|g| format!("{} {}", g.vendor, g.name)).collect();
-            log::info!("GPU work is off on {} (this agent never uses these vendors' GPUs): CPU jobs only there", off.join(", "));
+            log::info!("GPU work is off on {} (the owner turned these vendors' GPUs off): CPU jobs only there", off.join(", "));
+        }
+        // agent 0.3.11 (PROTOCOL 9.8): an AMD GPU runs DirectML only
+        for g in self.profile.gpus.iter().filter(|g| crate::profile::vendor_providers(&g.vendor).is_some()) {
+            let only = crate::profile::vendor_providers(&g.vendor).unwrap_or_default().join(", ");
+            log::info!("GPU {} {}: {only} only (never with a runtime pack that ships Windows ML's catalog)", g.vendor, g.name);
         }
         self.send_saved_reports();
     }
@@ -449,14 +454,17 @@ impl Engine {
             return false;
         }
         let now = zerofarm_common::now_unix();
-        let Some((entry, worker, runtime, rdir)) = crate::probe::next_probe(&self.cfg.layout, &self.cfg.keys, &self.profile.gpus, now) else {
+        let Some((entry, worker, runtime, rdir, sc)) = crate::probe::next_probe(&self.cfg.layout, &self.cfg.keys, &self.profile.gpus, &self.profile.gpus_off, now) else {
             return false;
         };
-        log::info!("probing the execution providers of runtime pack {runtime} with worker build {worker}");
+        log::info!(
+            "probing the execution providers of runtime pack {runtime} with worker build {worker}{}",
+            sc.pin.as_deref().map(|l| format!(" on adapter {l} ({})", sc.providers.join(", "))).unwrap_or_default()
+        );
         self.set_status(Phase::Working, "checking the GPU", None);
         let control = self.control.clone();
         let stop = move || control.quitting();
-        let p = crate::probe::run(&self.cfg.layout, &entry, &worker, &runtime, &rdir, &self.profile.gpus, &self.profile.gpus_off, self.worker_log.clone(), crate::probe::PROBE_TIMEOUT, &stop);
+        let p = crate::probe::run(&self.cfg.layout, &entry, &worker, &runtime, &rdir, &self.profile.gpus, &sc, self.worker_log.clone(), crate::probe::PROBE_TIMEOUT, &stop);
         if p.error.as_deref() == Some("stopped") {
             return true;
         }
