@@ -44,7 +44,9 @@ export const DOUBLES = [
 ] as const;
 
 // Numeric Stats fields kept in D1 (the lease's last Stats) but not sent to AE.
-export const EXTRA_NUMS = ["paused_ms", "resume_ms_max", "batch_rows"] as const; // batch_rows: rev 11 (PROTOCOL 9.6)
+// batch_rows: rev 11 (PROTOCOL 9.6); inflight, workers: a rolling lease's whole crew (rev 19 agents send them; kept
+// from rev 21 for the extension limit, PROTOCOL 10.4)
+export const EXTRA_NUMS = ["paused_ms", "resume_ms_max", "batch_rows", "inflight", "workers"] as const;
 
 const noop: Telemetry = { write() {} };
 

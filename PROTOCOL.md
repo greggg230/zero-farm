@@ -7,7 +7,8 @@ A change to anything here is a protocol change: bump the version it belongs to a
 bottom.
 
 Versions: HTTP API `v1` (path prefix), agent↔worker protocol `aw/1`, network files `zero-onnx/1`,
-manifests `manifest/1`. Current revision: v1 rev 20 (section 14, model variants per generation; rev 19: section 13, layout tuning and
+manifests `manifest/1`. Current revision: v1 rev 21 (section 10.4, the in-flight limit of rolling leases; rev 20: section 14, model
+variants per generation; rev 19: section 13, layout tuning and
 several workers per lease; rev 18: section 12, hardware routing; rev 17: section 11, platforms: macOS on Apple silicon).
 
 ## 1. Conventions
@@ -1216,7 +1217,8 @@ A rolling lease is a self-play lease (section 3) plus
 - `block`: ids `[lo, hi)` reserved for this lease, a fresh range from the run's `next_gid` (never from the pool), of
   `block` ids (fewer when a game id would pass 2^32).
 - **Released ids.** `job.gid_base` = `lo`; `job.games` = the ids released so far: the lease's game ids are `[lo, lo +
-  games)`. At grant `games` = min(headroom, `block`, 2 x the larger `inflight`, `"auto"` counting 256). Only released
+  games)`. At grant `games` = min(headroom, `block`, the larger `inflight`, `"auto"` counting 256; rev 21: once, before
+  rev 21 twice - the agent's first extension says how many games it really keeps in flight). Only released
   ids count as leased for the quota (section 4 `selfplay_state.leased` = the unclaimed released ids of active leases);
   the rest of the block belongs to the lease but to no game yet.
 - `until`: the lease runs to at least this time (`issued_at + max_s`, moved on by a renewal, 10.4).
@@ -1229,6 +1231,8 @@ A rolling lease is a self-play lease (section 3) plus
   the run's self-play headroom, or the block's end);
 - `{"games": total, "wait_s": 60, "reason": "quota"}`: nothing released now (no headroom: the generation's quota is
   full); ask again after `wait_s`;
+- `{"games": total, "wait_s": 20, "reason": "inflight"}` (rev 21): nothing released now: the lease already holds as many
+  unfinished ids as it may (**In-flight limit**, below); ask again after `wait_s`. (No headroom as well: `quota`.)
 - `{"games": total, "finish": true, "reason": "max_s" | "block" | "state"}`: no id will ever be released: finish the
   games in flight and close the lease (`done`). `max_s`: `until` has passed and the coordinator does not renew it;
   `block`: the block is used up; `state`: the run's self-play is no longer rolling, or the run, the machine or the
@@ -1245,6 +1249,22 @@ A rolling lease is a self-play lease (section 3) plus
 - 400 for a classic lease or a bad `games`; 404 a lease that isn't this machine's; 410 a lease that isn't active
   (expired, closed, cancelled). Rate limit: the beat bucket (section 1). The agent asks when its worker says it is
   low on ids (10.5 `low`), at most once per 10 s, for about 2 x its games in flight.
+- **In-flight limit** (rev 21; the owner's rule of 2026-11-20: a machine holds no more games than it needs to keep its
+  batch full). An extension releases at most what keeps the lease's unfinished ids - released, not finished: its games
+  in play and its unstarted ids - within
+  `limit = (crew ? 2 : 1) x inflight + buffer`, where
+  - finished = the ids its results credited (`claimed`), or its last beat's `progress.games_done` when higher;
+  - `inflight` = half of the `games` asked (agents ask for about 2 x their whole crew's games in flight), never fewer than
+    its last beat's Stats `concurrency` (its main worker's) or `inflight` (its crew's, 13.5);
+  - a crew - Stats `workers` > 1, or half the ask above its main worker's `concurrency` - holds twice that: a new
+    member's ids are released before it starts (13.5, a spare range or the tail's place);
+  - `buffer` = the games it finishes in 120 s at its rate - this lease's so far (finished / seconds since issue, less
+    paused time; at least 60 s) or the machine's rate for the run measured from its closed leases (as lease sizes use),
+    the higher - at least 1/8 of `inflight` and 16: finished games reach the coordinator with a beat (every 60 s) or a
+    result (`flush_s`), and the agent asks again within 20 s, so the worker keeps its games in flight meanwhile.
+  At the limit the answer is `wait_s` 20, `reason` `inflight` (3 asks and a beat a minute fit the beat bucket). Before
+  rev 21 an agent whose worker kept saying `low` (agents 0.3.6-0.3.8 seen holding 8 to 20 x their games in flight)
+  took every free id of the generation's quota, and other machines got `no_work`.
 
 ### 10.5 The worker (aw/1, feature `rolling`)
 
@@ -1893,7 +1913,7 @@ before rev 19, eval, fuzz and classic jobs are unchanged; GPU jobs are tuned fro
   runtime and network the best layout, its rate and state, the machines and runs. The admin page shows "Tuned layouts
   by hardware class" and "Tuned layouts by machine" (a crew's layout as "2 workers x (...)").
 - Lease stats (beats, `done`) of a rolling lease served by several workers add `workers` (how many play new games) and
-  `inflight` is all of theirs.
+  `inflight` is all of theirs. The coordinator keeps both with the lease's Stats from rev 21 (the in-flight limit, 10.4).
 
 ### 13.5 Several workers per lease
 
@@ -2113,6 +2133,12 @@ set the run's alternate's `model` (the CUDA alternate: `"model": "gpu"`) and the
 it: GPU machines play its default model.
 
 ## Changes
+- v1 rev 21 (2026-11-20; coordinator only, every agent version; no migration): **the in-flight limit of rolling leases**
+  (10.4). An extension releases ids only while the lease's unfinished ids stay within its games in flight (twice that for
+  a crew) plus a reporting buffer, else `wait_s` 20 with `reason` `inflight`; a grant releases the larger `inflight` once
+  (was twice, 10.3); lease Stats keep `inflight` and `workers`. Why: on a live run one laptop's lease (agent 0.3.6, 384
+  games in flight, ~2,000 games/h) held 2,657 unplayed ids and took 6,112 more within two minutes of the quota rising, so
+  two faster machines got `no_work`; another PC's (0.3.8) held ~3,200 with 384 in flight.
 - v1 rev 20, agent 0.3.10 (2026-11-20; no wire change): the tuner's "other programs" load (13.2 **quiet**) leaves out the
   system's interrupt and DPC time (Windows, `NtQuerySystemInformation` processor performance: drivers' work, no program's) - on the
   idle 4070 Ti PC a GPU crew's own batches drove 6-11 % of it, 11 % with two groups of small batches, so its trials were

@@ -32,7 +32,7 @@ import {
 } from "./helpers";
 
 const ROLL = "0.2.13"; // ROLLING_AGENT's default
-const ROLLING = { inflight: 8, gpu_inflight: 32, block: 1000 }; // first release: 2 x 32 = 64
+const ROLLING = { inflight: 8, gpu_inflight: 64, block: 1000 }; // first release: the larger in-flight count, 64
 
 // A run with rolling self-play: makeRun (gen 1, signed), then the same configuration with `rolling`.
 async function rollingRun(run: string, o: RunOpts & { rolling?: Record<string, unknown> } = {}): Promise<string> {
@@ -73,6 +73,11 @@ const pool = async (scope: string) =>
   (await env.DB.prepare(`SELECT lo, hi FROM pool WHERE scope = ? AND pool = 'selfplay' ORDER BY lo`).bind(scope).all<any>()).results.map((r) => [r.lo, r.hi]);
 // `until` has passed (instead of beating for max_s seconds).
 const due = (id: string) => env.DB.prepare(`UPDATE leases SET until = ? WHERE lease_id = ?`).bind(clock.now - 1, id).run();
+// The worker finished every released id (as its last beat would say), so the in-flight limit (rev 21) leaves room.
+const played = (id: string) =>
+  env.DB.prepare(`UPDATE leases SET progress = json_object('games_done', rel_hi - lo, 'games_total', rel_hi - lo) WHERE lease_id = ?`).bind(id).run();
+// The lease was issued `s` seconds ago (its rate so far, and so its reporting buffer, comes from that).
+const aged = (id: string, s: number) => env.DB.prepare(`UPDATE leases SET issued_at = ? WHERE lease_id = ?`).bind(clock.now - s, id).run();
 const games = (l: any) => l.job.games;
 
 describe("rolling leases: the run's setting (10.1)", () => {
@@ -121,9 +126,9 @@ describe("rolling leases: who gets one and the grant (10.2, 10.3)", () => {
     const l = await rollingLease(m);
     await checkDefinitionLease(m, l); // the job is still {kind, gid_base, games, seed}
     expect(l.kind).toBe("selfplay");
-    expect(l.rolling).toEqual({ block: [0, 1000], inflight: { cpu: 8, gpu: 32 }, until: clock.now + 7200, max_s: 7200, flush_s: 120 });
+    expect(l.rolling).toEqual({ block: [0, 1000], inflight: { cpu: 8, gpu: 64 }, until: clock.now + 7200, max_s: 7200, flush_s: 120 });
     expect(l.job.gid_base).toBe(0);
-    expect(games(l)).toBe(64); // min(headroom 110, block 1000, 2 x 32)
+    expect(games(l)).toBe(64); // min(headroom 110, block 1000, the larger in-flight count 64; rev 21: once, not twice)
     const st = await state("roll");
     expect(st.next_gid).toBe(1000);
     expect(st.selfplay_state.leased).toBe(64); // only released ids count
@@ -138,9 +143,9 @@ describe("rolling leases: who gets one and the grant (10.2, 10.3)", () => {
     expect(page.body).toContain("Rolling leases");
   });
 
-  it("the first release is capped by the headroom; 'auto' counts 256 games in flight", async () => {
+  it("the first release is capped by the headroom; 'auto' counts 256 games in flight (released once, rev 21)", async () => {
     await rollingRun("auto", { quota: 1000, slack: 0, rolling: { inflight: "auto", gpu_inflight: 4 } });
-    expect(games(await rollingLease(await enroll("a1")))).toBe(512);
+    expect(games(await rollingLease(await enroll("a1")))).toBe(256);
     await rollingRun("small", { quota: 20, slack: 0, priority: 2 });
     const l = await rollingLease(await enroll("a2"));
     expect(l.run).toBe("small");
@@ -206,6 +211,9 @@ describe("rolling leases: extend (10.4)", () => {
     ok(await admin("POST", "/v1/admin/run/q/ack", { cursor }));
     expect(ok(await extend(m, l.lease_id, { games: 50 }))).toEqual({ games: 100, wait_s: 60, reason: "quota" });
     ok(await finish(cm, c.lease_id, [], { given_back: true }));
+    // headroom again, but 80 unfinished ids are past this lease's limit (25 in flight + 40 of buffer): rev 21
+    expect(ok(await extend(m, l.lease_id, { games: 50 }))).toEqual({ games: 100, wait_s: 20, reason: "inflight" });
+    await played(l.lease_id);
     expect(ok(await extend(m, l.lease_id, { games: 50 }))).toEqual({ games: 110 });
     // x-ids may now reach the newly released ids
     ok(await upload(m, l.lease_id, 1, "chunk1", { ids: [[100, 110]], gen: 1 }));
@@ -213,10 +221,11 @@ describe("rolling leases: extend (10.4)", () => {
   });
 
   it("finishes when the block is used up", async () => {
-    await rollingRun("b", { quota: 10000, rolling: { inflight: 8, gpu_inflight: 32, block: 70 } });
+    await rollingRun("b", { quota: 10000, rolling: { inflight: 8, gpu_inflight: 64, block: 70 } });
     const m = await enroll("m");
     const l = await rollingLease(m);
     expect(games(l)).toBe(64);
+    await played(l.lease_id);
     expect(ok(await extend(m, l.lease_id, { games: 100 }))).toEqual({ games: 70 });
     expect(ok(await extend(m, l.lease_id, { games: 100 }))).toEqual({ games: 70, finish: true, reason: "block" });
   });
@@ -229,6 +238,7 @@ describe("rolling leases: extend (10.4)", () => {
     const l = await rollingLease(m);
     expect(l.run).toBe("renew");
     await due(l.lease_id);
+    await played(l.lease_id);
     expect(ok(await extend(m, l.lease_id, { games: 16 }))).toEqual({ games: 80 });
     expect((await row(l.lease_id)).until).toBe(clock.now - 1 + 7200);
     // before `until` nothing is looked at
@@ -245,6 +255,7 @@ describe("rolling leases: extend (10.4)", () => {
       eval: { batch: "b1", games: 10, checkpoints: [1], games_per_lease: 4, job: { settings: {}, seats: [{ net: 1 }, { bot: "random" }], paired: false } },
     });
     // before `until` the lease keeps going whatever waits
+    await played(l.lease_id);
     expect(ok(await extend(m, l.lease_id, { games: 8 }))).toEqual({ games: 72 });
     await due(l.lease_id);
     expect(ok(await extend(m, l.lease_id, { games: 8 }))).toEqual({ games: 72, finish: true, reason: "max_s" });
@@ -268,6 +279,7 @@ describe("rolling leases: extend (10.4)", () => {
     const l = await rollingLease(m);
     await makeCampaign("fz", { share: 0.1 }); // 1 > 0.1 x 2
     await due(l.lease_id);
+    await played(l.lease_id);
     expect(ok(await extend(m, l.lease_id, { games: 8 }))).toEqual({ games: 72 });
   });
 
@@ -277,6 +289,7 @@ describe("rolling leases: extend (10.4)", () => {
     const l = await rollingLease(m);
     await makeRun("full", { quota: 0, priority: 5 }); // no headroom: doesn't count
     await due(l.lease_id);
+    await played(l.lease_id);
     expect(ok(await extend(m, l.lease_id, { games: 8 }))).toEqual({ games: 72 });
     await makeRun("hi", { quota: 100, priority: 5 });
     await due(l.lease_id);
@@ -294,6 +307,7 @@ describe("rolling leases: extend (10.4)", () => {
     ok(await admin("POST", "/v1/admin/pause", { paused: true }));
     expect(ok(await extend(m, l.lease_id, { games: 8 }))).toEqual(fin);
     ok(await admin("POST", "/v1/admin/pause", { paused: false }));
+    await played(l.lease_id);
     expect(ok(await extend(m, l.lease_id, { games: 8 }))).toEqual({ games: 72 });
     ok(await admin("PUT", "/v1/admin/run/st", runBody(build, { quota: 10000 }))); // rolling removed
     expect(ok(await extend(m, l.lease_id, { games: 8 }))).toEqual({ ...fin, games: 72 });
@@ -308,6 +322,7 @@ describe("rolling leases: extend (10.4)", () => {
     await rollingRun("rp", { quota: 10000 });
     const m = await enroll("m");
     const l = await rollingLease(m);
+    await played(l.lease_id);
     expect(ok(await extend(m, l.lease_id, { games: 8 }))).toEqual({ games: 72 });
     const nb = await makeBuild({ tag: "rp-repinned" });
     const body: any = runBody(nb, { quota: 10000 });
@@ -340,6 +355,76 @@ describe("rolling leases: extend (10.4)", () => {
     let limited = 0;
     for (let i = 0; i < 14; i++) if ((await extend(n, l2.lease_id, { games: 1 })).status === 429) limited++;
     expect(limited).toBeGreaterThan(0);
+  });
+});
+
+describe("rolling leases: the in-flight limit (10.4, rev 21)", () => {
+  it("a single worker holds its games in flight plus the buffer; finished games (results or its last beat) make room", async () => {
+    await rollingRun("lim", { quota: 10000 });
+    const m = await enroll("m");
+    const l = await rollingLease(m); // 64 released
+    await aged(l.lease_id, 3600); // a slow rate so far: the buffer is its floor
+    ok(await beat(m, l.lease_id, "running", { stats: { concurrency: 64 }, progress: { games_done: 0, games_total: 64 } }));
+    // it asks for 2 x 64: 64 in flight + a buffer of max(16, 64 / 8) = 80 unfinished at most
+    expect(ok(await extend(m, l.lease_id, { games: 128 }))).toEqual({ games: 80 });
+    expect(ok(await extend(m, l.lease_id, { games: 128 }))).toEqual({ games: 80, wait_s: 20, reason: "inflight" });
+    // 30 games credited by a result: 50 unfinished, room for 30
+    ok(await upload(m, l.lease_id, 0, "rows", { ids: [[0, 30]], gen: 1 }));
+    expect(ok(await extend(m, l.lease_id, { games: 128 }))).toEqual({ games: 110 });
+    // the beat's own count, higher than the results': 50 finished, room for 20
+    ok(await beat(m, l.lease_id, "running", { stats: { concurrency: 64 }, progress: { games_done: 50, games_total: 110 } }));
+    expect(ok(await extend(m, l.lease_id, { games: 128 }))).toEqual({ games: 130 });
+  });
+
+  it("the buffer is the games it plays in ROLLING_BUFFER_S (120 s) at its rate so far", async () => {
+    await rollingRun("buf", { quota: 10000 });
+    const m = await enroll("m");
+    const l = await rollingLease(m); // 64 released
+    await aged(l.lease_id, 120);
+    await played(l.lease_id); // 64 games in 120 s: 64 more in the next 120 s
+    // 64 in flight (it asks for 128) + a buffer of 64
+    expect(ok(await extend(m, l.lease_id, { games: 128 }))).toEqual({ games: 192 });
+    expect(ok(await extend(m, l.lease_id, { games: 128 }))).toEqual({ games: 192, wait_s: 20, reason: "inflight" });
+  });
+
+  it("the machine's measured rate for the run counts when it is higher (a lease's first minutes finish little)", async () => {
+    await rollingRun("known", { quota: 10000 });
+    const m = await enroll("m");
+    const l = await rollingLease(m); // 64 released, nothing finished yet
+    await env.DB.prepare(`INSERT INTO rates (machine_id, kind, scope, rate, samples, t) VALUES (?, 'selfplay', 'run:known', 1.0, 3, ?)`)
+      .bind(m.machine_id, clock.now)
+      .run();
+    // 64 in flight + a buffer of 120 games (1 a second for 120 s): 184 unfinished at most
+    expect(ok(await extend(m, l.lease_id, { games: 128 }))).toEqual({ games: 184 });
+  });
+
+  it("a crew holds twice its games in flight: more workers in its last beat, or more games asked for than its main worker plays", async () => {
+    await rollingRun("crew", { quota: 10000 });
+    const m = await enroll("m");
+    const l = await rollingLease(m); // 64 released
+    await aged(l.lease_id, 3600);
+    ok(await beat(m, l.lease_id, "running", { stats: { concurrency: 64 }, progress: { games_done: 0, games_total: 64 } }));
+    // 2 workers of 64: it asks for 2 x 128, holds at most 2 x 128 + 16
+    expect(ok(await extend(m, l.lease_id, { games: 256 }))).toEqual({ games: 272 });
+    const m2 = await enroll("m2");
+    const l2 = await rollingLease(m2); // 64 released
+    await aged(l2.lease_id, 3600);
+    ok(await beat(m2, l2.lease_id, "running", { stats: { concurrency: 64, inflight: 64, workers: 2 }, progress: { games_done: 0, games_total: 64 } }));
+    // its beat says 2 workers (rev 19 agents): 2 x 64 + 16
+    expect(ok(await extend(m2, l2.lease_id, { games: 128 }))).toEqual({ games: 144 });
+    // the crew's numbers are kept with the lease's stats
+    const s = JSON.parse((await row(l2.lease_id)).stats);
+    expect([s.inflight, s.workers]).toEqual([64, 2]);
+  });
+
+  it("never under the games its main worker plays: a small ask still gets ids", async () => {
+    await rollingRun("big", { quota: 10000 });
+    const m = await enroll("m");
+    const l = await rollingLease(m); // 64 released
+    await aged(l.lease_id, 3600);
+    ok(await beat(m, l.lease_id, "running", { stats: { concurrency: 200 }, progress: { games_done: 0, games_total: 64 } }));
+    // half of 16 is 8, but the worker plays 200: at most 200 + 25 unfinished
+    expect(ok(await extend(m, l.lease_id, { games: 16 }))).toEqual({ games: 80 });
   });
 });
 

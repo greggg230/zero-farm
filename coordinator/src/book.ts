@@ -87,6 +87,13 @@ export interface RollingCfg {
 }
 export const ROLLING_AUTO_INFLIGHT = 256; // "auto" counts this much when sizing a grant's first release
 export const ROLLING_QUOTA_WAIT_S = 60; // an extension with no headroom: ask again after this
+// Rev 21 (PROTOCOL 10.4): a rolling lease holds no more unfinished ids than its games in flight (twice that for a crew)
+// plus a reporting buffer: the games it plays in ROLLING_BUFFER_S at its own rate (finished games reach the coordinator
+// with a beat, every BEAT_S, or a result; the agent asks again within ROLLING_INFLIGHT_WAIT_S), at least 1/8 of its
+// games in flight and ROLLING_BUFFER_MIN. At the limit an extension answers wait_s with reason "inflight".
+export const ROLLING_BUFFER_S = 120;
+export const ROLLING_BUFFER_MIN = 16;
+export const ROLLING_INFLIGHT_WAIT_S = 20; // the beat bucket's 6 a minute: a beat a minute plus 3 asks
 export const MAX_GID = 2 ** 32; // a rolling block never reaches past this game id (PROTOCOL 10.3)
 export const MAX_GEN_VARIANTS = 8; // rev 20 (PROTOCOL 14.2): model variants per checkpoint gen
 export interface EvalCfg {
@@ -732,12 +739,13 @@ async function grantRunGames(env: Env, req: GrantReq): Promise<Lease | null> {
     pool = "selfplay";
     if (req.rolling && def && sp.rolling) {
       // Rev 15 (PROTOCOL 10.3): a fresh block from next_gid (never the pool), of which the first ids are released:
-      // the headroom, the block, or 2 x the larger in-flight count ("auto" counting ROLLING_AUTO_INFLIGHT).
+      // the headroom, the block, or the larger in-flight count ("auto" counting ROLLING_AUTO_INFLIGHT; rev 21: once,
+      // before rev 21 twice - the agent's first extension says what it really keeps in flight).
       const r = sp.rolling;
       range = [run.next_gid, Math.min(run.next_gid + r.block, MAX_GID)];
       if (range[1] <= range[0]) return null;
       const cnt = (x: "auto" | number) => (x === "auto" ? ROLLING_AUTO_INFLIGHT : x);
-      relHiAt = range[0] + Math.min(st.headroom, range[1] - range[0], 2 * Math.max(cnt(r.inflight), cnt(r.gpu_inflight)));
+      relHiAt = range[0] + Math.min(st.headroom, range[1] - range[0], Math.max(cnt(r.inflight), cnt(r.gpu_inflight)));
       stmts.push(db.prepare(`UPDATE runs SET next_gid = ? WHERE run = ? AND next_gid = ?`).bind(range[1], run.run, run.next_gid));
       rolling = {
         block: [range[0], range[1]],
@@ -1054,7 +1062,41 @@ export interface ExtendAnswer {
   games: number; // the lease's ids are [lo, lo + games)
   wait_s?: number;
   finish?: true;
-  reason?: "quota" | "max_s" | "block" | "state";
+  reason?: "quota" | "inflight" | "max_s" | "block" | "state"; // inflight: rev 21
+}
+
+// Rev 21 (PROTOCOL 10.4): the games a rolling lease finished as far as the coordinator knows - the ids its results
+// credited, or the agent's own count in its last beat when that is higher - and the released ids not finished (the
+// games in play and the unstarted ids).
+export function finishedIds(l: LeaseRow): number {
+  const released = (l.rel_hi ?? l.hi ?? 0) - (l.lo ?? 0);
+  const p = parseJson<{ games_done?: unknown } | null>(l.progress, null);
+  const beat = typeof p?.games_done === "number" && Number.isFinite(p.games_done) ? p.games_done : 0;
+  return Math.max(0, Math.min(released, Math.max(l.claimed, beat)));
+}
+
+export function unfinishedIds(l: LeaseRow): number {
+  return (l.rel_hi ?? l.hi ?? 0) - (l.lo ?? 0) - finishedIds(l);
+}
+
+// Rev 21 (PROTOCOL 10.4): the most unfinished ids a rolling lease may hold after an extension asking for `asked`.
+// Its games in flight: half of what it asks (an agent asks for about 2 x its whole crew's games in flight), never
+// fewer than its last beat says its workers play. A crew (more workers than one, or more games asked for than its
+// main worker plays) holds twice that: each new worker's ids are released before it starts. Plus the reporting
+// buffer (ROLLING_BUFFER_S at its rate - this lease's so far or the machine's measured rate for the run, the higher;
+// at least 1/8 of its games in flight and ROLLING_BUFFER_MIN), so the batch stays full while finished games are on
+// their way to the coordinator.
+export function rollingLimit(l: LeaseRow, asked: number, now: number, knownRate = 0): number {
+  const s = parseJson<Record<string, unknown> | null>(l.stats, null) ?? {};
+  const num = (x: unknown) => (typeof x === "number" && Number.isFinite(x) && x > 0 ? x : 0);
+  const conc = num(s.concurrency); // the main worker's games in flight
+  const half = Math.ceil(asked / 2);
+  const inflight = Math.max(half, conc, num(s.inflight));
+  const crew = num(s.workers) > 1 || (conc > 0 && half > conc);
+  const active = Math.max(BEAT_S, now - l.issued_at - l.paused_s);
+  const rate = Math.max(finishedIds(l) / active, Number.isFinite(knownRate) ? knownRate : 0);
+  const buffer = Math.max(ROLLING_BUFFER_MIN, Math.ceil(inflight / 8), Math.ceil(rate * ROLLING_BUFFER_S));
+  return (crew ? 2 : 1) * inflight + buffer;
 }
 
 export async function extend(env: Env, r: ExtendReq): Promise<ExtendAnswer> {
@@ -1093,10 +1135,18 @@ export async function extend(env: Env, r: ExtendReq): Promise<ExtendAnswer> {
     stmts.push(db.prepare(`UPDATE leases SET until = ? WHERE lease_id = ?`).bind((l.until ?? r.now) + sp.rolling.max_s, l.lease_id));
   }
   const st = await selfplayState(db, run, sp);
-  const n = Math.min(r.games, st.headroom, hi - rel);
+  // Rev 21: never more unfinished ids than the lease's games in flight (crews twice) plus its reporting buffer.
+  const known = await db
+    .prepare(`SELECT rate FROM rates WHERE machine_id = ? AND kind = 'selfplay' AND scope = ?`)
+    .bind(l.machine_id, l.scope)
+    .first<{ rate: number }>();
+  const room = rollingLimit(l, r.games, r.now, known?.rate ?? 0) - unfinishedIds(l);
+  const n = Math.min(r.games, st.headroom, hi - rel, room);
   if (n < 1) {
     if (stmts.length) await db.batch(stmts);
-    return { games: rel - lo, wait_s: ROLLING_QUOTA_WAIT_S, reason: "quota" };
+    return st.headroom < 1
+      ? { games: rel - lo, wait_s: ROLLING_QUOTA_WAIT_S, reason: "quota" }
+      : { games: rel - lo, wait_s: ROLLING_INFLIGHT_WAIT_S, reason: "inflight" };
   }
   stmts.push(db.prepare(`UPDATE leases SET rel_hi = ? WHERE lease_id = ? AND rel_hi = ?`).bind(rel + n, l.lease_id, rel));
   await db.batch(stmts);
