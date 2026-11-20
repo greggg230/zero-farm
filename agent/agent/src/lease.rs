@@ -3305,10 +3305,10 @@ impl Run {
     /// agent 0.3.5: `n` new workers of layout `l` fit beside the lease's workers as a handoff leaves them - every one
     /// finishing its games, at what it commits (and its video memory as read) -, within `PLAN_SHARE` of the job's limit
     /// and the video memory budget.
-    fn room_beside(&self, n: u64, l: &Layout) -> bool {
+    fn room_beside(&mut self, n: u64, l: &Layout) -> bool {
         let limit = self.lease_limit_mb;
         let main = if self.main_exit.is_none() { self.worker.commit_mb().unwrap_or(0) } else { 0 };
-        let held = main + self.mates.iter().map(|m| m.worker.commit_mb().unwrap_or(0)).sum::<u64>();
+        let held = main + self.mates.iter_mut().map(|m| m.worker.commit_mb().unwrap_or(0)).sum::<u64>();
         let host = limit == 0 || (held + n * self.plan_mb(l.conc)) as f64 <= limit as f64 * crate::rolling::PLAN_SHARE;
         let vram = match self.roll.as_ref().and_then(|r| r.vram.as_ref()) {
             None => true,
