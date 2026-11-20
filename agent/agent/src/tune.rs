@@ -391,6 +391,9 @@ pub const GPU_CONC_STEP: u64 = 64;
 /// agent 0.3.4: a GPU job's games in flight in all may go this far over its target (the tuner's games-in-flight moves; a
 /// crew's rounded-up shares): 1,536 for a target of 1,024.
 pub const GPU_CONC_OVER: f64 = 1.5;
+/// agent 0.3.5: a GPU crew starts when it holds at least this share of the target in all (two workers of 506 on the 4070
+/// Ti PC at a 9.0 GB cap: 1,012 of 1,024; 0.3.4 asked for all of it and fell back to one worker).
+pub const GPU_START_SHARE: f64 = 0.8;
 /// agent 0.3.4: a GPU worker's batch has at most this many rows (the worker answers bigger batches in pieces of 1,024
 /// rows, PROTOCOL 8).
 pub const GPU_BATCH_MAX: u64 = 2048;
@@ -519,7 +522,7 @@ impl Space {
     }
 
     /// agent 0.3.4: a GPU job's starting crew (PROTOCOL 13.1): on an NVIDIA GPU the most workers (within the bounds) whose
-    /// start holds the target games in flight in all - three of 384 or two of 512 for a target of 1,024 where the video
+    /// start holds the target games in flight in all (agent 0.3.5: `GPU_START_SHARE` of it) - three of 384 or two of 512 for a target of 1,024 where the video
     /// memory and the memory plan allow, else one; on other GPUs one (the tuner tries more).
     pub fn gpu_start(&self, nvidia: bool, batch: u64) -> Layout {
         let lo = self.workers_min.max(1);
@@ -527,7 +530,7 @@ impl Space {
         if lo == hi || !nvidia {
             return self.gpu_layout(lo, batch);
         }
-        (lo..=hi).rev().map(|n| self.gpu_layout(n, batch)).find(|l| l.total_conc() >= self.target).unwrap_or_else(|| self.gpu_layout(lo, batch))
+        (lo..=hi).rev().map(|n| self.gpu_layout(n, batch)).find(|l| l.total_conc() as f64 >= self.target as f64 * GPU_START_SHARE).unwrap_or_else(|| self.gpu_layout(lo, batch))
     }
 
     /// The games in flight one of `n` workers may run under the memory plan (None: no limit): (`PLAN_SHARE` x the
@@ -1886,9 +1889,11 @@ mod tests {
         assert_eq!((s.workers_min, s.workers_max, s.conc_min, s.conc_max), (1, 3, 512, 1536));
         assert_eq!(s.gpu_start(true, 512), glay(3, 2, 1, 384));
         assert_eq!((s.target_conc(1), s.target_conc(2), s.target_conc(3)), (1024, 512, 384));
-        // a ~9.5 GB limit: three workers hold 3 x 222 in all, short of 1,024 - two of 512, 3 search threads each
+        // a ~9.5 GB limit: three workers hold 3 x 222 in all, 65 % of 1,024 - two of 512, 3 search threads each
         let s = gpu_space(9_500, 4, 9_939, None);
         assert_eq!(s.gpu_start(true, 512), glay(2, 3, 1, 512));
+        // a 9.0 GB limit: two hold 2 x 506 = 1,012, 99 % of the target (0.3.4: one worker of 1,024)
+        assert_eq!(gpu_space(9_000, 4, 9_939, None).gpu_start(true, 512), glay(2, 3, 1, 506));
         // at the default 45 MB a game: one worker, (8,075 - 1,800) / 45 = 139 games in flight (0.3.3's plan: 128)
         let s = gpu_space(9_500, 45, 9_939, None);
         assert_eq!(s.workers_max, 1);
@@ -1910,10 +1915,10 @@ mod tests {
         let s = gpu_space(16_384, 4, 3_000, None);
         assert_eq!((s.vram_rows(1), s.vram_rows(2), s.vram_rows(3)), (Some(988), Some(238), Some(0)));
         assert_eq!(s.workers_max, 2, "a third worker's base doesn't fit");
-        // two of 512 don't fit in one group each: two groups of 238 rows, 476 games in flight - short of the target, so
-        // the start is one worker of 1,024 in two groups of 512
+        // two of 512 don't fit in one group each: two groups of 238 rows, 476 games in flight - 952 in all, 93 % of the
+        // target: the start (0.3.4 asked for all of it: one worker of 1,024)
         assert_eq!(s.fit(glay(2, 3, 1, 512)), glay(2, 3, 2, 476));
-        assert_eq!(s.gpu_start(true, 512), glay(1, 6, 2, 1024));
+        assert_eq!(s.gpu_start(true, 512), glay(2, 3, 2, 476));
         // every layout of the space within the budget at its plan
         for l in [glay(1, 6, 1, 1536), glay(2, 3, 1, 768), glay(2, 3, 2, 768), glay(1, 6, 2, 4096)] {
             let f = s.fit(l);

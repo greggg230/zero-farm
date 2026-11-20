@@ -3272,7 +3272,8 @@ impl Run {
         // finishing their games, at what they commit): one that would wait for a whole drain doesn't start - a GPU drain
         // ends in its last games at a few rows a batch, and the 4070 Ti PC's old worker drained alone for 6-8 minutes,
         // starting no game, before each trial (0.3.4). The layout wanted runs unmeasured instead when its first worker fits
-        // (its others join as memory allows); any other trial is postponed, counted as that layout's discard (skipped after
+        // (its others join as memory allows; its first worker after the drain when even that doesn't fit beside); any other
+        // trial is postponed, counted as that layout's discard (skipped after
         // `tune::MAX_DISCARDS`) and against the cap. A handoff no trial measures - to the layout wanted, after calibration or
         // a discarded trial - starts as before (its first worker after the drain when it doesn't fit beside), and so does a
         // CPU job's trial (its drain overlaps the next crew as memory allows, PROTOCOL 13.2).
@@ -3280,11 +3281,12 @@ impl Run {
             let retry = 2 * (t.tune_warm + t.tune_window);
             let id = self.lease.lease_id.clone();
             let gpu = self.gpu_lease();
-            let first_fits = self.room_beside(1, &target.per_worker());
             let tu = self.tuning.as_mut().expect("checked");
             tu.postponed.push(Instant::now());
             tu.no_trial_before = Instant::now() + retry;
-            if target == wanted && target != tu.current && first_fits {
+            // (the layout wanted - the start picked again after calibration, the incumbent - runs anyway: its first worker
+            // beside the old ones when it fits, else after their drain)
+            if target == wanted && target != tu.current {
                 let line = format!("the layout wanted, {}, doesn't fit beside the running workers to be measured: running it unmeasured", target.describe_on(gpu));
                 log::info!("lease {id}: {line}");
                 eng.worker_log.write_line(&format!("tuning [{id}]: {line}"));

@@ -1718,7 +1718,8 @@ before rev 19, eval, fuzz and classic jobs are unchanged; GPU jobs are tuned fro
   layout the memory plan held back is lifted to its share of the target, not past it (10.6). Agents from 0.3.5: a
   start's groups are the rule's for the games in flight the memory plans leave (139: one batch of 139; 0.3.4 kept the
   target's 2 groups, 70 rows), and while a search measured nothing but the start (no trial yet) a calibration that
-  changes the plan (10.6) picks the start again - the 4070 Ti PC: one worker of 139 at 45 MB a game, two of 512 at 4. `autotune` off: the start
+  changes the plan (10.6) picks the start again - the 4070 Ti PC: one worker of 139 at 45 MB a game, two of 512 at 4 -,
+  and a crew starts when it holds 80 % of the target in all (two of 506 at a 9.0 GB cap; 0.3.4 asked for all of it). `autotune` off: the start
   for the owner's `workers` (else one), fixed (handed over only when the memory plan holds more, 10.6). A CPU job on a
   GPU runtime pack takes no hint either (the hint for that build and pack is most likely a GPU layout).
 - **The owner's settings** `autotune` (default on; Windows `machine.json`, macOS `ZeroFarm set autotune on|off`) and
@@ -1757,8 +1758,9 @@ before rev 19, eval, fuzz and classic jobs are unchanged; GPU jobs are tuned fro
   fresh worker), and at most 6 handoffs start per hour. **Agents from 0.3.5:** a GPU job's measured trial starts only
   when its workers fit beside the lease's workers as the handoff leaves them (every one finishing its games, at its commit and
   video memory, 10.6) - one that would wait for a whole drain doesn't start (the 4070 Ti PC's old worker drained alone,
-  starting no game, for 6-8 minutes before each trial with 0.3.4): the layout wanted runs unmeasured instead when its
-  first worker fits (its others join as memory allows), any other trial is postponed - counted as that layout's discard
+  starting no game, for 6-8 minutes before each trial with 0.3.4): the layout wanted runs unmeasured instead (its first
+  worker beside the old ones when it fits, else after their drain; its others join as memory allows), any other trial
+  is postponed - counted as that layout's discard
   and against the hour's 6 for trials (postponed trials and handoffs together) -; whether a trial can be measured is
   decided when its worker starts, not while the handoff waits, and a trial that can't is counted as discarded whatever
   layout it was (0.3.4 swapped a candidate for the incumbent at any tick of the wait and counted nothing: the same
