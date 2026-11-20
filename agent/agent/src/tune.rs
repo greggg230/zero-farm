@@ -50,6 +50,10 @@ pub const FEATURES: [&str; 1] = ["tuning"];
 pub const WORKER_FEATURE: &str = "infer_workers";
 /// Bumped when the search or the measurement changes: every key is searched again. (2: the worker count, 13.5.)
 pub const TUNER_VERSION: u32 = 2;
+/// agent 0.3.7: a GPU job's keys are searched again from this version (3: two groups a worker, trials after the drain).
+/// Entries of 0.3.5-0.3.6 counted every postponed trial as a discard: the 4070 Ti PC's crew of two had 3 (given up on)
+/// before 0.3.7 could hand over to it, and its start was a single worker.
+pub const GPU_TUNER_VERSION: u32 = 3;
 /// Worker processes a lease's job may run (searched and set) at most; a hint or a report may say up to `MAX_WORKERS_JSON`.
 pub const MAX_WORKERS: u32 = 3;
 pub const MAX_WORKERS_JSON: u32 = 8;
@@ -1155,7 +1159,7 @@ impl Cache {
 
     /// The coordinator's `tuning` (PROTOCOL 13): the most recently changed measured entries, at most `MAX_REPORTS`.
     pub fn reports(&self) -> Vec<Value> {
-        let mut es: Vec<&Entry> = self.entries.iter().filter(|e| e.key.tuner == TUNER_VERSION).collect();
+        let mut es: Vec<&Entry> = self.entries.iter().filter(|e| e.key.tuner == TUNER_VERSION || e.key.tuner == GPU_TUNER_VERSION).collect();
         es.sort_by_key(|e| std::cmp::Reverse(e.t));
         es.iter().filter_map(|e| e.report()).take(MAX_REPORTS).collect()
     }

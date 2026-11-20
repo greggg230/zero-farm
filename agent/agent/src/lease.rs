@@ -1294,7 +1294,7 @@ impl Engine {
                 None => hw,
             },
             os: p.os.clone(),
-            tuner: tune::TUNER_VERSION,
+            tuner: tune::GPU_TUNER_VERSION,
         };
         let now = zerofarm_common::now_unix();
         let start = space.gpu_start(g.vendor.eq_ignore_ascii_case("nvidia"), batch);

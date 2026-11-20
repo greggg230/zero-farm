@@ -530,6 +530,8 @@ fn a_trial_that_cant_run_when_its_worker_starts_counts_as_discarded() {
     let tuning: Value = serde_json::from_slice(&std::fs::read(h.layout.state().join("tuning.json")).unwrap()).unwrap();
     let e = &tuning["entries"][0];
     assert!(e["discards"].as_array().is_some_and(|d| d.iter().any(|x| x[1] == 1)), "the candidate counted as discarded: {e}");
+    // (agent 0.3.7: a GPU job's entry is keyed by the GPU tuner's version - 0.3.5-0.3.6's entries are searched again)
+    assert_eq!(e["key"]["tuner"], farm_agent::tune::GPU_TUNER_VERSION, "{e}");
     h.stop();
     let done = h.wait_done("l_GD");
     ids_accounted(&h, "l_GD", &done);

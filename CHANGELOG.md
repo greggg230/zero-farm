@@ -4,6 +4,13 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's: `agent-macos-v<version>`).
 
+## Unreleased (0.3.8)
+
+- **Graphics-card setups are worked out afresh.** Zero Farm 0.3.5 and 0.3.6 counted every setup they had to put off as
+  a failed try, and after three it never tried that setup again - on an RTX 4070 Ti that ruled out sharing the card
+  between job programs for good. Zero Farm 0.3.8 starts the graphics-card search over, with 0.3.7's ability to try
+  every setup.
+
 ## Unreleased (0.3.7)
 
 - **Graphics cards find their fastest setup.** When the job programs sharing a graphics card filled the memory Zero Farm

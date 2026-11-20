@@ -1844,7 +1844,7 @@ before rev 19, eval, fuzz and classic jobs are unchanged; GPU jobs are tuned fro
 
 - `state/tuning.json`, per key (worker build, runtime pack, network, hardware - with the owner's `workers` when set; a
   GPU job's (agents from 0.3.4) also the GPU - vendor, name, dedicated memory, driver - and the provider -, OS version,
-  tuner version 2): the start,
+  tuner version 2; a GPU job's 3 from agent 0.3.8): the start,
   the incumbent, every measurement, the window, the search's state. The network's fingerprint is the first 16 hex of the
   sha256 of the job template's canonical JSON without its per-lease fields, `|`, the model file's size in MiB (a run's
   generations keep it; another architecture or other settings change it); the hardware's is the CPU brand, cores,
@@ -2102,6 +2102,9 @@ set the run's alternate's `model` (the CUDA alternate: `"model": "gpu"`) and the
 it: GPU machines play its default model.
 
 ## Changes
+- v1 rev 20, agent 0.3.8 (2026-11-20; no wire change): a GPU job's tuning entries are keyed by the GPU tuner's version
+  3 (13: the key's tuner version), so 0.3.5-0.3.6's entries - whose postponed trials counted as discards, the 4070 Ti PC's crew of two given
+  up on after 3 - are searched again with 0.3.7's trials after the drain; CPU entries keep version 2.
 - v1 rev 20, agent 0.3.7 (2026-11-20; no wire change): **GPU layouts measured and split**, from a bench on the owner's
   4070 Ti PC: a GPU worker of 512+ games in flight runs two groups, games in flight up to twice the target (13.1); a GPU
   job's measured trials run after the drain when they don't fit beside, after the memory plan's early reading (13.2);
