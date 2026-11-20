@@ -137,11 +137,13 @@ export interface GpuNeed {
 
 // A run alternate (PROTOCOL 9.4): a worker build, the runtime pack it requires and the vendor condition. Rev 17
 // (PROTOCOL 11.4): the platform it is for (stored only when not windows-x64, so a run put before rev 17 reads the same),
-// and no vendor for a CPU alternate (offered to every machine of its platform, no GPU condition).
+// and no vendor for a CPU alternate (offered to every machine of its platform, no GPU condition). Rev 20 (PROTOCOL 14.3):
+// `model`, a model variant its machines play instead of each gen's default model (absent: the default).
 export interface Alternate {
   build_id: string;
   runtime: string;
   when: { platform?: Platform; vendor?: string; min_driver?: string | null };
+  model?: string;
 }
 export const altPlatform = (a: Alternate): Platform => storedPlatform(a.when.platform);
 

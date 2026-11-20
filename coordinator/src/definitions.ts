@@ -30,7 +30,11 @@ const GEN_RE = /^(0|[1-9]\d{0,8})$/;
 const MODE_RE = /^[A-Za-z0-9_.-]{1,128}$/;
 const ENV_RE = /^[A-Za-z0-9_]{1,64}$/;
 const TOP_KEYS = ["definition", "kind", "id", "version", "created", "expires", "game", "builds", "runtime", "checkpoints", "jobs"];
-const CKPT_KEYS = ["model_sha256", "model_size", "reference_sha256", "reference_size"];
+const CKPT_KEYS = ["model_sha256", "model_size", "reference_sha256", "reference_size", "variants"];
+// Rev 20 (PROTOCOL 14.1): a gen's model variants: at most MAX_VARIANTS, each exactly a model's sha256 and size.
+export const VARIANT_RE = /^[a-z0-9][a-z0-9-]{0,31}$/;
+export const MAX_VARIANTS = 8;
+const VARIANT_KEYS = ["model_sha256", "model_size"];
 // The keys a job template may have, per kind. Per-lease fields (`gid_base`, `games`, `seed`,
 // `first`, `count`) never: the coordinator sets those on each lease.
 const TEMPLATE_KEYS: Record<JobKind, string[]> = {
@@ -67,11 +71,18 @@ function noPaths(v: unknown, at: string, out: string[], depth = 0): void {
 export const defKey = (kind: DefKind, id: string, version: number) => `defs/${kind}/${id}/${version}/definition.json`;
 export const DEF_KEY_RE = /^defs\/(run|campaign)\/([a-z0-9][a-z0-9-]{0,62})\/([1-9]\d{0,14})\/definition\.json(\.minisig)?$/;
 
+export interface DefVariant {
+  model_sha256: string;
+  model_size: number;
+}
+
 export interface DefCheckpoint {
   model_sha256: string;
   model_size: number;
   reference_sha256: string | null;
   reference_size: number | null;
+  // Rev 20 (PROTOCOL 14.1): other model files of the gen (absent: none; never empty), sharing its reference set.
+  variants?: Record<string, DefVariant>;
 }
 
 export interface DefJobs {
@@ -232,6 +243,35 @@ function template(kind: JobKind, v: unknown, out: string[]): Record<string, Json
   return v as Record<string, Json>;
 }
 
+// Rev 20 (PROTOCOL 14.1): a gen's `variants` (absent: none). Present, it is an object of 1 to MAX_VARIANTS names, each
+// exactly {model_sha256, model_size}: an empty object is refused (agents before 0.3.5 can't read a definition with the
+// key at all, so "has the key" and "has variants" must be one thing).
+function variantsOf(v: unknown, n: string, size: (x: unknown) => boolean, p: string[]): Record<string, DefVariant> | undefined {
+  if (v === undefined) return undefined;
+  if (!isObj(v) || !Object.keys(v).length || Object.keys(v).length > MAX_VARIANTS) {
+    p.push(`${n}.variants must be an object of 1 to ${MAX_VARIANTS} variants (leave it out for none)`);
+    return undefined;
+  }
+  const out: Record<string, DefVariant> = {};
+  for (const [name, x] of Object.entries(v)) {
+    const at = `${n}.variants.${name}`;
+    if (!VARIANT_RE.test(name)) p.push(`${n}.variants: ${JSON.stringify(name.slice(0, 40))} is not a variant name ([a-z0-9][a-z0-9-]{0,31})`);
+    if (!isObj(x)) {
+      p.push(`${at} must be an object {model_sha256, model_size}`);
+      continue;
+    }
+    for (const k of Object.keys(x)) if (!VARIANT_KEYS.includes(k)) p.push(`${at}.${k}: unknown field`);
+    if (typeof x.model_sha256 !== "string" || !HEX64_RE.test(x.model_sha256)) p.push(`${at}.model_sha256 must be lowercase hex sha256`);
+    if (!size(x.model_size)) p.push(`${at}.model_size must be 1 to ${MAX_FILE} bytes`);
+    out[name] = { model_sha256: x.model_sha256, model_size: x.model_size };
+  }
+  return out;
+}
+
+// Rev 20 (PROTOCOL 14.1): a definition that signs any variant. Agents before VARIANT_AGENT can't read it, so it counts as
+// that min_agent for every lease of its run.
+export const hasVariants = (d: Pick<Def, "checkpoints">): boolean => Object.values(d.checkpoints).some((c) => !!c.variants);
+
 // Parses and checks definition.json (PROTOCOL 7). Throws 400 with every problem found.
 export function parseDefinition(text: string): DefinitionDoc {
   const p: string[] = [];
@@ -279,7 +319,8 @@ export function parseDefinition(text: string): DefinitionDoc {
         if (ref !== null && (typeof ref !== "string" || !HEX64_RE.test(ref))) p.push(`${n}.reference_sha256 must be lowercase hex sha256 or null`);
         if (ref !== null && !size(refSize)) p.push(`${n}.reference_size must be 1 to ${MAX_FILE} bytes`);
         if (ref === null && refSize !== null) p.push(`${n}.reference_size without reference_sha256`);
-        checkpoints[gen] = { model_sha256: c.model_sha256, model_size: c.model_size, reference_sha256: ref, reference_size: refSize };
+        const variants = variantsOf(c.variants, n, size, p);
+        checkpoints[gen] = { model_sha256: c.model_sha256, model_size: c.model_size, reference_sha256: ref, reference_size: refSize, ...(variants ? { variants } : {}) };
       }
     }
   }
@@ -351,6 +392,22 @@ export function checkpointProblem(d: Def, c: CkptFacts): string | null {
   if (c.reference_size !== null && e.reference_size !== null && e.reference_size !== c.reference_size) {
     return `checkpoint ${c.gen}'s reference size differs from definition v${d.version}`;
   }
+  return null;
+}
+
+// Rev 20 (PROTOCOL 14): a registered variant of a gen (checkpoints.variants), and why `d` doesn't sign it as registered
+// (null: it does, and a lease may carry it instead of the gen's default model). "Not signed" and "not registered" are
+// notes, not errors: the gen's default model is leased in its place.
+export interface VariantFacts {
+  model: string;
+  sha256: string;
+  size: number | null;
+}
+export function variantProblem(d: Def, gen: number, name: string, v: VariantFacts | undefined): string | null {
+  if (!v) return `gen ${gen}: no variant ${name} registered`;
+  const e = d.checkpoints[String(gen)]?.variants?.[name];
+  if (!e) return `gen ${gen}: definition v${d.version} doesn't sign variant ${name}`;
+  if (e.model_sha256 !== v.sha256 || (v.size !== null && e.model_size !== v.size)) return `gen ${gen}: variant ${name} differs from definition v${d.version}`;
   return null;
 }
 

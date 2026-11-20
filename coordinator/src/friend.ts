@@ -4,7 +4,7 @@ import * as book from "./book";
 import { blockedBuilds, recordBlock } from "./blocks";
 import { config } from "./config";
 import { authMachine, type Ctx, type MachineRow } from "./ctx";
-import { currentDefs, DEF_KEY_RE, leaseProblem, type JobKind } from "./definitions";
+import { currentDefs, DEF_KEY_RE, hasVariants, leaseProblem, type JobKind } from "./definitions";
 import { bookFor } from "./leasebook";
 import { minAgentOk } from "./manifest";
 import { DEFAULT_PLATFORM, type Platform, requestPlatform, storedPlatform } from "./platform";
@@ -270,6 +270,7 @@ interface Candidate {
   build_id: string;
   runtime: string | null;
   alt: boolean;
+  model?: string; // rev 20 (PROTOCOL 14.3): the model variant the chosen alternate names (book.ts decides per gen)
   gpu_lease: boolean; // an alternate, or a machine GPU-eligible for the job: `auto` leases get GPU_LEASE_MIN
   share?: number; // rev 13: a background job's share of the runs' active leases (PROTOCOL 5.3)
 }
@@ -426,6 +427,8 @@ export async function lease(c: Ctx): Promise<Response> {
         def_aware: o.defAware,
         platform: m.platform, // rev 17: checked again under the scope's lock
         ...(cd.alt ? { alt: { build_id: cd.build_id, runtime: cd.runtime } } : {}),
+        // rev 20 (PROTOCOL 14.3): this agent takes model variants
+        ...(cmpSemver(agent, cfg.variantAgent) >= 0 ? { variants: true } : {}),
         ...(rolling && cd.kind === "selfplay" ? { rolling: true } : {}),
       }),
     );
@@ -504,6 +507,8 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
   const defAware = cmpSemver(agent, cfg.definitionAgent) >= 0;
   // Rev 11 (PROTOCOL 9): this agent takes run alternates and packs with a GPU requirement.
   const altAware = defAware && cmpSemver(agent, cfg.altRuntimeAgent) >= 0;
+  // Rev 20 (PROTOCOL 14): this agent takes model variants (and can read a definition that signs them).
+  const variantAware = defAware && cmpSemver(agent, cfg.variantAgent) >= 0;
   // Where a job goes on this machine (PROTOCOL 8): GPU-eligible when it may use the GPU and
   // verified a provider the job allows, with the job's runtime pack if the profile says.
   const placeFor = (kind: "selfplay" | "eval" | "fuzz", r: Routing, runtime: string | null) =>
@@ -586,9 +591,9 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
   // conditions 5-7 and the build's `aw`. One that only its `min_agent` keeps from this agent is held: when the default
   // isn't of this platform it is the run's build here, so section 3's update rule asks for that agent (as it would for
   // a default build) instead of the run giving this machine nothing without a word.
-  type Variant = { build_id: string; runtime: string | null; alt: boolean; eligible: boolean; gpuLease: boolean };
-  const variantFor = (r: book.RunRow, kind: "selfplay" | "eval", routing: Routing): Variant | null => {
-    let held: Variant | null = null;
+  type Choice = { build_id: string; runtime: string | null; alt: boolean; eligible: boolean; gpuLease: boolean; model?: string };
+  const choiceFor = (r: book.RunRow, kind: "selfplay" | "eval", routing: Routing): Choice | null => {
+    let held: Choice | null = null;
     if (altAware) {
       for (const a of altsOf(r)) {
         if (altPlatform(a) !== platform) continue;
@@ -618,7 +623,7 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
         if (bi.aw !== null && bi.aw !== aw) continue;
         const def = defs.get(`run:${r.run}`); // 7: the definition authorizes it
         if (!def || leaseProblem(def, kind, a.build_id, a.runtime, c.now, a.runtime)) continue;
-        const v: Variant = { build_id: a.build_id, runtime: a.runtime, alt: true, eligible, gpuLease: !!vendor };
+        const v: Choice = { build_id: a.build_id, runtime: a.runtime, alt: true, eligible, gpuLease: !!vendor, ...(a.model ? { model: a.model } : {}) };
         if ([bi.min_agent, ri.min_agent].some((x) => x && !minAgentOk(agent, x))) {
           held ??= v; // 6: min_agent
           continue;
@@ -666,10 +671,12 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
     if (kinds.has("selfplay") && r.selfplay && r.current_gen !== null) {
       const sp = JSON.parse(r.selfplay) as book.SelfplayCfg;
       const routing = sp ? storedRouting(sp.gpu, sp.providers) : null;
-      const v = routing ? variantFor(r, "selfplay", routing) : null;
+      const v = routing ? choiceFor(r, "selfplay", routing) : null;
       const at = routing && v ? place("selfplay", routing, v.eligible, caps.gpu) : null;
       if (sp && routing && v && at && needsOk(sp.needs) && diskOk([v.build_id, v.runtime])) {
-        const ckptBonus = cachedCkpts.has(`${r.run}/${r.current_gen}`) ? 1.1 : 1;
+        // rev 20: a lease of an alternate naming a variant brings that file (agents from 0.3.5 list it as run/gen/name)
+        const ckptKey = v.model && variantAware ? `${r.run}/${r.current_gen}/${v.model}` : `${r.run}/${r.current_gen}`;
+        const ckptBonus = cachedCkpts.has(ckptKey) || cachedCkpts.has(`${r.run}/${r.current_gen}`) ? 1.1 : 1;
         // Rev 18 (PROTOCOL 12.1): played on this PC's GPU (a GPU lease, and the agent's bench didn't say no GPU pays
         // for this run here); else, while the run has a GPU version, this PC's self-play is the last resort.
         const gpuPlay = altAware && v.gpuLease && a.gpuGames.get(r.run) !== 0;
@@ -689,6 +696,7 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
           build_id: v.build_id,
           runtime: v.runtime,
           alt: v.alt,
+          ...(v.model ? { model: v.model } : {}),
           gpu_lease: altAware && v.gpuLease,
           ...(typeof sp.share === "number" ? { share: sp.share } : {}),
         });
@@ -697,21 +705,29 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
     if (kinds.has("eval") && r.eval) {
       const ev = JSON.parse(r.eval) as book.EvalCfg | null;
       const routing = ev ? storedRouting(ev.gpu, ev.providers) : null;
-      const v = routing ? variantFor(r, "eval", routing) : null;
+      const v = routing ? choiceFor(r, "eval", routing) : null;
       const at = routing && v ? place("eval", routing, v.eligible, caps.gpu) : null;
       if (ev && routing && v && at && Array.isArray(ev.checkpoints) && (poolN.get(`${scope}|eval:${ev.batch}`) ?? 0) > 0 && needsOk(ev.needs)) {
-        // Rev 5: the lease brings every network the seats name; uncached ones count against the disk.
+        // Rev 5: the lease brings every network the seats name; uncached ones count against the disk. Rev 20: a gen's
+        // variant instead (its own entry and size) when the alternate names one and the gen has it registered.
+        const vname = v.model && variantAware ? v.model : null;
         const keys = ev.checkpoints.map((g) => `${r.run}/${g}`);
         let ckptBytes = 0;
-        if (keys.some((k) => !cachedCkpts.has(k))) {
+        let ckptKeys = keys;
+        if (vname || keys.some((k) => !cachedCkpts.has(k))) {
           const { results } = await db
-            .prepare(`SELECT gen, size FROM checkpoints WHERE run = ? AND gen IN (${ev.checkpoints.map(() => "?").join(",")})`)
+            .prepare(`SELECT gen, size, variants FROM checkpoints WHERE run = ? AND gen IN (${ev.checkpoints.map(() => "?").join(",")})`)
             .bind(r.run, ...ev.checkpoints)
-            .all<{ gen: number; size: number | null }>();
-          ckptBytes = results.reduce((s, x) => s + (cachedCkpts.has(`${r.run}/${x.gen}`) ? 0 : (x.size ?? 0)), 0);
+            .all<{ gen: number; size: number | null; variants: string | null }>();
+          const fileOf = (x: { gen: number; size: number | null; variants: string | null }) => {
+            const vf = vname ? book.variantsOf(x)[vname] : undefined;
+            return vf ? { key: `${r.run}/${x.gen}/${vname}`, size: vf.size ?? 0 } : { key: `${r.run}/${x.gen}`, size: x.size ?? 0 };
+          };
+          ckptKeys = results.map((x) => fileOf(x).key);
+          ckptBytes = results.reduce((s, x) => s + (cachedCkpts.has(fileOf(x).key) ? 0 : fileOf(x).size), 0);
         }
         if (diskOk([v.build_id, v.runtime], ckptBytes)) {
-          const ckptBonus = keys.length && keys.every((k) => cachedCkpts.has(k)) ? 1.1 : 1;
+          const ckptBonus = ckptKeys.length && ckptKeys.every((k) => cachedCkpts.has(k)) ? 1.1 : 1;
           cands.push({
             scope,
             kind: "eval",
@@ -727,6 +743,7 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
             build_id: v.build_id,
             runtime: v.runtime,
             alt: v.alt,
+            ...(v.model ? { model: v.model } : {}),
             gpu_lease: altAware && v.gpuLease,
             ...(typeof ev.share === "number" ? { share: ev.share } : {}),
           });
@@ -771,7 +788,7 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
   const usable = cands.filter((cd) => {
     const r = cd.run ? runs.find((x) => x.run === cd.run) : null;
     const camp = r ? null : camps.find((x) => x.campaign === cd.campaign)!;
-    // Rev 11: the candidate's own build and runtime (a run's default, or the alternate variantFor chose; rev 17: a
+    // Rev 11: the candidate's own build and runtime (a run's default, or the alternate choiceFor chose; rev 17: a
     // campaign's build or its alternate).
     const ids = r ? [cd.build_id, cd.runtime] : [cd.build_id];
     if (ids.some((id) => id && blocked.has(id))) return false;
@@ -783,7 +800,9 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
     if (def && defAware && leaseProblem(def, cd.kind as JobKind, ids[0]!, r ? cd.runtime : null, c.now, cd.alt ? cd.runtime : undefined)) return false;
     // Rev 9: the run's or campaign's own min_agent counts like a build's.
     const own = r ? r.min_agent : camp!.min_agent;
-    const req = maxSemver([...infos.map((i) => i!.min_agent), cd.kind === "eval" ? EVAL_MIN_AGENT : null, def ? cfg.definitionAgent : null, own]);
+    // Rev 20 (PROTOCOL 14.1): a definition that signs a model variant can't be read by agents before VARIANT_AGENT.
+    const defAgent = def ? (hasVariants(def) ? maxSemver([cfg.definitionAgent, cfg.variantAgent]) : cfg.definitionAgent) : null;
+    const req = maxSemver([...infos.map((i) => i!.min_agent), cd.kind === "eval" ? EVAL_MIN_AGENT : null, defAgent, own]);
     if (req && !minAgentOk(agent, req)) {
       // Only ask for an update the channel can deliver.
       if (release && cmpSemver(req, release.version) <= 0) need = maxSemver([need, req]);

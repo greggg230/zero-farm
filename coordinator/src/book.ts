@@ -30,6 +30,8 @@ import {
   defRef,
   evalProblem,
   leaseProblem,
+  type VariantFacts,
+  variantProblem,
 } from "./definitions";
 import { intersect, normalize, parseRanges, subtract, total, type Range } from "./ranges";
 import { storedPlatform } from "./platform";
@@ -86,6 +88,7 @@ export interface RollingCfg {
 export const ROLLING_AUTO_INFLIGHT = 256; // "auto" counts this much when sizing a grant's first release
 export const ROLLING_QUOTA_WAIT_S = 60; // an extension with no headroom: ask again after this
 export const MAX_GID = 2 ** 32; // a rolling block never reaches past this game id (PROTOCOL 10.3)
+export const MAX_GEN_VARIANTS = 8; // rev 20 (PROTOCOL 14.2): model variants per checkpoint gen
 export interface EvalCfg {
   batch: string;
   games: number;
@@ -198,6 +201,9 @@ export interface LeaseRow {
   rel_hi: number | null;
   until: number | null; // rolling: the lease runs to at least this time (renewals move it on)
   cur_gen: number | null; // rolling: the newest generation the agent reported (`gen` stays the first)
+  // Rev 20 (PROTOCOL 14.3, migration 0016): the model variant the lease was granted for (its alternate's `model`, to an
+  // agent from VARIANT_AGENT); NULL: the default model. Absent on rows read before the migration.
+  variant?: string | null;
 }
 
 // Rev 15: a lease's game ids end here: the released ids of a rolling lease, all of [lo, hi) of a classic one.
@@ -213,7 +219,12 @@ export interface CheckpointRow {
   reference_sha256: string | null;
   size: number | null;
   reference_size: number | null;
+  variants?: string | null; // rev 20 (PROTOCOL 14.2): JSON {"<name>": {"model", "sha256", "size"}}; NULL: none
 }
+
+// Rev 20: a checkpoint's registered variants by name ({} without).
+export const variantsOf = (c: Pick<CheckpointRow, "variants">): Record<string, VariantFacts> =>
+  parseJson<Record<string, VariantFacts> | null>(c.variants ?? null, null) ?? {};
 
 export const ckptFacts = (c: CheckpointRow) => ({
   gen: c.gen,
@@ -223,13 +234,31 @@ export const ckptFacts = (c: CheckpointRow) => ({
   reference_size: c.reference_size ?? null,
 });
 
-export const checkpointOf = (c: CheckpointRow) => ({
+export interface CheckpointRef {
+  gen: number;
+  model: string;
+  sha256: string;
+  reference: string | null;
+  reference_sha256: string | null;
+  variant?: string; // rev 20 (PROTOCOL 14.3): `model`/`sha256` are this variant's (absent: the gen's default model)
+}
+
+export const checkpointOf = (c: CheckpointRow): CheckpointRef => ({
   gen: c.gen,
   model: c.model,
   sha256: c.sha256,
   reference: c.reference,
   reference_sha256: c.reference_sha256,
 });
+
+// Rev 20 (PROTOCOL 14.3): the checkpoint a lease carries for `c`: the variant `name` when the gen has it registered and
+// the lease's definition signs it as registered, else the gen's default model (the same network). No variant without a
+// definition, or without a name (an agent before VARIANT_AGENT, an alternate without `model`, the run's default build).
+export function checkpointFor(c: CheckpointRow, def: Def | null | undefined, name: string | null | undefined): CheckpointRef {
+  const v = name ? variantsOf(c)[name] : undefined;
+  if (!name || !def || !v || variantProblem(def, c.gen, name, v)) return checkpointOf(c);
+  return { ...checkpointOf(c), model: v.model, sha256: v.sha256, variant: name };
+}
 
 type Stmt = D1PreparedStatement;
 
@@ -536,6 +565,9 @@ export interface GrantReq {
   alt?: { build_id: string; runtime: string | null };
   // Rev 17 (PROTOCOL 11): the machine's platform (absent: windows-x64). Every build the lease carries is of it.
   platform?: string;
+  // Rev 20 (PROTOCOL 14.3): the agent knows model variants (VARIANT_AGENT or newer): a lease of an alternate that names
+  // one (`model`) carries it for each gen that has it signed.
+  variants?: boolean;
   // Rev 15 (PROTOCOL 10.2): the agent takes rolling leases (ROLLING_AGENT or newer, `features: ["rolling"]`): a
   // self-play lease of a run with `selfplay.rolling` set is then rolling. Ignored for every other lease.
   rolling?: boolean;
@@ -561,8 +593,8 @@ export interface Lease {
   campaign: string | null;
   build: { build_id: string; manifest: string };
   runtime: { build_id: string; manifest: string } | null;
-  checkpoint: ReturnType<typeof checkpointOf> | null;
-  checkpoints: ReturnType<typeof checkpointOf>[] | null; // eval only (rev 5)
+  checkpoint: CheckpointRef | null;
+  checkpoints: CheckpointRef[] | null; // eval only (rev 5)
   // Rev 6: the signed definition this lease is issued under (PROTOCOL 7); absent on legacy leases.
   // Then `job` holds only the per-lease fields (and `kind`): the agent builds the job line from
   // the definition's template.
@@ -599,8 +631,8 @@ function insertLease(db: D1Database, l: Lease, row: Partial<LeaseRow> & { scope:
   return db
     .prepare(
       `INSERT INTO leases (lease_id, machine_id, scope, run, campaign, kind, pool, lo, hi, gen, build_id, diag_id,
-         lease, state, beat_s, slack_s, issued_at, expires_at, def_version, rel_hi, until)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?)`,
+         lease, state, beat_s, slack_s, issued_at, expires_at, def_version, rel_hi, until, variant)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
     .bind(
       l.lease_id,
@@ -623,6 +655,7 @@ function insertLease(db: D1Database, l: Lease, row: Partial<LeaseRow> & { scope:
       row.def_version ?? null,
       row.rel_hi ?? null,
       l.rolling?.until ?? null,
+      row.variant ?? null,
     );
 }
 
@@ -666,9 +699,12 @@ async function grantRunGames(env: Env, req: GrantReq): Promise<Lease | null> {
   let buildId = run.build_id;
   let runtime = run.runtime;
   let buildRuntime: string | null | undefined;
+  let variant: string | null = null; // rev 20: the model variant the chosen alternate names (for an agent that knows them)
   if (req.alt) {
     const alts = parseJson<Alternate[] | null>(run.alternates ?? null, null) ?? [];
-    if (!alts.some((a) => a.build_id === req.alt!.build_id && a.runtime === req.alt!.runtime)) return null;
+    const a = alts.find((x) => x.build_id === req.alt!.build_id && x.runtime === req.alt!.runtime);
+    if (!a) return null;
+    if (a.model && req.variants) variant = a.model;
     const b = await db.prepare(`SELECT manifest FROM builds WHERE build_id = ?`).bind(req.alt.build_id).first<{ manifest: string }>();
     buildRuntime = requiresRuntimeOf(b?.manifest);
     if (buildRuntime !== req.alt.runtime) return null;
@@ -760,14 +796,24 @@ async function grantRunGames(env: Env, req: GrantReq): Promise<Lease | null> {
     campaign: null,
     build: buildRef(buildId),
     runtime: runtime ? buildRef(runtime) : null,
-    checkpoint: ckpt ? checkpointOf(ckpt) : null,
-    checkpoints: evalCkpts ? evalCkpts.map(checkpointOf) : null,
+    // Rev 20 (PROTOCOL 14.3): each gen's variant when the alternate names one and the definition signs it, else its default.
+    checkpoint: ckpt ? checkpointFor(ckpt, def, variant) : null,
+    checkpoints: evalCkpts ? evalCkpts.map((c) => checkpointFor(c, def, variant)) : null,
     ...(def ? { definition: defRef(def) } : {}),
     job,
     ...(rolling ? { rolling } : {}),
   };
   stmts.push(
-    insertLease(db, lease, { scope, machine_id: req.machine_id, pool, lo: range[0], hi: range[1], def_version: def?.version ?? null, rel_hi: relHiAt }),
+    insertLease(db, lease, {
+      scope,
+      machine_id: req.machine_id,
+      pool,
+      lo: range[0],
+      hi: range[1],
+      def_version: def?.version ?? null,
+      rel_hi: relHiAt,
+      variant: def ? variant : null,
+    }),
   );
   await db.batch(stmts);
   return lease;
@@ -886,7 +932,7 @@ export interface BeatReq {
 export interface BeatAnswer {
   action: "continue" | "cancel" | "give_back";
   expires_at: number;
-  checkpoint: ReturnType<typeof checkpointOf> | null;
+  checkpoint: CheckpointRef | null;
   // Rev 15 (PROTOCOL 10.6): with a checkpoint offered to a rolling lease, the current definition, which signs it.
   // Never on a classic lease's answer.
   definition?: { key: string; sha256: string };
@@ -953,6 +999,8 @@ export async function beat(env: Env, r: BeatReq): Promise<BeatAnswer> {
   // every checkpoint against the lease's definition). A new gen normally comes with a new
   // definition version, so it reaches new leases instead.
   let checkpoint: BeatAnswer["checkpoint"] = null;
+  // Rev 20 (PROTOCOL 14.3): the lease's model variant, while the run's alternate of its build and runtime still names it.
+  const variant = l.run && l.variant ? await leaseVariant(db, l) : null;
   if (rolling && l.run) {
     // Rev 15 (PROTOCOL 10.6): a rolling lease switches in place to the run's current gen once the *current*
     // definition signs it; the answer names that definition, which the agent verifies before it switches.
@@ -962,7 +1010,7 @@ export async function beat(env: Env, r: BeatReq): Promise<BeatAnswer> {
       const c = await getCheckpoint(db, l.run, run.current_gen);
       const def = c ? await currentDef(db, "run", l.run) : null;
       if (c && def && !checkpointProblem(def, ckptFacts(c))) {
-        return { action, expires_at: r.now + EXPIRE_BEATS * l.beat_s, checkpoint: checkpointOf(c), definition: defRef(def) };
+        return { action, expires_at: r.now + EXPIRE_BEATS * l.beat_s, checkpoint: checkpointFor(c, def, variant), definition: defRef(def) };
       }
     }
     return { action, expires_at: r.now + EXPIRE_BEATS * l.beat_s, checkpoint: null };
@@ -972,10 +1020,20 @@ export async function beat(env: Env, r: BeatReq): Promise<BeatAnswer> {
     if (run && run.current_gen !== null && (l.gen === null || run.current_gen > l.gen)) {
       const c = await getCheckpoint(db, l.run, run.current_gen);
       const def = c && l.def_version !== null ? await defAt(db, "run", l.run, l.def_version) : null;
-      if (c && (l.def_version === null || (def && !checkpointProblem(def, ckptFacts(c))))) checkpoint = checkpointOf(c);
+      if (c && (l.def_version === null || (def && !checkpointProblem(def, ckptFacts(c))))) checkpoint = checkpointFor(c, def, variant);
     }
   }
   return { action, expires_at: r.now + EXPIRE_BEATS * l.beat_s, checkpoint };
+}
+
+// Rev 20 (PROTOCOL 14.3): the model variant a lease's generation switches carry: the one it was granted for, as long as
+// the run's alternate of the lease's build and runtime still names it (an owner who drops `model` turns it off for the
+// next generation of running leases too); null: the default model.
+async function leaseVariant(db: D1Database, l: LeaseRow): Promise<string | null> {
+  const run = await getRun(db, l.run!);
+  const runtime = parseJson<{ runtime?: { build_id?: string } | null }>(l.lease, {}).runtime?.build_id ?? null;
+  const alts = parseJson<Alternate[] | null>(run?.alternates ?? null, null) ?? [];
+  return alts.some((a) => a.build_id === l.build_id && a.runtime === runtime && a.model === l.variant) ? l.variant! : null;
 }
 
 // ---------- extend (rev 15, PROTOCOL 10.4) ----------
@@ -1628,31 +1686,52 @@ export interface CheckpointReq {
   reference_sha256: string | null;
   size: number | null;
   reference_size: number | null;
+  variants: Record<string, VariantFacts>; // rev 20 (PROTOCOL 14.2): {} for none
   now: number;
 }
 
+const variantsJson = (v: Record<string, VariantFacts>): string | null => (Object.keys(v).length ? JSON.stringify(v) : null);
+// The answer's `variants`: every name the gen has, only when it has any (the answer of before rev 20 otherwise).
+const names = (v: Record<string, VariantFacts>) => (Object.keys(v).length ? { variants: Object.keys(v).sort() } : {});
+
 // Registers a checkpoint. A gen newer than the current one becomes current for self-play (and
 // starts its quota count); rev 5: an older one is only registered, as an eval opponent or a
-// head-to-head's label (`current: false`).
-export async function publishCheckpoint(env: Env, c: CheckpointReq): Promise<{ ok: true; unchanged: boolean; current: boolean }> {
+// head-to-head's label (`current: false`). Rev 20 (PROTOCOL 14.2): with its model variants; a registered gen (the same
+// default files) may add variant names, never change or remove one.
+export async function publishCheckpoint(
+  env: Env,
+  c: CheckpointReq,
+): Promise<{ ok: true; unchanged: boolean; current: boolean; variants?: string[] }> {
   const db = env.DB;
   const run = await getRun(db, c.run);
   if (!run) throw notFound(`no run ${c.run}`);
   const old = await getCheckpoint(db, c.run, c.gen);
   if (old) {
-    if (old.sha256 === c.sha256 && old.reference_sha256 === c.reference_sha256 && old.model === c.model && old.reference === c.reference) {
-      return { ok: true, unchanged: true, current: run.current_gen === c.gen };
+    if (old.sha256 !== c.sha256 || old.reference_sha256 !== c.reference_sha256 || old.model !== c.model || old.reference !== c.reference) {
+      throw conflict(`checkpoint ${c.gen} of ${c.run} was already published with different files`);
     }
-    throw conflict(`checkpoint ${c.gen} of ${c.run} was already published with different files`);
+    const have = variantsOf(old);
+    const added: Record<string, VariantFacts> = {};
+    for (const [name, v] of Object.entries(c.variants)) {
+      const h = have[name];
+      if (!h) added[name] = v;
+      else if (h.model !== v.model || h.sha256 !== v.sha256) throw conflict(`variant ${name} of checkpoint ${c.gen} of ${c.run} was already published with a different file`);
+    }
+    const all = { ...have, ...added };
+    if (Object.keys(all).length > MAX_GEN_VARIANTS) throw bad(`checkpoint ${c.gen} would have more than ${MAX_GEN_VARIANTS} variants`);
+    if (Object.keys(added).length) {
+      await db.prepare(`UPDATE checkpoints SET variants = ? WHERE run = ? AND gen = ?`).bind(variantsJson(all), c.run, c.gen).run();
+    }
+    return { ok: true, unchanged: !Object.keys(added).length, current: run.current_gen === c.gen, ...names(all) };
   }
   const insert = db
     .prepare(
-      `INSERT INTO checkpoints (run, gen, model, sha256, reference, reference_sha256, size, reference_size, t) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      `INSERT INTO checkpoints (run, gen, model, sha256, reference, reference_sha256, size, reference_size, t, variants) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     )
-    .bind(c.run, c.gen, c.model, c.sha256, c.reference, c.reference_sha256, c.size, c.reference_size, c.now);
+    .bind(c.run, c.gen, c.model, c.sha256, c.reference, c.reference_sha256, c.size, c.reference_size, c.now, variantsJson(c.variants));
   if (run.current_gen !== null && c.gen < run.current_gen) {
     await db.batch([insert]);
-    return { ok: true, unchanged: false, current: false };
+    return { ok: true, unchanged: false, current: false, ...names(c.variants) };
   }
   await db.batch([
     insert,
@@ -1660,7 +1739,7 @@ export async function publishCheckpoint(env: Env, c: CheckpointReq): Promise<{ o
     // A new generation starts its quota count from zero.
     db.prepare(`INSERT OR REPLACE INTO quotas (run, gen, accepted, t) VALUES (?, ?, 0, ?)`).bind(c.run, c.gen, c.now),
   ]);
-  return { ok: true, unchanged: false, current: true };
+  return { ok: true, unchanged: false, current: true, ...names(c.variants) };
 }
 
 export async function accept(env: Env, run: string, gen: number, games: number, now: number): Promise<SelfplayState | null> {

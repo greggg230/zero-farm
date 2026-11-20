@@ -23,6 +23,11 @@ import {
   leaseProblem,
   parseDefinition,
   seatGens,
+  hasVariants,
+  MAX_VARIANTS,
+  VARIANT_RE,
+  type VariantFacts,
+  variantProblem,
 } from "./definitions";
 import { MAX_EXTERNAL_BODY, type Contributor, type ExternalRow, ownContributor, parseReport, storeReport, totals } from "./external";
 import { CHANNELS, evictList, serveObject } from "./friend";
@@ -386,8 +391,10 @@ export function alternatesOf(v: unknown): Alternate[] | null {
   if (!v.length) return null;
   return v.map((x: unknown, i: number) => {
     const o = obj(x, `alternates[${i}]`);
-    for (const k of Object.keys(o)) if (!["build_id", "runtime", "when"].includes(k)) throw bad(`alternates[${i}].${k}: unknown field`);
+    for (const k of Object.keys(o)) if (!["build_id", "runtime", "when", "model"].includes(k)) throw bad(`alternates[${i}].${k}: unknown field`);
     const w = obj(o.when, `alternates[${i}].when`, { optional: true }) ?? {};
+    // Rev 20 (PROTOCOL 14.3): a model variant its machines play; only the name is checked here (variants arrive per gen).
+    const model = o.model === undefined || o.model === null ? undefined : str(o.model, `alternates[${i}].model`, { re: VARIANT_RE });
     for (const k of Object.keys(w)) if (!["platform", "vendor", "min_driver"].includes(k)) throw bad(`alternates[${i}].when.${k}: unknown field`);
     const platform = w.platform === undefined || w.platform === null ? undefined : platformOf(w.platform, `alternates[${i}].when.platform`);
     const vendor = str(w.vendor, `alternates[${i}].when.vendor`, { optional: true, re: VENDOR_RE });
@@ -396,6 +403,7 @@ export function alternatesOf(v: unknown): Alternate[] | null {
       build_id: str(o.build_id, `alternates[${i}].build_id`, { re: BUILD_RE }),
       runtime: str(o.runtime, `alternates[${i}].runtime`, { re: BUILD_RE }),
       when: { ...(platform ? { platform } : {}), vendor: vendor ?? "", ...(minDriver ? { min_driver: minDriver } : {}) },
+      ...(model ? { model } : {}),
     };
   });
 }
@@ -433,12 +441,12 @@ async function altCheck(db: D1Database, cfg: book.RunCfg): Promise<Alternate[] |
         throw bad(`${at}.when.vendor is required: runtime ${a.runtime} names no GPU vendor of its own (a CPU alternate names when.platform instead, PROTOCOL 11.4)`);
       }
       if (a.when.min_driver) throw bad(`${at}.when.min_driver needs a vendor: a CPU alternate has no GPU condition`);
-      out.push({ build_id: a.build_id, runtime: a.runtime, when: { platform } });
+      out.push({ build_id: a.build_id, runtime: a.runtime, when: { platform }, ...(a.model ? { model: a.model } : {}) });
       continue;
     }
     if (platform !== DEFAULT_PLATFORM) throw bad(`${at}: no GPU work on ${platform} yet (PROTOCOL 11.5); a CPU alternate names no vendor`);
     if (GPU_VENDORS_OFF.includes(vendor)) throw bad(`${at}: the farm runs no GPU work on ${vendor} GPUs (PROTOCOL 9.4)`);
-    out.push({ build_id: a.build_id, runtime: a.runtime, when: { vendor, ...(a.when.min_driver ? { min_driver: a.when.min_driver } : {}) } });
+    out.push({ build_id: a.build_id, runtime: a.runtime, when: { vendor, ...(a.when.min_driver ? { min_driver: a.when.min_driver } : {}) }, ...(a.model ? { model: a.model } : {}) });
   }
   return out;
 }
@@ -540,8 +548,8 @@ export async function getRunRoute(c: Ctx, run: string): Promise<Response> {
   if (!r) throw notFound(`no run ${run}`);
   const scope = book.runScope(run);
   const sp = unwrap(await bookFor(c.env, scope).selfplayState(run));
-  const ckpt = r.current_gen === null ? null : await c.env.DB.prepare(`SELECT * FROM checkpoints WHERE run = ? AND gen = ?`).bind(run, r.current_gen).first();
-  const gens = (await c.env.DB.prepare(`SELECT gen FROM checkpoints WHERE run = ? ORDER BY gen`).bind(run).all<{ gen: number }>()).results;
+  const ckpt = r.current_gen === null ? null : await c.env.DB.prepare(`SELECT * FROM checkpoints WHERE run = ? AND gen = ?`).bind(run, r.current_gen).first<book.CheckpointRow>();
+  const gens = (await c.env.DB.prepare(`SELECT gen, variants FROM checkpoints WHERE run = ? ORDER BY gen`).bind(run).all<{ gen: number; variants: string | null }>()).results;
   const batches = await evalBatches(c.env.DB, run, 50);
   const alternates = await alternatesStatus(c, r);
   return json({
@@ -557,8 +565,10 @@ export async function getRunRoute(c: Ctx, run: string): Promise<Response> {
     eval_batch: r.eval_batch,
     next_gid: r.next_gid,
     current_gen: r.current_gen,
-    checkpoint: ckpt,
+    // Rev 20 (PROTOCOL 14.2): the current gen's variants ({} without), and every gen that has any.
+    checkpoint: ckpt ? { ...ckpt, variants: book.variantsOf(ckpt) } : null,
     checkpoints: gens.map((g) => g.gen),
+    variants: Object.fromEntries(gens.filter((g) => g.variants).map((g) => [String(g.gen), Object.keys(book.variantsOf(g)).sort()])),
     selfplay_state: sp,
     eval_state: batches.find((b) => b.batch === r.eval_batch && b.replaced_at === null) ?? null,
     eval_batches: batches,
@@ -596,11 +606,37 @@ export async function rollingLeases(db: D1Database, scope: string) {
   }));
 }
 
-// Rev 11: a run's alternates, each with why its current definition doesn't authorize it (`problems`).
-async function alternatesStatus(c: Ctx, r: book.RunRow, known?: Def | null): Promise<(Alternate & { problems: string[] })[] | null> {
+// Rev 11: a run's alternates, each with why its current definition doesn't authorize it (`problems`). Rev 20 (PROTOCOL
+// 14.3): an alternate that names a model variant adds `variant_notes`: the gens it would play (the current gen, the
+// current eval batch's) whose variant isn't registered or signed as registered, so their default model is leased.
+async function alternatesStatus(
+  c: Ctx,
+  r: book.RunRow,
+  known?: Def | null,
+): Promise<(Alternate & { problems: string[]; variant_notes?: string[] })[] | null> {
   const alts = parseJson<Alternate[] | null>(r.alternates ?? null, null);
   if (!alts) return null;
   const d = known === undefined ? await currentDef(c.env.DB, "run", r.run) : known;
+  let rows: book.CheckpointRow[] | null = null;
+  const notesFor = async (name: string): Promise<string[]> => {
+    if (rows === null) {
+      const gens = new Set<number>();
+      if (parseJson<book.SelfplayCfg | null>(r.selfplay, null) && r.current_gen !== null) gens.add(r.current_gen);
+      const ev = parseJson<book.EvalCfg | null>(r.eval, null);
+      if (ev && Array.isArray(ev.checkpoints) && r.eval_batch === ev.batch) for (const g of ev.checkpoints) gens.add(g);
+      const list = [...gens].sort((a, b) => a - b);
+      rows = list.length
+        ? (await c.env.DB.prepare(`SELECT * FROM checkpoints WHERE run = ? AND gen IN (${list.map(() => "?").join(",")}) ORDER BY gen`).bind(r.run, ...list).all<book.CheckpointRow>())
+            .results
+        : [];
+    }
+    const out: string[] = [];
+    for (const ck of rows) {
+      const p = d ? variantProblem(d, ck.gen, name, book.variantsOf(ck)[name]) : null;
+      if (p) out.push(`${p}: its default model is leased`);
+    }
+    return out;
+  };
   const out = [];
   for (const a of alts) {
     const b = await c.env.DB.prepare(`SELECT manifest FROM builds WHERE build_id = ?`).bind(a.build_id).first<{ manifest: string }>();
@@ -614,7 +650,7 @@ async function alternatesStatus(c: Ctx, r: book.RunRow, known?: Def | null): Pro
         if (p) problems.push(`${k}: ${p}`);
       }
     }
-    out.push({ ...a, problems });
+    out.push({ ...a, problems, ...(a.model ? { variant_notes: await notesFor(a.model) } : {}) });
   }
   return out;
 }
@@ -652,10 +688,37 @@ export async function putCheckpoint(c: Ctx, run: string, genStr: string): Promis
     if (rh.checksums.sha256 && hex(rh.checksums.sha256) !== referenceSha) throw bad(`${reference} does not match reference_sha256`);
     referenceSize = rh.size;
   }
-  // Rev 6: a gen the current definition already signs must be exactly those files.
+  // Rev 20 (PROTOCOL 14.2): the gen's model variants, each a file under ckpt/<run>/ uploaded first, sharing its reference.
+  const variants: Record<string, VariantFacts> = {};
+  if (b.variants !== undefined && b.variants !== null) {
+    const vs = obj(b.variants, "variants");
+    if (Object.keys(vs).length > MAX_VARIANTS) throw bad(`variants: at most ${MAX_VARIANTS} per gen`);
+    const keys = new Set([model]);
+    for (const [name, x] of Object.entries(vs)) {
+      if (!VARIANT_RE.test(name)) throw bad(`variants: ${JSON.stringify(name.slice(0, 40))} is not a variant name ([a-z0-9][a-z0-9-]{0,31})`);
+      const v = obj(x, `variants.${name}`);
+      for (const k of Object.keys(v)) if (!["model", "sha256"].includes(k)) throw bad(`variants.${name}.${k}: unknown field`);
+      const key = checkKey(str(v.model, `variants.${name}.model`, { max: 512 }));
+      const sha = str(v.sha256, `variants.${name}.sha256`, { re: HEX64_RE });
+      if (!key.startsWith(`ckpt/${run}/`)) throw bad(`${key} is not under ckpt/${run}/`);
+      if (keys.has(key) || key === reference) throw bad(`variants.${name}.model ${key} is another file of this gen`);
+      keys.add(key);
+      const vh = await c.env.BUCKET.head(key);
+      if (!vh) throw bad(`${key} is not uploaded`);
+      if (vh.checksums.sha256 && hex(vh.checksums.sha256) !== sha) throw bad(`${key} does not match variants.${name}.sha256`);
+      variants[name] = { model: key, sha256: sha, size: vh.size };
+    }
+  }
+  // Rev 6: a gen the current definition already signs must be exactly those files (rev 20: its variants too).
   const def = await currentDef(c.env.DB, "run", run);
   const facts = { gen: Number(genStr), sha256, size: head.size, reference_sha256: referenceSha, reference_size: referenceSize };
   if (def && def.checkpoints[String(facts.gen)] && checkpointProblem(def, facts)) throw bad(checkpointProblem(def, facts)!);
+  for (const [name, v] of Object.entries(variants)) {
+    if (def && def.checkpoints[String(facts.gen)]?.variants?.[name]) {
+      const p = variantProblem(def, facts.gen, name, v);
+      if (p) throw bad(p);
+    }
+  }
   const ans = unwrap(
     await bookFor(c.env, book.runScope(run)).publishCheckpoint({
       run,
@@ -666,6 +729,7 @@ export async function putCheckpoint(c: Ctx, run: string, genStr: string): Promis
       reference_sha256: referenceSha,
       size: head.size,
       reference_size: referenceSize,
+      variants,
       now: c.now,
     }),
   );
@@ -1192,6 +1256,8 @@ export async function stats(c: Ctx): Promise<Response> {
       unacked_results: extra.unacked,
       pool: extra.pool,
       definition: await definitionStatus(c, "run", r.run, r, null, defs.get(`run:${r.run}`) ?? null),
+      // Rev 20 (PROTOCOL 14.3): its alternates (as in GET run: `problems`, and `variant_notes` for one naming a variant).
+      alternates: alts,
       // Rev 17 (PROTOCOL 11.4): the platforms that can get its jobs.
       platforms: await platformsOf(db, r.build_id, (alts ?? []).map((a) => ({ platform: altPlatform(a), problems: a.problems }))),
     });
@@ -1381,10 +1447,20 @@ export async function putDefinition(c: Ctx): Promise<Response> {
   const gens = Object.keys(d.checkpoints).map(Number);
   if (kind === "run" && gens.length) {
     const { results: ck } = await c.env.DB.prepare(`SELECT * FROM checkpoints WHERE run = ?`).bind(id).all<book.CheckpointRow>();
+    const asDef = { ...d, key, sha256: sha, size: bytes.length, key_id: "", registered_at: 0 };
     for (const row of ck) {
-      if (!d.checkpoints[String(row.gen)]) continue;
-      const p = checkpointProblem({ ...d, key, sha256: sha, size: bytes.length, key_id: "", registered_at: 0 }, book.ckptFacts(row));
+      const e = d.checkpoints[String(row.gen)];
+      if (!e) continue;
+      const p = checkpointProblem(asDef, book.ckptFacts(row));
       if (p) problems.push(p);
+      // Rev 20 (PROTOCOL 14.2): a variant both register and sign must be the same file (one only signed, or only
+      // registered, is no error: the gen's default model is leased until both agree).
+      const reg = book.variantsOf(row);
+      for (const name of Object.keys(e.variants ?? {})) {
+        if (!reg[name]) continue;
+        const vp = variantProblem(asDef, row.gen, name, reg[name]);
+        if (vp) problems.push(vp);
+      }
     }
   }
   if (problems.length) throw bad(`definition ${kind} ${id} version ${version} can't be registered`, { problems });
@@ -1425,6 +1501,10 @@ export interface DefStatus {
   gens: number[];
   jobs: string[];
   problems: string[];
+  // Rev 20 (PROTOCOL 14.1): the oldest agent that can read it (DEFINITION_AGENT, or VARIANT_AGENT when it signs a model
+  // variant: its run's leases go only to agents from there); null without a definition.
+  needs_agent: string | null;
+  variants: Record<string, string[]>; // rev 20: the variants it signs per gen ({} without)
 }
 
 async function definitionStatus(
@@ -1451,6 +1531,8 @@ async function definitionStatus(
       gens: [],
       jobs: [],
       problems: [`no definition: only agents older than ${agent} get its work (legacy leases)`],
+      needs_agent: null,
+      variants: {},
     };
   }
   const problems: string[] = [];
@@ -1494,6 +1576,12 @@ async function definitionStatus(
       .sort((a, b) => a - b),
     jobs: (["selfplay", "eval", "fuzz"] as const).filter((k) => d.jobs[k]),
     problems,
+    needs_agent: hasVariants(d) ? (cmpSemver(config(c.env).variantAgent, agent) > 0 ? config(c.env).variantAgent : agent) : agent,
+    variants: Object.fromEntries(
+      Object.entries(d.checkpoints)
+        .filter(([, e]) => e.variants)
+        .map(([g, e]) => [g, Object.keys(e.variants!).sort()]),
+    ),
   };
 }
 

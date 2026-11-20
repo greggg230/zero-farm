@@ -218,7 +218,14 @@ export async function definitionFor(kind: "run" | "campaign", id: string): Promi
     builds: [r.build_id],
     runtime: r.runtime,
     checkpoints: Object.fromEntries(
-      ck.map((c: any) => [String(c.gen), { model_sha256: c.sha256, model_size: c.size, reference_sha256: c.reference_sha256, reference_size: c.reference_size }]),
+      ck.map((c: any) => {
+        // Rev 20 (PROTOCOL 14.1): the gen's registered variants too, as the trainer signs them.
+        const vs = c.variants ? JSON.parse(c.variants) : null;
+        const variants = vs
+          ? { variants: Object.fromEntries(Object.entries(vs).map(([n, v]: [string, any]) => [n, { model_sha256: v.sha256, model_size: v.size }])) }
+          : {};
+        return [String(c.gen), { model_sha256: c.sha256, model_size: c.size, reference_sha256: c.reference_sha256, reference_size: c.reference_size, ...variants }];
+      }),
     ),
     // Templates as the agent takes them: only their kind's keys (no per-lease `seed`).
     jobs: {
@@ -495,11 +502,16 @@ export async function checkDefinitionLease(m: Machine, l: any): Promise<any> {
   }
   expect([d.kind, d.id]).toEqual(l.run ? ["run", l.run] : ["campaign", l.campaign]);
   expect(d.builds).toContain(l.build.build_id);
-  expect(d.runtime ?? null).toBe(l.runtime?.build_id ?? null);
+  if ((d.runtime ?? null) !== (l.runtime?.build_id ?? null)) {
+    // rev 11 (PROTOCOL 7, 9): an alternate's runtime is the one its worker build requires (its signed manifest)
+    const b = await env.DB.prepare(`SELECT manifest FROM builds WHERE build_id = ?`).bind(l.build.build_id).first<{ manifest: string }>();
+    expect(JSON.parse(b!.manifest).requires_runtime, "an alternate: the runtime its build requires").toBe(l.runtime?.build_id);
+  }
   for (const c of [l.checkpoint, ...(l.checkpoints ?? [])].filter(Boolean)) {
     const e = d.checkpoints[String(c.gen)];
     expect(e, `gen ${c.gen} signed`).toBeTruthy();
-    expect(e.model_sha256).toBe(c.sha256);
+    // rev 20: a variant's file is signed under the gen's `variants` (the reference stays the gen's)
+    expect(c.variant ? e.variants?.[c.variant]?.model_sha256 : e.model_sha256, `gen ${c.gen} ${c.variant ?? "default"} model`).toBe(c.sha256);
     expect(e.reference_sha256 ?? null).toBe(c.reference_sha256 ?? null);
   }
   const allowed = l.kind === "fuzz" ? ["count", "first", "kind"] : ["games", "gid_base", "kind", "seed"];

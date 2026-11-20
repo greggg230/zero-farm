@@ -24,7 +24,7 @@ export interface LeaseBookApi {
   cancelLease(leaseId: string, reason: string, now: number): Promise<Outcome<boolean>>;
   putRun(cfg: book.RunCfg, now: number): Promise<Outcome<{ ok: true; created: boolean }>>;
   putCampaign(cfg: book.CampaignCfg, now: number): Promise<Outcome<{ ok: true; created: boolean; cursor: number }>>;
-  publishCheckpoint(req: book.CheckpointReq): Promise<Outcome<{ ok: true; unchanged: boolean }>>;
+  publishCheckpoint(req: book.CheckpointReq): Promise<Outcome<{ ok: true; unchanged: boolean; current: boolean; variants?: string[] }>>;
   accept(run: string, gen: number, games: number, now: number): Promise<Outcome<book.SelfplayState | null>>;
   ack(scope: string, cursor: number, now: number): Promise<Outcome<{ ok: true; acked: number }>>;
   selfplayState(run: string): Promise<Outcome<book.SelfplayState | null>>;

@@ -38,8 +38,11 @@ CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET, an Access service token)
   run <run> <config.json|->                        create/update a run (PUT /v1/admin/run/<run>); alternates
                                                    take when.platform (a CPU alternate: no vendor)
   run-get <run>
-  checkpoint <run> <gen> <model.onnx> [reference.npz]   upload to ckpt/<run>/<gen>/ and publish
-                                                   (older than current: registered, not current)
+  checkpoint <run> <gen> <model.onnx> [reference.npz] [--variants NAME=FILE[,NAME=FILE]]
+                                                   upload to ckpt/<run>/<gen>/ and publish (older than
+                                                   current: registered, not current); --variants: model
+                                                   variants as ckpt/<run>/<gen>/model-NAME.onnx (rev 20,
+                                                   PROTOCOL 14.2; a registered gen may add names)
   results <run> [--after N] [--limit N]
   accept <run> <gen> <games>                       the trainer's total of accepted games for gen
   ack <run> <cursor>
@@ -270,7 +273,7 @@ async function main(argv: string[]): Promise<void> {
       need(pos, 1, "run-get <run>");
       return print(await api("GET", `/v1/admin/run/${pos[0]}`));
     case "checkpoint": {
-      need(pos, 3, "checkpoint <run> <gen> <model.onnx> [reference.npz]");
+      need(pos, 3, "checkpoint <run> <gen> <model.onnx> [reference.npz] [--variants NAME=FILE[,NAME=FILE]]");
       const [run, gen, model, ref] = pos;
       const modelKey = `ckpt/${run}/${gen}/model.onnx`;
       await putFile(modelKey, model);
@@ -280,6 +283,18 @@ async function main(argv: string[]): Promise<void> {
         await putFile(refKey, ref);
         body.reference = refKey;
         body.reference_sha256 = await sha256File(ref);
+      }
+      if (opt.variants) {
+        const variants: Record<string, { model: string; sha256: string }> = {};
+        for (const pair of opt.variants.split(",")) {
+          const at = pair.indexOf("=");
+          if (at < 1) throw new Error(`--variants: ${pair} is not NAME=FILE`);
+          const [name, file] = [pair.slice(0, at), pair.slice(at + 1)];
+          const key = `ckpt/${run}/${gen}/model-${name}.onnx`;
+          await putFile(key, file);
+          variants[name] = { model: key, sha256: await sha256File(file) };
+        }
+        body.variants = variants;
       }
       return print(await api("PUT", `/v1/admin/run/${run}/checkpoint/${gen}`, body));
     }

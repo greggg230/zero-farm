@@ -205,7 +205,8 @@ function render(s) {
   ], s.campaigns);
 
   // Signed definitions (PROTOCOL 7): what each run's and campaign's current definition allows.
-  const defs = [...s.runs.map((r) => ({ kind: "run", id: r.run, d: r.definition })), ...s.campaigns.map((x) => ({ kind: "campaign", id: x.campaign, d: x.definition }))];
+  // Rev 20 (PROTOCOL 14): a run's model variants per gen, and its alternates' notes (gens that lease the default model).
+  const defs = [...s.runs.map((r) => ({ kind: "run", id: r.run, d: r.definition, notes: (r.alternates || []).flatMap((a) => a.variant_notes || []) })), ...s.campaigns.map((x) => ({ kind: "campaign", id: x.campaign, d: x.definition }))];
   h += "<h2>Signed definitions</h2>" + table([
     ["run / campaign", (x) => esc(x.kind) + " " + esc(x.id)], ["version", (x) => (x.d && x.d.version !== null ? "v" + x.d.version : '<span class="warn">none</span>'), "n"],
     ["signed", (x) => (x.d && x.d.created ? when(x.d.created) : "")], ["key", (x) => "<code>" + esc((x.d && x.d.key_id) || "") + "</code>"],
@@ -213,6 +214,9 @@ function render(s) {
     ["jobs", (x) => esc(((x.d && x.d.jobs) || []).join(", "))], ["gens", (x) => esc(((x.d && x.d.gens) || []).join(", "))],
     ["builds", (x) => ((x.d && x.d.builds) || []).map((b) => "<code>" + esc(String(b).slice(0, 8)) + "</code>").join(" ") +
       (x.d && x.d.runtime ? ' <span class="muted">runtime</span> <code>' + esc(String(x.d.runtime).slice(0, 8)) + "</code>" : "")],
+    ["variants", (x) => esc(Object.entries((x.d && x.d.variants) || {}).map((e) => e[0] + ": " + e[1].join(", ")).join("; ")) +
+      (x.d && x.d.needs_agent && Object.keys(x.d.variants || {}).length ? ' <span class="muted">agents from ' + esc(x.d.needs_agent) + "</span>" : "") +
+      ((x.notes || []).length ? ' <span class="warn" title="' + esc(x.notes.join("; ")) + '">default model: ' + x.notes.length + " note(s)</span>" : ""), "wrapok"],
     ["can't lease because", (x) => '<span class="' + (x.d && x.d.version === null ? "warn" : "bad") + '">' + esc(((x.d && x.d.problems) || []).join("; ")) + "</span>", "wrapok"],
   ], defs);
 

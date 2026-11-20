@@ -1966,7 +1966,7 @@ worker tells the graphs apart from their metadata, so neither the agent nor aw/1
   switches variants on can add one to its current gen); a name registered before with other files → 409 (files never
   change); a PUT that leaves out a registered name keeps it (variants are never removed). Adding variants doesn't make the
   gen current or reset its quota. `unchanged` is true when nothing was added.
-- The answer adds `"variants": ["gpu", ...]` (every name the gen has now). `GET /v1/admin/run/{run}`: `checkpoint` (the
+- The answer adds `"variants": ["gpu", ...]` (every name the gen has now) when the gen has any. `GET /v1/admin/run/{run}`: `checkpoint` (the
   current gen) adds `variants` (`{"<name>": {"model", "sha256", "size"}}`, `{}` without), and `variants` lists every gen
   that has any (`{"<gen>": ["gpu"]}`).
 - Migration 0016: `checkpoints.variants` (JSON `{"<name>": {"model", "sha256", "size"}}`, NULL: none) and `leases.variant`
@@ -1996,9 +1996,11 @@ gen, machines get that gen's default model (14.3).
   - each of an eval lease's `checkpoints[]`, on its own (a batch's gens may differ);
   - a beat answer's `checkpoint` - a classic self-play lease's newer gen that its own definition signs (section 3), a
     rolling lease's in-place switch under the current definition (10.6) - with the lease's variant: `leases.variant`, the
-    alternate's `model` when the lease was granted, as long as the run's alternate of the lease's build and runtime still
-    names it (an owner who drops `model` turns it off for the next generation of running leases too); else the default.
-    A lease granted without a variant never gets one later.
+    alternate's `model` when the lease was granted (to an agent from 0.3.5), as long as the run's alternate of the lease's
+    build and runtime still names it (an owner who drops `model` turns it off for the next generation of running leases
+    too); else the default. A lease granted without one (an older agent, an alternate without `model` then, the run's
+    default build) never gets one later; a lease granted while its first gen had no variant gets the variant of a later
+    gen that has it.
   Fuzz and diag leases carry no checkpoint variant.
 - **A gen without the variant** (not registered, not signed, or registered other than signed): the machine plays that
   gen's default model - it is the same network, and a GPU alternate's pack runs the default graph as it did before rev
