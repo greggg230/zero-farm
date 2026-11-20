@@ -30,7 +30,7 @@ import {
   variantProblem,
 } from "./definitions";
 import { MAX_EXTERNAL_BODY, type Contributor, type ExternalRow, ownContributor, parseReport, storeReport, totals } from "./external";
-import { CHANNELS, evictList, serveObject } from "./friend";
+import { CHANNELS, evictList, serveObject, vendorsOffList } from "./friend";
 import { bookFor } from "./leasebook";
 import { minisignKeyId, verifyBuild, verifyMinisign } from "./manifest";
 import { DEFAULT_PLATFORM, PLATFORMS, type Platform, platformOf, storedPlatform } from "./platform";
@@ -39,18 +39,21 @@ import {
   type CampaignAlternate,
   DRIVER_RE,
   GPU_MODES,
-  GPU_VENDORS_OFF,
   MAX_ALTERNATES,
   MAX_EVAL_GAMES_PER_THREAD,
   MAX_EVAL_HORIZON_S,
   MAX_EVICT,
+  MAX_VENDORS_OFF,
   type Routing,
+  VENDOR_PROVIDERS,
   VENDOR_RE,
   altPlatform,
   gpuNeedOf,
   hwRoutingOf,
   requiresRuntimeOf,
   routingOf,
+  vendorPackProblem,
+  vendorRestricted,
 } from "./routing";
 import {
   BUILD_RE,
@@ -413,8 +416,10 @@ export function alternatesOf(v: unknown): Alternate[] | null {
 // `when.vendor` defaults to), or (rev 17) none: a CPU alternate, whose pack has no `gpu` and whose `when` names its
 // platform (an alternate that names neither a vendor nor a platform, with a pack that names no GPU vendor, is refused
 // as before rev 17: a GPU pack such as Windows ML needs its vendor spelled out); GPU alternates only for windows-x64;
-// none twice, none the default. Returns them with the vendor filled in; a CPU alternate keeps its platform, a GPU
-// alternate (windows-x64) stores none, as before rev 17.
+// none twice, none the default. Rev 22 (PROTOCOL 9.8): an alternate for a vendor with a provider restriction (amd:
+// DirectML only) needs a pack whose `gpu` names that vendor and exactly its providers and that doesn't ship Windows ML's
+// catalog (rev 12-21 refused every amd alternate). Returns them with the vendor filled in; a CPU alternate keeps its
+// platform, a GPU alternate (windows-x64) stores none, as before rev 17.
 async function altCheck(db: D1Database, cfg: book.RunCfg): Promise<Alternate[] | null> {
   if (!cfg.alternates) return null;
   const seen = new Set([`${cfg.build_id}|${cfg.runtime}`]);
@@ -445,7 +450,8 @@ async function altCheck(db: D1Database, cfg: book.RunCfg): Promise<Alternate[] |
       continue;
     }
     if (platform !== DEFAULT_PLATFORM) throw bad(`${at}: no GPU work on ${platform} yet (PROTOCOL 11.5); a CPU alternate names no vendor`);
-    if (GPU_VENDORS_OFF.includes(vendor)) throw bad(`${at}: the farm runs no GPU work on ${vendor} GPUs (PROTOCOL 9.4)`);
+    const vp = vendorPackProblem(vendor, text(a.runtime));
+    if (vp) throw bad(`${at}: ${vp}`);
     out.push({ build_id: a.build_id, runtime: a.runtime, when: { vendor, ...(a.when.min_driver ? { min_driver: a.when.min_driver } : {}) }, ...(a.model ? { model: a.model } : {}) });
   }
   return out;
@@ -609,14 +615,19 @@ export async function rollingLeases(db: D1Database, scope: string) {
 // Rev 11: a run's alternates, each with why its current definition doesn't authorize it (`problems`). Rev 20 (PROTOCOL
 // 14.3): an alternate that names a model variant adds `variant_notes`: the gens it would play (the current gen, the
 // current eval batch's) whose variant isn't registered or signed as registered, so their default model is leased.
+// Rev 22 (PROTOCOL 9.8): `problems` also says when its vendor is off (the owner's gpu_vendors_off) or its pack breaks the
+// vendor's provider rule (an amd alternate stored before rev 12); an alternate for a vendor with a rule adds `gpu_notes`
+// (the providers its GPUs run, the agents it goes to).
 async function alternatesStatus(
   c: Ctx,
   r: book.RunRow,
   known?: Def | null,
-): Promise<(Alternate & { problems: string[]; variant_notes?: string[] })[] | null> {
+  vendorsOff?: string[],
+): Promise<(Alternate & { problems: string[]; variant_notes?: string[]; gpu_notes?: string[] })[] | null> {
   const alts = parseJson<Alternate[] | null>(r.alternates ?? null, null);
   if (!alts) return null;
   const d = known === undefined ? await currentDef(c.env.DB, "run", r.run) : known;
+  const off = vendorsOff ?? (await vendorsOffList(c.env.DB));
   let rows: book.CheckpointRow[] | null = null;
   const notesFor = async (name: string): Promise<string[]> => {
     if (rows === null) {
@@ -650,7 +661,17 @@ async function alternatesStatus(
         if (p) problems.push(`${k}: ${p}`);
       }
     }
-    out.push({ ...a, problems, ...(a.model ? { variant_notes: await notesFor(a.model) } : {}) });
+    // rev 22 (PROTOCOL 9.8)
+    const vendor = a.when.vendor || null;
+    const gpuNotes: string[] = [];
+    if (vendor && off.includes(vendor)) problems.push(`GPU work on ${vendor} GPUs is off (gpu_vendors_off): not offered`);
+    if (vendor && vendorRestricted(vendor)) {
+      const rt = await c.env.DB.prepare(`SELECT manifest FROM builds WHERE build_id = ?`).bind(a.runtime).first<{ manifest: string }>();
+      const vp = vendorPackProblem(vendor, rt?.manifest);
+      if (vp) problems.push(`not offered: ${vp}`);
+      gpuNotes.push(`${vendor} GPUs run ${VENDOR_PROVIDERS[vendor].join(", ")} only; offered to agents from ${config(c.env).amdDmlAgent}`);
+    }
+    out.push({ ...a, problems, ...(a.model ? { variant_notes: await notesFor(a.model) } : {}), ...(gpuNotes.length ? { gpu_notes: gpuNotes } : {}) });
   }
   return out;
 }
@@ -989,6 +1010,28 @@ export async function getEvict(c: Ctx): Promise<Response> {
   return json({ builds: await evictList(c.env.DB) });
 }
 
+// ---------- rev 22: GPU vendors off (PROTOCOL 4, 9.8) ----------
+
+// The owner's kill switch: GPU vendors on whose GPUs no GPU work runs, without an agent release. Agents from
+// AMD_DML_AGENT get the list with `GET /v1/agent/latest` (at start and every 6 h) and treat those adapters as unusable
+// for GPU work; the coordinator never offers those vendors' alternates (nor a default pack that requires one) meanwhile.
+// Replaces the list; [] clears it.
+export async function vendorsOff(c: Ctx): Promise<Response> {
+  await authAdmin(c);
+  const b = await readJson(c.req);
+  for (const k of Object.keys(b)) if (k !== "vendors") throw bad(`${k}: unknown field`);
+  if (!Array.isArray(b.vendors)) throw bad(`vendors must be a list of GPU vendor names (e.g. ["amd"]; [] clears it)`);
+  if (b.vendors.length > MAX_VENDORS_OFF) throw bad(`vendors: at most ${MAX_VENDORS_OFF}`);
+  const vendors = [...new Set(b.vendors.map((x: unknown, i: number) => str(x, `vendors[${i}]`, { re: VENDOR_RE })))];
+  await c.env.DB.prepare(`INSERT OR REPLACE INTO settings (key, value) VALUES ('gpu_vendors_off', ?)`).bind(JSON.stringify(vendors)).run();
+  return json({ ok: true, vendors });
+}
+
+export async function getVendorsOff(c: Ctx): Promise<Response> {
+  await authAdmin(c);
+  return json({ vendors: await vendorsOffList(c.env.DB) });
+}
+
 // ---------- rev 18: hardware routing (PROTOCOL 12) ----------
 
 // The owner's switch and knobs. A POST names any of the fields; the others keep their stored (or default) values.
@@ -1223,6 +1266,8 @@ export async function stats(c: Ctx): Promise<Response> {
   });
 
   const defs = await currentDefs(db);
+  // rev 22 (PROTOCOL 9.8): the owner's GPU vendors off
+  const vendorsOff = await vendorsOffList(db);
   const runs = [];
   for (const r of runsR.results as book.RunRow[]) {
     const scope = book.runScope(r.run);
@@ -1237,7 +1282,7 @@ export async function stats(c: Ctx): Promise<Response> {
       .first<any>();
     const cur = r.eval_batch ? await book.getBatch(db, r.run, r.eval_batch) : null;
     const spCfg = parseJson<book.SelfplayCfg | null>(r.selfplay, null);
-    const alts = await alternatesStatus(c, r, defs.get(`run:${r.run}`) ?? null);
+    const alts = await alternatesStatus(c, r, defs.get(`run:${r.run}`) ?? null, vendorsOff);
     runs.push({
       run: r.run,
       game: r.game,
@@ -1354,9 +1399,12 @@ export async function stats(c: Ctx): Promise<Response> {
     t: c.now,
     auth: c.admin ?? null,
     paused: pausedR.results[0]?.value === "1",
+    gpu_vendors_off: vendorsOff,
     limits: {
       definition_agent: cfg.definitionAgent,
       platform_agent: cfg.platformAgent,
+      // rev 22 (PROTOCOL 9.8)
+      amd_dml_agent: cfg.amdDmlAgent,
       data_keys: cfg.dataPubkeys.length,
       max_active_leases: cfg.maxActiveLeases,
       max_lease_chunks: cfg.maxLeaseChunks,

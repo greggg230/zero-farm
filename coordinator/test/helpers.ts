@@ -104,6 +104,7 @@ export interface BuildOpts {
   platform?: string; // rev 17 (PROTOCOL 11.3): the manifest's platform (absent: none, i.e. windows-x64); min_agent 0.3.0 then
   game?: string; // worker: default mtg
   profile?: string; // worker: default release
+  extra_files?: string[]; // more files in the build (e.g. a runtime pack's DLLs, rev 22)
 }
 
 // Uploads a manifest, its signature file and one file, and registers the build. Returns its id.
@@ -131,11 +132,14 @@ export async function makeBuild(o: BuildOpts = {}): Promise<string> {
   if (o.platform) manifest.platform = o.platform;
   if (o.requires_runtime) manifest.requires_runtime = o.requires_runtime;
   if (o.gpu) manifest.gpu = o.gpu;
+  const extra = (o.extra_files ?? []).map((path) => ({ path, body: `extra ${path} ${o.tag ?? ""}` }));
+  for (const x of extra) (manifest.files as unknown[]).push({ path: x.path, sha256: await sha256(x.body), size: new TextEncoder().encode(x.body).length });
   const text = JSON.stringify(manifest, null, 2);
   const id = (await sha256(text)).slice(0, 24);
   await putArtifact(`builds/${id}/manifest.json`, text);
   await putArtifact(`builds/${id}/manifest.json.minisig`, `untrusted comment: test\nAAAA\ntrusted comment: build_id=${id} kind=${kind}\nAAAA\n`);
   await putArtifact(`builds/${id}/${entry}`, file);
+  for (const x of extra) await putArtifact(`builds/${id}/${x.path}`, x.body);
   if (o.register !== false) ok(await admin("POST", "/v1/admin/build", { build_id: id }));
   return id;
 }

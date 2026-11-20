@@ -54,6 +54,9 @@
     // Rev 20 (PROTOCOL 14): the first agent that knows model variants. A run whose current definition signs a variant
     // counts as min_agent this for every lease (older agents can't read such a definition).
     "VARIANT_AGENT": "0.3.5",
+    // Rev 22 (PROTOCOL 9.8): the first agent that reports AMD adapters again and runs only DirectML on them. Run
+    // alternates for AMD GPUs (a DirectML-only pack) go only to agents at or above it.
+    "AMD_DML_AGENT": "0.3.11",
     // Installers (agent release github_url) must be this repository's agent-v<version> assets.
     "GITHUB_REPO": "greggg230/zero-farm",
     // Limits (security review M3, M4): active leases per machine; result chunks and bytes per

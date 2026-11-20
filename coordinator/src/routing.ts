@@ -5,8 +5,9 @@
 import { type Platform, storedPlatform } from "./platform";
 import { bad } from "./util";
 
-// Execution providers by their wire names, and the GPU vendor each serves (`dml`: any DirectX 12
-// GPU). Every name but `cpu` is a GPU provider.
+// Execution providers by their wire names, and the GPU vendor each serves (`dml`: vendor-neutral, any DirectX 12
+// GPU). Every name but `cpu` is a GPU provider. Rev 22: AMD's own providers (`migraphx`, `amdgpu`) are never used on AMD
+// GPUs either (VENDOR_PROVIDERS below): they stay known names, for profiles and allowlists.
 export const PROVIDER_VENDOR = {
   cpu: null,
   tensorrt_rtx: "nvidia",
@@ -155,10 +156,20 @@ export interface CampaignAlternate {
 
 export const MAX_ALTERNATES = 4;
 export const VENDOR_RE = /^[a-z0-9]{1,32}$/;
-// GPU vendors the farm never uses (the owner's decision of 2026-11-13, after the AMD GPU probes: AMD PCs run CPU
-// work only). No run alternate may name them (PROTOCOL 9.4), none stored earlier is offered, and agents from 0.2.11
-// leave such adapters out of their profiles altogether.
-export const GPU_VENDORS_OFF: readonly string[] = ["amd"];
+
+// Rev 22 (PROTOCOL 9.8): GPU vendors whose GPUs run only some providers - the owner's decision of 2026-11-20: AMD GPUs
+// with DirectML only, never AMD's own Windows ML providers (amdgpu, migraphx: they failed on a farm PC's AMD GPU, and a
+// probe of them very likely took that PC down; rev 12-21 ran no GPU work on AMD GPUs at all). A run alternate for such a
+// vendor needs a runtime pack whose `gpu` requirement (PROTOCOL 9.2) names that vendor and exactly these providers, and
+// that doesn't ship Windows ML's catalog (WINML_CATALOG_DLL, which can register the vendors' catalog providers); it is
+// offered only to agents of at least AMD_DML_AGENT (which report AMD adapters again, DirectML only).
+export const VENDOR_PROVIDERS: Readonly<Record<string, readonly Provider[]>> = { amd: ["dml"] };
+export const WINML_CATALOG_DLL = "Microsoft.Windows.AI.MachineLearning.dll";
+export const vendorRestricted = (vendor: string): boolean => Object.hasOwn(VENDOR_PROVIDERS, vendor);
+
+// Rev 22 (PROTOCOL 9.8): the owner's kill switch - GPU vendors turned off without an agent release (settings
+// `gpu_vendors_off`, POST /v1/admin/gpu_vendors_off). At most this many names.
+export const MAX_VENDORS_OFF = 8;
 
 // Rev 12 (PROTOCOL 2): at most this many build ids in the evict list (`settings.evict_builds`).
 export const MAX_EVICT = 64;
@@ -196,6 +207,42 @@ export function gpuNeedOf(manifestText: string | null | undefined): GpuNeed | nu
   };
 }
 
+// The file paths of a manifest (its stored JSON text); [] when it can't be read.
+export function packFiles(manifestText: string | null | undefined): string[] {
+  try {
+    const m = JSON.parse(manifestText ?? "");
+    return Array.isArray(m?.files) ? m.files.map((f: any) => f?.path).filter((x: unknown): x is string => typeof x === "string") : [];
+  } catch {
+    return [];
+  }
+}
+
+// Rev 22 (PROTOCOL 9.8): why a runtime pack (its stored manifest text) may not serve an alternate of `vendor`, or null.
+// Only vendors with a provider restriction (VENDOR_PROVIDERS: amd) have a rule: the pack's `gpu` requirement must name
+// that vendor and exactly its providers (["dml"]), and the pack must not ship Windows ML's catalog.
+export function vendorPackProblem(vendor: string, manifestText: string | null | undefined): string | null {
+  if (!vendorRestricted(vendor)) return null;
+  const only = VENDOR_PROVIDERS[vendor];
+  let raw: unknown = null;
+  try {
+    raw = JSON.parse(manifestText ?? "")?.gpu ?? null;
+  } catch {
+    raw = null;
+  }
+  const g = raw && typeof raw === "object" ? (raw as Record<string, unknown>) : null;
+  if (!g) return `${vendor} GPUs run ${only.join(", ")} only: the runtime needs a gpu requirement naming ${vendor} and exactly ${JSON.stringify(only)} (PROTOCOL 9.8)`;
+  if (g.vendor !== vendor) return `the runtime is for ${String(g.vendor)} GPUs, not ${vendor}`;
+  const provs = Array.isArray(g.providers) ? g.providers : [];
+  if (provs.length !== only.length || !only.every((p) => provs.includes(p)) || new Set(provs).size !== provs.length) {
+    return `${vendor} GPUs run ${only.join(", ")} only, but the runtime brings ${JSON.stringify(provs)} (PROTOCOL 9.8)`;
+  }
+  const cat = WINML_CATALOG_DLL.toLowerCase();
+  if (packFiles(manifestText).some((f) => (f.split("/").pop() ?? "").toLowerCase() === cat)) {
+    return `the runtime ships ${WINML_CATALOG_DLL}, which can register other providers on ${vendor} GPUs (PROTOCOL 9.8)`;
+  }
+  return null;
+}
+
 // The `requires_runtime` of a worker manifest (its stored JSON text), or null.
 export function requiresRuntimeOf(manifestText: string | null | undefined): string | null {
   if (!manifestText) return null;
@@ -226,11 +273,29 @@ export function runtimeProvidersOf(profile: RoutingProfile | null, runtime: stri
   return strings((per as Record<string, unknown>)[runtime]);
 }
 
+// Rev 22: a GPU provider can serve an adapter of `vendor` (its own vendor's, or vendor-neutral DirectML), and the vendor
+// has no restriction that leaves it out (VENDOR_PROVIDERS: an AMD GPU runs dml only).
+export function servesVendor(p: Provider, vendor: string): boolean {
+  const v = PROVIDER_VENDOR[p];
+  if (v === null || (v !== "any" && v !== vendor)) return false;
+  return !vendorRestricted(vendor) || VENDOR_PROVIDERS[vendor].includes(p);
+}
+
 // The GPU providers an alternate's pack brings that the job's allowlist allows (a pack without `gpu`: every GPU
-// provider the allowlist allows).
-export function altProviders(need: GpuNeed | null, allow: readonly string[] | null): Provider[] {
-  const brings = need ? need.providers.filter(isGpuProvider) : PROVIDERS.filter(isGpuProvider);
+// provider the allowlist allows; rev 22, given the alternate's vendor: every one that can serve that vendor's GPUs).
+export function altProviders(need: GpuNeed | null, allow: readonly string[] | null, vendor?: string): Provider[] {
+  const brings = need ? need.providers.filter(isGpuProvider) : PROVIDERS.filter((p) => isGpuProvider(p) && (!vendor || servesVendor(p, vendor)));
   return brings.filter((p) => !allow || allow.includes(p));
+}
+
+// Rev 22: the stored kill switch (`settings.gpu_vendors_off`, its JSON text, or null: never set) as a set of names.
+export function vendorsOffOf(text: string | null | undefined): Set<string> {
+  try {
+    const v = text ? JSON.parse(text) : [];
+    return new Set(Array.isArray(v) ? v.filter((x): x is string => typeof x === "string" && VENDOR_RE.test(x)).slice(0, MAX_VENDORS_OFF) : []);
+  } catch {
+    return new Set();
+  }
 }
 
 // GPU leases of `auto` jobs are at least this many games (PROTOCOL 9.4): a batch never has more rows than games

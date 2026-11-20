@@ -57,6 +57,8 @@ CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET, an Access service token)
   diag-list [--machine <id>]
   stats
   routing [JSON|-]                                 hardware routing (rev 18): show, or set {on, eval_horizon_s, eval_games_per_thread}
+  gpu-vendors-off [VENDOR[,VENDOR...]|none]        GPU vendors turned off (rev 22, PROTOCOL 9.8): show, set (e.g. amd),
+                                                   or clear (none); agents from 0.3.11 run CPU work only on those GPUs
   external <report.json|->                         a reporter's numbers for own machines (admin page only)
 `;
 
@@ -341,6 +343,12 @@ async function main(argv: string[]): Promise<void> {
       // the fields it names (`routing -` reads the JSON from stdin)
       if (!pos.length) return print(await api("GET", "/v1/admin/routing"));
       return print(await api("POST", "/v1/admin/routing", pos[0] === "-" ? readConfig("-") : JSON.parse(pos[0])));
+    case "gpu-vendors-off": {
+      // rev 22 (PROTOCOL 9.8): the owner's kill switch; `gpu-vendors-off amd` turns AMD GPUs off, `none` clears the list
+      if (!pos.length) return print(await api("GET", "/v1/admin/gpu_vendors_off"));
+      const vendors = pos[0] === "none" ? [] : pos.join(",").split(",").map((v) => v.trim().toLowerCase()).filter(Boolean);
+      return print(await api("POST", "/v1/admin/gpu_vendors_off", { vendors }));
+    }
     case "external":
       need(pos, 1, "external <report.json|->");
       return print(await api("POST", "/v1/admin/external", readConfig(pos[0])));

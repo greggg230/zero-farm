@@ -131,6 +131,8 @@ function render(s) {
   const tri = (k) => '<b>' + tw(T.all, k) + "</b><small>farm " + tw(T.farm, k) + " &middot; own " + tw(T.own, k) + "</small>";
   let h = '<div class="tiles">';
   h += '<div class="tile">farm<b class="' + (s.paused ? "warn" : "ok") + '">' + (s.paused ? "paused" : "running") + "</b></div>";
+  // Rev 22 (PROTOCOL 9.8): GPU vendors the owner turned off (POST /v1/admin/gpu_vendors_off)
+  if ((s.gpu_vendors_off || []).length) h += '<div class="tile">GPU off<b class="warn">' + esc(s.gpu_vendors_off.join(", ")) + "</b></div>";
   h += '<div class="tile">farm PCs online / working<b>' + online + " / " + working + "</b><small>own machines online: " + ownOn + " of " + own.length + "</small></div>";
   h += '<div class="tile">self-play games 1 h / 24 h' + tri("selfplay") + "</div>";
   h += '<div class="tile">eval games 1 h / 24 h' + tri("eval") + "</div>";
@@ -169,6 +171,10 @@ function render(s) {
     ["rolling", (r) => (r.rolling ? (r.rolling_leases || []).length + ' leases<br><span class="muted">block ' + num(r.rolling.block) +
       ", " + Math.round(r.rolling.max_s / 60) + " min</span>" : (r.rolling_leases || []).length ? (r.rolling_leases || []).length + " leases (setting removed)" : "-")],
     ["definition", (r) => defCell(r.definition)], ["platforms", (r) => esc((r.platforms || []).join(", "))],
+    // Rev 11 / 22 (PROTOCOL 9.4, 9.8): its GPU alternates by vendor (red: not offered, why on hover; an AMD one's rule too)
+    ["GPU alternates", (r) => (r.alternates || []).filter((a) => a.when && a.when.vendor).map((a) => '<span class="' + ((a.problems || []).length ? "bad" : "ok") +
+      '" title="' + esc((a.problems || []).concat(a.gpu_notes || []).join("; ")) + '">' + esc(a.when.vendor) + "</span>" +
+      ((a.gpu_notes || []).length ? ' <span class="muted">dml only</span>' : "")).join(", ") || '<span class="muted">-</span>'],
     ["active leases", (r) => r.active_leases, "n"], ["pool", (r) => num(r.pool), "n"], ["next gid", (r) => num(r.next_gid), "n"],
   ], s.runs);
 

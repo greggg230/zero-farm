@@ -327,6 +327,23 @@ describe("builds and agent releases", () => {
     expect(ok(await call("GET", "/v1/agent/latest", { token: m.token })).evict).toBeUndefined();
   });
 
+  it("rev 22: the GPU vendors off ride on /v1/agent/latest (absent while empty)", async () => {
+    const m = await enroll("pc");
+    const a1 = await makeBuild({ kind: "agent", version: "0.3.1" });
+    ok(await admin("POST", "/v1/admin/agent/release", { version: "0.3.1", build_id: a1, channel: "stable", min_agent: "0.3.0" }));
+    expect(ok(await call("GET", "/v1/agent/latest", { token: m.token })).gpu_vendors_off).toBeUndefined();
+    ok(await admin("POST", "/v1/admin/gpu_vendors_off", { vendors: ["amd"] }));
+    expect(ok(await call("GET", "/v1/agent/latest", { token: m.token }))).toEqual({
+      version: "0.3.1",
+      build_id: a1,
+      manifest: `builds/${a1}/manifest.json`,
+      min_agent: "0.3.0",
+      gpu_vendors_off: ["amd"],
+    });
+    ok(await admin("POST", "/v1/admin/gpu_vendors_off", { vendors: [] }));
+    expect(ok(await call("GET", "/v1/agent/latest", { token: m.token })).gpu_vendors_off).toBeUndefined();
+  });
+
   it("a machine moved to another channel updates from that channel, whatever it asks for (rev 10)", async () => {
     const m = await enroll("pc"); // enrolled on stable, so its agent asks ?channel=stable
     const a1 = await makeBuild({ kind: "agent", version: "0.3.1" });

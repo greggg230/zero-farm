@@ -32,7 +32,9 @@ import {
   runtimeProvidersOf,
   storedRouting,
   verifiedProviders,
-  GPU_VENDORS_OFF,
+  vendorPackProblem,
+  vendorRestricted,
+  vendorsOffOf,
   CPU_SELFPLAY_TIER,
   DEFERRED_EVAL_RANK,
   type HwRouting,
@@ -509,6 +511,8 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
   const altAware = defAware && cmpSemver(agent, cfg.altRuntimeAgent) >= 0;
   // Rev 20 (PROTOCOL 14): this agent takes model variants (and can read a definition that signs them).
   const variantAware = defAware && cmpSemver(agent, cfg.variantAgent) >= 0;
+  // Rev 22 (PROTOCOL 9.8): this agent reports AMD adapters and runs only DirectML on them: it may get AMD alternates.
+  const amdAware = altAware && cmpSemver(agent, cfg.amdDmlAgent) >= 0;
   // Where a job goes on this machine (PROTOCOL 8): GPU-eligible when it may use the GPU and
   // verified a provider the job allows, with the job's runtime pack if the profile says.
   const placeFor = (kind: "selfplay" | "eval" | "fuzz", r: Routing, runtime: string | null) =>
@@ -516,7 +520,7 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
   // Rev 17 (PROTOCOL 11): the machine's platform. Every build it is offered is of it; its channel's releases are too.
   const platform: Platform = storedPlatform(m.platform);
 
-  const [runsR, campsR, releaseR, pausedR, activeR, poolR, ratesR, classR, diagR, mineR, hwR] = await db.batch<any>([
+  const [runsR, campsR, releaseR, pausedR, activeR, poolR, ratesR, classR, diagR, mineR, hwR, offR] = await db.batch<any>([
     db.prepare(`SELECT * FROM runs WHERE state = 'active'`),
     db.prepare(`SELECT * FROM campaigns WHERE state = 'active'`),
     db.prepare(`SELECT * FROM agent_releases WHERE channel = ? AND platform = ? ORDER BY id DESC LIMIT 1`).bind(m.channel, platform),
@@ -539,8 +543,15 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
     // This machine's live leases (an expired one not swept yet doesn't count).
     db.prepare(`SELECT COUNT(*) AS n FROM leases WHERE machine_id = ? AND state = 'active' AND expires_at >= ?`).bind(m.machine_id, c.now),
     db.prepare(`SELECT value FROM settings WHERE key = 'hw_routing'`),
+    db.prepare(`SELECT value FROM settings WHERE key = 'gpu_vendors_off'`),
   ]);
   const hw = hwRoutingOf(hwR.results[0]?.value ?? null);
+  // Rev 22 (PROTOCOL 9.8): the owner's kill switch - no alternate (nor a default pack) for these vendors' GPUs is offered
+  const vendorsOff = vendorsOffOf(offR.results[0]?.value ?? null);
+  // Rev 22: a vendor with a provider restriction (amd: DirectML only) only for agents that keep it, and only with a pack
+  // that keeps it (`gpu` naming the vendor and exactly its providers, no Windows ML catalog: vendorPackProblem)
+  const vendorOk = (vendor: string, packManifest: string | null | undefined) =>
+    !vendorsOff.has(vendor) && (!vendorRestricted(vendor) || (amdAware && vendorPackProblem(vendor, packManifest) === null));
   const defs = await currentDefs(db);
   const runs = runsR.results as book.RunRow[];
   const camps = campsR.results as book.CampaignRow[];
@@ -580,7 +591,7 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
   const needOf = (id: string | null) => (id ? gpuNeedOf(builds.get(id)?.manifest) : null);
   const packFits = (id: string | null) => {
     const need = needOf(id);
-    return !need || (altAware && hasAdapter(machineProfile, need.vendor, [need.min_driver]));
+    return !need || (altAware && vendorOk(need.vendor, builds.get(id!)?.manifest) && hasAdapter(machineProfile, need.vendor, [need.min_driver]));
   };
   // Rev 17 (PROTOCOL 11.4): a build's platform (one not registered counts as windows-x64; such a candidate is dropped
   // below anyway); no runtime fits every platform.
@@ -611,9 +622,11 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
           eligible = gpuEligible(caps.gpu, verifiedProviders(machineProfile, a.runtime), routing.providers);
         } else {
           if (need && need.vendor !== vendor) continue;
-          if (GPU_VENDORS_OFF.includes(vendor)) continue; // (an alternate stored before rev 12)
+          // rev 22 (PROTOCOL 9.8): not a vendor the owner turned off; amd only to agents from AMD_DML_AGENT, with a
+          // DirectML-only pack (an AMD alternate stored before rev 12 has none)
+          if (!vendorOk(vendor, ri.manifest)) continue;
           if (!hasAdapter(machineProfile, vendor, [a.when.min_driver, need?.min_driver])) continue; // 2
-          const allowed = altProviders(need, routing.providers); // 3
+          const allowed = altProviders(need, routing.providers, vendor); // 3
           if (!allowed.length) continue;
           const rp = runtimeProvidersOf(machineProfile, a.runtime); // 4: never probed here, or a provider passed
           if (rp !== undefined && !rp.some((p) => (allowed as string[]).includes(p))) continue;
@@ -665,7 +678,14 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
   };
   // Rev 18 (PROTOCOL 12.1): a run has a GPU version when it lists an alternate for a GPU vendor the farm uses, or its
   // default runtime pack requires a GPU (rev 17: a CPU alternate, without `vendor`, is not one; a default pack that only may use one, DirectML, counts by its alternates).
-  const hasGpuVersion = (r: book.RunRow) => altsOf(r).some((x) => !!x.when.vendor && !GPU_VENDORS_OFF.includes(x.when.vendor)) || needOf(r.runtime) !== null;
+  // Rev 22: a vendor the owner turned off doesn't count; an AMD alternate counts when its pack is DirectML-only (whoever
+  // asks: the run has that GPU version for the farm, not just for this agent).
+  const usedVendor = (vendor: string, packManifest: string | null | undefined) =>
+    !vendorsOff.has(vendor) && (!vendorRestricted(vendor) || vendorPackProblem(vendor, packManifest) === null);
+  const hasGpuVersion = (r: book.RunRow) => {
+    const need = needOf(r.runtime);
+    return altsOf(r).some((x) => !!x.when.vendor && usedVendor(x.when.vendor, builds.get(x.runtime)?.manifest)) || (need !== null && usedVendor(need.vendor, builds.get(r.runtime!)?.manifest));
+  };
   for (const r of runs) {
     const scope = book.runScope(r.run);
     if (kinds.has("selfplay") && r.selfplay && r.current_gen !== null) {
@@ -1148,6 +1168,12 @@ export async function artifact(c: Ctx, rawKey: string): Promise<Response> {
   return serveObject(c, key);
 }
 
+// Rev 22 (PROTOCOL 9.8): the owner's GPU vendors off (`POST /v1/admin/gpu_vendors_off`), in the order stored.
+export async function vendorsOffList(db: D1Database): Promise<string[]> {
+  const row = await db.prepare(`SELECT value FROM settings WHERE key = 'gpu_vendors_off'`).first<{ value: string }>();
+  return [...vendorsOffOf(row?.value ?? null)];
+}
+
 // Rev 12 (PROTOCOL 2): the owner's evict list (`POST /v1/admin/evict`).
 export async function evictList(db: D1Database): Promise<string[]> {
   const row = await db.prepare(`SELECT value FROM settings WHERE key = 'evict_builds'`).first<{ value: string }>();
@@ -1169,14 +1195,17 @@ export async function agentLatest(c: Ctx): Promise<Response> {
   // Rev 17 (PROTOCOL 11.2): the newest release of the machine's channel for its platform.
   const rel = await latestRelease(c.env.DB, channel, m.platform);
   if (!rel) throw notFound(`no agent release on ${channel} for ${m.platform}`);
-  // Rev 12: the evict list rides along (only when there is one: the answer of before otherwise)
+  // Rev 12: the evict list rides along (only when there is one: the answer of before otherwise); rev 22: the GPU vendors
+  // off too (agents from AMD_DML_AGENT apply it; absent: none)
   const evict = await evictList(c.env.DB);
+  const vendorsOff = await vendorsOffList(c.env.DB);
   return json({
     version: rel.version,
     build_id: rel.build_id,
     manifest: `builds/${rel.build_id}/manifest.json`,
     min_agent: rel.min_agent,
     ...(evict.length ? { evict } : {}),
+    ...(vendorsOff.length ? { gpu_vendors_off: vendorsOff } : {}),
   });
 }
 

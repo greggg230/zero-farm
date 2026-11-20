@@ -26,6 +26,9 @@ export const DEFAULT_ROLLING_AGENT = "0.2.13";
 export const DEFAULT_PLATFORM_AGENT = "0.3.0";
 // Rev 20 (PROTOCOL 14): the first agent that knows model variants (it can read a definition that signs them).
 export const DEFAULT_VARIANT_AGENT = "0.3.5";
+// Rev 22 (PROTOCOL 9.8): the first agent that reports AMD adapters again and runs only DirectML on them; run alternates
+// for AMD GPUs go only to it and newer.
+export const DEFAULT_AMD_DML_AGENT = "0.3.11";
 
 export interface Config {
   githubRepo: string; // owner/repo whose agent-v<version> releases installers may come from
@@ -35,6 +38,7 @@ export interface Config {
   rollingAgent: string; // rev 15: the first agent that takes rolling self-play leases (PROTOCOL 10)
   platformAgent: string; // rev 17: the first agent that knows platforms (PROTOCOL 11)
   variantAgent: string; // rev 20: the first agent that knows model variants (PROTOCOL 14)
+  amdDmlAgent: string; // rev 22: the first agent that runs AMD GPUs with DirectML only (PROTOCOL 9.8)
   maxActiveLeases: number; // per machine
   maxLeaseChunks: number; // result chunks per lease
   maxLeaseBytes: number; // result bytes per lease
@@ -63,6 +67,7 @@ export function config(env: object): Config {
   const rollAgent = String(e.ROLLING_AGENT ?? "").trim();
   const platAgent = String(e.PLATFORM_AGENT ?? "").trim();
   const varAgent = String(e.VARIANT_AGENT ?? "").trim();
+  const amdAgent = String(e.AMD_DML_AGENT ?? "").trim();
   return {
     githubRepo: /^[A-Za-z0-9_.-]{1,100}\/[A-Za-z0-9_.-]{1,100}$/.test(repo) ? repo : DEFAULT_GITHUB_REPO,
     dataPubkeys: list(e.DATA_PUBKEYS),
@@ -71,6 +76,7 @@ export function config(env: object): Config {
     rollingAgent: isSemver(rollAgent) ? rollAgent : DEFAULT_ROLLING_AGENT,
     platformAgent: isSemver(platAgent) ? platAgent : DEFAULT_PLATFORM_AGENT,
     variantAgent: isSemver(varAgent) ? varAgent : DEFAULT_VARIANT_AGENT,
+    amdDmlAgent: isSemver(amdAgent) ? amdAgent : DEFAULT_AMD_DML_AGENT,
     maxActiveLeases: intVar(e.MAX_ACTIVE_LEASES, 2, 1, 1000),
     maxLeaseChunks: intVar(e.MAX_LEASE_CHUNKS, 2000, 1, 1_000_000),
     maxLeaseBytes: intVar(e.MAX_LEASE_BYTES, 1024 ** 3, 1, 2 ** 50),
