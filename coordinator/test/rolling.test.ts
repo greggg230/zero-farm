@@ -199,6 +199,8 @@ describe("rolling leases: extend (10.4)", () => {
     ok(await upload(m, l.lease_id, 0, "chunk0", { ids: [[0, 20]], gen: 1 }));
     let st = (await state("q")).selfplay_state;
     expect([st.leased, st.pending, st.headroom]).toEqual([44 + 10, 20, 110 - 54 - 20]);
+    // its worker plays 100 at once (rev 21: ids up to its batch may take any headroom, the reserve included)
+    ok(await beat(m, l.lease_id, "running", { stats: { concurrency: 100 } }));
     // asked 100, got the headroom (36)
     expect(ok(await extend(m, l.lease_id, { games: 100 }))).toEqual({ games: 100 });
     expect((await row(l.lease_id)).rel_hi).toBe(100);
@@ -211,9 +213,7 @@ describe("rolling leases: extend (10.4)", () => {
     ok(await admin("POST", "/v1/admin/run/q/ack", { cursor }));
     expect(ok(await extend(m, l.lease_id, { games: 50 }))).toEqual({ games: 100, wait_s: 20, reason: "quota" });
     ok(await finish(cm, c.lease_id, [], { given_back: true }));
-    // headroom again, but 80 unfinished ids are past this lease's limit (25 in flight + 40 of buffer): rev 21
-    expect(ok(await extend(m, l.lease_id, { games: 50 }))).toEqual({ games: 100, wait_s: 20, reason: "inflight" });
-    await played(l.lease_id);
+    // 10 of headroom again: 80 unfinished, 20 short of its batch
     expect(ok(await extend(m, l.lease_id, { games: 50 }))).toEqual({ games: 110 });
     // x-ids may now reach the newly released ids
     ok(await upload(m, l.lease_id, 1, "chunk1", { ids: [[100, 110]], gen: 1 }));
@@ -427,10 +427,11 @@ describe("rolling leases: the in-flight limit (10.4, rev 21)", () => {
     await aged(lb.lease_id, 3600);
     ok(await beat(a, la.lease_id, "running", { stats: { concurrency: 64 }, progress: { games_done: 0, games_total: 64 } })); // at its batch
     ok(await beat(b, lb.lease_id, "running", { stats: { concurrency: 128 }, progress: { games_done: 0, games_total: 64 } })); // 64 short
-    // a (a crew asking for 2 x 128: limit 272) may take the headroom less b's 64: 108
-    expect(ok(await extend(a, la.lease_id, { games: 256 }))).toEqual({ games: 172 });
-    // the last 64 are b's: a waits as for a full quota
-    expect(ok(await extend(a, la.lease_id, { games: 256 }))).toEqual({ games: 172, wait_s: 20, reason: "quota" });
+    // a (a crew asking for 2 x 128: limit 272) is at its batch: it may take the headroom less b's 64 and the reserve
+    // (a quarter of the cap, 75): 33
+    expect(ok(await extend(a, la.lease_id, { games: 256 }))).toEqual({ games: 97 });
+    // the rest is b's or the reserve: a waits as for a full quota
+    expect(ok(await extend(a, la.lease_id, { games: 256 }))).toEqual({ games: 97, wait_s: 20, reason: "quota" });
     expect(ok(await extend(b, lb.lease_id, { games: 256 }))).toEqual({ games: 128 });
   });
 

@@ -96,6 +96,9 @@ export const ROLLING_QUOTA_WAIT_S = 20;
 export const ROLLING_BUFFER_S = 120;
 export const ROLLING_BUFFER_MIN = 16;
 export const ROLLING_INFLIGHT_WAIT_S = 20; // the beat bucket's 6 a minute: a beat a minute plus 3 asks
+// Ids past a lease's batch (a crew's next member, the buffer) never take the last quarter of the generation's cap: it
+// stays for new leases and for leases below their batch.
+export const ROLLING_RESERVE_SHARE = 0.25;
 export const MAX_GID = 2 ** 32; // a rolling block never reaches past this game id (PROTOCOL 10.3)
 export const MAX_GEN_VARIANTS = 8; // rev 20 (PROTOCOL 14.2): model variants per checkpoint gen
 export interface EvalCfg {
@@ -1152,17 +1155,19 @@ export async function extend(env: Env, r: ExtendReq): Promise<ExtendAnswer> {
     .first<{ rate: number }>();
   const room = rollingLimit(l, r.games, r.now, known?.rate ?? 0) - unfinishedIds(l);
   // Rev 21: the headroom goes first to leases below their batch. What brings this lease back to its batch may take any
-  // headroom; ids past it (a crew's next member, the buffer) only what the other leases' shortfalls leave.
+  // headroom; ids past it (a crew's next member, the buffer) only what the other leases' shortfalls and the reserve
+  // for new leases (ROLLING_RESERVE_SHARE of the cap) leave.
   const others = await db
     .prepare(`SELECT * FROM leases WHERE scope = ? AND kind = 'selfplay' AND state = 'active' AND rel_hi IS NOT NULL AND lease_id != ?`)
     .bind(l.scope, l.lease_id)
     .all<LeaseRow>();
   const owed = others.results.reduce((a, o) => a + Math.max(0, batchOf(o) - unfinishedIds(o)), 0);
-  const free = Math.max(batchOf(l) - unfinishedIds(l), st.headroom - owed);
+  const reserve = Math.floor(st.cap * ROLLING_RESERVE_SHARE);
+  const free = Math.max(batchOf(l) - unfinishedIds(l), st.headroom - owed - reserve);
   const n = Math.min(r.games, st.headroom, hi - rel, room, free);
   if (n < 1) {
     if (stmts.length) await db.batch(stmts);
-    // no headroom at all: quota; else at its own limit: inflight; else the headroom is owed to others: quota
+    // no headroom at all: quota; else at its own limit: inflight; else the headroom is owed to others or reserved: quota
     return st.headroom >= 1 && room < 1
       ? { games: rel - lo, wait_s: ROLLING_INFLIGHT_WAIT_S, reason: "inflight" }
       : { games: rel - lo, wait_s: ROLLING_QUOTA_WAIT_S, reason: "quota" };

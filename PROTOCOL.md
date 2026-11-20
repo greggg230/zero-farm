@@ -1267,7 +1267,8 @@ A rolling lease is a self-play lease (section 3) plus
   **Headroom to the short first.** A lease's batch is what its workers play at once by its last beat (Stats `inflight`,
   else `concurrency`; 0 before its first beat). Ids that bring it back to its batch may take any headroom; ids past it
   (a crew's next member, the buffer) take only the headroom left after every other active rolling lease of the run is
-  topped up to its batch; else `quota`. Without this a crew allowed 2 x its planned workers, asking every 20 s, took the
+  topped up to its batch and never the last quarter of the generation's cap (kept for new leases, whose grants and
+  first top-ups to their batch may use it); else `quota`. Without this a crew allowed 2 x its planned workers, asking every 20 s, took the
   headroom while a lease below its batch waited out a 60 s `quota` answer and played fewer games at once. Before
   rev 21 an agent whose worker kept saying `low` (agents 0.3.6-0.3.8 seen holding 8 to 20 x their games in flight)
   took every free id of the generation's quota, and other machines got `no_work`.
@@ -2142,7 +2143,8 @@ it: GPU machines play its default model.
 - v1 rev 21 (2026-11-20; coordinator only, every agent version; no migration): **the in-flight limit of rolling leases**
   (10.4). An extension releases ids only while the lease's unfinished ids stay within its games in flight (twice that for
   a crew) plus a reporting buffer, else `wait_s` 20 with `reason` `inflight`; ids past a lease's batch take only the
-  headroom that other leases below their batch don't need; a `quota` answer waits 20 s (was 60); a grant releases the
+  headroom that other leases below their batch don't need, and never the last quarter of the cap (room for new leases);
+  a `quota` answer waits 20 s (was 60); a grant releases the
   larger `inflight` once (was twice, 10.3); lease Stats keep `inflight` and `workers`. Why: on a live run one laptop's lease (agent 0.3.6, 384
   games in flight, ~2,000 games/h) held 2,657 unplayed ids and took 6,112 more within two minutes of the quota rising, so
   two faster machines got `no_work`; another PC's (0.3.8) held ~3,200 with 384 in flight.
