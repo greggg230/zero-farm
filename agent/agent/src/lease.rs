@@ -95,15 +95,16 @@ struct Roll {
     /// remembered at the end when more than planned.
     per_game_max: u64,
     /// agent 0.3.3: the most a worker committed per game at its steady state (`rolling::steady_reading`; 0: none reached
-    /// it yet): remembered when lower than planned (`Learned::steady`, with a margin), and planned with when well lower
-    /// (`calibrate`).
-    steady_per_game: u64,
+    /// it yet; agent 0.3.9: KB, `rolling::measured_per_game_kb`): remembered when lower than planned (`Learned::steady`,
+    /// with a margin), and planned with when well lower (`calibrate`).
+    steady_kb: u64,
     /// agent 0.3.3: the steady reading `calibrate` last acted on, and the most a reading over the plan was remembered at
     /// (`Learned::raise`, at once).
     calibrated: u64,
     raised: u64,
-    /// agent 0.3.5: a GPU job's early reading (`rolling::early_reading`; 0: none yet), and whether `calibrate` acted on it.
-    early_per_game: u64,
+    /// agent 0.3.5: a GPU job's early reading (`rolling::early_reading`; 0: none yet; agent 0.3.9: KB), and whether
+    /// `calibrate` acted on it.
+    early_kb: u64,
     early_done: bool,
     /// agent 0.3.6: the lowest base reading of the lease's workers (`rolling::base_reading`; 0: none yet), and the one
     /// `calibrate` acted on.
@@ -1103,10 +1104,10 @@ impl Engine {
                 gpu: gpu_choice,
                 peak_mb: 0,
                 per_game_max: 0,
-                steady_per_game: 0,
+                steady_kb: 0,
                 calibrated: 0,
                 raised: 0,
-                early_per_game: 0,
+                early_kb: 0,
                 early_done: false,
                 base_min: 0,
                 base_applied: 0,
@@ -1834,13 +1835,14 @@ impl Run {
         let Some(now) = self.worker.commit_mb() else { return };
         r.peak_mb = r.peak_mb.max(now);
         let per = crate::rolling::measured_per_game(now, conc, r.mem.cost);
+        let per_kb = crate::rolling::measured_per_game_kb(now, conc, r.mem.cost);
         r.per_game_max = r.per_game_max.max(per);
         if steady {
-            r.steady_per_game = r.steady_per_game.max(per);
+            r.steady_kb = r.steady_kb.max(per_kb);
         }
-        // (an early reading at or under the base is less than 1 MB a game: 1)
+        // (an early reading at or under the base counts 1 MB a game: planned at 2, as 0.3.5-0.3.8)
         if early && r.gpu {
-            r.early_per_game = r.early_per_game.max(per.max(1));
+            r.early_kb = r.early_kb.max(per_kb.max(1024));
         }
         // (agent 0.3.3: more per game than planned is remembered at once; the plan of this lease changes at 92 %)
         if per > r.mem.cost.per_game_mb && per > r.raised {
@@ -2839,9 +2841,9 @@ impl Run {
             }
             // agent 0.3.3: workers that ran to their steady state under the plan lower it (with a margin, never below
             // what any of them committed per game at it)
-            if r.steady_per_game > 0 {
-                if let Some(v) = Learned::steady(&eng.cfg.layout, run, build, r.gpu, r.steady_per_game) {
-                    log::info!("lease {id}: its workers committed at most {} MB per game at their steady state: remembering {v} MB for this run and worker build", r.steady_per_game);
+            if r.steady_kb > 0 {
+                if let Some(v) = Learned::steady(&eng.cfg.layout, run, build, r.gpu, r.steady_kb) {
+                    log::info!("lease {id}: its workers committed at most {:.1} MB per game at their steady state: remembering {v} MB for this run and worker build", r.steady_kb as f64 / 1024.0);
                 }
             }
             // agent 0.3.4: a GPU job's video memory per batch row at the workers' steady state likewise
@@ -3086,7 +3088,10 @@ impl Run {
             return;
         }
         let (idle_ms, total_ms) = crate::worker::sys_cpu_ms();
-        let ours_ms = self.worker.cpu_ms() + self.mates.iter().map(|d| d.worker.cpu_ms()).sum::<u64>();
+        // (agent 0.3.9: the agent's own CPU time is ours too - it compresses and uploads the workers' results, ~11-20k
+        // games an hour from a GPU crew; 0.3.8 counted it as another program's, and the idle 4070 Ti PC read 7-11 % "other
+        // programs" during its GPU trials, at the 10 % bar)
+        let ours_ms = crate::worker::self_cpu_ms() + self.worker.cpu_ms() + self.mates.iter().map(|d| d.worker.cpu_ms()).sum::<u64>();
         let now = LoadMark { idle_ms, total_ms, ours_ms };
         let tu = self.tuning.as_mut().expect("checked");
         if let Some((at, prev)) = tu.load {
@@ -3811,7 +3816,10 @@ impl Run {
         // (agent 0.3.6: the base, from the workers' base readings - lower than planned: planned with at once)
         if r.base_min > 0 && r.base_min != r.base_applied {
             r.base_applied = r.base_min;
-            if let Some(b) = Learned::set_base(&eng.cfg.layout, &run, &build, r.gpu, r.base_min) {
+            if let Some(raw) = Learned::set_base(&eng.cfg.layout, &run, &build, r.gpu, r.base_min) {
+                // (agent 0.3.9: a GPU worker's reading plus the base's drift after its first status, as `Learned::plan`;
+                // within a lease only ever lower, a higher base planned from the next lease)
+                let b = crate::rolling::planned_base(raw, r.gpu);
                 let was = r.mem.cost.base_mb;
                 if (b as f64) < was as f64 * (1.0 - crate::rolling::BASE_TOLERANCE) {
                     let line = format!("a worker commits {} MB before its games grow: planning a base of {b} MB (was {was})", r.base_min);
@@ -3823,12 +3831,12 @@ impl Run {
             }
         }
         // (agent 0.3.5: a GPU job's early reading first - once -, then the steady ones)
-        let reading = if r.steady_per_game > 0 && r.steady_per_game != r.calibrated {
-            r.calibrated = r.steady_per_game;
-            Some((r.steady_per_game, false))
-        } else if r.early_per_game > 0 && !r.early_done && r.steady_per_game == 0 {
+        let reading = if r.steady_kb > 0 && r.steady_kb != r.calibrated {
+            r.calibrated = r.steady_kb;
+            Some((r.steady_kb, false))
+        } else if r.early_kb > 0 && !r.early_done && r.steady_kb == 0 {
             r.early_done = true;
-            Some((r.early_per_game, true))
+            Some((r.early_kb, true))
         } else {
             None
         };
@@ -3837,8 +3845,9 @@ impl Run {
             if let Some(v) = learned {
                 let was = r.mem.cost.per_game_mb;
                 let when = if early { "early in their games (planned x 2)" } else { "at their steady state" };
-                log::info!("lease {id}: its workers commit {reading} MB per game in flight {when} (planned {was}): remembering {v} MB for this run and worker build");
-                eng.worker_log.write_line(&format!("tuning [{id}]: the workers commit {reading} MB per game in flight {when}: planning {v} MB (was {was})"));
+                let mb = reading as f64 / 1024.0;
+                log::info!("lease {id}: its workers commit {mb:.1} MB per game in flight {when} (planned {was}): remembering {v} MB for this run and worker build");
+                eng.worker_log.write_line(&format!("tuning [{id}]: the workers commit {mb:.1} MB per game in flight {when}: planning {v} MB (was {was})"));
                 if v as f64 <= was as f64 * crate::rolling::RAISE_INFLIGHT_SHARE {
                     r.mem.cost.per_game_mb = v;
                     r.mem.measured = true;
@@ -4346,7 +4355,7 @@ impl Run {
             let per = crate::rolling::measured_per_game(c, m.layout.conc, cost);
             per_max = per_max.max(per);
             if m.counters.is_some_and(|(_, g, s)| crate::rolling::steady_reading(g, s, m.layout.conc)) {
-                steady = steady.max(per);
+                steady = steady.max(crate::rolling::measured_per_game_kb(c, m.layout.conc, cost));
             }
             let lim = m.worker.mem_limit_mb;
             if high.is_none() && lim > 0 && c as f64 >= lim as f64 * crate::rolling::HIGH_SHARE {
@@ -4358,7 +4367,7 @@ impl Run {
         }
         if let Some(r) = self.roll.as_mut() {
             r.per_game_max = r.per_game_max.max(per_max);
-            r.steady_per_game = r.steady_per_game.max(steady);
+            r.steady_kb = r.steady_kb.max(steady);
         }
         if let Some((i, c)) = high {
             return self.mate_memory_high(eng, i, c);

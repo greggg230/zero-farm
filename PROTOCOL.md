@@ -1349,7 +1349,10 @@ A rolling lease is a self-play lease (section 3) plus
     up) is remembered when lower than planned, and planned with as a steady reading is (above). The 4070 Ti PC's first
     0.3.4 lease, 2026-11-20: a CUDA build not measured there was planned at the default 45 MB a game - 139 in flight
     under its 9.5 GB cap, 5,179 leaves/s - while the memory-fixed worker commits ~2 MB a game; two turnovers of 139 take
-    ~4 minutes there. An early reading at or under the base counts 1 MB a game.
+    ~4 minutes there. An early reading at or under the base counts 1 MB a game. **Agents from 0.3.9:** steady and early
+    readings are taken in KB (`rolling::measured_per_game_kb`, rounded up) and the margin's product is rounded once - a
+    steady reading to the nearest MB, an early one up -: 0.3.3-0.3.8 rounded the reading up to a whole MB and the
+    product up again, so the 4070 Ti PC's 2.6 MB a game was read as 3 and planned at 4 (x 1.2), never 3.
   - **The base, measured** (agents from 0.3.6; a GPU job). A worker's commit at its first `status` after its sessions
     exist (it names a provider) with games started and none finished is a base reading: the runtime and the network,
     its games barely begun. The lease's lowest reading is remembered per run, worker build and provider class (key
@@ -1358,6 +1361,13 @@ A rolling lease is a self-play lease (section 3) plus
     the default is in the cost per game measured over it), and planned with at once, as a lower cost per game is (the
     worker bounds, the layouts held back, the start). The 4070 Ti PC's 0.3.5 lease (round 5, 2026-11-20): planned at
     1,800 MB + 4 MB a game per worker under a 9.3 GB limit, a crew of two never fitted beside the running worker.
+    **Agents from 0.3.9:** a GPU worker's base reading plans with 400 MB more (`rolling::GPU_BASE_DRIFT_MB`; the stored
+    reading is the raw one): CUDA loads kernels lazily as batch shapes come and the runtime's arenas grow after the first
+    status, and counted per game that drift made the cost per game too high. The 4070 Ti PC (one worker, fp16 network,
+    10-minute runs, 2026-11-20): first status 1,659 MB; 3.54 GB at 575 games in flight; +1.48 GB commit and +1.43 GB
+    working set from 575 to 1,150 games (2.6 MB a game, touched; commit less working set a fixed ~1.1 GB a worker) - a
+    steady base of ~2.0 GB. Within a lease a base reading only ever lowers the plan; a higher one is planned with from the
+    next lease. (Lazy CUDA module loading saves ~2.4 GB a worker there: never `CUDA_MODULE_LOADING=EAGER`.)
 - **The job's memory limit** (`caps.ram_mb`; agents from 0.3.6). The owner's `max_ram_mb`, else half the RAM, and never
   more than the free memory less what is kept for the owner: an eighth of the RAM while the PC is idle (no input for
   `idle_minutes`), a quarter else, at least 4 GB either way (`policy::mem_floor_now`). Free memory below that floor blocks
@@ -2102,6 +2112,10 @@ set the run's alternate's `model` (the CUDA alternate: `"model": "gpu"`) and the
 it: GPU machines play its default model.
 
 ## Changes
+- v1 rev 20, agent 0.3.9 (2026-11-20; no wire change): the memory plan's cost per game from KB readings, rounded once
+  (10.6 **Early reading**), a GPU worker's base reading plus 400 MB (10.6 **The base, measured**) - the 4070 Ti PC's 2.6 MB a
+  game planned at 3 instead of 4 over a ~2.0 GB base -, and the agent's own CPU time (its uploads) counted as the job's,
+  not another program's, in the tuner's load (13.2).
 - v1 rev 20, agent 0.3.8 (2026-11-20; no wire change): a GPU job's tuning entries are keyed by the GPU tuner's version
   3 (13: the key's tuner version), so 0.3.5-0.3.6's entries - whose postponed trials counted as discards, the 4070 Ti PC's crew of two given
   up on after 3 - are searched again with 0.3.7's trials after the drain; CPU entries keep version 2.

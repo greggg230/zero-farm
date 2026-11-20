@@ -263,6 +263,12 @@ pub fn kill_orphans(work: &Path) -> usize {
     n
 }
 
+/// agent 0.3.9: CPU time (user + system) this agent's own process has used, ms (its uploads, pings and logs are the
+/// job's work, `tune::LoadMark`).
+pub fn self_cpu_ms() -> u64 {
+    crate::macos::proc_cpu_ms(std::process::id() as i32).unwrap_or(0)
+}
+
 /// rev 19 (PROTOCOL 13): the system's CPU time so far over all cores, ms: (idle, total).
 pub fn sys_cpu_ms() -> (u64, u64) {
     let (idle, total) = crate::macos::cpu_ticks();

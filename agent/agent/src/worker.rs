@@ -31,7 +31,7 @@ use zerofarm_common::rotlog::RotatingFile;
 #[path = "worker_unix.rs"]
 mod unix;
 #[cfg(unix)]
-pub use unix::{kill_orphans, sys_cpu_ms, CpuMark, WorkerProc};
+pub use unix::{kill_orphans, self_cpu_ms, sys_cpu_ms, CpuMark, WorkerProc};
 
 /// Longest stdout line accepted from a worker.
 pub const MAX_LINE: usize = 1 << 20;
@@ -339,6 +339,20 @@ impl Drop for WorkerProc {
 #[cfg(windows)]
 fn ft(t: &windows_sys::Win32::Foundation::FILETIME) -> u64 {
     ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64
+}
+
+/// agent 0.3.9: CPU time (user + kernel) this agent's own process has used, ms - its uploads (compressing the workers'
+/// results), pings and logs are the job's work, not another program's (`tune::LoadMark`).
+#[cfg(windows)]
+pub fn self_cpu_ms() -> u64 {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessTimes};
+    let z = || FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
+    let (mut c, mut e, mut k, mut u) = (z(), z(), z(), z());
+    if unsafe { GetProcessTimes(GetCurrentProcess(), &mut c, &mut e, &mut k, &mut u) } == 0 {
+        return 0;
+    }
+    (ft(&k) + ft(&u)) / 10_000
 }
 
 /// rev 19 (PROTOCOL 13): the system's CPU time so far over all CPUs, ms: (idle, total).

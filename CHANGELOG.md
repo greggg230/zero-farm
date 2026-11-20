@@ -4,6 +4,15 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's: `agent-macos-v<version>`).
 
+## Unreleased (0.3.9)
+
+- **Graphics cards hold more games at once.** Zero Farm planned about 4 MB of memory for each game on a graphics card
+  where the job programs use about 2.6 MB, partly because memory the graphics driver loads in the first minutes was
+  counted per game. It now allows for that start-up memory separately and rounds less, so the same memory holds more
+  games - on an RTX 4070 Ti with 32 GB, two job programs of about 1,300 games instead of about 1,100.
+- **Finding the fastest setup is less often interrupted.** Zero Farm's own work (packing and uploading results) no
+  longer counts as "other programs" when it checks that the computer is quiet enough to time a setup.
+
 ## Unreleased (0.3.8)
 
 - **Graphics-card setups are worked out afresh.** Zero Farm 0.3.5 and 0.3.6 counted every setup they had to put off as

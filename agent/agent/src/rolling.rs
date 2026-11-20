@@ -314,6 +314,24 @@ pub fn measured_per_game(commit_mb: u64, conc: u64, cost: MemCost) -> u64 {
     commit_mb.saturating_sub(cost.base_mb).div_ceil(conc.max(1))
 }
 
+/// agent 0.3.9: the same in KB (rounded up) - the steady and early readings the plan calibrates from: a whole MB rounded
+/// up before the margin made 2.6 MB a game 3, and x 1.2 then 4 (0.3.3-0.3.8).
+pub fn measured_per_game_kb(commit_mb: u64, conc: u64, cost: MemCost) -> u64 {
+    (commit_mb.saturating_sub(cost.base_mb) * 1024).div_ceil(conc.max(1))
+}
+
+/// agent 0.3.9: a GPU worker's commit at its first status (its base reading) is short of its base by about this much -
+/// CUDA loads kernels lazily as batch shapes come, and the runtime's arenas grow after the first status; counted per
+/// game, it made the plan's cost per game too high. The 4070 Ti PC (2026-11-20, one worker, fp16 network, 10-minute
+/// runs): first status 1,659 MB; 3.54 GB at 575 games in flight and ~2.6 MB a game more from 575 to 1,150 (commit and
+/// working set alike) - a steady base of ~2.0 GB.
+pub const GPU_BASE_DRIFT_MB: u64 = 400;
+
+/// agent 0.3.9: the base a base reading plans with (a GPU worker's: plus `GPU_BASE_DRIFT_MB`).
+pub fn planned_base(reading_mb: u64, gpu: bool) -> u64 {
+    reading_mb + if gpu { GPU_BASE_DRIFT_MB } else { 0 }
+}
+
 /// The memory a game in flight was measured to take on this PC, per run, worker build and provider class
 /// (`state\rolling_memory.json`, keys `<run>/<build_id>/cpu` and `.../gpu`, MB per game over the base; agent 0.3.3 -
 /// 0.2.14-0.3.2's `<run>/cpu` keys, measured with builds of before, are not read). The memory plan calibrates itself
@@ -357,7 +375,7 @@ impl Learned {
     pub fn plan(layout: &Layout, run: &str, build: &str, gpu: bool, ram_mb: u64) -> MemPlan {
         let d = Self::default_cost(gpu);
         let m = Self::get(layout, run, build, gpu);
-        let base = Self::base(layout, run, build, gpu).unwrap_or(d.base_mb);
+        let base = Self::base(layout, run, build, gpu).map(|b| planned_base(b, gpu)).unwrap_or(d.base_mb);
         MemPlan { ram_mb, cost: MemCost { base_mb: base, per_game_mb: m.unwrap_or(d.per_game_mb).max(1) }, measured: m.is_some() }
     }
 
@@ -393,20 +411,27 @@ impl Learned {
         Self::raise_key(layout, Self::key(run, build, gpu), Self::default_cost(gpu).per_game_mb, per_game_mb)
     }
 
-    /// agent 0.3.3: a steady reading (`steady_reading`) of `reading_mb` per game: remembered as `reading_mb` x
-    /// `LEARN_MARGIN` (rounded up, at least 1) when that is less than what is planned with now (the stored value, else the
-    /// default) -> the new value when it was lowered. Rises go through `raise`, at once.
-    pub fn steady(layout: &Layout, run: &str, build: &str, gpu: bool, reading_mb: u64) -> Option<u64> {
-        Self::steady_key(layout, Self::key(run, build, gpu), Self::default_cost(gpu).per_game_mb, reading_mb)
+    /// agent 0.3.3: a steady reading (`steady_reading`) of `reading_kb` KB per game: remembered as the reading x
+    /// `LEARN_MARGIN` in MB (agent 0.3.9: rounded to the nearest MB from the KB reading - 0.3.3-0.3.8 rounded the reading
+    /// up to a whole MB and the product up again; at least 1) when that is less than what is planned with now (the stored
+    /// value, else the default) -> the new value when it was lowered. Rises go through `raise`, at once.
+    pub fn steady(layout: &Layout, run: &str, build: &str, gpu: bool, reading_kb: u64) -> Option<u64> {
+        let v = ((reading_kb as f64 * LEARN_MARGIN / 1024.0).round() as u64).max(1);
+        Self::lower_key(layout, Self::key(run, build, gpu), Self::default_cost(gpu).per_game_mb, v)
     }
 
-    /// agent 0.3.5: an early reading (`early_reading`) of `reading_mb` per game: remembered as `reading_mb` x `EARLY_MARGIN`
-    /// (rounded up, at least 1) when that is less than what is planned with now -> the new value when it was lowered.
-    pub fn early(layout: &Layout, run: &str, build: &str, gpu: bool, reading_mb: u64) -> Option<u64> {
-        let v = ((reading_mb.max(1) as f64 * EARLY_MARGIN).ceil() as u64).max(1);
+    /// agent 0.3.5: an early reading (`early_reading`) of `reading_kb` KB per game: remembered as the reading x
+    /// `EARLY_MARGIN` in MB (rounded up, at least 1) when that is less than what is planned with now -> the new value when
+    /// it was lowered.
+    pub fn early(layout: &Layout, run: &str, build: &str, gpu: bool, reading_kb: u64) -> Option<u64> {
+        let v = ((reading_kb.max(1) as f64 * EARLY_MARGIN / 1024.0).ceil() as u64).max(1);
+        Self::lower_key(layout, Self::key(run, build, gpu), Self::default_cost(gpu).per_game_mb, v)
+    }
+
+    /// `v` stored under `k` when lower than what is planned with now (the stored value, else `default`) -> `v` when it was.
+    fn lower_key(layout: &Layout, k: String, default: u64, v: u64) -> Option<u64> {
         let mut m = Self::load(layout);
-        let k = Self::key(run, build, gpu);
-        let now = m.get(&k).copied().unwrap_or(Self::default_cost(gpu).per_game_mb);
+        let now = m.get(&k).copied().unwrap_or(default);
         if v >= now {
             return None;
         }
@@ -693,18 +718,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let layout = Layout::new(&dir);
         let d = cpu_cost().per_game_mb;
-        // the fixed native worker (2026-11-19): 2.5 MB a game at its steady state, read as 3 (whole MB, rounded up) ->
-        // planned at 4 (x 1.2, rounded up), below the platform's default: no max with it any more
-        assert_eq!(Learned::steady(&layout, "r", "fixed", false, 3), Some(4));
+        // a steady reading (KB, agent 0.3.9) of 3 MB a game -> x 1.2 = 3.6: planned at 4, below the platform's default (no
+        // max with it any more)
+        assert_eq!(Learned::steady(&layout, "r", "fixed", false, 3072), Some(4));
         assert_eq!(Learned::plan(&layout, "r", "fixed", false, 10_000).cost.per_game_mb, 4);
-        assert_eq!(Learned::steady(&layout, "r", "fixed", false, 2), Some(3), "lower again");
-        assert_eq!(Learned::steady(&layout, "r", "fixed", false, 3), None, "3 x 1.2 = 4 is no lower than 3");
+        assert_eq!(Learned::steady(&layout, "r", "fixed", false, 2048), Some(2), "lower again: 2.4, to the nearest MB");
+        assert_eq!(Learned::steady(&layout, "r", "fixed", false, 2560), None, "the fixed native worker's 2.5 MB x 1.2 = 3 is no lower than 2");
         // a rise is remembered at once
         assert!(Learned::raise(&layout, "r", "fixed", false, 7));
         assert_eq!(Learned::plan(&layout, "r", "fixed", false, 10_000).cost.per_game_mb, 7);
         // an old build at the default (no measurement): a steady reading near it changes nothing; one well under lowers it
-        assert_eq!(Learned::steady(&layout, "r", "old", false, d), None);
-        assert_eq!(Learned::steady(&layout, "r", "old", false, d - d / 4), Some(((d - d / 4) as f64 * 1.2).ceil() as u64).filter(|&v| v < d));
+        assert_eq!(Learned::steady(&layout, "r", "old", false, d * 1024), None);
+        assert_eq!(Learned::steady(&layout, "r", "old", false, (d - d / 4) * 1024), Some(((d - d / 4) as f64 * 1.2).round() as u64).filter(|&v| v < d));
         // steady: twice the games in flight finished, the games in flight full
         assert!(steady_reading(1764, 2646, 882));
         assert!(!steady_reading(1763, 2645, 882), "one turnover and a bit");
@@ -712,9 +737,13 @@ mod tests {
         assert!(steady_reading(2, 3, 1));
         // agent 0.3.5: an early reading once half the games in flight finished, full; x 2 when lower than planned
         assert!(early_reading(70, 209, 139) && !early_reading(69, 208, 139) && !early_reading(70, 100, 139));
-        assert_eq!(Learned::early(&layout, "r", "gpu-build", true, 2), Some(4), "2 MB a game early: planned at 4 (default 45)");
-        assert_eq!(Learned::early(&layout, "r", "gpu-build", true, 3), None, "6 is no lower than 4");
-        assert_eq!(Learned::early(&layout, "r", "gpu-build2", true, 0), Some(2), "a reading under the base counts 1");
+        assert_eq!(Learned::early(&layout, "r", "gpu-build", true, 2048), Some(4), "2 MB a game early: planned at 4 (default 45)");
+        assert_eq!(Learned::early(&layout, "r", "gpu-build", true, 3072), None, "6 is no lower than 4");
+        assert_eq!(Learned::early(&layout, "r", "gpu-build2", true, 1024), Some(2), "a reading under the base counts 1 MB (lease.rs): 2");
+        // agent 0.3.9: a steady reading of 2.6 MB a game (KB) x 1.2 = 3.1: planned at 3 (0.3.3-0.3.8: 3 x 1.2 rounded up, 4)
+        assert_eq!(Learned::steady(&layout, "r", "gpu-build", true, 2662), Some(3));
+        assert_eq!(measured_per_game_kb(3540, 575, MemCost { base_mb: 2059, per_game_mb: 4 }), 2638, "1,481 MB over 575 games, rounded up");
+        assert_eq!(measured_per_game(3540, 575, MemCost { base_mb: 2059, per_game_mb: 4 }), 3);
         // agent 0.3.6: the base, measured - only lower, by more than 5 %; planned with
         assert!(base_reading(true, 0, 139) && !base_reading(false, 0, 139) && !base_reading(true, 1, 139) && !base_reading(true, 0, 0));
         assert_eq!(Learned::set_base(&layout, "r", "g", true, 1750), None, "within 5 % of the default 1,800");
@@ -722,7 +751,8 @@ mod tests {
         assert_eq!(Learned::set_base(&layout, "r", "g", true, 1900), None, "never raised: a reading holds the games' first memory too");
         assert_eq!(Learned::set_base(&layout, "r", "g", true, 100), Some(MIN_BASE_MB));
         let p = Learned::plan(&layout, "r", "g", true, 9_300);
-        assert_eq!((p.cost.base_mb, p.cost.per_game_mb), (MIN_BASE_MB, GPU_COST.per_game_mb));
+        assert_eq!((p.cost.base_mb, p.cost.per_game_mb), (MIN_BASE_MB + GPU_BASE_DRIFT_MB, GPU_COST.per_game_mb), "agent 0.3.9: a GPU base reading plans with its drift");
+        assert_eq!((planned_base(1659, true), planned_base(1659, false)), (2059, 1659));
         assert_eq!(Learned::base(&layout, "r", "g", false), None, "per provider class");
         let _ = std::fs::remove_dir_all(&dir);
     }
