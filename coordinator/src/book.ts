@@ -86,7 +86,9 @@ export interface RollingCfg {
   flush_s: number; // the longest a finished game waits in the worker before it is uploaded
 }
 export const ROLLING_AUTO_INFLIGHT = 256; // "auto" counts this much when sizing a grant's first release
-export const ROLLING_QUOTA_WAIT_S = 60; // an extension with no headroom: ask again after this
+// An extension with no headroom (or headroom owed to leases below their batch): ask again after this. Rev 21: 20 s,
+// was 60 - a lease at its in-flight limit asks every 20 s, and a starved one must not ask less often.
+export const ROLLING_QUOTA_WAIT_S = 20;
 // Rev 21 (PROTOCOL 10.4): a rolling lease holds no more unfinished ids than its games in flight (twice that for a crew)
 // plus a reporting buffer: the games it plays in ROLLING_BUFFER_S at its own rate (finished games reach the coordinator
 // with a beat, every BEAT_S, or a result; the agent asks again within ROLLING_INFLIGHT_WAIT_S), at least 1/8 of its
@@ -1079,6 +1081,14 @@ export function unfinishedIds(l: LeaseRow): number {
   return (l.rel_hi ?? l.hi ?? 0) - (l.lo ?? 0) - finishedIds(l);
 }
 
+// Rev 21 (PROTOCOL 10.4): the games a rolling lease's workers play at once as its last beat says (its crew's
+// `inflight`, else its main worker's `concurrency`; 0 before its first beat) - its batch.
+export function batchOf(l: LeaseRow): number {
+  const s = parseJson<Record<string, unknown> | null>(l.stats, null) ?? {};
+  const num = (x: unknown) => (typeof x === "number" && Number.isFinite(x) && x > 0 ? x : 0);
+  return Math.max(num(s.inflight), num(s.concurrency));
+}
+
 // Rev 21 (PROTOCOL 10.4): the most unfinished ids a rolling lease may hold after an extension asking for `asked`.
 // Its games in flight: half of what it asks (an agent asks for about 2 x its whole crew's games in flight), never
 // fewer than its last beat says its workers play. A crew (more workers than one, or more games asked for than its
@@ -1141,12 +1151,21 @@ export async function extend(env: Env, r: ExtendReq): Promise<ExtendAnswer> {
     .bind(l.machine_id, l.scope)
     .first<{ rate: number }>();
   const room = rollingLimit(l, r.games, r.now, known?.rate ?? 0) - unfinishedIds(l);
-  const n = Math.min(r.games, st.headroom, hi - rel, room);
+  // Rev 21: the headroom goes first to leases below their batch. What brings this lease back to its batch may take any
+  // headroom; ids past it (a crew's next member, the buffer) only what the other leases' shortfalls leave.
+  const others = await db
+    .prepare(`SELECT * FROM leases WHERE scope = ? AND kind = 'selfplay' AND state = 'active' AND rel_hi IS NOT NULL AND lease_id != ?`)
+    .bind(l.scope, l.lease_id)
+    .all<LeaseRow>();
+  const owed = others.results.reduce((a, o) => a + Math.max(0, batchOf(o) - unfinishedIds(o)), 0);
+  const free = Math.max(batchOf(l) - unfinishedIds(l), st.headroom - owed);
+  const n = Math.min(r.games, st.headroom, hi - rel, room, free);
   if (n < 1) {
     if (stmts.length) await db.batch(stmts);
-    return st.headroom < 1
-      ? { games: rel - lo, wait_s: ROLLING_QUOTA_WAIT_S, reason: "quota" }
-      : { games: rel - lo, wait_s: ROLLING_INFLIGHT_WAIT_S, reason: "inflight" };
+    // no headroom at all: quota; else at its own limit: inflight; else the headroom is owed to others: quota
+    return st.headroom >= 1 && room < 1
+      ? { games: rel - lo, wait_s: ROLLING_INFLIGHT_WAIT_S, reason: "inflight" }
+      : { games: rel - lo, wait_s: ROLLING_QUOTA_WAIT_S, reason: "quota" };
   }
   stmts.push(db.prepare(`UPDATE leases SET rel_hi = ? WHERE lease_id = ? AND rel_hi = ?`).bind(rel + n, l.lease_id, rel));
   await db.batch(stmts);

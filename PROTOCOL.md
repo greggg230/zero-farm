@@ -1229,8 +1229,9 @@ A rolling lease is a self-play lease (section 3) plus
 `{"games": k}` (k ≥ 1): release k more ids. Answers (200):
 - `{"games": total}`: the lease's ids are now `[lo, lo + total)` (total ≥ the previous; it may be less than asked:
   the run's self-play headroom, or the block's end);
-- `{"games": total, "wait_s": 60, "reason": "quota"}`: nothing released now (no headroom: the generation's quota is
-  full); ask again after `wait_s`;
+- `{"games": total, "wait_s": 20, "reason": "quota"}`: nothing released now (no headroom: the generation's quota is
+  full; rev 21: or the headroom left is owed to leases below their batch, below); ask again after `wait_s` (60 before
+  rev 21);
 - `{"games": total, "wait_s": 20, "reason": "inflight"}` (rev 21): nothing released now: the lease already holds as many
   unfinished ids as it may (**In-flight limit**, below); ask again after `wait_s`. (No headroom as well: `quota`.)
 - `{"games": total, "finish": true, "reason": "max_s" | "block" | "state"}`: no id will ever be released: finish the
@@ -1262,7 +1263,12 @@ A rolling lease is a self-play lease (section 3) plus
     paused time; at least 60 s) or the machine's rate for the run measured from its closed leases (as lease sizes use),
     the higher - at least 1/8 of `inflight` and 16: finished games reach the coordinator with a beat (every 60 s) or a
     result (`flush_s`), and the agent asks again within 20 s, so the worker keeps its games in flight meanwhile.
-  At the limit the answer is `wait_s` 20, `reason` `inflight` (3 asks and a beat a minute fit the beat bucket). Before
+  At the limit the answer is `wait_s` 20, `reason` `inflight` (3 asks and a beat a minute fit the beat bucket).
+  **Headroom to the short first.** A lease's batch is what its workers play at once by its last beat (Stats `inflight`,
+  else `concurrency`; 0 before its first beat). Ids that bring it back to its batch may take any headroom; ids past it
+  (a crew's next member, the buffer) take only the headroom left after every other active rolling lease of the run is
+  topped up to its batch; else `quota`. Without this a crew allowed 2 x its planned workers, asking every 20 s, took the
+  headroom while a lease below its batch waited out a 60 s `quota` answer and played fewer games at once. Before
   rev 21 an agent whose worker kept saying `low` (agents 0.3.6-0.3.8 seen holding 8 to 20 x their games in flight)
   took every free id of the generation's quota, and other machines got `no_work`.
 
@@ -2135,8 +2141,9 @@ it: GPU machines play its default model.
 ## Changes
 - v1 rev 21 (2026-11-20; coordinator only, every agent version; no migration): **the in-flight limit of rolling leases**
   (10.4). An extension releases ids only while the lease's unfinished ids stay within its games in flight (twice that for
-  a crew) plus a reporting buffer, else `wait_s` 20 with `reason` `inflight`; a grant releases the larger `inflight` once
-  (was twice, 10.3); lease Stats keep `inflight` and `workers`. Why: on a live run one laptop's lease (agent 0.3.6, 384
+  a crew) plus a reporting buffer, else `wait_s` 20 with `reason` `inflight`; ids past a lease's batch take only the
+  headroom that other leases below their batch don't need; a `quota` answer waits 20 s (was 60); a grant releases the
+  larger `inflight` once (was twice, 10.3); lease Stats keep `inflight` and `workers`. Why: on a live run one laptop's lease (agent 0.3.6, 384
   games in flight, ~2,000 games/h) held 2,657 unplayed ids and took 6,112 more within two minutes of the quota rising, so
   two faster machines got `no_work`; another PC's (0.3.8) held ~3,200 with 384 in flight.
 - v1 rev 20, agent 0.3.10 (2026-11-20; no wire change): the tuner's "other programs" load (13.2 **quiet**) leaves out the

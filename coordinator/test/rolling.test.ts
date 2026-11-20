@@ -204,12 +204,12 @@ describe("rolling leases: extend (10.4)", () => {
     expect((await row(l.lease_id)).rel_hi).toBe(100);
     st = (await state("q")).selfplay_state;
     expect(st.headroom).toBe(0);
-    expect(ok(await extend(m, l.lease_id, { games: 50 }))).toEqual({ games: 100, wait_s: 60, reason: "quota" });
+    expect(ok(await extend(m, l.lease_id, { games: 50 }))).toEqual({ games: 100, wait_s: 20, reason: "quota" });
     // accepting and acking the 20 games changes nothing (accepted + in flight); the classic lease given back does
     ok(await admin("POST", "/v1/admin/run/q/accept", { gen: 1, games: 20 }));
     const { cursor } = ok(await admin("GET", "/v1/admin/run/q/results"));
     ok(await admin("POST", "/v1/admin/run/q/ack", { cursor }));
-    expect(ok(await extend(m, l.lease_id, { games: 50 }))).toEqual({ games: 100, wait_s: 60, reason: "quota" });
+    expect(ok(await extend(m, l.lease_id, { games: 50 }))).toEqual({ games: 100, wait_s: 20, reason: "quota" });
     ok(await finish(cm, c.lease_id, [], { given_back: true }));
     // headroom again, but 80 unfinished ids are past this lease's limit (25 in flight + 40 of buffer): rev 21
     expect(ok(await extend(m, l.lease_id, { games: 50 }))).toEqual({ games: 100, wait_s: 20, reason: "inflight" });
@@ -415,6 +415,23 @@ describe("rolling leases: the in-flight limit (10.4, rev 21)", () => {
     // the crew's numbers are kept with the lease's stats
     const s = JSON.parse((await row(l2.lease_id)).stats);
     expect([s.inflight, s.workers]).toEqual([64, 2]);
+  });
+
+  it("the headroom goes first to leases below their batch; ids past a lease's batch take only what is left", async () => {
+    await rollingRun("fair", { quota: 300, slack: 0 }); // cap 300
+    const a = await enroll("a");
+    const la = await rollingLease(a); // 64 released
+    const b = await enroll("b");
+    const lb = await rollingLease(b); // 64 released: headroom 172
+    await aged(la.lease_id, 3600);
+    await aged(lb.lease_id, 3600);
+    ok(await beat(a, la.lease_id, "running", { stats: { concurrency: 64 }, progress: { games_done: 0, games_total: 64 } })); // at its batch
+    ok(await beat(b, lb.lease_id, "running", { stats: { concurrency: 128 }, progress: { games_done: 0, games_total: 64 } })); // 64 short
+    // a (a crew asking for 2 x 128: limit 272) may take the headroom less b's 64: 108
+    expect(ok(await extend(a, la.lease_id, { games: 256 }))).toEqual({ games: 172 });
+    // the last 64 are b's: a waits as for a full quota
+    expect(ok(await extend(a, la.lease_id, { games: 256 }))).toEqual({ games: 172, wait_s: 20, reason: "quota" });
+    expect(ok(await extend(b, lb.lease_id, { games: 256 }))).toEqual({ games: 128 });
   });
 
   it("never under the games its main worker plays: a small ask still gets ids", async () => {
