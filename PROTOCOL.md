@@ -1343,6 +1343,12 @@ A rolling lease is a self-play lease (section 3) plus
     `autotune` off, 13.1), so its games in flight follow the measurement within the lease: the 4070 Ti PC's lease, planned
     at the default 1,800 MB + 45 MB a game (128 in flight with its limit), measured ~3 MB and kept 128 with agent 0.3.3;
     from 0.3.4 it is handed over to the target's 1,024 (or a crew, 13.1) once the steady reading says it fits.
+  - **Early reading** (agents from 0.3.5; a GPU job). A GPU job's main worker gives one early reading once it finished
+    half its games in flight with them full, and at least 90 s after it started: the cost per game it shows x 2 (rounded
+    up) is remembered when lower than planned, and planned with as a steady reading is (above). The 4070 Ti PC's first
+    0.3.4 lease, 2026-11-20: a CUDA build not measured there was planned at the default 45 MB a game - 139 in flight
+    under its 9.5 GB cap, 5,179 leaves/s - while the memory-fixed worker commits ~2 MB a game; two turnovers of 139 take
+    ~4 minutes there. An early reading at or under the base counts 1 MB a game.
   - No wire change: the coordinator sees one lease, its released ids and its extensions as before.
 - **Video memory** (agents from 0.3.4; a GPU job). 0.2.13-0.3.3 planned none: one worker of at most 512 games in flight
   never came near a GPU's. A GPU job's workers (13.5) are planned within it:
@@ -1709,7 +1715,10 @@ before rev 19, eval, fuzz and classic jobs are unchanged; GPU jobs are tuned fro
   whether its layout ran on the GPU or the CPU of the same build and pack): on an NVIDIA GPU the most workers within the bounds whose start holds the target in all
   (each its share rounded up to a multiple of 64 - 1,024: 1 x 1,024 in two groups of 512, 2 x 512, 3 x 384 - in batches
   of at most the full batch, and its share of the search threads), else one; on other GPUs one (the tuner tries more). A
-  layout the memory plan held back is lifted to its share of the target, not past it (10.6). `autotune` off: the start
+  layout the memory plan held back is lifted to its share of the target, not past it (10.6). Agents from 0.3.5: a
+  start's groups are the rule's for the games in flight the memory plans leave (139: one batch of 139; 0.3.4 kept the
+  target's 2 groups, 70 rows), and while a search measured nothing but the start (no trial yet) a calibration that
+  changes the plan (10.6) picks the start again - the 4070 Ti PC: one worker of 139 at 45 MB a game, two of 512 at 4. `autotune` off: the start
   for the owner's `workers` (else one), fixed (handed over only when the memory plan holds more, 10.6). A CPU job on a
   GPU runtime pack takes no hint either (the hint for that build and pack is most likely a GPU layout).
 - **The owner's settings** `autotune` (default on; Windows `machine.json`, macOS `ZeroFarm set autotune on|off`) and
@@ -1745,7 +1754,17 @@ before rev 19, eval, fuzz and classic jobs are unchanged; GPU jobs are tuned fro
   time** (agents from 0.3.3; before: 2 drainers per worker of the crew): no handoff starts while any worker of the
   lease finishes its games (a handoff's, a crew member's at the end of its range or after giving way to memory, a
   restart's). A handoff never goes to the layout the main worker runs unless to measure it (a measurement needs a
-  fresh worker), and at most 6 handoffs start per hour (a safety net; 0.3.2 handed a job over to the same layout 3 times
+  fresh worker), and at most 6 handoffs start per hour. **Agents from 0.3.5:** a GPU job's measured trial starts only
+  when its workers fit beside the lease's workers as the handoff leaves them (every one finishing its games, at its commit and
+  video memory, 10.6) - one that would wait for a whole drain doesn't start (the 4070 Ti PC's old worker drained alone,
+  starting no game, for 6-8 minutes before each trial with 0.3.4): the layout wanted runs unmeasured instead when its
+  first worker fits (its others join as memory allows), any other trial is postponed - counted as that layout's discard
+  and against the hour's 6 for trials (postponed trials and handoffs together) -; whether a trial can be measured is
+  decided when its worker starts, not while the handoff waits, and a trial that can't is counted as discarded whatever
+  layout it was (0.3.4 swapped a candidate for the incumbent at any tick of the wait and counted nothing: the same
+  candidate was handed over to again 20 s later, three times, measuring nothing - CPU and GPU jobs alike; a CPU job's
+  trial still starts after the drain when it doesn't fit beside); nothing is written to a worker that
+  ended (a handoff's ping after a drainer's `end` failed with "the pipe is being closed") (a safety net; 0.3.2 handed a job over to the same layout 3 times
   in 7 minutes). A trial that can't be measured any more when its worker would start (the machine got busy or used):
   a candidate gives way to the incumbent; the incumbent's own measurement starts unmeasured and counts as discarded.
   The lease closes (`done`) once every worker ended, its `unfinished` worked out from the credited ids (as after a
@@ -2045,6 +2064,12 @@ set the run's alternate's `model` (the CUDA alternate: `"model": "gpu"`) and the
 it: GPU machines play its default model.
 
 ## Changes
+- v1 rev 20, agent 0.3.5, GPU fixes (2026-11-20; no wire change): from a real lease on the owner's 4070 Ti PC with
+  0.3.4 (139 games in flight planned at the default 45 MB a game for a build not measured there, 5,179 leaves/s; the
+  tuner handing over to the same trial again and again while the old worker drained for minutes): a GPU job's early
+  memory reading (10.6), its start's groups after the memory plan and the start picked again after calibration (13.1),
+  measured trials only when their workers fit beside the running ones, else postponed and counted; a trial's
+  measurability decided when its worker starts and a lost trial always counted (13.2).
 - v1 rev 20, agent 0.3.5 (2026-11-19; coordinator migration 0016): **model variants per generation** (section 14). A
   definition's `checkpoints[gen]` may sign `variants` (`{"<name>": {"model_sha256", "model_size"}}`, sharing the gen's
   reference set); `PUT /v1/admin/run/{run}/checkpoint/{gen}` registers them (`variants`: `{"<name>": {"model", "sha256"}}`,

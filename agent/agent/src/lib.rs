@@ -106,6 +106,9 @@ pub struct Timings {
     pub tune_settle: Duration,
     /// agent 0.3.3: at most `tune::MAX_HANDOFFS` layout handoffs start per this long (an hour; a safety net).
     pub tune_handoff_window: Duration,
+    /// agent 0.3.5: a GPU job's worker gives an early memory reading (`rolling::early_reading`) no sooner than this after
+    /// it started.
+    pub early_calibration: Duration,
 }
 
 impl Default for Timings {
@@ -137,6 +140,7 @@ impl Default for Timings {
             tune_ping: Duration::from_secs(2),
             tune_settle: Duration::from_secs(1),
             tune_handoff_window: Duration::from_secs(3600),
+            early_calibration: Duration::from_secs(90),
         }
     }
 }

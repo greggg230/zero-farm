@@ -512,7 +512,10 @@ impl Space {
         let n = n.max(1);
         let conc = self.target_conc(n);
         let threads = self.search_cap(n);
-        self.fit(Layout { workers: n, threads, infer_workers: 1, infer_threads: threads, groups: crate::rolling::gpu_groups(conc, batch), conc })
+        let l = self.fit(Layout { workers: n, threads, infer_workers: 1, infer_threads: threads, groups: crate::rolling::gpu_groups(conc, batch), conc });
+        // (agent 0.3.5: the groups of the games in flight the memory plans leave - 0.3.4 kept the target's: 139 games in
+        // flight in 2 groups of 70 rows on the 4070 Ti PC, where one batch of 139 is the rule's)
+        self.fit(Layout { groups: crate::rolling::gpu_groups(l.conc, batch), ..l })
     }
 
     /// agent 0.3.4: a GPU job's starting crew (PROTOCOL 13.1): on an NVIDIA GPU the most workers (within the bounds) whose
@@ -1889,7 +1892,7 @@ mod tests {
         // at the default 45 MB a game: one worker, (8,075 - 1,800) / 45 = 139 games in flight (0.3.3's plan: 128)
         let s = gpu_space(9_500, 45, 9_939, None);
         assert_eq!(s.workers_max, 1);
-        assert_eq!(s.gpu_start(true, 512), glay(1, 6, 2, 139));
+        assert_eq!(s.gpu_start(true, 512), glay(1, 6, 1, 139), "one batch of 139 (0.3.4: 2 groups of 70 rows)");
         // not NVIDIA: one worker of 1,024 in two groups of 512 (the tuner tries more)
         assert_eq!(gpu_space(16_384, 4, 9_939, None).gpu_start(false, 512), glay(1, 6, 2, 1024));
         // the owner's two workers; `autotune` off without them: one
@@ -1958,8 +1961,10 @@ mod tests {
         new.bound_workers(None, 3);
         assert_eq!(new.workers_max, 3);
         e.lift_conc(&old, &new);
-        assert_eq!(e.wanted(&new), glay(1, 6, 2, 1024));
+        assert_eq!(e.wanted(&new), glay(1, 6, 1, 1024));
         assert_eq!(new.top_conc(3), 222, "three workers: the memory plan's 222 each");
+        // (agent 0.3.5: lease.rs `calibrate` picks a start nothing else beat again for the new plan: two of 512)
+        assert_eq!(new.gpu_start(true, 512), glay(2, 3, 1, 512));
         // a tuner's choice of fewer games than the old plan held stays
         let roomy = gpu_space(9_500, 10, 9_939, None);
         assert_eq!(roomy.top_conc(1), 627);

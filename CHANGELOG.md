@@ -12,6 +12,14 @@ version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's:
   exactly like the normal network (and refuses anything else), keeps it next to the normal one, and hands it to the job
   program. Computers without a suitable graphics card, and Macs, keep the normal network. Runs that use this need Zero
   Farm 0.3.5: older versions are asked to update first.
+- **A graphics card reaches full speed within minutes.** For a job version it hadn't seen before, Zero Farm 0.3.4
+  planned for far more memory per game than the job program uses, so an RTX 4070 Ti started with only 139 games at once
+  and stayed there. Zero Farm now checks the real memory use within the first minutes and moves to two job programs of
+  about 500 games each (on that card) as soon as they fit.
+- **No more endless switching while finding the fastest setup.** When a graphics-card setup to try didn't fit in memory
+  beside the running job program, Zero Farm 0.3.4 let the running one wind down alone for minutes, then often started
+  the old setup again and tried the same switch a few seconds later. Now such a setup is put off (and given up after a
+  few tries), and a try that can't be measured counts as tried.
 
 ## Unreleased (0.3.4)
 

@@ -206,6 +206,16 @@ pub const LEARN_MARGIN: f64 = 1.2;
 /// A steady cost at most this share of the cost a lease is planned with raises its games in flight (a layout handoff,
 /// lease.rs `calibrate`); a smaller gain only waits for the next lease.
 pub const RAISE_INFLIGHT_SHARE: f64 = 0.8;
+/// agent 0.3.5: a GPU job's worker gives an **early reading** once it finished this share of its games in flight with
+/// them full (and `Timings::early_calibration` after its start): the job's memory plan calibrates within minutes instead
+/// of after `STEADY_TURNOVERS` (the 4070 Ti PC's first 0.3.4 lease, 2026-11-20: planned at the default 45 MB a game for a
+/// build not measured there - 139 games in flight under its 9.5 GB cap, 5,179 leaves/s - while the memory-fixed worker
+/// commits 2-3 MB a game; 2 x 139 games take ~4 minutes there, and the layout trials kept replacing the worker before).
+pub const EARLY_TURNOVER: f64 = 0.5;
+/// ... and an early reading is planned with this margin (the cost per game it shows x 2, rounded up): a young game holds
+/// less than a grown one (the fixed worker: ~1.6 MB a game over the base at 5 minutes, 2-3 MB later). A later steady
+/// reading lowers it further (x `LEARN_MARGIN`); more is remembered at once, as always.
+pub const EARLY_MARGIN: f64 = 2.0;
 
 /// The run's setting for a CPU or GPU job (`rolling.inflight.cpu` / `.gpu`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -362,6 +372,21 @@ impl Learned {
         Self::steady_key(layout, Self::key(run, build, gpu), Self::default_cost(gpu).per_game_mb, reading_mb)
     }
 
+    /// agent 0.3.5: an early reading (`early_reading`) of `reading_mb` per game: remembered as `reading_mb` x `EARLY_MARGIN`
+    /// (rounded up, at least 1) when that is less than what is planned with now -> the new value when it was lowered.
+    pub fn early(layout: &Layout, run: &str, build: &str, gpu: bool, reading_mb: u64) -> Option<u64> {
+        let v = ((reading_mb.max(1) as f64 * EARLY_MARGIN).ceil() as u64).max(1);
+        let mut m = Self::load(layout);
+        let k = Self::key(run, build, gpu);
+        let now = m.get(&k).copied().unwrap_or(Self::default_cost(gpu).per_game_mb);
+        if v >= now {
+            return None;
+        }
+        m.insert(k, v);
+        Self::save(layout, &m);
+        Some(v)
+    }
+
     /// agent 0.3.4: a GPU job's video memory per batch row over `GPU_VRAM`'s base, per run and worker build (key
     /// `<run>/<build_id>/vram`), calibrated as the memory per game: a build not measured here is planned with `GPU_VRAM`;
     /// more is remembered at once (`vram_raise`), less from steady readings with the margin (`vram_steady`). -> (the cost,
@@ -414,6 +439,13 @@ impl Learned {
             log::warn!("could not record a rolling job's memory per game: {e}");
         }
     }
+}
+
+/// agent 0.3.5: a GPU job's worker's reading counts as an early one: it finished `EARLY_TURNOVER` of its `conc` games in
+/// flight, its games in flight full (as `steady_reading`).
+pub fn early_reading(games: u64, started: u64, conc: u64) -> bool {
+    let conc = conc.max(1);
+    games as f64 >= (EARLY_TURNOVER * conc as f64).ceil() && started.saturating_sub(games) as f64 >= (0.98 * conc as f64).floor().max(1.0)
 }
 
 /// agent 0.3.3: a worker's reading counts as its steady state: it finished `STEADY_TURNOVERS` times its `conc` games in
@@ -629,6 +661,11 @@ mod tests {
         assert!(!steady_reading(1763, 2645, 882), "one turnover and a bit");
         assert!(!steady_reading(5000, 5100, 882), "short of ids: few games in flight");
         assert!(steady_reading(2, 3, 1));
+        // agent 0.3.5: an early reading once half the games in flight finished, full; x 2 when lower than planned
+        assert!(early_reading(70, 209, 139) && !early_reading(69, 208, 139) && !early_reading(70, 100, 139));
+        assert_eq!(Learned::early(&layout, "r", "gpu-build", true, 2), Some(4), "2 MB a game early: planned at 4 (default 45)");
+        assert_eq!(Learned::early(&layout, "r", "gpu-build", true, 3), None, "6 is no lower than 4");
+        assert_eq!(Learned::early(&layout, "r", "gpu-build2", true, 0), Some(2), "a reading under the base counts 1");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

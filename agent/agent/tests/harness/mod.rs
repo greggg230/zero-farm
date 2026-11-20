@@ -98,6 +98,7 @@ pub fn fast_timings() -> Timings {
         tune_settle: Duration::from_millis(150),
         // (the safety net's hour, shortened: 6 handoffs per 3 s never slow a test's search; a test of the net sets more)
         tune_handoff_window: Duration::from_secs(3),
+        early_calibration: Duration::from_millis(500),
     }
 }
 

@@ -102,6 +102,9 @@ struct Roll {
     /// (`Learned::raise`, at once).
     calibrated: u64,
     raised: u64,
+    /// agent 0.3.5: a GPU job's early reading (`rolling::early_reading`; 0: none yet), and whether `calibrate` acted on it.
+    early_per_game: u64,
+    early_done: bool,
     /// The current worker's ids start at `lo + offset` (0 until a restart; a restart's worker gets the ids after
     /// the ones its predecessor started).
     offset: u64,
@@ -258,6 +261,15 @@ struct Tuning {
     bounds: (Option<u32>, u32),
     /// agent 0.3.4: a GPU job's layout (PROTOCOL 13.1).
     gpu: bool,
+    /// agent 0.3.5: a GPU job's start rule's inputs (an NVIDIA GPU, the bench's full batch): the start is picked again
+    /// when the memory plan calibrates and nothing better was measured (`calibrate`).
+    gpu_start: (bool, u64),
+    /// agent 0.3.5: a trial may run now (the last tick's verdict: idle, quiet, not paused) - checked again when a trial's
+    /// worker starts, not while it waits for room.
+    strict: bool,
+    /// agent 0.3.5: trials postponed because their workers didn't fit beside the running ones: they count against
+    /// `tune::MAX_HANDOFFS` per `tune_handoff_window` for trials, with the handoffs.
+    postponed: Vec<Instant>,
     /// rev 19 (PROTOCOL 13.5): the workers a measurement counts (generation, last counters): every member of the crew
     /// since it started - one that finished its range stays counted until it ends, then with its last counters (a
     /// rotation is the crew's normal work); one that fails discards it.
@@ -1086,6 +1098,8 @@ impl Engine {
                 steady_per_game: 0,
                 calibrated: 0,
                 raised: 0,
+                early_per_game: 0,
+                early_done: false,
                 offset: 0,
                 restarts: 0,
                 restart: None,
@@ -1196,6 +1210,9 @@ impl Engine {
             probe_members: Vec::new(),
             bounds: (settings.workers, d.max_workers),
             gpu: false,
+            gpu_start: (false, 0),
+            strict: false,
+            postponed: Vec::new(),
         };
         (t, next.is_some())
     }
@@ -1302,6 +1319,9 @@ impl Engine {
             probe_members: Vec::new(),
             bounds: (set, max_workers),
             gpu: true,
+            gpu_start: (g.vendor.eq_ignore_ascii_case("nvidia"), batch),
+            strict: false,
+            postponed: Vec::new(),
         };
         (t, next.is_some())
     }
@@ -1531,6 +1551,11 @@ impl Run {
     }
 
     fn send(&mut self, v: Value) {
+        // (agent 0.3.5: nothing to a worker that ended - its pipe closes: "The pipe is being closed", os error 232, when
+        // a handoff's ping came after a drainer's `end`)
+        if self.end_ev.is_some() || self.eof {
+            return;
+        }
         if let Err(e) = self.worker.send(&v) {
             log::warn!("lease {}: write to worker failed: {e}", self.id());
         }
@@ -1639,7 +1664,7 @@ impl Run {
                     self.crew_crash(eng, &format!("worker exited with code {code} without `end`"), Some(code as i64));
                 }
                 // rev 19: a handoff whose old worker finished its games before the next one could start beside it
-                self.handoff_after_exit();
+                self.handoff_after_exit(eng);
                 // agent 0.3.3: the next worker starts only when its plan fits beside the workers still finishing their
                 // games; until then the lease winds down with them
                 if self.restart_pending() && !self.restart_room() {
@@ -1784,6 +1809,8 @@ impl Run {
         }
         let conc = self.conc.unwrap_or(1);
         let steady = self.progress.is_some_and(|(g, s)| crate::rolling::steady_reading(g, s, conc));
+        // (agent 0.3.5: a GPU job's early reading - half its games in flight finished, some time after its start)
+        let early = !steady && self.started.elapsed() >= eng.cfg.timings.early_calibration && self.progress.is_some_and(|(g, s)| crate::rolling::early_reading(g, s, conc));
         let (run, build) = (self.lease.run.clone().unwrap_or_default(), self.lease.build.build_id.clone());
         let Some(r) = self.roll.as_mut().filter(|r| r.active) else { return };
         let Some(now) = self.worker.commit_mb() else { return };
@@ -1792,6 +1819,10 @@ impl Run {
         r.per_game_max = r.per_game_max.max(per);
         if steady {
             r.steady_per_game = r.steady_per_game.max(per);
+        }
+        // (an early reading at or under the base is less than 1 MB a game: 1)
+        if early && r.gpu {
+            r.early_per_game = r.early_per_game.max(per.max(1));
         }
         // (agent 0.3.3: more per game than planned is remembered at once; the plan of this lease changes at 92 %)
         if per > r.mem.cost.per_game_mb && per > r.raised {
@@ -3159,6 +3190,9 @@ impl Run {
         });
         let quiet = quiet_load && self.stall_since.is_none();
         let strict = eng.tune_ok && quiet && !must_pause;
+        if let Some(x) = self.tuning.as_mut() {
+            x.strict = strict;
+        }
         if self.tuning.as_ref().is_some_and(|x| x.probe.is_some()) {
             let why = if !eng.tune_ok {
                 Some("the computer is in use, on battery, running a fullscreen app or otherwise not idle".to_string())
@@ -3216,12 +3250,15 @@ impl Run {
         }
         let tu = self.tuning.as_mut().expect("checked");
         tu.handoffs.retain(|at| at.elapsed() < t.tune_handoff_window);
+        tu.postponed.retain(|at| at.elapsed() < t.tune_handoff_window);
         if tu.handoffs.len() >= tune::MAX_HANDOFFS {
             // (the safety net: the next handoff waits until the oldest of these leaves the window)
             return;
         }
         let wanted = tu.entry.wanted(&tu.space);
-        let next = if !fixed && strict && !tu.revert_due && Instant::now() >= tu.no_trial_before { tu.entry.plan(&tu.space) } else { None };
+        // (agent 0.3.5: postponed trials count against the cap for trials too)
+        let trials_capped = tu.handoffs.len() + tu.postponed.len() >= tune::MAX_HANDOFFS;
+        let next = if !fixed && strict && !tu.revert_due && !trials_capped && Instant::now() >= tu.no_trial_before { tu.entry.plan(&tu.space) } else { None };
         let (target, measure) = match next {
             Some(l) => (l, true),
             None if tu.current != wanted && (!fixed || wanted.conc > tu.current.conc) => (wanted, strict && !fixed),
@@ -3231,7 +3268,57 @@ impl Run {
         if target == tu.current && !measure {
             return;
         }
+        // agent 0.3.5: a GPU job's measured trial starts only when its workers fit beside the running ones (all of them then
+        // finishing their games, at what they commit): one that would wait for a whole drain doesn't start - a GPU drain
+        // ends in its last games at a few rows a batch, and the 4070 Ti PC's old worker drained alone for 6-8 minutes,
+        // starting no game, before each trial (0.3.4). The layout wanted runs unmeasured instead when its first worker fits
+        // (its others join as memory allows); any other trial is postponed, counted as that layout's discard (skipped after
+        // `tune::MAX_DISCARDS`) and against the cap. A handoff no trial measures - to the layout wanted, after calibration or
+        // a discarded trial - starts as before (its first worker after the drain when it doesn't fit beside), and so does a
+        // CPU job's trial (its drain overlaps the next crew as memory allows, PROTOCOL 13.2).
+        if measure && self.gpu_lease() && !self.room_beside(target.workers.max(1) as u64, &target.per_worker()) {
+            let retry = 2 * (t.tune_warm + t.tune_window);
+            let id = self.lease.lease_id.clone();
+            let gpu = self.gpu_lease();
+            let first_fits = self.room_beside(1, &target.per_worker());
+            let tu = self.tuning.as_mut().expect("checked");
+            tu.postponed.push(Instant::now());
+            tu.no_trial_before = Instant::now() + retry;
+            if target == wanted && target != tu.current && first_fits {
+                let line = format!("the layout wanted, {}, doesn't fit beside the running workers to be measured: running it unmeasured", target.describe_on(gpu));
+                log::info!("lease {id}: {line}");
+                eng.worker_log.write_line(&format!("tuning [{id}]: {line}"));
+                self.start_handoff(eng, target, false);
+                return;
+            }
+            let line = format!("the trial of {} is postponed: its workers don't fit beside the running ones (memory)", target.describe_on(gpu));
+            log::info!("lease {id}: {line}");
+            eng.worker_log.write_line(&format!("tuning [{id}]: {line}"));
+            tu.entry.discard(target, &tu.space, zerofarm_common::now_unix());
+            self.save_tuning(eng);
+            self.show_tuning(eng);
+            return;
+        }
         self.start_handoff(eng, target, measure);
+    }
+
+    /// agent 0.3.5: `n` new workers of layout `l` fit beside the lease's workers as a handoff leaves them - every one
+    /// finishing its games, at what it commits (and its video memory as read) -, within `PLAN_SHARE` of the job's limit
+    /// and the video memory budget.
+    fn room_beside(&self, n: u64, l: &Layout) -> bool {
+        let limit = self.lease_limit_mb;
+        let main = if self.main_exit.is_none() { self.worker.commit_mb().unwrap_or(0) } else { 0 };
+        let held = main + self.mates.iter().map(|m| m.worker.commit_mb().unwrap_or(0)).sum::<u64>();
+        let host = limit == 0 || (held + n * self.plan_mb(l.conc)) as f64 <= limit as f64 * crate::rolling::PLAN_SHARE;
+        let vram = match self.roll.as_ref().and_then(|r| r.vram.as_ref()) {
+            None => true,
+            Some(v) => {
+                let ours = self.vram_mb + self.mates.iter().map(|m| m.vram_mb).sum::<u64>();
+                let budget = v.budget_mb.min(crate::rolling::vram_budget(v.total_mb, v.adapter_used_mb.saturating_sub(ours)));
+                ours + n * v.cost.plan_mb(l.batch()) <= budget
+            }
+        };
+        host && vram
     }
 
     /// A layout handoff starts: the main worker - and every member of the crew - starts no new game (`finish`); once
@@ -3267,28 +3354,11 @@ impl Run {
     /// A handoff waits for the old worker's id count (two equal reads after `finish`, else after `10 x tune_settle` the
     /// next worker takes fresh ids), then for room: the lease's workers' reservation (`reserved_mb`: the old crew, now
     /// finishing, at its commit) plus the next worker's plan (a measured crew's: every one of its workers') within
-    /// `PLAN_SHARE` of the job's limit. A trial that can't be measured any more by then: a candidate gives way to the
-    /// incumbent; the layout wanted anyway (the incumbent measured afresh) starts unmeasured and the trial counts as
-    /// discarded (agent 0.3.3: 0.3.2 started it unmeasured and handed over to it again at once).
+    /// `PLAN_SHARE` of the job's limit. A trial that can't be measured when its worker starts: the incumbent starts instead,
+    /// unmeasured, and the trial counts as discarded (`settle_trial`; agent 0.3.3: 0.3.2 started it unmeasured and handed
+    /// over to it again at once; 0.3.4 counted only the incumbent's re-measure, not a candidate's).
     fn handoff_tick(&mut self, eng: &mut Engine, t: &crate::Timings, strict: bool) {
-        let id = self.lease.lease_id.clone();
         let retry = 2 * (t.tune_warm + t.tune_window);
-        let tu = self.tuning.as_mut().expect("tuning");
-        let wanted = tu.entry.wanted(&tu.space);
-        let h = tu.handoff.as_mut().expect("handoff");
-        // (a trial that can't be measured now: the incumbent instead)
-        if h.measure && !strict {
-            h.measure = false;
-            let l = std::mem::replace(&mut h.next, wanted);
-            if l == wanted {
-                let line = format!("the trial of {} can't run now (the computer is busy or not idle): counted as discarded", l.describe_on(tu.gpu));
-                log::info!("lease {id}: {line}");
-                eng.worker_log.write_line(&format!("tuning [{id}]: {line}"));
-                tu.entry.discard(l, &tu.space, zerofarm_common::now_unix());
-                tu.no_trial_before = Instant::now() + retry;
-                self.save_tuning(eng);
-            }
-        }
         let tu = self.tuning.as_mut().expect("tuning");
         let h = tu.handoff.as_mut().expect("handoff");
         if h.since.elapsed() < t.tune_settle {
@@ -3307,6 +3377,11 @@ impl Run {
         } else {
             return;
         };
+        // (agent 0.3.5: whether the trial can be measured is decided now that its worker starts - 0.3.4 decided it at any
+        // tick while the handoff waited, and swapped a candidate for the incumbent without counting it: the next trial
+        // was the same candidate 20 s later, again and again)
+        self.settle_trial(eng, strict, retry);
+        let h = self.tuning.as_ref().and_then(|x| x.handoff.clone()).expect("handoff");
         // (a measured crew starts together: room for all of it; otherwise its workers join as memory allows)
         let workers = if h.measure { h.next.workers.max(1) as u64 } else { 1 };
         if !self.room_for(workers, &h.next.per_worker()) {
@@ -3429,9 +3504,32 @@ impl Run {
         self.show_tuning(eng);
     }
 
+    /// agent 0.3.5: a handoff's trial whose worker starts now while no trial may run (the computer got busy or used): the
+    /// incumbent starts instead, unmeasured, and the trial counts as discarded (retried later, skipped after
+    /// `tune::MAX_DISCARDS`; no trial before `retry` from now).
+    fn settle_trial(&mut self, eng: &Engine, strict: bool, retry: Duration) {
+        let id = self.lease.lease_id.clone();
+        let Some(tu) = self.tuning.as_mut() else { return };
+        let wanted = tu.entry.wanted(&tu.space);
+        let Some(h) = tu.handoff.as_mut().filter(|h| h.measure && !strict) else { return };
+        h.measure = false;
+        let l = std::mem::replace(&mut h.next, wanted);
+        let line = format!("the trial of {} can't run now (the computer is busy or not idle): counted as discarded, {} instead", l.describe_on(tu.gpu), wanted.describe_on(tu.gpu));
+        log::info!("lease {id}: {line}");
+        eng.worker_log.write_line(&format!("tuning [{id}]: {line}"));
+        tu.entry.discard(l, &tu.space, zerofarm_common::now_unix());
+        tu.no_trial_before = Instant::now() + retry;
+        tu.revert_due = false;
+        self.save_tuning(eng);
+    }
+
     /// The main worker ended while a handoff waited for room: the next worker starts after it (`restart_worker`, with
     /// the released ids it never started).
-    fn handoff_after_exit(&mut self) {
+    fn handoff_after_exit(&mut self, eng: &Engine) {
+        // (agent 0.3.5: a trial is measured only if one may run now)
+        let strict = self.tuning.as_ref().is_some_and(|t| t.strict);
+        let retry = 2 * (eng.cfg.timings.tune_warm + eng.cfg.timings.tune_window);
+        self.settle_trial(eng, strict, retry);
         let Some(h) = self.tuning.as_mut().and_then(|t| t.handoff.take()) else { return };
         if let Some(r) = self.roll.as_mut().filter(|r| !r.finishing && r.restart.is_none()) {
             r.restart = Some(Restart { conc: h.next.conc, burn: false, layout: Some(h.next), count: false, measure: h.measure });
@@ -3711,12 +3809,23 @@ impl Run {
         let (run, build) = (self.lease.run.clone().unwrap_or_default(), self.lease.build.build_id.clone());
         let groups = Engine::job_shape(&self.plan).2;
         let limit = self.lease_limit_mb;
-        let Some(r) = self.roll.as_mut().filter(|r| r.active && !r.finishing && r.steady_per_game > 0 && r.steady_per_game != r.calibrated) else { return };
-        r.calibrated = r.steady_per_game;
-        let reading = r.steady_per_game;
-        let Some(v) = Learned::steady(&eng.cfg.layout, &run, &build, r.gpu, reading) else { return };
+        let Some(r) = self.roll.as_mut().filter(|r| r.active && !r.finishing) else { return };
+        // (agent 0.3.5: a GPU job's early reading first - once -, then the steady ones)
+        let (reading, early) = if r.steady_per_game > 0 && r.steady_per_game != r.calibrated {
+            r.calibrated = r.steady_per_game;
+            (r.steady_per_game, false)
+        } else if r.early_per_game > 0 && !r.early_done && r.steady_per_game == 0 {
+            r.early_done = true;
+            (r.early_per_game, true)
+        } else {
+            return;
+        };
+        let learned = if early { Learned::early(&eng.cfg.layout, &run, &build, r.gpu, reading) } else { Learned::steady(&eng.cfg.layout, &run, &build, r.gpu, reading) };
+        let Some(v) = learned else { return };
         let was = r.mem.cost.per_game_mb;
-        log::info!("lease {id}: its workers commit {reading} MB per game in flight at their steady state (planned {was}): remembering {v} MB for this run and worker build");
+        let when = if early { "early in their games (planned x 2)" } else { "at their steady state" };
+        log::info!("lease {id}: its workers commit {reading} MB per game in flight {when} (planned {was}): remembering {v} MB for this run and worker build");
+        eng.worker_log.write_line(&format!("tuning [{id}]: the workers commit {reading} MB per game in flight {when}: planning {v} MB (was {was})"));
         if v as f64 > was as f64 * crate::rolling::RAISE_INFLIGHT_SHARE {
             return;
         }
@@ -3739,6 +3848,16 @@ impl Run {
         let (set, max) = t.bounds;
         t.space.bound_workers(set, max);
         t.entry.lift_conc(&old, &t.space);
+        // (agent 0.3.5: a GPU job's start was picked under the old plan - an uncalibrated 45 MB a game held the 4070 Ti PC
+        // to one worker of 139 -: picked again while nothing else won, so the job goes to the crew the plan now holds)
+        if t.gpu && t.entry.incumbent == t.entry.start && t.entry.state == tune::State::Searching && t.entry.trials == 0 {
+            let (nvidia, batch) = t.gpu_start;
+            let s = t.space.gpu_start(nvidia, batch);
+            if s != t.entry.wanted(&t.space) {
+                t.entry.start = s;
+                t.entry.incumbent = s;
+            }
+        }
         let wanted = t.entry.wanted(&t.space);
         let line = format!("planning {v} MB per game in flight from now on (was {was}): the layout wanted is {}", wanted.describe_on(t.gpu));
         log::info!("lease {id}: {line}");

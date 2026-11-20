@@ -254,8 +254,8 @@ fn a_gpu_jobs_games_in_flight_follow_the_calibrated_memory_within_the_lease() {
     h.start();
     assert!(wait(|| !job_lines(&h).is_empty()), "{}", h.agent_log());
     let first = h.job_line();
-    // (0.85 x 9,500 - 1,800) / 45 = 139 games in flight (0.3.3's plan rounded it to 128)
-    assert_eq!((first["conc"].as_u64(), first["groups"].as_u64()), (Some(139), Some(2)), "{first}");
+    // (0.85 x 9,500 - 1,800) / 45 = 139 games in flight (0.3.3's plan rounded it to 128), one batch (0.3.4: 2 of 70)
+    assert_eq!((first["conc"].as_u64(), first["groups"].as_u64()), (Some(139), Some(1)), "{first}");
     let t0 = Instant::now();
     assert!(
         mockcoord::testkit::wait_until(Duration::from_secs(90), || job_lines(&h).iter().any(|j| j["conc"] == 1024)),
@@ -444,4 +444,90 @@ fn the_tuner_chooses_the_gpu_layout_and_reports_its_worker_count() {
     assert_eq!(rep["layout"]["workers"], 2, "{req}");
     assert_eq!(rep["layout"]["infer_workers"], 1, "{rep}");
     h.stop();
+}
+
+/// What the tuner logged: (every handoff line, every handoff to a measured trial).
+fn handoffs(h: &H, id: &str) -> (Vec<String>, Vec<String>) {
+    let all: Vec<String> = h.agent_log().lines().filter(|l| l.contains(&format!("tuning [{id}]: handing the job over to"))).map(String::from).collect();
+    let measured = all.iter().filter(|l| l.contains("(a measured trial)")).cloned().collect();
+    (all, measured)
+}
+
+/// Agent 0.3.5, the 4070 Ti PC's first 0.3.4 lease (round 4, 2026-11-20): no memory measured for the (run, build), so the
+/// plan used the GPU default (1,800 MB + 45 MB a game) under its 9.5 GB cap - 139 games in flight, 5,179 leaves/s -
+/// while the memory-fixed worker commits ~2 MB a game; and the tuner handed the job over to a trial whose worker didn't
+/// fit beside the old one, which then drained alone for minutes, again and again. Now an early reading (half the games in
+/// flight finished) plans ~4 MB a game within the first minutes, the start is picked again for the plan - a crew of two
+/// of 512 there -, the crew starts beside the old worker as memory allows, and trials that would wait for a whole drain
+/// are postponed (counted), never looping.
+#[test]
+fn an_uncalibrated_gpu_start_reaches_the_target_within_minutes_and_never_loops() {
+    let (mut h, g) = harness(12_282, None, true);
+    h.machine.lock().unwrap().settings.max_ram_mb = Some(9_500);
+    // the memory-fixed worker: ~1.7 GB of runtime, ~2 MB a game in flight
+    let mut fk = fake(40, json!([1.0, 1.25, 1.4]));
+    (fk["mem_base_mb"], fk["mem_per_game_mb"]) = (json!(1700), json!(2));
+    h.push(gpu_lease(&h, &g, "l_GE", &fk, json!("auto"), 10_000_000));
+    let t0 = Instant::now();
+    h.start();
+    assert!(wait(|| !job_lines(&h).is_empty()), "{}", h.agent_log());
+    let first = h.job_line();
+    assert_eq!((first["conc"].as_u64(), first["groups"].as_u64()), (Some(139), Some(1)), "the default plan's start, one batch of 139: {first}");
+    // the crew of two of 512 (1,024 games in flight in all) within the first minutes - here seconds
+    let beat = |h: &H| h.mock.with(|s| s.beats.iter().filter(|(l, _)| l == "l_GE").map(|(_, b)| b["stats"].clone()).next_back());
+    assert!(
+        mockcoord::testkit::wait_until(Duration::from_secs(60), || beat(&h).is_some_and(|b| b["workers"] == 2 && b["inflight"] == 1024)),
+        "not at the target after {:?}: {:?}\n{}\n{:?}",
+        t0.elapsed(),
+        beat(&h),
+        crew_log(&h),
+        learned(&h)
+    );
+    eprintln!("at the target after {:?}", t0.elapsed());
+    let log = h.agent_log();
+    assert!(log.contains("early in their games"), "an early reading planned the job: {}", crew_log(&h));
+    let per = learned(&h)[format!("{RUN}/{}/gpu", g.alt)].as_u64().unwrap();
+    assert!((2..=6).contains(&per), "~2 MB a game measured, planned x 2: {per}");
+    // the tuner runs on, without a handoff loop: trials that don't fit beside the crew are postponed
+    std::thread::sleep(Duration::from_secs(12));
+    let (all, measured) = handoffs(&h, "l_GE");
+    assert!(all.len() <= 3, "a handoff loop: {all:#?}\n{}", crew_log(&h));
+    let distinct: BTreeSet<&String> = measured.iter().collect();
+    assert_eq!(distinct.len(), measured.len(), "a trial handed over to twice: {measured:#?}");
+    assert!(!log.contains("drained alone"), "no full-drain trial");
+    let lines = job_lines(&h);
+    assert!(lines.len() <= 4, "workers started: {}\n{}", lines.len(), crew_log(&h));
+    h.stop();
+    let done = h.wait_done("l_GE");
+    ids_accounted(&h, "l_GE", &done);
+    assert!(h.crashes().is_empty(), "{:?}", h.crashes());
+}
+
+/// Agent 0.3.5, the same lease's loop: a trial was handed over to, and by the time its worker started a trial couldn't run
+/// any more (the PC's background load hovered at the 10 % bar); 0.3.4 swapped the candidate for the incumbent silently,
+/// counting nothing, and planned the same candidate 20 s later. Now that is decided when the worker starts, and the
+/// candidate counts as discarded (no trial again for a while, skipped after 3).
+#[test]
+fn a_trial_that_cant_run_when_its_worker_starts_counts_as_discarded() {
+    let (mut h, g) = harness(12_282, Some(1), true);
+    // (the owner's computer: work goes on while it is used, trials don't)
+    h.machine.lock().unwrap().settings.mode = farm_agent::settings::Mode::Always;
+    seed_memory(&h, &g, 4);
+    let mut fk = fake(40, json!([1.0]));
+    fk["rate"]["best"] = json!({"batch": 256});
+    h.push(gpu_lease(&h, &g, "l_GD", &fk, json!(512), 10_000_000));
+    h.start();
+    // the start is measured by the lease's first worker; then a trial is handed over to - and the owner comes back
+    assert!(wait(|| !handoffs(&h, "l_GD").1.is_empty()), "{}", crew_log(&h));
+    h.user_active(true);
+    assert!(wait(|| h.agent_log().contains("can't run now (the computer is busy or not idle): counted as discarded")), "{}", crew_log(&h));
+    let n = handoffs(&h, "l_GD").1.len();
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(handoffs(&h, "l_GD").1.len(), n, "no trial while the computer is used: {}", crew_log(&h));
+    let tuning: Value = serde_json::from_slice(&std::fs::read(h.layout.state().join("tuning.json")).unwrap()).unwrap();
+    let e = &tuning["entries"][0];
+    assert!(e["discards"].as_array().is_some_and(|d| d.iter().any(|x| x[1] == 1)), "the candidate counted as discarded: {e}");
+    h.stop();
+    let done = h.wait_done("l_GD");
+    ids_accounted(&h, "l_GD", &done);
 }
