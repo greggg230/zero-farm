@@ -1944,8 +1944,8 @@ worker tells the graphs apart from their metadata, so neither the agent nor aw/1
     every lease of the run - self-play and eval, default build or alternate - with section 3's update rule (`{"update"}`
     when the machine's channel offers 0.3.5, else nothing from that run: the machine gets other work);
   - the desktop sets the run's own `min_agent` to at least 0.3.5 (`PUT /v1/admin/run`) before it registers the run's
-    first definition with variants (zero-core's `zero.farm_def` and pool remote do), so the run's configuration says so
-    too;
+    first definition with variants (zero-core's `zero.farm_def` and pool remote, 14.5), so the run's configuration says
+    so too;
   - a lease granted to an older agent before keeps running: a classic one never reads a newer definition; a rolling one
     gets the new definition with its next generation (10.6), can't read it and finishes gracefully (its games in flight
     complete, one crash report `definition` for the lease), and its next `/v1/lease` gets `{"update"}` or other work.
@@ -1966,9 +1966,9 @@ worker tells the graphs apart from their metadata, so neither the agent nor aw/1
   switches variants on can add one to its current gen); a name registered before with other files → 409 (files never
   change); a PUT that leaves out a registered name keeps it (variants are never removed). Adding variants doesn't make the
   gen current or reset its quota. `unchanged` is true when nothing was added.
-- The answer adds `"variants": ["gpu", ...]` (every name the gen has now) when the gen has any. `GET /v1/admin/run/{run}`: `checkpoint` (the
-  current gen) adds `variants` (`{"<name>": {"model", "sha256", "size"}}`, `{}` without), and `variants` lists every gen
-  that has any (`{"<gen>": ["gpu"]}`).
+- The answer adds `"variants": ["gpu", ...]` (every name the gen has now) when the gen has any. `GET
+  /v1/admin/run/{run}`: `checkpoint` (the current gen) adds `variants` (`{"<name>": {"model", "sha256", "size"}}`, `{}`
+  without), and `variants` lists every gen that has any (`{"<gen>": ["gpu"]}`).
 - Migration 0016: `checkpoints.variants` (JSON `{"<name>": {"model", "sha256", "size"}}`, NULL: none) and `leases.variant`
   (the variant the lease was granted for, 14.3; NULL: the default).
 
@@ -2004,9 +2004,13 @@ gen, machines get that gen's default model (14.3).
   Fuzz and diag leases carry no checkpoint variant.
 - **A gen without the variant** (not registered, not signed, or registered other than signed): the machine plays that
   gen's default model - it is the same network, and a GPU alternate's pack runs the default graph as it did before rev
-  20 -, and the admin stats say so: per alternate `variant_notes`, one per gen concerned (the run's current gen and the
-  current eval batch's gens), e.g. `"gen 82: no variant gpu registered: its default model is leased"`. A note, not one of
-  the alternate's `problems` (which mean it can't be leased at all).
+  20 -, and the admin stats say so: per alternate `variant_notes`, one per gen concerned (the run's current gen while it
+  has self-play, and the current eval batch's gens), e.g. `"gen 82: no variant gpu registered: its default model is
+  leased"`, `"gen 82: definition v12 doesn't sign variant gpu: ..."` or `"gen 82: variant gpu differs from definition
+  v12: ..."`. A note, not one of the alternate's `problems` (which mean it can't be leased at all). The run's
+  `definition` (GET run and the stats) adds `needs_agent` (the oldest agent that can read it: 0.2.5, or 0.3.5 when it
+  signs a variant) and `variants` (the names it signs per gen, `{"<gen>": ["gpu"]}`); the admin page's "Signed
+  definitions" shows both and the notes.
 - **Cached checkpoints.** Agents from 0.3.5 list `"<run>/<gen>/<name>"` in `cached.ckpts` (section 3) for each variant
   model in their cache, beside `"<run>/<gen>"` for the default model. For a lease that would carry a variant, the
   coordinator's cache bonus and disk check use that entry and the variant's size.
