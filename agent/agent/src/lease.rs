@@ -686,7 +686,8 @@ impl Engine {
 
     /// The measured choice for the job (PROTOCOL 9.6), or for a rolling lease (rev 15, PROTOCOL 10.6) with its games in
     /// flight: the run's setting for the CPU and the GPU, "auto" worked out by `rolling.rs` (a fixed number on the
-    /// CPU, a GPU's from its bench row, both within the memory plans `mem` (CPU, GPU), PROTOCOL 10.6).
+    /// CPU, a GPU's from its bench row, both within the memory plans `mem` (CPU, GPU), PROTOCOL 10.6; agent 0.3.12: a
+    /// DirectML candidate's from DirectML's start, `rolling::dml_shape`).
     #[allow(clippy::too_many_arguments)]
     fn pick(bench: Option<&crate::probe::Bench>, gpus: &[zerofarm_common::protocol::Gpu], lease: &Lease, plan: &Plan, gpu_ok: bool, mem: (MemPlan, MemPlan), roll: Option<&Setup>) -> crate::probe::Choice {
         let (games, conc, groups) = Self::job_shape(plan);
@@ -695,7 +696,15 @@ impl Engine {
             None => crate::probe::choose(bench, gpus, allow, gpu_ok, games, conc, groups),
             Some(r) => {
                 let cpu = crate::rolling::cpu_shape(r.cpu, groups, mem.0);
-                let gpu = |row: &crate::probe::BenchRow| crate::rolling::gpu_shape(r.gpu, &row.rows, groups, mem.1);
+                // (agent 0.3.12: a DirectML candidate rated at the batch of DirectML's start - 576 rows for "auto" -, not at
+                // the bench's CUDA-shaped target under a default memory plan)
+                let gpu = |row: &crate::probe::BenchRow| {
+                    if row.provider == "dml" {
+                        crate::rolling::dml_shape(r.gpu, r.hi - r.lo, mem.1)
+                    } else {
+                        crate::rolling::gpu_shape(r.gpu, &row.rows, groups, mem.1)
+                    }
+                };
                 crate::probe::choose_rolling(bench, gpus, allow, gpu_ok, cpu, &gpu, groups)
             }
         }
@@ -1286,10 +1295,11 @@ impl Engine {
     /// the GPU and its driver, the provider, OS, tuner), what may vary (the workers: 1 to 3, at most one per physical core,
     /// as many as the memory plan and the video memory plan hold; the search threads they share; one or two groups each;
     /// the games in flight from half the target to 1.5 times it, or a run's number), and the remembered search or a new
-    /// one from the GPU's start (an NVIDIA GPU: the most workers that hold the target in all, `tune::Space::gpu_start`).
-    /// No coordinator hint: a report doesn't say whether its layout ran on the GPU or on the CPU of the same build and
-    /// pack (no wire change), and the GPU's start from its own bench is near. `autotune` off: the start for the owner's worker
-    /// count (else one), fixed. -> (tuning, measured).
+    /// one from the GPU's start (an NVIDIA GPU: the most workers that hold the target in all, `tune::Space::gpu_start`;
+    /// agent 0.3.12: a DirectML job on any vendor's GPU DirectML's own crew, `tune::Space::dml_start`, keyed by
+    /// `tune::DML_TUNER_VERSION`). No coordinator hint: a report doesn't say whether its layout ran on the GPU or on the
+    /// CPU of the same build and pack (no wire change), and the GPU's start from its own bench is near. `autotune` off: the
+    /// start for the owner's worker count (else one), fixed. -> (tuning, measured).
     #[allow(clippy::too_many_arguments)]
     fn gpu_tuning_for(&self, lease: &Lease, plan: &Plan, prep: &Prepared, setup: &Setup, choice: &crate::probe::Choice, batch: u64, mem: (u64, crate::rolling::MemCost), vram: Option<&Vram>) -> (Tuning, bool) {
         let p = &self.profile;
@@ -1298,7 +1308,11 @@ impl Engine {
         // the search threads the workers share: the owner's `cpu_threads`, else 1.5 per physical core (at most the
         // logical processors)
         let threads = settings.cpu_threads.unwrap_or(((p.cores.max(1) as f64) * crate::rolling::GPU_THREADS_PER_CORE).round() as u32).clamp(1, p.threads.max(1));
-        let target = crate::rolling::gpu_target(setup.gpu, batch);
+        let provider = choice.providers.first().cloned().unwrap_or_default();
+        // (agent 0.3.12: a DirectML job, any vendor, targets DirectML's crew - up to 3 workers of 1,152 games in flight in
+        // two groups, within the lease's block -, not two of the bench's full batches)
+        let dml = provider == "dml";
+        let target = if dml { crate::rolling::dml_target(setup.gpu, setup.hi - setup.lo) } else { crate::rolling::gpu_target(setup.gpu, batch) };
         // (no video memory plan: one worker; `autotune` off without the owner's count: one)
         let set = match (vram.is_some(), fixed) {
             (false, _) => Some(1),
@@ -1306,11 +1320,16 @@ impl Engine {
             (true, false) => settings.workers,
         };
         let max_workers = tune::MAX_WORKERS.min(p.cores.max(1));
-        let space = tune::Space::new_gpu(threads, set, max_workers, target, matches!(setup.gpu, crate::rolling::Inflight::N(_)), Some(mem), vram.map(|v| (v.budget_mb, v.cost)));
+        let run_n = matches!(setup.gpu, crate::rolling::Inflight::N(_));
+        let vram_plan = vram.map(|v| (v.budget_mb, v.cost));
+        let space = if dml {
+            tune::Space::new_dml(threads, set, max_workers, target, run_n, Some(mem), vram_plan)
+        } else {
+            tune::Space::new_gpu(threads, set, max_workers, target, run_n, Some(mem), vram_plan)
+        };
         let run = lease.run.clone().unwrap_or_default();
         let luid = choice.gpu.get("luid").and_then(Value::as_str).unwrap_or("");
         let g = p.gpus.iter().find(|g| g.luid.as_deref().is_some_and(|l| l.eq_ignore_ascii_case(luid))).cloned().unwrap_or_default();
-        let provider = choice.providers.first().cloned().unwrap_or_default();
         let hw = tune::gpu_fingerprint(p, &g, &provider);
         let key = tune::Key {
             build: lease.build.build_id.clone(),
@@ -1321,7 +1340,8 @@ impl Engine {
                 None => hw,
             },
             os: p.os.clone(),
-            tuner: tune::GPU_TUNER_VERSION,
+            // (agent 0.3.12: DirectML's keys searched again from its own start)
+            tuner: if dml { tune::DML_TUNER_VERSION } else { tune::GPU_TUNER_VERSION },
         };
         let now = zerofarm_common::now_unix();
         let start = space.gpu_start(g.vendor.eq_ignore_ascii_case("nvidia"), batch);

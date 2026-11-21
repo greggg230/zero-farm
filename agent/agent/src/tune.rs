@@ -54,6 +54,11 @@ pub const TUNER_VERSION: u32 = 2;
 /// Entries of 0.3.5-0.3.6 counted every postponed trial as a discard: the 4070 Ti PC's crew of two had 3 (given up on)
 /// before 0.3.7 could hand over to it, and its start was a single worker.
 pub const GPU_TUNER_VERSION: u32 = 3;
+/// agent 0.3.12: a DirectML GPU job's keys (provider `dml`) are searched again from this version (4: DirectML's own
+/// start, `Space::dml_start`). 0.3.11's entries started from one worker of ~270 games in flight and crept up within 9
+/// trials (discarded whenever the PC wasn't idle); their incumbents would keep a lease from ever starting the crew. Other
+/// GPU jobs' keys keep `GPU_TUNER_VERSION`.
+pub const DML_TUNER_VERSION: u32 = 4;
 /// Worker processes a lease's job may run (searched and set) at most; a hint or a report may say up to `MAX_WORKERS_JSON`.
 pub const MAX_WORKERS: u32 = 3;
 pub const MAX_WORKERS_JSON: u32 = 8;
@@ -387,6 +392,10 @@ pub struct Space {
     /// it, not past it (`top_conc`). 0: none (a CPU job: its bounds are the target).
     #[serde(default)]
     pub target: u64,
+    /// agent 0.3.12: a DirectML job (PROTOCOL 13.1 **DirectML**): its start is DirectML's (`dml_start`, any vendor) and
+    /// each worker's share of an "auto" target is at most `rolling::DML_CONC` (`target_conc`).
+    #[serde(default)]
+    pub dml: bool,
 }
 
 /// agent 0.3.4: a GPU crew's share of the target games in flight is rounded up to a multiple of this (1,024 for three
@@ -426,6 +435,7 @@ impl Space {
             gpu: false,
             vram: None,
             target: 0,
+            dml: false,
         };
         s.bound_workers(workers, d.max_workers);
         s
@@ -453,7 +463,23 @@ impl Space {
             gpu: true,
             vram,
             target,
+            dml: false,
         };
+        s.bound_workers(workers, max_workers);
+        s
+    }
+
+    /// agent 0.3.12: the space of a DirectML GPU job (PROTOCOL 13.1 **DirectML**), any vendor: `new_gpu`'s, with
+    /// `target` from `rolling::dml_target`, each worker's share of an "auto" target at most `rolling::DML_CONC`
+    /// (`target_conc`), its games in flight in all ("auto") from `rolling::DML_MIN_CONC` (so one worker's start is
+    /// DirectML's 1,152, not half the crew's target) to `GPU_CONC_OVER` times the target, and DirectML's start
+    /// (`dml_start`).
+    pub fn new_dml(threads: u32, workers: Option<u32>, max_workers: u32, target: u64, fixed: bool, mem: Option<(u64, crate::rolling::MemCost)>, vram: Option<(u64, crate::rolling::VramCost)>) -> Space {
+        let mut s = Space::new_gpu(threads, workers, max_workers, target, fixed, mem, vram);
+        s.dml = true;
+        if !fixed {
+            s.conc_min = crate::rolling::DML_MIN_CONC.min(s.target).max(1);
+        }
         s.bound_workers(workers, max_workers);
         s
     }
@@ -506,6 +532,11 @@ impl Space {
     /// multiple of `GPU_CONC_STEP` for N > 1: 1,024 is 1 x 1,024, 2 x 512, 3 x 384).
     pub fn target_conc(&self, n: u32) -> u64 {
         let n = n.max(1) as u64;
+        // (agent 0.3.12: a DirectML job's "auto" share is DirectML's per worker - 1,152 for one, two or three of 3,456 -,
+        // a run's number is shared as any GPU job's)
+        if self.dml && self.conc_min < self.conc_max {
+            return (self.target / n).clamp(1, crate::rolling::DML_CONC);
+        }
         if n > 1 {
             self.target.div_ceil(n).div_ceil(GPU_CONC_STEP) * GPU_CONC_STEP
         } else {
@@ -528,14 +559,36 @@ impl Space {
 
     /// agent 0.3.4: a GPU job's starting crew (PROTOCOL 13.1): on an NVIDIA GPU the most workers (within the bounds) whose
     /// start holds the target games in flight in all (agent 0.3.5: `GPU_START_SHARE` of it) - three of 384 or two of 512 for a target of 1,024 where the video
-    /// memory and the memory plan allow, else one; on other GPUs one (the tuner tries more).
+    /// memory and the memory plan allow, else one; on other GPUs one (the tuner tries more). Agent 0.3.12: a DirectML job,
+    /// whatever the vendor, DirectML's start (`dml_start`).
     pub fn gpu_start(&self, nvidia: bool, batch: u64) -> Layout {
+        if self.dml {
+            return self.dml_start();
+        }
         let lo = self.workers_min.max(1);
         let hi = self.workers_max.max(lo);
         if lo == hi || !nvidia {
             return self.gpu_layout(lo, batch);
         }
         (lo..=hi).rev().map(|n| self.gpu_layout(n, batch)).find(|l| l.total_conc() as f64 >= self.target as f64 * GPU_START_SHARE).unwrap_or_else(|| self.gpu_layout(lo, batch))
+    }
+
+    /// agent 0.3.12 (PROTOCOL 13.1 **DirectML**): a DirectML job's starting crew, on any vendor's GPU: `rolling::dml_crew`
+    /// within the bounds - the most workers (at most `workers_max`) each of whose start (`gpu_layout`: its share of the
+    /// target, at most `rolling::DML_CONC`, in batches of at most `rolling::DML_ROWS` rows, cut by the memory plan and the
+    /// video memory plan) keeps `rolling::DML_MIN_CONC` games in flight - where memory holds less, fewer games each first,
+    /// then fewer workers -, else the fewest workers allowed with what they hold (the owner's fixed count: that many). The
+    /// tuner searches from it as from any start.
+    pub fn dml_start(&self) -> Layout {
+        let lo = self.workers_min.max(1);
+        let hi = self.workers_max.max(lo);
+        let rows = crate::rolling::DML_ROWS;
+        if lo == hi {
+            return self.gpu_layout(lo, rows);
+        }
+        let room = |n: u32| Some(self.gpu_layout(n.clamp(lo, hi), rows).conc);
+        let (n, _) = crate::rolling::dml_crew(self.target, self.conc_min >= self.conc_max, hi, &room);
+        self.gpu_layout(n.clamp(lo, hi), rows)
     }
 
     /// The games in flight one of `n` workers may run under the memory plan (None: no limit): (`PLAN_SHARE` x the
@@ -1159,7 +1212,7 @@ impl Cache {
 
     /// The coordinator's `tuning` (PROTOCOL 13): the most recently changed measured entries, at most `MAX_REPORTS`.
     pub fn reports(&self) -> Vec<Value> {
-        let mut es: Vec<&Entry> = self.entries.iter().filter(|e| e.key.tuner == TUNER_VERSION || e.key.tuner == GPU_TUNER_VERSION).collect();
+        let mut es: Vec<&Entry> = self.entries.iter().filter(|e| [TUNER_VERSION, GPU_TUNER_VERSION, DML_TUNER_VERSION].contains(&e.key.tuner)).collect();
         es.sort_by_key(|e| std::cmp::Reverse(e.t));
         es.iter().filter_map(|e| e.report()).take(MAX_REPORTS).collect()
     }
@@ -1395,7 +1448,7 @@ mod tests {
 
     /// The M4 Max's space: search and inference threads at most 16, sessions, 1,152-2,304 games in flight, 192-384 rows.
     fn space() -> Space {
-        Space { max_search: 16, max_infer: 16, sessions: true, conc_min: 1152, conc_max: 2304, batch_min: 192, batch_max: 384, workers_min: 1, workers_max: 1, mem: None, gpu: false, vram: None, target: 0 }
+        Space { max_search: 16, max_infer: 16, sessions: true, conc_min: 1152, conc_max: 2304, batch_min: 192, batch_max: 384, workers_min: 1, workers_max: 1, mem: None, gpu: false, vram: None, target: 0, dml: false }
     }
 
     fn lay(threads: u32, w: u32, t: u32, groups: u64, conc: u64) -> Layout {
@@ -2002,6 +2055,128 @@ mod tests {
         let mut e = Entry::new(key(), "r", glay(1, 6, 2, 600), false, 0);
         e.lift_conc(&roomy, &new);
         assert_eq!(e.incumbent.conc, 600);
+    }
+
+    /// agent 0.3.12: a DirectML job's space - "auto" (3,456 games in flight: `rolling::dml_target` of a 65,536-id block),
+    /// `threads` search threads shared, at most 3 workers, the job's memory limit with a base and cost per game, and
+    /// `vram_mb` of video memory for its workers.
+    fn dml_space(limit: u64, base: u64, per_game: u64, vram_mb: u64, threads: u32, set: Option<u32>) -> Space {
+        let mem = crate::rolling::MemCost { base_mb: base, per_game_mb: per_game };
+        let target = crate::rolling::dml_target(crate::rolling::Inflight::Auto, 65_536);
+        Space::new_dml(threads, set, 3, target, false, Some((limit, mem)), Some((vram_mb, crate::rolling::GPU_VRAM)))
+    }
+
+    /// The video memory a 12 GB and a 16 GB GPU leave the job's workers (85 % of 12,282 / 16,304 MB, less 1,024 MB for
+    /// other programs).
+    const VRAM_12G: u64 = 9_415;
+    const VRAM_16G: u64 = 12_834;
+
+    /// agent 0.3.12 (PROTOCOL 13.1 **DirectML**): a DirectML job starts from DirectML's own layout on any vendor's GPU -
+    /// three workers of 1,152 games in flight in two groups of 576 rows where the memory plans hold it (the 4070 Ti PC's
+    /// measured best, 3 x 1,150: 12.0k leaves/s) -, never the one small worker 0.3.11 started a GPU other than NVIDIA's with.
+    #[test]
+    fn a_directml_job_starts_from_directmls_crew_on_any_vendor() {
+        // a 12 GB GPU, 4 cores (6 search threads), a 24,000 MB limit, 3 MB a game measured: 3 x 1,152, 2 search threads each
+        let s = dml_space(24_000, 1800, 3, VRAM_12G, 6, None);
+        assert!(s.dml && s.gpu);
+        assert_eq!((s.workers_min, s.workers_max, s.conc_min, s.conc_max, s.target), (1, 3, 768, 4096, 3456));
+        assert_eq!((s.target_conc(1), s.target_conc(2), s.target_conc(3)), (1152, 1152, 1152), "DirectML's 1,152 a worker, however many");
+        let start = s.gpu_start(true, 1024);
+        assert_eq!(start, glay(3, 2, 2, 1152));
+        assert_eq!((start.batch(), start.total_conc()), (576, 3456));
+        // the same on an AMD GPU (vendor no matter): a 16 GB GPU, 8 cores (12 search threads), 4 each
+        assert_eq!(dml_space(24_000, 1800, 3, VRAM_16G, 12, None).gpu_start(false, 1024), glay(3, 4, 2, 1152));
+        // a 16 GB AMD GPU on a 32 GB PC (the job's limit half of it), 2 MB a game measured: 3 x 1,152 too
+        assert_eq!(dml_space(16_384, 1800, 2, VRAM_16G, 12, None).gpu_start(false, 1024), glay(3, 4, 2, 1152));
+        // ... at 3 MB a game: (4,642 - 1,800) / 3 = 947 each (fewer games each, not fewer workers)
+        assert_eq!(dml_space(16_384, 1800, 3, VRAM_16G, 12, None).gpu_start(false, 1024), glay(3, 4, 2, 947));
+        // a 32 GB PC's first lease, nothing measured (the default 1,800 MB + 45 MB a game): one worker of 269 in one batch,
+        // as before - until the lease's early reading (lease.rs `calibrate` picks the start again): at 4 MB a game over a
+        // measured base of 2,059 MB two of 1,152 (three would hold 645 each), at a steady 3 MB three of 861
+        let first = dml_space(16_384, 1800, 45, VRAM_12G, 6, None);
+        assert_eq!(first.workers_max, 1);
+        assert_eq!(first.gpu_start(true, 1024), glay(1, 6, 1, 269));
+        assert_eq!(dml_space(16_384, 2059, 4, VRAM_12G, 6, None).gpu_start(true, 1024), glay(2, 3, 2, 1152));
+        assert_eq!(dml_space(16_384, 2059, 3, VRAM_12G, 6, None).gpu_start(true, 1024), glay(3, 2, 2, 861));
+        // a layout the default plan held back is lifted to DirectML's 1,152 a worker, not the crew's 3,456 (its groups kept,
+        // as any GPU job's; a search that measured nothing but the start picks the start again instead)
+        let calibrated = dml_space(16_384, 2059, 3, VRAM_12G, 6, None);
+        assert_eq!((calibrated.top_conc(1), calibrated.top_conc(3)), (1152, 861));
+        let mut e = Entry::new(key(), "r", first.gpu_start(true, 1024), false, 0);
+        e.lift_conc(&first, &calibrated);
+        assert_eq!(e.wanted(&calibrated), glay(1, 6, 1, 1152));
+    }
+
+    /// agent 0.3.12: where the memory plans hold less than 3 x 1,152, a DirectML crew's workers run fewer games each - down to
+    /// 768 (batches of 384 rows) -, then the crew has a worker fewer; one worker runs what memory holds.
+    #[test]
+    fn a_directml_crew_shrinks_its_games_then_its_workers_where_memory_is_short() {
+        // 4 MB a game: an 18,000 MB limit holds 3 x 825; 16,000 MB 3 x 683 - under 768: two of 1,152; 9,500 MB two of 559:
+        // one of 1,152
+        assert_eq!(dml_space(18_000, 1800, 4, VRAM_12G, 6, None).gpu_start(true, 1024), glay(3, 2, 2, 825));
+        assert_eq!(dml_space(16_000, 1800, 4, VRAM_12G, 6, None).gpu_start(true, 1024), glay(2, 3, 2, 1152));
+        let small = dml_space(9_500, 1800, 4, VRAM_12G, 6, None);
+        assert_eq!(small.workers_max, 2, "three don't hold 768 in all");
+        assert_eq!(small.gpu_start(true, 1024), glay(1, 6, 2, 1152));
+        // the default 45 MB a game under 9,500 MB: one worker of 139 in one batch
+        assert_eq!(dml_space(9_500, 1800, 45, VRAM_12G, 6, None).gpu_start(true, 1024), glay(1, 6, 1, 139));
+        // a 4 GB GPU (3,000 MB for the job) and plenty of RAM: two workers' batches hold 238 rows (2 x 476 < 768), one
+        // worker's 988: one of 1,152 in two batches of 576
+        let gpu4 = dml_space(24_000, 1800, 3, 3_000, 6, None);
+        assert_eq!(gpu4.workers_max, 2);
+        assert_eq!(gpu4.gpu_start(true, 1024), glay(1, 6, 2, 1152));
+        // every start within the video memory plan
+        for s in [dml_space(18_000, 1800, 4, VRAM_12G, 6, None), gpu4, dml_space(24_000, 1800, 3, 4_500, 6, None)] {
+            let l = s.gpu_start(true, 1024);
+            assert!(l.workers as u64 * crate::rolling::GPU_VRAM.plan_mb(l.batch()) <= s.vram.unwrap().0, "{l:?}");
+            assert!(l.workers == 1 || l.conc >= crate::rolling::DML_MIN_CONC, "{l:?}");
+        }
+    }
+
+    /// agent 0.3.12: the owner's worker count, a run's number and a small block bound DirectML's start as any GPU job's;
+    /// the tuner searches from it (its first trial: one worker fewer, the job's games in flight and batches kept).
+    #[test]
+    fn directmls_start_keeps_the_owners_settings_and_the_tuner_searches_from_it() {
+        assert_eq!(dml_space(24_000, 1800, 3, VRAM_12G, 6, Some(1)).gpu_start(true, 1024), glay(1, 6, 2, 1152));
+        assert_eq!(dml_space(24_000, 1800, 3, VRAM_12G, 6, Some(2)).gpu_start(true, 1024), glay(2, 3, 2, 1152));
+        // a run's 2,048: shared - three of 682 keep less than 768, two of 1,024
+        let mem = crate::rolling::MemCost { base_mb: 1800, per_game_mb: 3 };
+        let fixed = Space::new_dml(6, None, 3, 2048, true, Some((24_000, mem)), Some((VRAM_12G, crate::rolling::GPU_VRAM)));
+        assert_eq!((fixed.conc_min, fixed.conc_max), (2048, 2048));
+        assert_eq!(fixed.gpu_start(true, 1024), glay(2, 3, 2, 1024));
+        // a lease's block of 2,000 ids: two of 1,000
+        let target = crate::rolling::dml_target(crate::rolling::Inflight::Auto, 2_000);
+        let block = Space::new_dml(6, None, 3, target, false, Some((24_000, mem)), Some((VRAM_12G, crate::rolling::GPU_VRAM)));
+        assert_eq!(block.gpu_start(true, 1024), glay(2, 3, 2, 1000));
+        // the search from 3 x 1,152: one worker fewer (the job's 3,456 and its 576-row batches kept as far as two groups
+        // go), games in flight halved / doubled within each worker's part, search threads within their share
+        let s = dml_space(24_000, 1800, 3, VRAM_12G, 6, None);
+        let start = s.gpu_start(true, 1024);
+        assert_eq!(neighbour(&start, Coord::Workers, false, &s), Some(glay(2, 3, 2, 1728)));
+        assert_eq!(neighbour(&start, Coord::Workers, true, &s), None, "at most 3");
+        assert_eq!(neighbour(&start, Coord::Conc, true, &s), Some(glay(3, 2, 2, 1365)));
+        assert_eq!(neighbour(&start, Coord::Conc, false, &s), Some(glay(3, 2, 1, 576)));
+        assert_eq!(neighbour(&start, Coord::Search, false, &s), Some(glay(3, 1, 2, 1152)));
+        let mut e = Entry::new(key(), "r", start, false, 0);
+        assert_eq!(e.plan(&s), Some(start), "the start is measured first");
+        e.record(start, 12_000.0, Some(0.0), None, &s, 0);
+        assert_eq!(e.plan(&s), Some(glay(2, 3, 2, 1728)), "then the first candidate");
+    }
+
+    /// agent 0.3.12: nothing changes for a GPU job on another provider - CUDA's crew from the bench's target on an NVIDIA
+    /// GPU, one worker on another vendor's GPU -, and a space stored before 0.3.12 reads as not DirectML.
+    #[test]
+    fn a_cuda_jobs_start_is_unchanged_by_directml() {
+        let cuda = gpu_space(16_384, 4, 9_939, None);
+        assert!(!cuda.dml);
+        assert_eq!(cuda.gpu_start(true, 512), glay(3, 2, 1, 384));
+        assert_eq!(cuda.gpu_start(false, 512), glay(1, 6, 2, 1024), "another provider on another vendor's GPU: one worker");
+        assert_eq!((cuda.conc_min, cuda.conc_max, cuda.target_conc(1), cuda.target_conc(3)), (512, 2048, 1024, 384));
+        // the same PC on DirectML: its own crew (two of 1,152 under this plan: three would hold 710 each)
+        assert_eq!(dml_space(16_384, 1800, 4, 9_939, 6, None).gpu_start(true, 512), glay(2, 3, 2, 1152));
+        let mut v = serde_json::to_value(cuda).unwrap();
+        v.as_object_mut().unwrap().remove("dml");
+        assert_eq!(serde_json::from_value::<Space>(v).unwrap(), cuda);
     }
 
     #[test]

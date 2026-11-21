@@ -611,3 +611,186 @@ fn turning_the_gpus_vendor_off_gives_a_running_gpu_lease_back() {
     assert!(wait(|| h.mock.with(|s| s.lease_requests.last().is_some_and(|r| r["caps"]["gpu_allowed"] == true))));
     h.stop();
 }
+
+// ---------- agent 0.3.12 (PROTOCOL 9.6, 13.1 **DirectML**): DirectML jobs start from DirectML's own crew ----------
+
+/// A 16 GB AMD GPU.
+fn amd16() -> Gpu {
+    Gpu { vendor: "amd".into(), name: "RX 9070 XT".into(), vram_mb: 16_304, driver: "32.0.21001.9024".into(), luid: Some("00000000000000a1".into()) }
+}
+
+/// The probe and bench of a PC where DirectML passes on `g`, beside the CPU's flat 1,000 rows/s: DirectML's large fixed
+/// cost per call makes it slow at small batches (an AMD GPU's float32 graph: 351 rows/s at 32 rows, 1,342 at 128) and fast
+/// at big ones (4,718 at 512, 7,638 at 1,024).
+fn dml_report(g: &Gpu) -> Value {
+    let rows = |v: [f64; 6]| json!({"1": v[0], "8": v[1], "32": v[2], "128": v[3], "512": v[4], "1024": v[5]});
+    json!({"probe": 1, "providers": ["dml", "cpu"], "error": null, "results": [
+        {"provider": "cpu", "gpu": null, "ok": true, "rows_per_s": 1000.0, "rows_per_s_by_batch": rows([1000.0; 6])},
+        {"provider": "dml", "gpu": {"name": g.name, "luid": g.luid}, "ok": true, "rows_per_s": 5000.0,
+         "rows_per_s_by_batch": rows([11.0, 88.0, 351.0, 1342.0, 4718.0, 7638.0])}]})
+}
+
+/// The harness of a PC with `g` (GPU work allowed) and a DirectML-only runtime pack signed for its vendor (`gpu` {vendor,
+/// [dml]}), the fakeworker build requiring it, whose probe and bench report DirectML passing on `g`.
+fn dml_harness(g: Gpu, workers: Option<u32>, autotune: bool) -> (H, Gpus) {
+    let mut h = H::new();
+    h.version = "0.3.12".into();
+    h.signals.real_starvation = false;
+    gpu_signal(&h, true);
+    {
+        let mut m = h.machine.lock().unwrap();
+        m.settings.workers = workers;
+        m.settings.autotune = autotune;
+    }
+    let dir = h.dir.path().join("pack");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("onnxruntime.dll"), b"a small dll").unwrap();
+    std::fs::write(dir.join("DirectML.dll"), b"directml").unwrap();
+    let mut t = template(Kind::Runtime, "dml-test");
+    t.min_agent = Some("0.2.10".into());
+    t.gpu = Some(GpuNeed { vendor: g.vendor.clone(), min_driver: None, providers: vec!["dml".into()] });
+    let pack = zerofarm_common::sign::sign_dir(&dir, t, &h.key.key).unwrap().0;
+    h.mock.add_build_dir(&dir);
+    let wdir = h.dir.path().join("wdml");
+    std::fs::create_dir_all(&wdir).unwrap();
+    std::fs::copy(mockcoord::testkit::bin("fakeworker"), wdir.join("fakeworker.exe")).unwrap();
+    std::fs::write(wdir.join("probe.json"), dml_report(&g).to_string()).unwrap();
+    std::fs::write(wdir.join("probe_model.json"), dml_report(&g).to_string()).unwrap();
+    let mut t = template(Kind::Worker, "fake-dml");
+    t.game = Some("fake".into());
+    t.aw = Some(1);
+    t.zero_onnx = Some(vec![1]);
+    t.profile = Some("release".into());
+    t.entry = Some("fakeworker.exe".into());
+    t.requires_runtime = Some(pack.clone());
+    t.min_agent = Some("0.2.10".into());
+    let alt = zerofarm_common::sign::sign_dir(&wdir, t, &h.key.key).unwrap().0;
+    h.mock.add_build_dir(&wdir);
+    h.gpus = vec![g];
+    (h, Gpus { pack, alt })
+}
+
+/// The fake as a DirectML worker.
+fn dml_fake(game_ms: u64, crew: Value) -> Value {
+    let mut f = fake(game_ms, crew);
+    f["provider"] = json!("dml");
+    f
+}
+
+fn tuning_entry(h: &H) -> Value {
+    std::fs::read(h.layout.state().join("tuning.json")).ok().and_then(|b| serde_json::from_slice::<Value>(&b).ok()).map_or(Value::Null, |v| v["entries"][0].clone())
+}
+
+/// A DirectML job on an NVIDIA GPU (a run's DirectML alternate) starts DirectML's crew - three workers of 1,152 games in
+/// flight in two groups of 576 rows, the search threads shared (12 on this test PC's 8 cores: 4 each) -, not CUDA's crew
+/// of the bench's target (two full batches of its 1,024-row batch: 3 x 704) nor 0.3.11's one worker.
+#[test]
+fn a_directml_lease_starts_directmls_crew_on_an_nvidia_gpu() {
+    let (mut h, g) = dml_harness(nvidia(12_282), None, true);
+    // (the owner's computer in use: work goes on, trials don't - the start's layout stays)
+    h.machine.lock().unwrap().settings.mode = farm_agent::settings::Mode::Always;
+    h.user_active(true);
+    // 2 MB a game measured with this build: the job's 15,808 MB limit holds 3 x 1,152 (1,339 each)
+    seed_memory(&h, &g, 2);
+    h.push(gpu_lease(&h, &g, "l_DN", &dml_fake(20, json!([1.0, 1.6, 2.2])), json!("auto"), 1_000_000));
+    h.start();
+    assert!(wait(|| job_lines(&h).len() >= 3), "{}", h.agent_log());
+    for j in &job_lines(&h)[..3] {
+        assert_eq!(j["providers"], json!(["dml", "cpu"]), "{j}");
+        assert_eq!(j["gpu"]["luid"], "000000000000d1f3", "{j}");
+        assert_eq!((j["conc"].as_u64(), j["groups"].as_u64(), j["threads"].as_u64()), (Some(1152), Some(2), Some(4)), "3 x 1,152 in two groups, 4 of 12 search threads: {j}");
+    }
+    let beat = |h: &H| h.mock.with(|s| s.beats.iter().filter(|(l, _)| l == "l_DN").map(|(_, b)| b["stats"].clone()).next_back());
+    assert!(wait(|| beat(&h).is_some_and(|b| b["workers"] == 3 && b["inflight"] == 3456)), "{:?}
+{}", beat(&h), crew_log(&h));
+    let status = h.status.lock().unwrap().tuning.clone().unwrap_or_default();
+    assert!(status.contains("3 workers x (4 search threads, 1,152 games in flight in 2 groups (576 rows)) on the GPU"), "{status}");
+    h.stop();
+    let done = h.wait_done("l_DN");
+    ids_accounted(&h, "l_DN", &done);
+    assert!(h.crashes().is_empty(), "{:?}", h.crashes());
+}
+
+/// A 16 GB AMD GPU on a 32 GB PC (the job's limit: half the RAM, at most the free memory less a floor - 15,808 MB here),
+/// this build's per-game memory not measured yet (its base is: 256 MB, planned at 656): the default 45 MB a game leaves the
+/// first worker 284 games in flight in one batch - 0.3.11 rated DirectML there (256 rows, ~2,500 rows/s); now the choice
+/// rates it at DirectML's start (576 rows, ~5,100 rows/s). Once the lease's early reading calibrates the plan (2 MB a
+/// game), the start is picked again: DirectML's crew of three of 1,152 on the AMD GPU (0.3.11 started one worker on any
+/// GPU but NVIDIA's), keyed by DirectML's tuner version.
+#[test]
+fn an_amd_gpu_forms_directmls_crew_once_the_memory_is_calibrated() {
+    let (mut h, g) = dml_harness(amd16(), None, true);
+    h.machine.lock().unwrap().settings.mode = farm_agent::settings::Mode::Always;
+    h.user_active(true);
+    std::fs::create_dir_all(h.layout.state()).unwrap();
+    std::fs::write(h.layout.state().join("rolling_memory.json"), json!({format!("{RUN}/{}/gpu_base", g.alt): 256}).to_string()).unwrap();
+    h.push(gpu_lease(&h, &g, "l_DA", &dml_fake(20, json!([1.0, 1.6, 2.2])), json!("auto"), 10_000_000));
+    let t0 = Instant::now();
+    h.start();
+    assert!(wait(|| !job_lines(&h).is_empty()), "{}", h.agent_log());
+    let first = h.job_line();
+    assert_eq!(first["providers"], json!(["dml", "cpu"]), "{first}
+{}", h.agent_log());
+    assert_eq!((first["gpu"]["vendor"].as_str(), first["gpu"]["luid"].as_str()), (Some("amd"), Some("00000000000000a1")), "{first}");
+    assert_eq!((first["conc"].as_u64(), first["groups"].as_u64(), first["threads"].as_u64()), (Some(284), Some(1), Some(12)), "the default plan's one worker, one batch: {first}");
+    // (the beats' `rows_per_s`: DirectML as rated, at 576 rows - between the bench's 4,718 at 512 and 7,638 at 1,024)
+    let beat = |h: &H| h.mock.with(|s| s.beats.iter().filter(|(l, _)| l == "l_DA").map(|(_, b)| b["stats"].clone()).next_back());
+    assert!(wait(|| beat(&h).is_some()), "{}", crew_log(&h));
+    let rated = beat(&h).unwrap()["rows_per_s"]["dml"].as_f64().unwrap_or(0.0);
+    assert!(rated > 4718.0 && rated < 7638.0, "rated at DirectML's batch: {:?}", beat(&h));
+    // the crew of three of 1,152 once the plan is calibrated (seconds here, minutes on a real PC)
+    assert!(
+        mockcoord::testkit::wait_until(Duration::from_secs(60), || beat(&h).is_some_and(|b| b["workers"] == 3 && b["inflight"] == 3456)),
+        "no crew after {:?}: {:?}
+{}
+{:?}",
+        t0.elapsed(),
+        beat(&h),
+        crew_log(&h),
+        learned(&h)
+    );
+    assert!(h.agent_log().contains("early in their games"), "an early reading planned the job: {}", crew_log(&h));
+    let lines = job_lines(&h);
+    let members: Vec<&Value> = lines.iter().filter(|j| j["conc"] == 1152).collect();
+    assert!(members.len() >= 3 && members.iter().all(|j| j["groups"] == 2 && j["threads"] == 4 && j["providers"] == json!(["dml", "cpu"])), "{lines:?}");
+    // remembered per GPU and provider, keyed by DirectML's tuner version (0.3.11's entries are searched again), its start
+    // the crew the calibrated plan holds
+    assert!(wait(|| tuning_entry(&h)["start"]["workers"] == 3), "{}", tuning_entry(&h));
+    let e = tuning_entry(&h);
+    assert_eq!(e["key"]["tuner"], farm_agent::tune::DML_TUNER_VERSION, "{e}");
+    assert!(e["key"]["hw"].as_str().unwrap().ends_with("gpu amd RX 9070 XT 16304 MB driver 32.0.21001.9024 | dml"), "{e}");
+    assert_eq!((e["space"]["dml"].clone(), e["start"]["conc"].clone(), e["start"]["groups"].clone()), (json!(true), json!(1152), json!(2)), "{e}");
+    h.stop();
+    let done = h.wait_done("l_DA");
+    ids_accounted(&h, "l_DA", &done);
+    assert!(h.crashes().is_empty(), "{:?}", h.crashes());
+}
+
+/// A DirectML job under a small memory limit (3,000 MB; this build measured at 1 MB a game over a 300 MB base, planned at
+/// 700): a crew's workers would hold 575 (two) or 150 (three) games in flight each, under DirectML's 768 - so one worker
+/// of 1,152 in two groups, and it stays one.
+#[test]
+fn a_directml_job_under_a_small_memory_limit_runs_one_worker_of_directmls_batch() {
+    let (mut h, g) = dml_harness(amd16(), None, true);
+    h.machine.lock().unwrap().settings.mode = farm_agent::settings::Mode::Always;
+    h.machine.lock().unwrap().settings.max_ram_mb = Some(3_000);
+    h.user_active(true);
+    std::fs::create_dir_all(h.layout.state()).unwrap();
+    std::fs::write(h.layout.state().join("rolling_memory.json"), json!({format!("{RUN}/{}/gpu", g.alt): 1, format!("{RUN}/{}/gpu_base", g.alt): 300}).to_string()).unwrap();
+    // the worker commits what was measured (300 MB, 1 MB a game in flight): the plan stays
+    let mut fk = dml_fake(20, json!([1.0, 1.6, 2.2]));
+    (fk["mem_base_mb"], fk["mem_per_game_mb"]) = (json!(300), json!(1));
+    h.push(gpu_lease(&h, &g, "l_DS", &fk, json!("auto"), 10_000_000));
+    h.start();
+    assert!(wait(|| !job_lines(&h).is_empty()), "{}", h.agent_log());
+    let first = h.job_line();
+    assert_eq!((first["providers"].clone(), first["conc"].as_u64(), first["groups"].as_u64(), first["threads"].as_u64()), (json!(["dml", "cpu"]), Some(1152), Some(2), Some(12)), "{first}");
+    assert!(wait(|| workers_uploading(&h, "l_DS") >= 1), "{}", crew_log(&h));
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(job_lines(&h).len(), 1, "one worker: {}", crew_log(&h));
+    h.stop();
+    let done = h.wait_done("l_DS");
+    ids_accounted(&h, "l_DS", &done);
+    assert!(h.crashes().is_empty(), "{:?}", h.crashes());
+}
+

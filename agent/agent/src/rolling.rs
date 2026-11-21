@@ -582,6 +582,67 @@ pub fn gpu_target(setting: Inflight, batch: u64) -> u64 {
     }
 }
 
+/// agent 0.3.12 (PROTOCOL 13.1 **DirectML**): a DirectML job (`dml`, any vendor) starts from DirectML's own layout, not
+/// from the bench's full batch: up to this many workers ...
+pub const DML_WORKERS: u32 = 3;
+/// ... each with this many games in flight ("auto") in `DML_GROUPS` groups - batches of `DML_ROWS` rows. DirectML pays a
+/// large fixed cost per inference call (~130-140 ms on an RTX 4070 Ti whether the batch has 448 or 671 rows, the GPU 33-46
+/// % busy), so it wants big batches and several processes calling at once. That PC (the worker's self-play on a real
+/// network, 5-minute windows, leaves/s, 2026-11-20): 1 worker x 2,048 games in flight in two groups 3.3k, 2 x 2,048 7.5k,
+/// 3 x 768 8.6k, 4 x 768 10.7k, 3 x 1,150 12.0k (the best; CUDA on that layout 25.3k). Agents 0.3.11 started a DirectML
+/// job as any GPU but NVIDIA's: one worker of the bench's target, which the memory plan held to ~270 games in flight in
+/// one group until its early reading, then one worker of 2,048 (~740 games an hour on that PC in a lease's first 15
+/// minutes). 1,152: the measured best rounded to `tune::GPU_CONC_STEP`.
+pub const DML_CONC: u64 = 1152;
+/// A DirectML worker plays its games in this many groups (one plays on the CPU while the other is on the GPU).
+pub const DML_GROUPS: u64 = 2;
+/// A DirectML worker's rows per inference call at `DML_CONC`.
+pub const DML_ROWS: u64 = DML_CONC / DML_GROUPS;
+/// agent 0.3.12: where the memory plans hold less, a DirectML crew's workers each run fewer games in flight, down to this
+/// many (batches of 384 rows), before the crew has a worker fewer: 3 x 768 played 8.6k on the 4070 Ti PC above, more than
+/// 2 x 2,048 (7.5k) - DirectML's time per call barely depends on the batch, so more processes calling at once pay more
+/// than bigger batches. One worker runs what the memory holds.
+pub const DML_MIN_CONC: u64 = 768;
+
+/// agent 0.3.12: the games in flight a DirectML job targets in all: "auto" `DML_WORKERS` x `DML_CONC` (3,456), at most
+/// the lease's block of ids (`block`) and `MAX_INFLIGHT`; a run's number as it is. The coordinator's in-flight limit
+/// (rev 21, 10.4) follows the agent's asks (about twice the crew's games in flight, a crew allowed twice its games in
+/// flight), so it doesn't bound the start.
+pub fn dml_target(setting: Inflight, block: u64) -> u64 {
+    match setting {
+        Inflight::N(n) => n,
+        Inflight::Auto => (DML_WORKERS as u64 * DML_CONC).min(block.max(1)).min(MAX_INFLIGHT),
+    }
+}
+
+/// agent 0.3.12: DirectML's start rule (PROTOCOL 13.1), as (workers, games in flight each) for `total` games in flight in
+/// all (`dml_target`; `fixed`: a run's number, shared by the workers, else each worker at most `DML_CONC`), at most
+/// `max_workers`, each one of n within `room(n)` (the games in flight the memory plans leave one of n workers; None: no
+/// limit): the most workers that each keep `DML_MIN_CONC` - fewer games each first, then fewer workers -, else one worker
+/// with what it holds. `tune::Space::dml_start` applies it within a lease's whole space (its video memory plan, the
+/// owner's settings).
+pub fn dml_crew(total: u64, fixed: bool, max_workers: u32, room: &dyn Fn(u32) -> Option<u64>) -> (u32, u64) {
+    let per = |n: u32| {
+        let share = total.max(1) / n.max(1) as u64;
+        let p = if fixed { share } else { share.min(DML_CONC) };
+        room(n).map_or(p, |r| p.min(r)).max(1)
+    };
+    (2..=max_workers.max(1)).rev().map(|n| (n, per(n))).find(|&(_, p)| p >= DML_MIN_CONC).unwrap_or((1, per(1)))
+}
+
+/// agent 0.3.12 (PROTOCOL 9.6): one DirectML worker's (conc, groups) as the measured choice rates a `dml` candidate - the
+/// batch DirectML's start will use (`dml_crew` of `dml_target`: 1,152 games in flight in two groups of 576 rows for
+/// "auto"), not the bench's CUDA-shaped target under the memory plan (0.3.11 rated DirectML at the ~192-270 rows a
+/// default memory plan left one worker, where it is slow). The memory plan bounds it only when this PC measured the run's
+/// cost per game (`mem.measured`): the default's conservative cost is replaced by the lease's early reading within
+/// minutes, and the start picked again then (lease.rs `calibrate`).
+pub fn dml_shape(setting: Inflight, block: u64, mem: MemPlan) -> (u64, u64) {
+    let total = dml_target(setting, block);
+    let room = |n: u32| mem.measured.then(|| ((mem.ram_mb as f64 * PLAN_SHARE / n.max(1) as f64) as u64).saturating_sub(mem.cost.base_mb) / mem.cost.per_game_mb.max(1));
+    let (_, conc) = dml_crew(total, matches!(setting, Inflight::N(_)), DML_WORKERS, &room);
+    (conc, gpu_groups(conc, DML_ROWS))
+}
+
 /// A CPU job's (conc, groups): the run's number (in the template's groups, at most one per game), or "auto":
 /// `cpu_auto()` (`CPU_INFLIGHT` games in `CPU_GROUPS` groups; more on macOS); capped by memory (`MemPlan::cap`; on
 /// macOS the cores' groups kept, the batches shrinking to `MACOS_CPU_MIN_BATCH` rows, `mac_capped_groups`, 0.3.3).
@@ -845,6 +906,36 @@ mod tests {
         // agent 0.3.7: two groups once each keeps 256 rows, even under a bigger batch (the 4070 Ti PC's crew of 3 x 575
         // under its 1,024-row batch: two groups of 288 rows, not one of 575)
         assert_eq!((gpu_groups(575, 1024), gpu_groups(511, 1024), gpu_groups(512, 1024)), (2, 1, 2));
+    }
+
+    /// agent 0.3.12: DirectML's start - up to 3 workers of 1,152 games in flight in two groups of 576 rows (3,456 in all),
+    /// within the lease's block; where memory holds less, fewer games each down to 768, then fewer workers - and the batch
+    /// the measured choice rates a DirectML candidate at.
+    #[test]
+    fn directml_targets_its_own_crew_and_is_rated_at_its_batch() {
+        assert_eq!((DML_CONC, DML_ROWS, DML_GROUPS, DML_MIN_CONC), (1152, 576, 2, 768));
+        assert_eq!(dml_target(Inflight::Auto, 65_536), 3456);
+        assert_eq!(dml_target(Inflight::Auto, 2_000), 2000, "at most the lease's block");
+        assert_eq!(dml_target(Inflight::N(500), 65_536), 500, "a run's number as it is");
+        // the crew: as many workers as each keep 768 games in flight, 1,152 at most each
+        let none = |_: u32| None;
+        assert_eq!(dml_crew(3456, false, 3, &none), (3, 1152));
+        assert_eq!(dml_crew(3456, false, 2, &none), (2, 1152), "two allowed: 1,152 each, not 1,728");
+        assert_eq!(dml_crew(3456, false, 1, &none), (1, 1152));
+        // memory for 3 x 900: fewer games each first; 3 x 700 doesn't keep 768: two workers; 2 x 600 neither: one
+        assert_eq!(dml_crew(3456, false, 3, &|n| Some([0, 2000, 1500, 900][n as usize])), (3, 900));
+        assert_eq!(dml_crew(3456, false, 3, &|n| Some([0, 2000, 1500, 700][n as usize])), (2, 1152));
+        assert_eq!(dml_crew(3456, false, 3, &|n| Some([0, 300, 150, 100][n as usize])), (1, 300), "one worker runs what it holds");
+        // a run's number is shared: 2,048 -> 2 x 1,024 (3 x 682 < 768); 4,096 -> 3 x 1,365 (no per-worker cap)
+        assert_eq!(dml_crew(2048, true, 3, &none), (2, 1024));
+        assert_eq!(dml_crew(4096, true, 3, &none), (3, 1365));
+        assert_eq!(dml_crew(2000, false, 3, &none), (2, 1000), "a block of 2,000");
+        // the choice's batch: 1,152 in two groups (576 rows) unless this PC measured the run's cost and it holds less
+        assert_eq!(dml_shape(Inflight::Auto, 65_536, auto_gpu(8_000)), (1152, 2), "the default 45 MB a game: not the start's bound");
+        assert_eq!(dml_shape(Inflight::Auto, 65_536, plan(16_384, 1800, 3, true)), (947, 2), "measured: 3 x (4,642 - 1,800) / 3");
+        assert_eq!(dml_shape(Inflight::Auto, 65_536, plan(16_000, 1800, 4, true)), (1152, 2), "3 x 683 doesn't keep 768: two of 1,152");
+        assert_eq!(dml_shape(Inflight::Auto, 65_536, plan(4_000, 1800, 4, true)), (400, 1), "one worker of 400 in one batch");
+        assert_eq!(dml_shape(Inflight::N(2048), 65_536, auto_gpu(8_000)), (1024, 2));
     }
 
     #[test]

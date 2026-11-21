@@ -4,6 +4,18 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's: `agent-macos-v<version>`).
 
+## Unreleased (0.3.12)
+
+- **Graphics cards running DirectML start from a setup that suits it.** DirectML, which AMD cards (and some NVIDIA
+  cards, when a run asks for it) use, spends a long, fixed time on every batch of positions however big, so it does best
+  with big batches and three job programs sharing the card. Zero Farm 0.3.11 started such a card like any card that isn't
+  NVIDIA's: one job program with a few hundred games at once, which on an RTX 4070 Ti made only about a quarter of what
+  DirectML can do there. It now starts up to three job programs of about 1,150 games each - fewer games each, then fewer
+  programs, where the computer's memory or the card's memory holds less - and still tries other setups afterwards.
+- **A DirectML card is judged at the batch size it will really use.** Zero Farm compared DirectML with the processor at
+  the small batches a cautious first memory estimate allowed, where DirectML is slow, so on a computer with little memory
+  set aside for the farm it could leave the card unused. It now compares them at DirectML's own batch size.
+
 ## Unreleased (0.3.11)
 
 - **AMD graphics cards can help again, through DirectML only.** Since 0.2.11 Zero Farm left AMD cards alone, because

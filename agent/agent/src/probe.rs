@@ -684,21 +684,32 @@ fn choose_shaped(
         }
     }
     // The fewest games per lease at which a GPU pays (PROTOCOL 9.4): the smallest batch where one reaches 2x the CPU,
-    // else GPU_MARGIN times, with `games_groups` batches in turn.
+    // else GPU_MARGIN times, with `games_groups` batches in turn (agent 0.3.12: a DirectML row with DirectML's groups -
+    // two once each batch keeps `rolling::GPU_SPLIT_MIN_ROWS` rows, as its start runs them -, whatever the template's).
     let cpu_rows = &b.results.iter().find(|r| r.ok && r.provider == "cpu").expect("checked above").rows;
     let gpu_rows: Vec<&BenchRow> = b.results.iter().filter(|r| r.ok && allowed(&r.provider) && adapter_of(r).is_some()).collect();
+    let games_at = |r: &BenchRow, n: u64| {
+        if r.provider != "dml" {
+            n * games_groups
+        } else if n >= crate::rolling::GPU_SPLIT_MIN_ROWS {
+            n * crate::rolling::DML_GROUPS
+        } else {
+            n
+        }
+    };
     let pays_at = |ratio: f64| {
         let mut n = 1u64;
         while n <= 1024 {
             let cpu_n = rate_at(cpu_rows, n).unwrap_or(cpu);
-            if gpu_rows.iter().any(|r| rate_at(&r.rows, n).is_some_and(|x| x >= ratio * cpu_n)) {
-                return Some(n);
+            let games = gpu_rows.iter().filter(|r| rate_at(&r.rows, n).is_some_and(|x| x >= ratio * cpu_n)).map(|r| games_at(r, n)).min();
+            if games.is_some() {
+                return games;
             }
             n = (n * 5).div_ceil(4);
         }
         None
     };
-    c.gpu_games = pays_at(2.0).or_else(|| pays_at(GPU_MARGIN)).map(|n| n * games_groups);
+    c.gpu_games = pays_at(2.0).or_else(|| pays_at(GPU_MARGIN));
     if !gpu_ok {
         c.why = "the GPU may not be used now".into();
         return c;
@@ -1138,6 +1149,39 @@ mod tests {
         // an adapter this PC doesn't have (any more) is never chosen
         let gone = bench(&[("cpu", None, CPU), ("cuda", Some("RTX 3090"), CUDA)]);
         assert_eq!(choose(Some(&gone), &gpus, None, true, 128, 16, 2).providers, vec!["cpu"]);
+    }
+
+    /// agent 0.3.12 (PROTOCOL 9.6): a rolling lease's DirectML candidate is rated at the batch of DirectML's start (1,152
+    /// games in flight in two groups: 576 rows), not at the bench's target as a default memory plan cuts it - where
+    /// DirectML, with its large fixed cost per call, is slow -; its `gpu_games` counts DirectML's two groups.
+    #[test]
+    fn a_directml_candidate_is_rated_at_directmls_batch() {
+        // an AMD GPU's DirectML (a float32 graph) beside a CPU of 1,600 rows/s
+        const RX: &[(u64, f64)] = &[(1, 11.0), (8, 88.0), (32, 351.0), (128, 1342.0), (512, 4718.0), (1024, 7638.0)];
+        const CPU16: &[(u64, f64)] = &[(1, 1600.0), (8, 1600.0), (32, 1600.0), (128, 1600.0), (512, 1600.0), (1024, 1600.0)];
+        let gpus = [gpu("RX 9070 XT", "amd", "00000000000000a1")];
+        let b = bench(&[("cpu", None, CPU16), ("dml", Some("RX 9070 XT"), RX)]);
+        let auto = crate::rolling::Inflight::Auto;
+        // an 8,000 MB job limit at the default 1,800 MB + 45 MB a game (nothing measured here yet)
+        let mem = crate::rolling::MemPlan { ram_mb: 8_000, cost: crate::rolling::GPU_COST, measured: false };
+        // 0.3.11: rated at the 96 rows that plan left one worker of the bench's target - under 1.1 x the CPU: the CPU
+        let old = |row: &BenchRow| crate::rolling::gpu_shape(auto, &row.rows, 1, mem);
+        let c = choose_rolling(Some(&b), &gpus, None, true, (32, 4), &old, 1);
+        assert_eq!(c.providers, vec!["cpu"], "{}", c.why);
+        assert!(c.rows_per_s["dml"] < GPU_MARGIN * 1600.0, "{:?}", c.rows_per_s);
+        // now (lease.rs `pick`): at DirectML's start - DirectML
+        let new = |row: &BenchRow| if row.provider == "dml" { crate::rolling::dml_shape(auto, 65_536, mem) } else { crate::rolling::gpu_shape(auto, &row.rows, 1, mem) };
+        let c = choose_rolling(Some(&b), &gpus, None, true, (32, 4), &new, 1);
+        assert_eq!(c.providers, vec!["dml", "cpu"], "{}", c.why);
+        assert_eq!((c.conc, c.groups, c.batch_rows), (Some(1152), Some(2), 576));
+        assert!(c.rows_per_s["dml"] > 4718.0 && c.rows_per_s["dml"] < 7638.0, "{:?}", c.rows_per_s);
+        assert_eq!(c.gpu["vendor"], "amd");
+        // DirectML reaches 2x the CPU at 363 rows (the scan's step): 726 games in DirectML's two groups (0.3.11: 363 with
+        // the template's one group); a CUDA row keeps the template's groups
+        assert_eq!(c.gpu_games, Some(726));
+        let cuda = bench(&[("cpu", None, CPU16), ("cuda", Some("RTX 4070 Ti"), RX)]);
+        let nv = [gpu("RTX 4070 Ti", "nvidia", "00000000000000d1")];
+        assert_eq!(choose_rolling(Some(&cuda), &nv, None, true, (32, 4), &new, 1).gpu_games, Some(363));
     }
 
     fn probe_rec(runtime: &str, key: &str, t: i64, providers: &[&str], error: Option<&str>, need: Option<&[&str]>) -> Probe {

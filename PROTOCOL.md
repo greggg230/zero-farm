@@ -1125,6 +1125,18 @@ job's batch size ever runs. From the same numbers the agent works out `caps.gpu_
 and `done`) carry `batch_rows` (`b` as chosen) and `rows_per_s` (`{"<provider>": rows/s at b}` for the CPU and
 each GPU candidate), which the coordinator keeps with the lease's stats.
 
+**DirectML candidates** (agents from 0.3.12, no wire change). DirectML pays a large fixed cost per call, so it is slow at
+small batches and fast at big ones (13.1 **DirectML**). On a rolling lease a `dml` candidate is rated at the batch of
+DirectML's start, `b` = one worker's games in flight / its groups: `"auto"` 1,152 games in flight in two groups, 576 rows
+(a run's number: its share for the crew that holds it; at most the lease's block) - within the memory plan (10.6) only when
+this PC measured the run's cost per game with the lease's worker build (the default's conservative 45 MB a game is
+replaced by the lease's early reading within minutes, and the start picked again then). 0.3.11 rated it, as any GPU
+candidate, at the bench's target as the memory plan cut it: ~192-270 rows under the default plan, where a DirectML GPU can
+be slower than the CPU and was then not used. The bench already measures 512 and 1,024 rows (`--bench-rows` above);
+576 is interpolated between them. In `caps.gpu_games` a `dml` row counts DirectML's groups (two once a batch has 256
+rows, whatever the template's `groups`); every other provider's rating and `gpu_games` are unchanged. A classic lease's
+choice is unchanged.
+
 The built-in graph is not the last word: the bench also tries a pack's own `gpu.providers` when the built-in probe
 failed them (that graph fails CUDA's priors, max abs 2.4e-3 from duplicate scatter slots in its reference rows, where
 real exports pass at ~2e-6). A pass there is the factory's full self-test on the job's own network and reference set
@@ -1203,8 +1215,9 @@ PC down twice, so rev 12 turned AMD GPUs off altogether (below); DirectML had ru
 - The rest of a GPU lease is vendor-neutral and holds on an AMD GPU without NVML: the GPU busy gate (PDH, section 8);
   the temperature rule (D3DKMT; a driver that reports none has no temperature rule: the busy gate and the driver's own
   thermal limits still apply, and GPU work is never blocked for want of a reading); the adapter's dedicated memory
-  (DXGI) and its use (Windows' GPU memory counters, 10.6 **Video memory**); crews and the tuner (13.1: a GPU other than
-  NVIDIA starts with one worker, the tuner tries more); a DirectML worker out of video memory (`E_OUTOFMEMORY`, 10.6);
+  (DXGI) and its use (Windows' GPU memory counters, 10.6 **Video memory**); crews and the tuner (13.1: agents from 0.3.12
+  start a DirectML job on any vendor's GPU with DirectML's own crew, 13.1 **DirectML**; 0.3.11 started a GPU other than
+  NVIDIA's with one worker, the tuner tried more); a DirectML worker out of video memory (`E_OUTOFMEMORY`, 10.6);
   `caps.gpu` and `caps.gpu_allowed` (an AMD-only PC asks with `gpu_allowed` now); the hardware class (its biggest GPU,
   section 4).
 
@@ -1831,7 +1844,8 @@ before rev 19, eval, fuzz and classic jobs are unchanged; GPU jobs are tuned fro
   3 x 1,150 in two 28.0k, 2 x 1,536 in two 27.0k; the trainer's own path there 32.8k. **Start** (no coordinator hint: a report doesn't say
   whether its layout ran on the GPU or the CPU of the same build and pack): on an NVIDIA GPU the most workers within the bounds whose start holds the target in all
   (each its share rounded up to a multiple of 64 - 1,024: 1 x 1,024 in two groups of 512, 2 x 512, 3 x 384 - in batches
-  of at most the full batch, and its share of the search threads), else one; on other GPUs one (the tuner tries more). A
+  of at most the full batch, and its share of the search threads), else one; on other GPUs one (the tuner tries more); a
+  DirectML job, on any vendor's GPU, DirectML's own start (agents from 0.3.12, **DirectML** below). A
   layout the memory plan held back is lifted to its share of the target, not past it (10.6). Agents from 0.3.5: a
   start's groups are the rule's for the games in flight the memory plans leave (139: one batch of 139; 0.3.4 kept the
   target's 2 groups, 70 rows), and while a search measured nothing but the start (no trial yet) a calibration that
@@ -1842,6 +1856,33 @@ before rev 19, eval, fuzz and classic jobs are unchanged; GPU jobs are tuned fro
   and stayed one worker of 1,024. `autotune` off: the start
   for the owner's `workers` (else one), fixed (handed over only when the memory plan holds more, 10.6). A CPU job on a
   GPU runtime pack takes no hint either (the hint for that build and pack is most likely a GPU layout).
+- **DirectML** (agents from 0.3.12; no wire change). DirectML (`dml`) pays a large fixed cost per inference call: on the
+  4070 Ti PC (2026-11-20, the worker's self-play on a real network, 5-minute windows) ~130-140 ms whether a batch had 448
+  or 671 rows, the GPU 33-46 % busy; leaves/s by layout (workers x games in flight, groups): 1 x 2,048 in two groups
+  3.3k, 2 x 2,048 7.5k, 3 x 768 8.6k, 4 x 768 10.7k, 3 x 1,150 12.0k (the best; CUDA on that layout 25.3k, its best
+  28.1k) - it wants big batches and several processes calling at once. Agent 0.3.11 started a DirectML job as any GPU's
+  but NVIDIA's (one worker of two of the bench's full batches, ~200-290 games in flight in one group under a default
+  memory plan, then one worker of 2,048): ~740 games an hour there in a lease's first 15 minutes. So a GPU job whose
+  provider is `dml`, on any vendor's GPU, has its own target and start (the rest of the bullet above holds):
+  - **Target:** `"auto"` 3 workers x 1,152 games in flight (the measured best rounded to 64) = 3,456 in all, at most the
+    lease's `block` (10.3) and 4,096; a run's number kept. Each worker's share of an `"auto"` target is at most 1,152
+    whatever the crew's size; games in flight (all workers', `"auto"`) from 768 to twice the target. The coordinator's
+    in-flight limit (rev 21, 10.4) follows the agent's asks, so it doesn't bound the start.
+  - **Start:** the most workers within the bounds (at most 3, one per physical core, the owner's `workers`, the memory
+    plan and the video memory plan, as above) each of which keeps at least 768 games in flight (batches of 384 rows) -
+    each its share (at most 1,152) in two groups of at most 576 rows, cut by the memory plans; where memory holds less,
+    fewer games each first, then fewer workers (3 x 768 played more than 2 x 2,048 above) -, else the fewest workers
+    allowed with what they hold. The owner's fixed `workers` (or `autotune` off: that count, else one) start that many,
+    each its share. A 4070 Ti PC's lease, half of 32 GB as the job's limit (16,384 MB): nothing measured yet (1,800 MB +
+    45 MB a game) one worker of 269 in one batch, as 0.3.11; after the early reading (4 MB a game over a measured base of
+    2,059 MB) two of 1,152 (three would hold 645 each); at a steady 3 MB three of 861; with room (e.g. a 24,000 MB limit
+    at 3 MB) three of 1,152 in two groups of 576. As for every GPU start, a calibration that changes the plan while
+    nothing but the start was measured picks it again (10.6), and the tuner searches from it (13.2: first one worker fewer,
+    the job's games in flight and rows per batch kept as far as two groups go).
+  - **Tuning key:** DirectML jobs' keys carry tuner version 4 (13.3), so 0.3.11's entries - started from one small worker,
+    their incumbents never a crew - are searched again from this start; other GPU jobs keep 3.
+  - **Measured choice** (9.6): a DirectML candidate is rated at the batch of this start, not at the bench's target as the
+    memory plan cuts it.
 - **The owner's settings** `autotune` (default on; Windows `machine.json`, macOS `ZeroFarm set autotune on|off`) and
   `workers` (`auto` (default) | 1 | 2 | 3, 13.5). `autotune` off: the fixed rules of before (one worker, `threads` = the
   CPU threads, no `infer_*` fields, 10.6's games in flight) - unless `workers` is 2 or 3: then that many workers with
@@ -1943,7 +1984,7 @@ before rev 19, eval, fuzz and classic jobs are unchanged; GPU jobs are tuned fro
 
 - `state/tuning.json`, per key (worker build, runtime pack, network, hardware - with the owner's `workers` when set; a
   GPU job's (agents from 0.3.4) also the GPU - vendor, name, dedicated memory, driver - and the provider -, OS version,
-  tuner version 2; a GPU job's 3 from agent 0.3.8): the start,
+  tuner version 2; a GPU job's 3 from agent 0.3.8, a DirectML job's 4 from agent 0.3.12): the start,
   the incumbent, every measurement, the window, the search's state. The network's fingerprint is the first 16 hex of the
   sha256 of the job template's canonical JSON without its per-lease fields, `|`, the model file's size in MiB (a run's
   generations keep it; another architecture or other settings change it); the hardware's is the CPU brand, cores,
@@ -2201,6 +2242,15 @@ set the run's alternate's `model` (the CUDA alternate: `"model": "gpu"`) and the
 it: GPU machines play its default model.
 
 ## Changes
+- v1 rev 22, agent 0.3.12 (2026-11-20; no wire change): **DirectML jobs start from DirectML's own layout** (13.1
+  **DirectML**, 9.6 **DirectML candidates**). A GPU job whose provider is `dml`, on any vendor's GPU, targets up to 3
+  workers of 1,152 games in flight in two groups of 576 rows (within the lease's block) and starts the most workers that
+  each keep 768 games in flight under the memory plans (fewer games each first, then fewer workers), instead of one worker
+  of two of the bench's full batches (0.3.11 on any GPU but NVIDIA's; on an NVIDIA GPU CUDA's rule); its tuning keys carry
+  tuner version 4 (searched again from that start); the measured choice rates a `dml` candidate at that start's batch, and
+  `caps.gpu_games` counts DirectML's two groups. CUDA, TensorRT, OpenVINO and CPU jobs are unchanged. Why: on a 4070 Ti PC
+  DirectML played 12.0k leaves/s at 3 x 1,150 in two groups but 3.3k as one worker of 2,048, and 0.3.11's DirectML leases
+  there made ~740 games an hour in their first 15 minutes (one worker of ~270 games in flight, then of 2,048).
 - v1 rev 22 (2026-11-20; agent 0.3.11, canary first; coordinator var `AMD_DML_AGENT`, no migration): **AMD GPUs with
   DirectML only, and the owner's GPU vendors off** (section 9.8). Agents report AMD adapters again and run only `dml` on
   them: a probe or bench on a PC with an AMD adapter is pinned to one adapter (the pack's vendor, then NVIDIA, AMD,
