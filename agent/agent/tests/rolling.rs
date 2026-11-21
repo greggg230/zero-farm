@@ -506,3 +506,60 @@ fn a_cost_over_the_plan_is_remembered_at_once() {
     let done = h.wait_done("l_RR");
     assert!(done.get("refused").is_none(), "{done}");
 }
+
+// ---- agent 0.3.15 (PROTOCOL 10.6 **A worker that stops playing**) ----
+
+/// A worker that plays nothing more with games in flight while it keeps sending `status` (never silent, so the
+/// silence check never fires) is taken as failed once its counters stood still for `stall_after`: a lone rolling
+/// worker is started again (its games in flight lost, reported once) and the lease plays on. Agent 0.3.14 left such a
+/// lease playing nothing until it ended.
+#[test]
+fn a_worker_that_plays_nothing_more_is_started_again() {
+    let mut h = H::new();
+    h.signals.real_starvation = false;
+    h.machine.lock().unwrap().settings.autotune = false;
+    h.timings.stall_after = Duration::from_secs(3);
+    let g1 = generation_1_with(&h, settings_with(50, json!({"rate": {"leaves_s": 1000, "best": {}}, "freeze_after": 10, "status_ms": 200})));
+    h.push(rolling_lease(&h, "l_RF", &g1, 0, 16, 100_000, json!(8)));
+    h.start();
+    assert!(wait(|| h.agent_log().contains("frozen")), "{}", h.agent_log());
+    assert!(wait(|| h.job_line_n(1).is_some()), "the worker is started again: {}", h.agent_log());
+    let log = h.agent_log();
+    assert!(log.contains("played nothing for") && log.contains("games in flight"), "{log}");
+    assert!(!log.contains("silent for"), "it never went silent: {log}");
+    let crashes = h.crashes();
+    assert!(crashes.first().is_some_and(|c| c["message"].as_str().unwrap().contains("played nothing")), "{crashes:?}");
+    // the next worker plays its own games (then freezes too: started again while restarts are left)
+    assert!(wait(|| credited(&h, "l_RF") > 15), "the lease plays on: {}", h.agent_log());
+    h.stop();
+    let done = h.wait_done("l_RF");
+    assert!(done.get("refused").is_none(), "{done}");
+}
+
+/// No false alarm: a slow worker whose games take longer than `stall_after` (its leaves moving), a pause longer than
+/// `stall_after`, and the resume after it are no failure.
+#[test]
+fn slow_or_paused_workers_are_not_taken_as_failed() {
+    let mut h = H::new();
+    h.signals.real_starvation = false;
+    h.machine.lock().unwrap().settings.autotune = false;
+    h.timings.stall_after = Duration::from_secs(2);
+    // a game ends every 1,000 leaves at 200 leaves/s: 5 s a game, two and a half times `stall_after`
+    let g1 = generation_1_with(&h, settings_with(50, json!({"rate": {"leaves_s": 200, "best": {}}, "game_leaves": 1000, "status_ms": 200})));
+    h.push(rolling_lease(&h, "l_RS", &g1, 0, 16, 100_000, json!(8)));
+    h.start();
+    assert!(wait(|| h.job_line_n(0).is_some()), "{}", h.agent_log());
+    std::thread::sleep(Duration::from_secs(6));
+    h.user_active(true);
+    assert!(wait(|| h.phase() == farm_agent::status::Phase::Paused), "{}", h.agent_log());
+    std::thread::sleep(Duration::from_secs(3));
+    h.user_active(false);
+    assert!(wait(|| h.phase() == farm_agent::status::Phase::Working), "{}", h.agent_log());
+    std::thread::sleep(Duration::from_secs(4));
+    let log = h.agent_log();
+    assert!(h.job_line_n(1).is_none(), "one worker all along: {log}");
+    assert!(!log.contains("played nothing") && !log.contains("the worker failed"), "{log}");
+    assert!(h.crashes().is_empty(), "{:?}", h.crashes());
+    h.stop();
+    h.wait_done("l_RS");
+}

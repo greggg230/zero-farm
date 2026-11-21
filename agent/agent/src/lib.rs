@@ -60,6 +60,15 @@ pub struct Timings {
     pub ping_after: Duration,
     /// No message from a running worker for this long → it is hung: kill it.
     pub hang_after: Duration,
+    /// agent 0.3.15 (`lease::Watch`): a running or resuming worker with games in flight whose counters (leaves, games,
+    /// games started) didn't move for this long while it got CPU has failed - it may still answer every `ping`. Sized from
+    /// real leases: workers report every 10 s, and the slowest self-play of the farm's week to 2026-11-21 (D1 lease stats)
+    /// still searched ~2,800 leaves per second on a CPU and ~5,600 on DirectML, whose every call takes ~130 ms whatever
+    /// its rows - a live worker's leaves move between any two statuses. 5 minutes is 30 statuses without one leaf.
+    pub stall_after: Duration,
+    /// agent 0.3.15: a worker that answered `resume` with a non-fatal `error` (its sessions not built again) and played
+    /// nothing for this long after it has failed.
+    pub resume_fail_after: Duration,
     /// After `quit`, how long to wait for `end` before killing.
     pub quit_grace: Duration,
     /// The worker runs at idle priority: on a CPU saturated by other programs it may get no CPU
@@ -123,6 +132,8 @@ impl Default for Timings {
             yield_answer: Duration::from_secs(2),
             ping_after: Duration::from_secs(30),
             hang_after: Duration::from_secs(90),
+            stall_after: Duration::from_secs(300),
+            resume_fail_after: Duration::from_secs(30),
             quit_grace: Duration::from_secs(10),
             starve_cap: Duration::from_secs(600),
             starve_window: Duration::from_secs(5),

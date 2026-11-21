@@ -612,6 +612,72 @@ fn turning_the_gpus_vendor_off_gives_a_running_gpu_lease_back() {
     h.stop();
 }
 
+// ---------- agent 0.3.15 (PROTOCOL 10.6 **A worker that stops playing**): a resume that fails ----------
+
+/// zero-core's message when CUDA can't build a session again after a pause (another program took the GPU's memory).
+const CUBLAS_ALLOC: &str = "model-gpu.onnx: ONNX Runtime: Exception during initialization: onnxruntime::CudaCall CUBLAS failure 3: \
+                            CUBLAS_STATUS_ALLOC_FAILED ; GPU=0 ; expr=cublasCreate(&cublas_handle_);";
+
+/// The lease of 2026-11-21 that sat dead for 86 minutes: after a pause the worker's `resume` fails (its CUDA session
+/// can't be built again: a non-fatal `error`, no `resumed`) and it plays nothing more - while it still sends `status`,
+/// so it is never silent. Agent 0.3.14 left it so until the lease ended; from 0.3.15 the failed resume is a failed
+/// worker: out of video memory, it starts again with smaller batches (the plan per row raised), reported once, and the
+/// lease plays on.
+#[test]
+fn a_worker_whose_resume_fails_is_started_again_with_smaller_batches() {
+    let (mut h, g) = harness(12_282, None, false);
+    seed_memory(&h, &g, 4);
+    let mut fk = fake(20, json!([1.0]));
+    fk["resume_error"] = json!(CUBLAS_ALLOC);
+    h.push(gpu_lease(&h, &g, "l_GR", &fk, json!("auto"), 1_000_000));
+    h.start();
+    assert!(wait(|| !chunk_ids(&h, "l_GR").is_empty()), "{}", h.agent_log());
+    assert_eq!(job_lines(&h).len(), 1);
+    // another program takes the GPU, then lets it go: the worker yields, and its resume fails
+    gpu_signal(&h, false);
+    assert!(wait(|| !pids_logging(&h, "yielded").is_empty()), "{}", crew_log(&h));
+    gpu_signal(&h, true);
+    assert!(wait(|| h.agent_log().contains("failed to resume")), "{}", h.agent_log());
+    assert!(wait(|| job_lines(&h).len() >= 2), "the worker is started again: {}", h.agent_log());
+    let lines = job_lines(&h);
+    assert!(lines[1]["conc"].as_u64() < lines[0]["conc"].as_u64(), "smaller batches: {lines:?}");
+    let before = chunk_ids(&h, "l_GR").len();
+    assert!(wait(|| chunk_ids(&h, "l_GR").len() > before + 4), "the lease plays on: {}", h.agent_log());
+    let m = learned(&h);
+    assert!(m[format!("{RUN}/{}/vram", g.alt)].as_u64().unwrap() > farm_agent::rolling::GPU_VRAM.per_row_mb, "{m}");
+    let crashes = h.crashes();
+    assert_eq!(crashes.len(), 1, "{crashes:?}");
+    let msg = crashes[0]["message"].as_str().unwrap();
+    assert!(msg.contains("ran out of video memory") && msg.contains("resume"), "{msg}");
+    h.stop();
+    let done = h.wait_done("l_GR");
+    ids_accounted(&h, "l_GR", &done);
+}
+
+/// The same in a crew: every worker's resume fails; the main worker starts again smaller and the other member is
+/// replaced (`mate_failed`), and the lease plays on.
+#[test]
+fn a_crew_whose_resumes_fail_is_started_again() {
+    let (mut h, g) = harness(12_282, Some(2), false);
+    seed_memory(&h, &g, 4);
+    let mut fk = fake(30, json!([1.0, 1.3]));
+    fk["resume_error"] = json!(CUBLAS_ALLOC);
+    h.push(gpu_lease(&h, &g, "l_GRC", &fk, json!(64), 1_000_000));
+    h.start();
+    assert!(wait(|| job_lines(&h).len() >= 2 && workers_uploading(&h, "l_GRC") >= 2), "{}", crew_log(&h));
+    gpu_signal(&h, false);
+    assert!(wait(|| pids_logging(&h, "yielded").len() >= 2), "{}", crew_log(&h));
+    gpu_signal(&h, true);
+    assert!(wait(|| h.agent_log().matches("failed to resume").count() >= 2), "{}", h.agent_log());
+    assert!(wait(|| job_lines(&h).len() >= 4), "both workers are started again: {}", crew_log(&h));
+    let before = chunk_ids(&h, "l_GRC").len();
+    assert!(wait(|| chunk_ids(&h, "l_GRC").len() > before + 4), "the lease plays on: {}", crew_log(&h));
+    assert!(!h.crashes().is_empty());
+    h.stop();
+    let done = h.wait_done("l_GRC");
+    ids_accounted(&h, "l_GRC", &done);
+}
+
 // ---------- agent 0.3.12 (PROTOCOL 9.6, 13.1 **DirectML**): DirectML jobs start from DirectML's own crew ----------
 
 /// A 16 GB AMD GPU.

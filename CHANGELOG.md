@@ -4,6 +4,16 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's: `agent-macos-v<version>`).
 
+## Unreleased (0.3.15)
+
+- **A job program that stops playing is started again.** After a pause, a job program has to set its graphics card up
+  again; when it couldn't - another program still held the card's memory - it said so, played nothing more, but kept
+  answering Zero Farm, which took it for busy: on a PC in November its job sat like that for an hour and a half until
+  the farm ended it. Zero Farm now watches that a job program's games move on. One whose set-up failed after a pause
+  is started again within a minute (on a graphics card with smaller batches, which fit), and one that plays nothing
+  for five minutes while it has games running and gets the processor is started again too. Slow graphics cards and
+  busy processors aren't affected: even the slowest job programs on the farm move on every few seconds.
+
 ## Unreleased (0.3.14)
 
 - **A new training run starts with what the computer already knows about its program.** Zero Farm measures how much

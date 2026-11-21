@@ -219,6 +219,87 @@ struct Mate {
     /// agent 0.3.6: since when it finishes its games, and whether its last ones were ended (`tail_tick`).
     finishing_since: Option<Instant>,
     tail_quit: bool,
+    /// agent 0.3.15: its progress watched (`Watch`), and since when a `resume` went out without its `resumed`.
+    watch: Watch,
+    resuming: Option<Instant>,
+}
+
+/// agent 0.3.15 (PROTOCOL 10.6 **A worker that stops playing**): a worker's progress, watched. zero-core's worker answers
+/// a `resume` whose sessions can't be built again (2026-11-21: CUDA out of memory after a pause, another program holding
+/// the GPU) with a non-fatal `error` and no `resumed`, and then plays nothing - but answers every `ping` with its frozen
+/// counters, so the silence check (`Timings::hang_after`) never fires: a lease sat dead for 86 minutes until the
+/// coordinator cancelled it. A worker is taken as failed (the paths a fatal error takes, `Lease::worker_failed`) when:
+/// - it sent a non-fatal `error` while resuming and its counters didn't move for `Timings::resume_fail_after` after it;
+/// - or, running or resuming, with games in flight (`games_started` over `games`; a worker that doesn't count them has
+///   none here) its counters (leaves, games, games started) didn't move for `Timings::stall_after` while it got CPU.
+#[derive(Debug, Clone)]
+pub(crate) struct Watch {
+    /// The worker watched (the main worker changes at restarts and handoffs: a new one starts a new watch).
+    pid: u32,
+    /// Its last counters (leaves, games, games_started) and when they last moved.
+    seen: Option<(u64, u64, u64)>,
+    moved: Instant,
+    /// A non-fatal error it sent while resuming, and when.
+    resume_error: Option<(String, Instant)>,
+    /// Its last non-fatal error (told in the failure's message).
+    last_error: Option<String>,
+}
+
+/// agent 0.3.15: the lease's event loop not ticking for this long (the PC slept, the agent was stopped) starts every
+/// progress watch's clock again.
+const WATCH_TICK_GAP: Duration = Duration::from_secs(30);
+
+impl Watch {
+    pub(crate) fn new(pid: u32) -> Watch {
+        Watch { pid, seen: None, moved: Instant::now(), resume_error: None, last_error: None }
+    }
+
+    /// A `status`'s counters: when they moved, the clock starts again (and a resume error is forgotten: it plays).
+    pub(crate) fn status(&mut self, leaves: Option<u64>, games: Option<u64>, started: Option<u64>) {
+        let games = games.unwrap_or(0);
+        let c = (leaves.unwrap_or(0), games, started.unwrap_or(games));
+        if self.seen != Some(c) {
+            if self.seen.is_some() {
+                self.resume_error = None;
+            }
+            self.seen = Some(c);
+            self.moved = Instant::now();
+        }
+    }
+
+    /// The clock starts again (a resume sent, CPU starvation, a gap in the loop).
+    pub(crate) fn restart_clock(&mut self) {
+        self.moved = Instant::now();
+    }
+
+    /// A non-fatal `error`, `resuming` or not.
+    pub(crate) fn error(&mut self, msg: &str, resuming: bool) {
+        self.last_error = Some(msg.to_string());
+        if resuming {
+            self.resume_error = Some((msg.to_string(), Instant::now()));
+        }
+    }
+
+    fn in_flight(&self) -> u64 {
+        self.seen.map_or(0, |(_, g, st)| st.saturating_sub(g))
+    }
+
+    /// Whether the worker failed at `now` (`resuming`: a `resume` went out and no `resumed` came; `starved`: the PC gives
+    /// it no CPU, which isn't a stall) -> why, for the failure's message.
+    pub(crate) fn verdict(&self, now: Instant, resume_fail_after: Duration, stall_after: Duration, resuming: bool, starved: bool) -> Option<String> {
+        if let Some((msg, at)) = &self.resume_error {
+            if now.saturating_duration_since(*at) >= resume_fail_after && self.moved <= *at {
+                return Some(format!("its resume failed ({msg}) and it played nothing for {} s after", now.saturating_duration_since(*at).as_secs()));
+            }
+        }
+        let quiet = now.saturating_duration_since(self.moved);
+        if starved || quiet < stall_after || !(resuming || self.in_flight() > 0) {
+            return None;
+        }
+        let state = if resuming { "after a resume (no `resumed`)".to_string() } else { format!("with {} games in flight", self.in_flight()) };
+        let err = self.last_error.as_deref().map(|e| format!("; its last error: {e}")).unwrap_or_default();
+        Some(format!("it played nothing for {} s {state}{err}", quiet.as_secs()))
+    }
 }
 
 /// rev 19 (PROTOCOL 13.5): where a finishing worker's ids stop: its `games_started` after `finish`, read until two agree.
@@ -1192,6 +1273,8 @@ impl Engine {
             counters: None,
             progress: None,
             counters_at: None,
+            watch: Watch::new(0),
+            watch_tick: Instant::now(),
             crew_changed: Instant::now(),
             last_counter_ping: None,
             vram_mb: 0,
@@ -1558,6 +1641,9 @@ struct Run {
     /// whether its memory reading is a steady one, `rolling::steady_reading`).
     progress: Option<(u64, u64)>,
     counters_at: Option<Instant>,
+    /// agent 0.3.15: the main worker's progress watched (`Watch`), and the event loop's last tick (`WATCH_TICK_GAP`).
+    watch: Watch,
+    watch_tick: Instant,
     /// The crew changed (a worker joined or left): no trial for a while.
     crew_changed: Instant,
     last_counter_ping: Option<Instant>,
@@ -1775,7 +1861,7 @@ impl Run {
                 // abort on a failed allocation) is restarted smaller, as one that said so
                 if self.end_ev.is_none() && !self.killed && !self.memory_failure(eng, &format!("worker exited with code {code}")) {
                     // rev 19 (PROTOCOL 13.5): a crew's main worker that crashed is replaced; the others go on
-                    self.crew_crash(eng, &format!("worker exited with code {code} without `end`"), Some(code as i64));
+                    self.crew_crash(eng, &format!("worker exited with code {code} without `end`"), Some(code as i64), false);
                 }
                 // rev 19: a handoff whose old worker finished its games before the next one could start beside it
                 self.handoff_after_exit(eng);
@@ -1808,6 +1894,14 @@ impl Run {
         }
         let d = eng.decide(&self.worker_pids());
         let must_pause = !d.work || (self.gpu_job() && !d.gpu);
+        // (agent 0.3.15: a gap in the loop - the PC slept - is no worker's stall)
+        if self.watch_tick.elapsed() > WATCH_TICK_GAP {
+            self.watch.restart_clock();
+            for m in &mut self.mates {
+                m.watch.restart_clock();
+            }
+        }
+        self.watch_tick = Instant::now();
         // rev 22 (PROTOCOL 9.8): the owner turned GPU work on this job's GPU's vendor off (a rolling lease's update check):
         // the lease goes back at once, its GPU released
         if let Some(v) = self.gpu_vendor_off(eng) {
@@ -1848,6 +1942,7 @@ impl Run {
                     eng.set_status(Phase::Paused, why, Some(describe_job(&self.lease)));
                 } else {
                     self.check_alive(eng, &t);
+                    self.check_progress(eng, &t);
                 }
             }
             WState::Yielding(since) => {
@@ -1875,12 +1970,17 @@ impl Run {
                     self.send(json!({"op": "resume"}));
                     self.state = WState::Resuming(Instant::now());
                     self.last_msg = Instant::now();
+                    // (agent 0.3.15: its progress is watched from the resume on)
+                    self.main_watch().restart_clock();
                     // The stall lasts until a starvation window shows the worker getting CPU.
                     self.sample = (CpuMark::take(&self.worker), Instant::now());
                     eng.set_status(Phase::Working, "", Some(describe_job(&self.lease)));
                 }
             }
-            WState::Resuming(_) => self.check_alive(eng, &t),
+            WState::Resuming(_) => {
+                self.check_alive(eng, &t);
+                self.check_progress(eng, &t);
+            }
             WState::Stopping(since) => {
                 if since.elapsed() > t.quit_grace && !self.killed {
                     self.kill("no end after quit");
@@ -1894,7 +1994,7 @@ impl Run {
         self.mem_check(eng);
         self.vram_check(eng);
         self.calibrate(eng);
-        self.mates_tick(&t, must_pause);
+        self.mates_tick(eng, &t, must_pause);
         self.tune_tick(eng, &t, must_pause);
         self.crew_tick(eng, &t, must_pause);
         self.tail_tick(eng, &t, must_pause);
@@ -2406,6 +2506,53 @@ impl Run {
         }
     }
 
+    /// agent 0.3.15: the main worker's progress watch (a new main worker - a restart, a handoff - starts a new one).
+    fn main_watch(&mut self) -> &mut Watch {
+        if self.watch.pid != self.worker.pid {
+            self.watch = Watch::new(self.worker.pid);
+        }
+        &mut self.watch
+    }
+
+    /// agent 0.3.15 (PROTOCOL 10.6 **A worker that stops playing**): a running or resuming main worker that failed its
+    /// resume or plays nothing (`Watch::verdict`) failed - as with a fatal error (`worker_failed`): a rolling worker out of
+    /// video memory (a session it couldn't build again) starts again with smaller batches, a crew's main worker - and a
+    /// lone rolling worker - is replaced, else the failure is reported and the lease fails.
+    fn check_progress(&mut self, eng: &mut Engine, t: &crate::Timings) {
+        if self.killed || self.after.is_some() || eng.quitting() || matches!(self.state, WState::Stopping(_)) {
+            return;
+        }
+        let resuming = matches!(self.state, WState::Resuming(_));
+        let starved = self.stall_since.is_some();
+        let w = self.main_watch();
+        if starved {
+            // (a worker the PC gives no CPU plays nothing; the slack rule bounds that)
+            w.restart_clock();
+        }
+        let Some(why) = w.verdict(Instant::now(), t.resume_fail_after, t.stall_after, resuming, starved) else { return };
+        log::warn!("lease {}: the worker failed: {why}", self.id());
+        eng.worker_log.write_line(&format!("watch [{}]: the worker failed: {why}", self.lease.lease_id));
+        self.worker_failed(eng, &why, &format!("worker failed: {why}"), true, "it plays nothing");
+    }
+
+    /// The main worker failed - its fatal error (`msg`), or (agent 0.3.15) a failed resume or no progress (`check_progress`)
+    /// -, one way for all: a rolling worker out of memory or video memory starts again with fewer games in flight
+    /// (`memory_failure`, rev 15 / agent 0.3.4); a crew's main worker is replaced, the others going on (`crew_crash`, rev
+    /// 19; `lone`: a lone rolling worker too - its build works, the worker lost its sessions); else the failure (`why`) is
+    /// reported and the worker killed: the lease fails (`kill_why`).
+    fn worker_failed(&mut self, eng: &mut Engine, msg: &str, why: &str, lone: bool, kill_why: &str) {
+        if self.memory_failure(eng, msg) {
+            return;
+        }
+        if self.crew_crash(eng, why, None, lone) {
+            self.worker.kill();
+            self.killed = true;
+            return;
+        }
+        self.report(eng, "crash", why, None);
+        self.kill(kill_why);
+    }
+
     fn check_alive(&mut self, eng: &Engine, t: &crate::Timings) {
         let quiet = self.last_msg.elapsed();
         if quiet > t.hang_after {
@@ -2715,6 +2862,10 @@ impl Run {
                 if let (Some(g), Some(st)) = (s.get("games").and_then(Value::as_u64), s.get("games_started").and_then(Value::as_u64)) {
                     self.progress = Some((g, st));
                 }
+                // (agent 0.3.15: its progress watched)
+                let n = |k: &str| s.get(k).and_then(Value::as_u64);
+                let (leaves, games, started) = (n("leaves"), n("games"), n("games_started"));
+                self.main_watch().status(leaves, games, started);
                 // (agent 0.3.4: a worker that reports its video memory)
                 self.stats_vram = s.get("vram_mb").and_then(Value::as_u64).unwrap_or(0);
                 // (agent 0.3.6: a GPU job's worker's base reading - sessions built, games started, none finished)
@@ -2787,6 +2938,7 @@ impl Run {
                     self.resume_ms_max = self.resume_ms_max.max(since.elapsed().as_millis() as u64);
                     self.state = WState::Running;
                 }
+                self.main_watch().resume_error = None;
             }
             "end" => {
                 log::info!("lease {}: worker ended ({})", self.id(), v.get("reason").and_then(Value::as_str).unwrap_or("?"));
@@ -2798,20 +2950,13 @@ impl Run {
             "error" => {
                 let msg = v.get("message").and_then(Value::as_str).unwrap_or("").to_string();
                 if v.get("fatal").and_then(Value::as_bool).unwrap_or(false) {
-                    // rev 15 (PROTOCOL 10.6): a rolling worker out of memory is started again with fewer games
-                    if self.memory_failure(eng, &msg) {
-                        return;
-                    }
-                    // rev 19 (PROTOCOL 13.5): a crew's main worker that failed is replaced; the others go on
-                    if self.crew_crash(eng, &format!("worker fatal error: {msg}"), None) {
-                        self.worker.kill();
-                        self.killed = true;
-                        return;
-                    }
-                    self.report(eng, "crash", &format!("worker fatal error: {msg}"), None);
-                    self.kill("fatal error");
+                    self.worker_failed(eng, &msg, &format!("worker fatal error: {msg}"), false, "fatal error");
                 } else {
-                    log::warn!("lease {}: worker error: {msg}", self.id());
+                    // (agent 0.3.15: one while resuming is taken as a failed resume once nothing is played after it,
+                    // `Watch`)
+                    let resuming = matches!(self.state, WState::Resuming(_));
+                    log::warn!("lease {}: worker error{}: {msg}", self.id(), if resuming { " while resuming" } else { "" });
+                    self.main_watch().error(&msg, resuming);
                 }
             }
             other => log::debug!("lease {}: ignoring worker event {other:?}", self.id()),
@@ -3714,6 +3859,8 @@ impl Run {
             stats_vram: std::mem::take(&mut self.stats_vram),
             finishing_since: None,
             tail_quit: std::mem::take(&mut self.tail_quit),
+            watch: Watch::new(0),
+            resuming: None,
         });
         if let Some(r) = self.roll.as_mut() {
             r.offset = first - lo;
@@ -3861,6 +4008,8 @@ impl Run {
                 if let (Some(l), Some(g), Some(st)) = (n("leaves"), n("games"), n("games_started")) {
                     m.counters = Some((l, g, st));
                 }
+                // (agent 0.3.15: its progress watched)
+                m.watch.status(n("leaves"), n("games"), n("games_started"));
                 m.stats_vram = n("vram_mb").unwrap_or(0);
                 if m.active() {
                     self.probe_sample(eng);
@@ -3894,6 +4043,19 @@ impl Run {
                 let msg = v.get("message").and_then(Value::as_str).unwrap_or("").to_string();
                 log::warn!("lease {}: worker pid {} failed: {msg}", self.id(), self.mates[i].worker.pid);
                 self.mates[i].fatal = Some(msg);
+            }
+            // agent 0.3.15: a non-fatal one - while resuming, a failed resume once nothing is played after it (`Watch`)
+            "error" => {
+                let msg = v.get("message").and_then(Value::as_str).unwrap_or("").to_string();
+                let m = &mut self.mates[i];
+                let resuming = m.resuming.is_some();
+                log::warn!("lease {}: worker pid {} error{}: {msg}", self.lease.lease_id, m.worker.pid, if resuming { " while resuming" } else { "" });
+                m.watch.error(&msg, resuming);
+            }
+            "resumed" => {
+                let m = &mut self.mates[i];
+                m.resuming = None;
+                m.watch.resume_error = None;
             }
             _ => {}
         }
@@ -4193,24 +4355,31 @@ impl Run {
 
     /// rev 19 (PROTOCOL 13.5): the main worker failed (not of memory: a fatal error or an exit without `end`) while
     /// crew members play their ranges: it is replaced (a new tail after every released id; its games in flight lost),
-    /// reported once per lease, and the others go on. -> true when a restart is due (else the lease fails as before).
-    fn crew_crash(&mut self, eng: &mut Engine, why: &str, code: Option<i64>) -> bool {
+    /// reported once per lease, and the others go on. Agent 0.3.15: with `lone`, a lone rolling worker too (one that
+    /// failed its resume or plays nothing, `check_progress`: a fresh worker of the same build builds its sessions anew).
+    /// -> true when a restart is due (else the lease fails as before).
+    fn crew_crash(&mut self, eng: &mut Engine, why: &str, code: Option<i64>, lone: bool) -> bool {
         let stopping = matches!(self.state, WState::Stopping(_)) || self.after.is_some() || eng.quitting();
         let crew = self.mates.iter().any(|m| m.active());
         let layout = self.tuning.as_ref().map_or(self.main_layout(), |t| t.current);
         let selftest_failed = self.selftest_failed;
         let Some(r) = self.roll.as_mut().filter(|r| r.active && !r.finishing && r.restart.is_none()) else { return false };
-        if !crew || stopping || selftest_failed || r.restarts >= crate::rolling::MAX_RESTARTS {
+        if !(crew || lone) || stopping || selftest_failed || r.restarts >= crate::rolling::MAX_RESTARTS {
             return false;
         }
         r.restart = Some(Restart { conc: layout.conc, burn: true, layout: Some(layout), count: true, measure: false });
-        log::warn!("lease {}: the crew's main worker failed ({why}); starting another, the others go on", self.lease.lease_id);
+        if crew {
+            log::warn!("lease {}: the crew's main worker failed ({why}); starting another, the others go on", self.lease.lease_id);
+        } else {
+            log::warn!("lease {}: the worker failed ({why}); starting another", self.lease.lease_id);
+        }
         if self.tuning.as_ref().is_some_and(|t| t.probe.is_some()) {
             self.end_probe(eng, Err("the crew's main worker failed during the trial".into()));
         }
         if !self.crash_reported {
             let kind = if self.worker.stderr_tail().contains("panicked at") { "panic" } else { "crash" };
-            self.report(eng, kind, &format!("crew main worker failed: {why}; replaced (the other workers go on)"), code);
+            let msg = if crew { format!("crew main worker failed: {why}; replaced (the other workers go on)") } else { format!("{why}; started again") };
+            self.report(eng, kind, &msg, code);
         }
         true
     }
@@ -4218,10 +4387,12 @@ impl Run {
     /// Workers beside the main one are stopped while work is paused (all of them, with the main worker) and the finishing
     /// ones while the next crew is measured; any is killed when silent too long (or with no `hello` in time); a crew
     /// member silent past `ping_after` is pinged.
-    fn mates_tick(&mut self, t: &crate::Timings, must_pause: bool) {
+    fn mates_tick(&mut self, eng: &Engine, t: &crate::Timings, must_pause: bool) {
         let measuring = self.tuning.as_ref().is_some_and(|x| x.probe.is_some()) && self.crew_complete();
         let id = self.lease.lease_id.clone();
         let gpu = self.gpu_lease();
+        // (agent 0.3.15: the PC gives the workers no CPU - the main worker's sample says so: no member's stall)
+        let starved = self.stall_since.is_some();
         for d in &mut self.mates {
             let stop = must_pause || (d.finishing && measuring);
             d.want_stop = stop;
@@ -4252,17 +4423,25 @@ impl Run {
             } else if !stop && d.worker.is_suspended() {
                 d.worker.resume();
                 d.last_msg = Instant::now();
+                d.watch.restart_clock();
             }
             if !stop && (d.yielded || d.yield_at.is_some()) {
                 // (its session is built again: `resume`; a `yield` the pause outlived is answered by it too)
                 let _ = d.worker.send(&json!({"op": "resume"}));
                 (d.yielded, d.yield_at) = (false, None);
                 d.last_msg = Instant::now();
+                // (agent 0.3.15: watched from the resume on, its `resumed` awaited)
+                d.resuming = Some(Instant::now());
+                d.watch.restart_clock();
             }
             if d.worker.is_suspended() {
                 continue;
             }
+            if starved {
+                d.watch.restart_clock();
+            }
             let quiet = d.last_msg.elapsed();
+            let failed = if d.job_sent && d.fatal.is_none() { d.watch.verdict(Instant::now(), t.resume_fail_after, t.stall_after, d.resuming.is_some(), starved) } else { None };
             if !d.job_sent && !d.finishing && d.spawned.elapsed() > t.hello {
                 log::warn!("lease {id}: worker pid {} sent no hello within {} s: killing it", d.worker.pid, t.hello.as_secs());
                 d.fatal = Some(format!("no hello within {} s", t.hello.as_secs()));
@@ -4272,6 +4451,13 @@ impl Run {
                 d.fatal.get_or_insert_with(|| format!("silent for {} s", quiet.as_secs()));
                 d.worker.kill();
                 d.last_msg = Instant::now();
+            } else if let Some(why) = failed {
+                // agent 0.3.15 (`Watch`): it failed - its exit takes the paths of any member's (`mate_failed`: out of video
+                // memory, the plan per row raised; a replacement joins while restarts are left)
+                log::warn!("lease {id}: worker pid {} failed: {why}: killing it", d.worker.pid);
+                eng.worker_log.write_line(&format!("watch [{id}]: worker pid {} failed: {why}", d.worker.pid));
+                d.fatal = Some(why);
+                d.worker.kill();
             } else if d.active() && d.job_sent && quiet > t.ping_after && !d.pinged {
                 d.pinged = true;
                 let _ = d.worker.send(&json!({"op": "ping"}));
@@ -4315,7 +4501,7 @@ impl Run {
         } else {
             self.stall_since = None;
         }
-        self.mates_tick(&t, pause && self.after.is_none());
+        self.mates_tick(eng, &t, pause && self.after.is_none());
         self.retire_mates(eng, &t);
         self.tail_tick(eng, &t, pause);
         self.maybe_beat(eng, pause);
@@ -4816,6 +5002,8 @@ impl Run {
             stats_vram: 0,
             finishing_since: None,
             tail_quit: false,
+            watch: Watch::new(0),
+            resuming: None,
         });
         self.crew_changed = Instant::now();
         self.show_tuning(eng);
@@ -4885,6 +5073,8 @@ impl Run {
             stats_vram: std::mem::take(&mut self.stats_vram),
             finishing_since: None,
             tail_quit: std::mem::take(&mut self.tail_quit),
+            watch: Watch::new(0),
+            resuming: None,
         });
         if let Some(r) = self.roll.as_mut() {
             r.offset = released;
@@ -4937,5 +5127,49 @@ mod tests {
     fn panic_sites() {
         assert_eq!(super::panic_site("thread 'main' panicked at engine/src/x.rs:42:9:\nboom"), "engine/src/x.rs:42:9");
         assert_eq!(super::panic_site("index out of bounds"), "unknown");
+    }
+
+    /// agent 0.3.15: when a watched worker has failed (`Watch::verdict`).
+    #[test]
+    fn a_worker_that_plays_nothing_is_told_from_a_slow_one() {
+        use super::Watch;
+        use std::time::{Duration, Instant};
+        let (fail, stall) = (Duration::from_secs(30), Duration::from_secs(300));
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        let mut w = Watch::new(7);
+        w.moved = t0;
+        assert_eq!(w.verdict(at(1000), fail, stall, false, false), None, "no counters yet: no games in flight known");
+        w.seen = Some((5000, 10, 18));
+        assert_eq!(w.verdict(at(299), fail, stall, false, false), None);
+        let why = w.verdict(at(300), fail, stall, false, false).expect("5 minutes, 8 games in flight");
+        assert!(why.contains("played nothing for 300 s with 8 games in flight"), "{why}");
+        assert_eq!(w.verdict(at(900), fail, stall, false, true), None, "starved of CPU: no stall");
+        w.seen = Some((5000, 18, 18));
+        assert_eq!(w.verdict(at(900), fail, stall, false, false), None, "no games in flight: waiting for ids");
+        assert!(w.verdict(at(900), fail, stall, true, false).is_some_and(|y| y.contains("after a resume")), "resuming: no `resumed` in 5 minutes");
+        // counters that move start the clock again
+        w.status(Some(5001), Some(18), Some(26));
+        assert_eq!(w.verdict(Instant::now() + Duration::from_secs(299), fail, stall, false, false), None);
+        // a failed resume: failed once nothing moved for `resume_fail_after` after it, starved or not
+        let mut r = Watch::new(7);
+        r.seen = Some((100, 1, 9));
+        r.moved = t0;
+        r.error("resume: CUBLAS_STATUS_ALLOC_FAILED", true);
+        let e = r.resume_error.as_ref().unwrap().1;
+        assert_eq!(r.verdict(e + Duration::from_secs(29), fail, stall, true, false), None);
+        let why = r.verdict(e + Duration::from_secs(30), fail, stall, true, true).expect("failed resume");
+        assert!(why.contains("its resume failed (resume: CUBLAS_STATUS_ALLOC_FAILED)"), "{why}");
+        // ... unless it plays after all
+        r.status(Some(150), Some(1), Some(9));
+        assert!(r.resume_error.is_none());
+        assert_eq!(r.verdict(Instant::now() + Duration::from_secs(60), fail, stall, true, false), None);
+        // an error when not resuming is only remembered (told with a stall)
+        let mut n = Watch::new(7);
+        n.seen = Some((1, 0, 4));
+        n.moved = t0;
+        n.error("extend: games is required", false);
+        assert!(n.resume_error.is_none());
+        assert!(n.verdict(at(300), fail, stall, false, false).is_some_and(|y| y.ends_with("its last error: extend: games is required")));
     }
 }

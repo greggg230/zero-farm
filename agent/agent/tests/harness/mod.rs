@@ -76,6 +76,9 @@ pub fn fast_timings() -> Timings {
         yield_answer: Duration::from_secs(2),
         ping_after: Duration::from_secs(5),
         hang_after: Duration::from_secs(15),
+        // (agent 0.3.15: no test's worker plays nothing this long with games in flight unless the test means it)
+        stall_after: Duration::from_secs(20),
+        resume_fail_after: Duration::from_secs(2),
         quit_grace: Duration::from_secs(8),
         starve_cap: Duration::from_secs(600),
         starve_window: Duration::from_millis(250),

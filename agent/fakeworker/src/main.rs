@@ -9,6 +9,11 @@
 //!  "crash_after": null,        // games finished, then a panic message on stderr + exit 101
 //!  "hang_after": null,         // games finished, then silence forever (ignores stdin)
 //!  "fatal_after": null,        // games finished, then {"ev":"error","fatal":true} + exit 2
+//!  "freeze_after": null,       // games finished, then plays nothing more but still sends `status` (its counters
+//!                              //   frozen) and answers `ping`, `quit` ending it (agent 0.3.15: a worker that stops)
+//!  "resume_error": null,       // a message: every `resume` after a `yield` fails like zero-core's worker whose sessions
+//!                              //   can't be built again - a non-fatal `error` with it, no `resumed` -, and it is frozen
+//!                              //   then as with `freeze_after`
 //!  "fail_seeds": [10450007],   // fuzz: seeds that "fail"
 //!  "chunk": 1000,              // fuzz: seeds per step
 //!  "selftest_fail_gen": null,  // eval: this network fails its self-test (then a fatal error)
@@ -214,6 +219,8 @@ struct Cfg {
     crash_after: Option<u64>,
     hang_after: Option<u64>,
     fatal_after: Option<u64>,
+    freeze_after: Option<u64>,
+    resume_error: Option<String>,
     fail_seeds: Vec<u64>,
     chunk: u64,
     selftest_fail_gen: Option<u64>,
@@ -258,6 +265,8 @@ impl Cfg {
             crash_after: o("crash_after"),
             hang_after: o("hang_after"),
             fatal_after: o("fatal_after"),
+            freeze_after: o("freeze_after"),
+            resume_error: f.get("resume_error").and_then(Value::as_str).map(String::from),
             fail_seeds: f
                 .get("fail_seeds")
                 .and_then(Value::as_array)
@@ -497,6 +506,11 @@ impl W {
             match self.rx.recv() {
                 Ok(Some(op)) => match op.get("op").and_then(Value::as_str).unwrap_or("") {
                     "resume" => {
+                        if let Some(msg) = self.cfg.resume_error.clone() {
+                            eprintln!("fakeworker: pid {} failed to resume", std::process::id());
+                            self.out.send(json!({"ev": "error", "message": format!("resume: {msg}"), "fatal": false}));
+                            self.freeze();
+                        }
                         self.yielded = false;
                         eprintln!("fakeworker: pid {} resumed", std::process::id());
                         self.out.send(json!({"ev": "resumed"}));
@@ -514,6 +528,27 @@ impl W {
                     _ => {}
                 },
                 Ok(None) | Err(_) => std::process::exit(0),
+            }
+        }
+    }
+
+    /// `freeze_after` / `resume_error`: plays nothing more, ever - `status` every `status_ms` and on `ping` with the same
+    /// counters (zero-core's worker after a failed resume: its control thread answers, its games wait for sessions that
+    /// never come back); `quit` or a closed stdin ends it (exit 0, no `end`: its games can't finish).
+    fn freeze(&mut self) -> ! {
+        eprintln!("fakeworker: pid {} frozen", std::process::id());
+        loop {
+            if self.last_status.elapsed() >= Duration::from_millis(self.cfg.status_ms) {
+                self.status();
+            }
+            match self.rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(Some(op)) => match op.get("op").and_then(Value::as_str).unwrap_or("") {
+                    "ping" => self.status(),
+                    "quit" => std::process::exit(0),
+                    _ => {}
+                },
+                Ok(None) | Err(RecvTimeoutError::Disconnected) => std::process::exit(0),
+                Err(RecvTimeoutError::Timeout) => {}
             }
         }
     }
@@ -560,6 +595,9 @@ fake crash at game {gid:?}");
         if self.cfg.fatal_after == Some(self.done) {
             self.out.send(json!({"ev": "error", "message": "fake fatal error", "fatal": true}));
             std::process::exit(2);
+        }
+        if self.cfg.freeze_after == Some(self.done) {
+            self.freeze();
         }
         if self.cfg.hang_after == Some(self.done) {
             eprintln!("fakeworker: hanging");

@@ -467,6 +467,26 @@ scans a newly downloaded executable before it starts); `yielded` within 2 s of `
 agent kills the process); `status` at least every 30 s while running (the agent pings after 30 s of
 silence and kills a worker silent for 90 s).
 
+**A worker that stops playing** (agents from 0.3.15; no wire change). A worker that answers every `ping` is never
+silent, so the agent also watches its `status` counters (`leaves`, `games`, `games_started`): it has failed when
+- it answered `resume` with a non-fatal `error` (no `resumed`) and its counters didn't move for 30 s after it - zero-core's
+  worker does that when its sessions can't be built again after a `yield` (2026-11-21: CUDA's
+  `CUBLAS_STATUS_ALLOC_FAILED`, another program holding the GPU's memory) and then plays nothing, answering pings with
+  frozen counters: a lease sat dead for 86 minutes;
+- or, running or resuming, with games in flight (`games_started` over `games`), its counters didn't move for 5
+  minutes while it got CPU (not paused, not starved by other programs: those keep the slack rule). Workers report
+  every 10 s, and the slowest self-play of the farm's week to 2026-11-21 still searched thousands of leaves a second
+  (CPU ~2.8k, DirectML ~5.6k: every DirectML call takes ~130 ms whatever its rows), so a live worker's leaves move
+  between any two statuses; 5 minutes is 30 statuses without one leaf. A worker that doesn't count games started
+  (fuzz) has no games in flight here.
+
+Such a worker takes the paths of a fatal error: a rolling worker whose message says it ran out of video memory (10.6
+**Video memory**) starts again with smaller batches, its plan per row raised; a crew's main worker - and, from
+0.3.15, a lone rolling worker - is replaced by a new one (its games in flight lost, a new tail after every released
+id, at most 4 restarts a lease); a crew member is replaced as when it exits (13.5 **Failures**); anything else is
+reported (`/v1/crash`) and the lease fails. A worker should send `fatal: true` (and exit) when it can't build its
+sessions again; zero-core's worker is to do so in a later build - the watch covers the builds already published.
+
 The worker reports the `build_id` of the `manifest.json` next to its executable (first 24 hex of its
 sha256); a mismatch with the lease is fatal. Paths in `job`/`checkpoint` lines are absolute.
 `runtime_dir`, when set, is a verified runtime pack; the agent also puts it first on the worker's
@@ -2315,6 +2335,12 @@ set the run's alternate's `model` (the CUDA alternate: `"model": "gpu"`) and the
 it: GPU machines play its default model.
 
 ## Changes
+- v1 rev 23, agent 0.3.15 (2026-11-21; no wire change): **a worker that stops playing is a failed worker** (5,
+  **A worker that stops playing**): a non-fatal `error` while resuming followed by 30 s without progress, or 5 minutes
+  without progress with games in flight while running, takes the paths of a fatal error (video memory: smaller
+  batches; a crew's main worker or a lone rolling one: replaced; a crew member: replaced; else reported, the lease
+  fails). Why: a worker whose CUDA session couldn't be built again after a pause answered every ping and played
+  nothing for 86 minutes, its lease never ending.
 - v1 rev 23, agent 0.3.14 (2026-11-21; no wire change): **a run not measured here plans with its worker build's
   measurement** (10.6 **Self-calibrating**): the cost per game, the base and the video memory per row of a run with no
   entry of its own on the PC are another run's of the same worker build and provider class (the highest), not the
