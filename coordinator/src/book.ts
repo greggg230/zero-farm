@@ -35,7 +35,7 @@ import {
 } from "./definitions";
 import { intersect, normalize, parseRanges, subtract, total, type Range } from "./ranges";
 import { storedPlatform } from "./platform";
-import { type Alternate, type CampaignAlternate, type GpuMode, type Provider, requiresRuntimeOf } from "./routing";
+import { type Alternate, type CampaignAlternate, type GpuMode, type Provider, YIELD_PREFIX, requiresRuntimeOf, yieldTarget } from "./routing";
 import {
   HttpError,
   type Json,
@@ -194,7 +194,9 @@ export interface LeaseRow {
   diag_id: number | null;
   lease: string;
   state: "active" | "done" | "given_back" | "expired" | "cancelled";
-  pending: "cancel" | "give_back" | null;
+  // Rev 24 (PROTOCOL 15.3, 15.4): "yield:<scope>" - the lease gives its machine to that eval batch (a fuzz lease's beats
+  // answer give_back, a rolling lease's extensions finish).
+  pending: "cancel" | "give_back" | `yield:${string}` | null;
   beat_s: number;
   slack_s: number;
   issued_at: number;
@@ -940,6 +942,9 @@ export interface BeatReq {
   progress: Json | undefined;
   stats: Json | undefined;
   gen?: number | null; // rev 15: a rolling lease's newest generation in play (ignored for classic leases)
+  // Rev 24 (PROTOCOL 15.3): a fuzz lease whose machine an eval batch waits for: that batch's scope (friend.ts decides;
+  // null or absent: none). Honoured only for an active fuzz lease with nothing pending.
+  yield_to?: string | null;
 }
 
 export interface BeatAnswer {
@@ -977,9 +982,18 @@ export async function beat(env: Env, r: BeatReq): Promise<BeatAnswer> {
   if (rolling && typeof r.gen === "number" && (l.gen === null || r.gen >= l.gen)) curGen = r.gen;
 
   let action: BeatAnswer["action"] = "continue";
+  let pending: LeaseRow["pending"] = l.pending;
   if (l.pending === "cancel") action = "cancel";
   else if (l.pending === "give_back") action = "give_back";
-  else if (pausedSince !== null && r.now - pausedSince > l.slack_s) action = "give_back"; // the agent should have
+  // rev 24 (PROTOCOL 15.3): a fuzz lease on its way to an eval batch keeps answering give_back (a lost answer is repeated)
+  else if (yieldTarget(l.pending) !== null && l.kind === "fuzz") action = "give_back";
+  else if (pausedSince !== null && r.now - pausedSince > l.slack_s) {
+    action = "give_back"; // the agent should have
+    pending = "give_back";
+  } else if (r.yield_to && l.kind === "fuzz" && l.pending === null && !paused) {
+    action = "give_back";
+    pending = `${YIELD_PREFIX}${r.yield_to}`;
+  }
 
   const upd = db
     .prepare(
@@ -994,7 +1008,7 @@ export async function beat(env: Env, r: BeatReq): Promise<BeatAnswer> {
       progress,
       stats,
       action === "cancel" ? l.expires_at : r.now + EXPIRE_BEATS * l.beat_s,
-      action === "give_back" ? "give_back" : l.pending,
+      pending,
       curGen,
       l.lease_id,
     );
@@ -1061,13 +1075,16 @@ export interface ExtendReq {
   // Past `until`: what else waits for this machine, in the order PROTOCOL 3 picks work (friend.ts works it out;
   // null: nothing, so the lease is renewed). Not looked at before `until`.
   waiting: string | null;
+  // Rev 24 (PROTOCOL 15.4): the eval batch (its scope) this machine gives way to now, before or after `until` (friend.ts
+  // decides; null or absent: none). The lease is marked on its way there and finishes.
+  yield_to?: string | null;
 }
 
 export interface ExtendAnswer {
   games: number; // the lease's ids are [lo, lo + games)
   wait_s?: number;
   finish?: true;
-  reason?: "quota" | "inflight" | "max_s" | "block" | "state"; // inflight: rev 21
+  reason?: "quota" | "inflight" | "max_s" | "block" | "state" | "yield"; // inflight: rev 21; yield: rev 24
 }
 
 // Rev 21 (PROTOCOL 10.4): the games a rolling lease finished as far as the coordinator knows - the ids its results
@@ -1125,7 +1142,7 @@ export async function extend(env: Env, r: ExtendReq): Promise<ExtendAnswer> {
   const lo = l.lo;
   const hi = l.hi;
   const rel = l.rel_hi!;
-  const finish = (reason: "max_s" | "block" | "state"): ExtendAnswer => ({ games: rel - lo, finish: true, reason });
+  const finish = (reason: "max_s" | "block" | "state" | "yield"): ExtendAnswer => ({ games: rel - lo, finish: true, reason });
 
   // The run's self-play is no longer rolling, the run or the machine is paused, or the lease is being cancelled or
   // given back (its next beat says so).
@@ -1140,6 +1157,12 @@ export async function extend(env: Env, r: ExtendReq): Promise<ExtendAnswer> {
   const def = await currentDef(db, "run", run.run);
   if (def && !def.builds.includes(l.build_id)) return finish("state");
   if (rel >= hi) return finish("block");
+  // Rev 24 (PROTOCOL 15.4): an eval batch waits for this machine: the lease is marked on its way there (so the batch's
+  // machines in transit count it) and finishes its games in flight; later extensions answer `state` (pending is set).
+  if (r.yield_to) {
+    await db.prepare(`UPDATE leases SET pending = ? WHERE lease_id = ? AND state = 'active' AND pending IS NULL`).bind(`${YIELD_PREFIX}${r.yield_to}`, l.lease_id).run();
+    return finish("yield");
+  }
 
   const stmts: Stmt[] = [];
   if (l.until === null || r.now >= l.until) {

@@ -309,14 +309,23 @@ export const GPU_LEASE_MIN = { selfplay: 64, eval: 128 } as const;
 // run's self-play on its GPU takes an eval batch ahead of that self-play only while the CPU PCs online could not
 // finish the batch's unissued games within this many seconds (0: always, the order of before). `eval_games_per_thread`:
 // an `auto` eval lease on the CPU gets at least this many games per caps.thread (0: no floor).
+// Rev 24 (PROTOCOL 15): `priority_lane` - "off": the behaviour of rev 23 exactly; "canary": waiting eval work preempts
+// fuzz and rolling self-play (and the deferral reads capacity as 15.5 says) only on machines of the canary channel, and
+// an idle machine asks again after LANE_WAIT_S while eval work is about to need it (every machine); "all": every
+// machine. `eval_stall_s`: under the lane, a batch nobody has taken or worked on for this long is behind (0: no such rule).
+export const PRIORITY_LANES = ["off", "canary", "all"] as const;
+export type PriorityLane = (typeof PRIORITY_LANES)[number];
 export interface HwRouting {
   on: boolean;
   eval_horizon_s: number;
   eval_games_per_thread: number;
+  priority_lane: PriorityLane; // rev 24
+  eval_stall_s: number; // rev 24
 }
-export const HW_ROUTING_DEFAULT: HwRouting = { on: true, eval_horizon_s: 1800, eval_games_per_thread: 2 };
+export const HW_ROUTING_DEFAULT: HwRouting = { on: true, eval_horizon_s: 1800, eval_games_per_thread: 2, priority_lane: "canary", eval_stall_s: 180 };
 export const MAX_EVAL_HORIZON_S = 7 * 86400;
 export const MAX_EVAL_GAMES_PER_THREAD = 16;
+export const MAX_EVAL_STALL_S = 86400;
 
 // The stored setting (its JSON text, or null: never set) with every missing or unreadable field at its default.
 export function hwRoutingOf(text: string | null | undefined): HwRouting {
@@ -332,8 +341,43 @@ export function hwRoutingOf(text: string | null | undefined): HwRouting {
     on: typeof o.on === "boolean" ? o.on : HW_ROUTING_DEFAULT.on,
     eval_horizon_s: n(o.eval_horizon_s, MAX_EVAL_HORIZON_S, HW_ROUTING_DEFAULT.eval_horizon_s),
     eval_games_per_thread: n(o.eval_games_per_thread, MAX_EVAL_GAMES_PER_THREAD, HW_ROUTING_DEFAULT.eval_games_per_thread),
+    priority_lane: (PRIORITY_LANES as readonly unknown[]).includes(o.priority_lane) ? (o.priority_lane as PriorityLane) : HW_ROUTING_DEFAULT.priority_lane,
+    eval_stall_s: n(o.eval_stall_s, MAX_EVAL_STALL_S, HW_ROUTING_DEFAULT.eval_stall_s),
   };
 }
+
+// ---------- rev 24 (PROTOCOL 15): the priority lane ----------
+
+// The lane's preemption (15.3, 15.4) and its reading of eval capacity (15.5) apply to a machine of this channel.
+export function laneApplies(hw: HwRouting, channel: string): boolean {
+  return hw.priority_lane === "all" || (hw.priority_lane === "canary" && channel === "canary");
+}
+
+// A `no_work` answer while eval work is about to need the machine (15.2): ask again after this many seconds (300
+// otherwise). The lease bucket allows one request per 5 s on average (ratelimit.ts), so this is 1/12 of it.
+export const LANE_WAIT_S = 60;
+// A run without self-play or a current batch, put this recently, is being set up (a campaign about to register its
+// batch, 15.2).
+export const LANE_SOON_S = 600;
+// A fuzz lease that will be done within this many seconds at its own pace so far is not given back (15.3).
+export const FUZZ_TAIL_S = 120;
+
+// `leases.pending` of a lease on its way to an eval batch (15.3, 15.4): "yield:" + the batch's scope ("run:<run>").
+export const YIELD_PREFIX = "yield:";
+export const yieldTarget = (pending: string | null | undefined): string | null =>
+  typeof pending === "string" && pending.startsWith(YIELD_PREFIX) ? pending.slice(YIELD_PREFIX.length) : null;
+
+// Where a candidate sorts in a machine's order (friend.ts offer): tier, then rank, then score (higher first).
+export interface SortKey {
+  tier: number;
+  rank: number;
+  score: number;
+}
+export const sortsBefore = (a: SortKey, b: SortKey): boolean =>
+  a.tier < b.tier || (a.tier === b.tier && (a.rank < b.rank || (a.rank === b.rank && a.score > b.score)));
+
+// The most machines an eval batch can use now (15.3, 15.4): its unissued games over one machine's lease size.
+export const batchMachines = (unissued: number, leaseSize: number): number => Math.ceil(unissued / Math.max(1, leaseSize));
 
 // A deferred eval batch (a PC that plays self-play on its GPU, the batch not behind) ranks after that self-play
 // (rank 1) and before a background job past its share (rank 2), still in tier 1 (before fuzz).
