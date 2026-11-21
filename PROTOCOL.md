@@ -533,6 +533,19 @@ stale, so eval leases ignore `max_stale` (and `x-gen`).
 - **Seat**: `{"net": <gen>}` or `{"bot": "<name>"}` (a built-in bot of the game; a name of up to 64
   characters from `A-Za-z0-9_.:-`), exactly one of the two; other keys are passed to the worker as
   they are.
+- **Seat settings** (zero-core docs/az.md 68; worker feature `seat_settings`; no coordinator or agent change): a
+  network Seat may carry `"set": {"<run setting>": <value>, ...}` - the evaluation settings that seat plays other than
+  the job's: the seat is the job's `settings` with the set laid over them (`{"net": 1, "set": {"eval_infoset_merge":
+  1}}`). Keys: only what an evaluation seat reads (zero-core `zero_worker::settings::SEAT_READS`: eval_sims, c_puct,
+  chance_k, margin_w, redet, cq_c_visit, cq_c_scale, eval_select, eval_select_min_visits, eval_select_c_visit,
+  eval_select_c_scale, eval_root_min_visits, root_min_visits_max_actions, eval_leaf_value_view, eval_root_search,
+  gumbel_m, eval_gumbel_scale, eval_cache, eval_infoset_merge, eval_belief_tilt, belief_clip, belief_mix, belief_fast,
+  eval_belief_tilts, eval_value_choice_worlds, eval_value_choice_temp). The worker refuses any other key, an empty
+  set, a set on a bot, or a set the seat's own checks refuse (a fatal `error` before any game). The coordinator and
+  the agent pass `set` through untouched like any other Seat key; the definition signs it as part of
+  `jobs.eval.seats`. Two seats may name the same gen with different sets (`checkpoints` lists it once). The desktop
+  sends a set only to a build whose `hello`/`info` `features` list `seat_settings` (an older worker refuses the seat:
+  "one key, net or bot"). Result rows echo each Seat as parsed, a set's keys sorted.
 - **Paired games**: with `"paired": true` game ids come in pairs `(2k, 2k+1)`: the same deal with
   the seats swapped. A paired batch starts on an even id (an odd id skipped to get there goes to the
   run's self-play pool). Leases always carry whole pairs (`gid_base` and `games` even). Seat order
