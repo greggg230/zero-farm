@@ -7,8 +7,8 @@ A change to anything here is a protocol change: bump the version it belongs to a
 bottom.
 
 Versions: HTTP API `v1` (path prefix), agent↔worker protocol `aw/1`, network files `zero-onnx/1`,
-manifests `manifest/1`. Current revision: v1 rev 22 (section 9.8, AMD GPUs with DirectML only and the owner's GPU vendors
-off; rev 21: section 10.4, the in-flight limit of rolling leases; rev 20: section 14, model variants per generation; rev 19: section 13, layout tuning and
+manifests `manifest/1`. Current revision: v1 rev 23 (section 12.2, a batch's CPU capacity counts only PCs of a platform its
+run has a build for; rev 22: section 9.8, AMD GPUs with DirectML only and the owner's GPU vendors off; rev 21: section 10.4, the in-flight limit of rolling leases; rev 20: section 14, model variants per generation; rev 19: section 13, layout tuning and
 several workers per lease; rev 18: section 12, hardware routing; rev 17: section 11, platforms: macOS on Apple silicon).
 
 ## 1. Conventions
@@ -1791,7 +1791,9 @@ eval batch in tier 1 that may run on the CPU (`gpu` not `required`) is **deferre
   unissued games > (sum of the CPU PCs' eval rates) x `eval_horizon_s`
 
 where the CPU PCs are the machines with `gpu_play` 0, seen in the last 300 s, not paused or revoked, without a fresh
-presence (section 3, rev 16), not the asking PC; each counts its measured eval rate for that batch (ids per running
+presence (section 3, rev 16), not the asking PC, and (rev 23) of a platform the batch's run has a build for - its default
+build's or an alternate's (section 11.4): a Mac is no capacity for a run without a macOS build (before rev 23 such a
+batch never looked behind while Macs were online); each counts its measured eval rate for that batch (ids per running
 second, PROTOCOL 3), else its average over every eval it played, else nothing (no CPU capacity: behind while anything
 is unissued). A deferred batch ranks after the PC's self-play (rank 1.5: still tier 1, before fuzz; never earlier than
 a background share puts it, section 5.3), so the PC gets it when its self-play has no headroom. On a rolling lease's

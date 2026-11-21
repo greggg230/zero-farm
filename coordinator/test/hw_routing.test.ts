@@ -8,6 +8,8 @@ import { describe, expect, it } from "vitest";
 import { type Machine, PROFILE, admin, advance, ask, call, clock, define, enroll, err, finish, lease, makeBuild, makeCampaign, makeRun, ok, publishCkpt, runBody } from "./helpers";
 
 const CPU_ONLY = { ...PROFILE, gpus: [], providers: ["cpu"] };
+const MAC = "macos-arm64";
+const MAC_PROFILE = { os: "macOS 26.1", cpu: "Apple M4 Pro", cores: 12, threads: 12, ram_mb: 24576, disk_free_mb: 300000, gpus: [], providers: ["cpu"], platform: MAC };
 const GPU_OK = { gpu: false, gpu_allowed: true };
 const EVAL = (games = 400) => ({
   batch: "b1",
@@ -26,13 +28,18 @@ interface Setup {
 
 // A self-play run whose default is the CPU pack, with the CUDA alternate (a GPU version); optionally an eval batch
 // and rolling self-play. Its definition lists both builds.
-async function gpuRun(run: string, o: { eval?: unknown; rolling?: unknown; quota?: number } = {}): Promise<Setup> {
+async function gpuRun(run: string, o: { eval?: unknown; rolling?: unknown; quota?: number; mac?: boolean } = {}): Promise<Setup> {
   const cpuRt = await makeBuild({ kind: "runtime", tag: `cpu-${run}` });
   const cuda = await makeBuild({ kind: "runtime", tag: `cuda-${run}`, gpu: { vendor: "nvidia", min_driver: "527.41", providers: ["cuda"] } });
   const def = await makeBuild({ tag: `w-cpu-${run}`, requires_runtime: cpuRt });
   const alt = await makeBuild({ tag: `w-cuda-${run}`, requires_runtime: cuda });
+  // `mac`: also a macOS CPU alternate (rev 17), so Macs can play the run
+  const macRt = o.mac ? await makeBuild({ kind: "runtime", tag: `mac-cpu-${run}`, platform: MAC }) : null;
+  const mac = macRt ? await makeBuild({ tag: `w-mac-${run}`, requires_runtime: macRt, platform: MAC }) : null;
+  const alternates: unknown[] = [{ build_id: alt, runtime: cuda, when: { vendor: "nvidia" } }];
+  if (mac) alternates.push({ build_id: mac, runtime: macRt, when: { platform: MAC } });
   const body = (extra: Record<string, unknown> = {}) => {
-    const b: any = { ...runBody(def, { games_per_lease: "auto", quota: o.quota ?? 100000 }), runtime: cpuRt, alternates: [{ build_id: alt, runtime: cuda, when: { vendor: "nvidia" } }], ...extra };
+    const b: any = { ...runBody(def, { games_per_lease: "auto", quota: o.quota ?? 100000 }), runtime: cpuRt, alternates, ...extra };
     if (o.rolling) b.selfplay.rolling = o.rolling;
     return b;
   };
@@ -42,7 +49,7 @@ async function gpuRun(run: string, o: { eval?: unknown; rolling?: unknown; quota
     await publishCkpt(run, 2);
     ok(await admin("PUT", `/v1/admin/run/${run}`, body({ eval: o.eval })));
   }
-  await define("run", run, (d) => d.builds.push(alt));
+  await define("run", run, (d) => d.builds.push(alt, ...(mac ? [mac] : [])));
   return { cpuRt, cuda, def, alt };
 }
 
@@ -149,6 +156,27 @@ describe("eval batches on PCs that play self-play on their GPU (rev 18)", () => 
     expect(await probe("nv6")).toBe("selfplay");
     advance(301);
     expect(await probe("nv7")).toBe("eval"); // offline: not seen for 5 minutes
+  });
+
+  it("a Mac is no capacity for a batch whose run has no macOS build (rev 23)", async () => {
+    await gpuRun("sp", { eval: EVAL(400) });
+    const mac = await enroll("mac", { profile: MAC_PROFILE, platform: MAC });
+    await online(mac);
+    await setRate(mac, "run:sp", 1); // 1 game/s x 1800 s >= 400 unissued - if a Mac could play it
+    expect((await lease(await enroll("nv"), { caps: GPU_OK })).kind).toBe("eval");
+    // a Windows CPU PC at the same rate does count: the batch isn't behind
+    const cpu = await enroll("cpu", { profile: CPU_ONLY });
+    await online(cpu);
+    await setRate(cpu, "run:sp", 1);
+    expect((await lease(await enroll("nv2"), { caps: GPU_OK })).kind).toBe("selfplay");
+  });
+
+  it("a Mac counts for a batch whose run lists a macOS alternate (rev 23)", async () => {
+    await gpuRun("sp", { eval: EVAL(400), mac: true });
+    const mac = await enroll("mac", { profile: MAC_PROFILE, platform: MAC });
+    await online(mac);
+    await setRate(mac, "run:sp", 1);
+    expect((await lease(await enroll("nv"), { caps: GPU_OK })).kind).toBe("selfplay");
   });
 
   it("eval_horizon_s 0 or routing off: eval before self-play everywhere, as before", async () => {

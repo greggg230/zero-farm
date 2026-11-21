@@ -262,6 +262,7 @@ interface Candidate {
   fit: number;
   gpu_play?: boolean; // rev 18: self-play this PC plays on its GPU (a GPU lease whose GPU pays here)
   unissued?: number; // rev 18: an eval batch's unissued games
+  platforms?: Platform[]; // rev 23: an eval batch's platforms (its run's default build's and alternates'): whose CPU PCs can play it
   deferred?: boolean; // rev 18: an eval batch this GPU self-play PC takes after its self-play (not behind)
   configured: "auto" | number;
   gpu_configured?: "auto" | number; // rev 11: the job's gpu_games_per_lease (absent: none)
@@ -486,17 +487,21 @@ interface Offer {
 // and are online and free to work: not playing self-play on a GPU (the `gpu_play` their last offer recorded), seen in
 // the last ONLINE_S, not paused or revoked, no fresh presence (in use by their owner). Each counts its measured rate for
 // this batch, else its average over every eval it played, else nothing (unknown: the batch counts as behind sooner).
+// Rev 23: only PCs of a platform the run has a build for (its default's, its alternates') - a Mac can't play a batch
+// of a run without a macOS build, so it is no capacity for it.
 export const ONLINE_S = 300;
-async function cpuEvalRate(db: D1Database, scope: string, self: string, now: number): Promise<number> {
+async function cpuEvalRate(db: D1Database, scope: string, self: string, now: number, platforms: Platform[]): Promise<number> {
+  if (!platforms.length) return 0;
   const { results } = await db
     .prepare(
       `SELECT m.last_seen, m.presence, m.presence_t,
          (SELECT r.rate FROM rates r WHERE r.machine_id = m.machine_id AND r.kind = 'eval' AND r.scope = ?) AS own,
          (SELECT AVG(r.rate) FROM rates r WHERE r.machine_id = m.machine_id AND r.kind = 'eval') AS any_rate
        FROM machines m
-       WHERE m.machine_id != ? AND COALESCE(m.gpu_play, 0) = 0 AND m.revoked_at IS NULL AND m.paused = 0 AND m.last_seen >= ?`,
+       WHERE m.machine_id != ? AND COALESCE(m.gpu_play, 0) = 0 AND m.revoked_at IS NULL AND m.paused = 0 AND m.last_seen >= ?
+         AND m.platform IN ${IN_JSON}`,
     )
-    .bind(scope, self, now - ONLINE_S)
+    .bind(scope, self, now - ONLINE_S, inJson(platforms))
     .all<{ last_seen: number | null; presence: string | null; presence_t: number | null; own: number | null; any_rate: number | null }>();
   return results.filter((x) => !presenceOf(x, now)).reduce((s, x) => s + (x.own ?? x.any_rate ?? 0), 0);
 }
@@ -757,6 +762,7 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
             fit: at.fit * (cachedBuilds.has(v.build_id) ? 1.2 : 1) * ckptBonus,
             // (a batch that requires a GPU has no CPU PCs to wait for: never deferred)
             ...(routing.gpu === "required" ? {} : { unissued: poolN.get(`${scope}|eval:${ev.batch}`) ?? 0 }),
+            platforms: [...new Set([platOf(r.build_id), ...altsOf(r).map((a) => altPlatform(a))])],
             configured: ev.games_per_lease,
             gpu_configured: ev.gpu_games_per_lease,
             providers: routing.providers,
@@ -849,7 +855,7 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
   if (hw.on && gpuPlay && hw.eval_horizon_s > 0) {
     for (const cd of usable) {
       if (cd.kind !== "eval" || cd.tier !== 1 || cd.unissued === undefined) continue;
-      cd.deferred = !evalBehind(cd.unissued, await cpuEvalRate(db, cd.scope, m.machine_id, c.now), hw.eval_horizon_s);
+      cd.deferred = !evalBehind(cd.unissued, await cpuEvalRate(db, cd.scope, m.machine_id, c.now, cd.platforms ?? [platform]), hw.eval_horizon_s);
     }
   }
 
