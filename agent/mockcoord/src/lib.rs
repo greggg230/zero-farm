@@ -16,7 +16,8 @@
 //! that lists the feature (else classic: `rolling` removed); `POST /v1/lease/{id}/extend` releases ids from the
 //! block (scriptable: [`MockCoord::script_extend`]), raising the lease's `job.games` so `x-ids` and `unfinished`
 //! may name them; beats of a rolling lease whose `gen` is older than the run's current one
-//! ([`MockCoord::set_run_current`]) answer with `checkpoint` and `definition`.
+//! ([`MockCoord::set_run_current`]) answer with `checkpoint` and `definition`. With [`State::inflight_cap`] set, an
+//! unscripted extension follows the coordinator's in-flight limit (rev 21, PROTOCOL 10.4; [`InflightCap`]).
 
 pub mod testkit;
 
@@ -36,6 +37,26 @@ pub struct Logged {
     pub path: String,
     pub agent: Option<String>,
     pub status: u16,
+}
+
+/// rev 21 (PROTOCOL 10.4): the coordinator's in-flight limit, modelled on `book.ts` `rollingLimit`: an unscripted
+/// extension asking for `k` ids releases at most what keeps the lease's unfinished ids - released less finished, where
+/// finished = the ids its chunks credited, or its last beat's `progress.games_done` when higher - within
+/// `(crew ? 2 : 1) x inflight + buffer`: `inflight` = the most of half the ask and the last beat's Stats `concurrency`
+/// and `inflight`; a crew = Stats `workers` > 1 or half the ask above `concurrency`; `buffer` = the most of
+/// `buffer_min`, an eighth of `inflight` and the lease's rate (finished per second since its grant) x `buffer_s`. At the
+/// limit it answers `wait_s` with reason `inflight`. (The run's quota is not modelled.)
+#[derive(Debug, Clone)]
+pub struct InflightCap {
+    pub buffer_min: u64,
+    pub buffer_s: f64,
+    pub wait_s: u64,
+}
+
+impl Default for InflightCap {
+    fn default() -> Self {
+        InflightCap { buffer_min: 16, buffer_s: 120.0, wait_s: 20 }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -123,6 +144,15 @@ pub struct State {
     pub extend_script: HashMap<String, VecDeque<Value>>,
     /// rev 15: per run, its current generation's checkpoint and definition reference.
     pub run_current: HashMap<String, (Value, Value)>,
+    /// rev 21: the coordinator's in-flight limit on unscripted extensions (None: every ask released, to the block).
+    pub inflight_cap: Option<InflightCap>,
+    /// The run's self-play quota is full: every unscripted extension answers `wait_s` (the cap's, else 20) with reason
+    /// `quota`, nothing released.
+    pub quota_full: bool,
+    /// rev 15: every extension answer (lease, answer), in order.
+    pub extend_answers: Vec<(String, Value)>,
+    /// When each lease was granted (its rate, for the in-flight limit's buffer).
+    pub granted: HashMap<String, std::time::Instant>,
 }
 
 pub struct MockCoord {
@@ -141,6 +171,25 @@ impl Drop for MockCoord {
             let _ = t.join();
         }
     }
+}
+
+/// rev 21 (PROTOCOL 10.4, [`InflightCap`]): how many more ids lease `id` (`released` so far) may be released now for an
+/// ask of `k`.
+fn inflight_room(s: &State, id: &str, released: u64, k: u64, cap: &InflightCap) -> u64 {
+    let credited: u64 = s.credits.iter().filter(|(l, ..)| l == id).map(|(_, _, c, _)| c).sum();
+    let beat = s.beats.iter().filter(|(l, _)| l == id).map(|(_, b)| b).next_back();
+    let num = |k: &str| beat.and_then(|b| b["stats"][k].as_f64()).filter(|x| x.is_finite() && *x > 0.0).unwrap_or(0.0);
+    let done = beat.and_then(|b| b["progress"]["games_done"].as_u64()).unwrap_or(0);
+    let finished = credited.max(done).min(released);
+    let unfinished = released - finished;
+    let conc = num("concurrency");
+    let half = k.div_ceil(2) as f64;
+    let inflight = half.max(conc).max(num("inflight"));
+    let crew = num("workers") > 1.0 || (conc > 0.0 && half > conc);
+    let secs = s.granted.get(id).map_or(1.0, |t| t.elapsed().as_secs_f64().max(1.0));
+    let buffer = (cap.buffer_min as f64).max((inflight / 8.0).ceil()).max((finished as f64 / secs * cap.buffer_s).ceil());
+    let limit = (if crew { 2.0 } else { 1.0 }) * inflight + buffer;
+    (limit as u64).saturating_sub(unfinished)
 }
 
 fn sha(b: &[u8]) -> String {
@@ -604,6 +653,7 @@ fn handle(mut req: Request, st: &Arc<Mutex<State>>) {
                     l["expires_at"] = json!(t + 900);
                 }
                 let id = l["lease_id"].as_str().unwrap().to_string();
+                s.granted.insert(id.clone(), std::time::Instant::now());
                 s.leases.insert(id, LeaseState { lease: l.clone(), ..Default::default() });
                 let ans = with_diag(&mut s, json!({"lease": l}));
                 done!(reply(req, 200, ans))
@@ -679,7 +729,14 @@ fn handle(mut req: Request, st: &Arc<Mutex<State>>) {
                         }
                     };
                     let (total, ans) = match &script {
-                        None => release(k),
+                        None if s.quota_full => (cur, json!({"games": cur, "wait_s": s.inflight_cap.as_ref().map_or(20, |c| c.wait_s), "reason": "quota"})),
+                        None => match s.inflight_cap.clone() {
+                            None => release(k),
+                            Some(cap) => match inflight_room(&s, &id, cur, k, &cap) {
+                                0 => (cur, json!({"games": cur, "wait_s": cap.wait_s, "reason": "inflight"})),
+                                room => release(k.min(room)),
+                            },
+                        },
                         Some(a) if a.get("release").is_some() => release(a["release"].as_u64().unwrap_or(0)),
                         Some(a) if a.get("wait_s").is_some() => (cur, json!({"games": cur, "wait_s": a["wait_s"], "reason": "quota"})),
                         Some(a) if a.get("finish").is_some() => {
@@ -694,6 +751,7 @@ fn handle(mut req: Request, st: &Arc<Mutex<State>>) {
                         done!(err(req, code as u16, "scripted", "scripted extension failure"))
                     } else {
                         s.leases.get_mut(&id).unwrap().lease["job"]["games"] = json!(total);
+                        s.extend_answers.push((id.clone(), ans.clone()));
                         done!(reply(req, 200, ans))
                     }
                 }

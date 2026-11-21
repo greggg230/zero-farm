@@ -80,6 +80,9 @@ struct Roll {
     /// No extension before this (at most one per `extend_every`; a `wait_s`; a backoff after an error).
     next_extend: Instant,
     backoff: Backoff,
+    /// agent 0.3.13: the last extension released nothing (a `wait_s` - the coordinator's in-flight limit or the run's
+    /// quota - or a failed call); cleared when ids are released and when a new main worker starts.
+    refused: bool,
     /// The definition the lease runs under (at grant, then each accepted new one).
     def: DefinitionRef,
     def_inflight: bool,
@@ -240,6 +243,10 @@ const RUNWAY_INFLIGHTS: u64 = 2;
 /// then they run on the plan as it is.
 const GPU_TRIAL_WAIT: Duration = Duration::from_secs(15 * 60);
 
+/// agent 0.3.13: a beat brought forward because a worker started or ended (`beat_soon`) goes out at most this soon after
+/// the last one (the coordinator's beat bucket: one per 10 s after a burst, extensions included; PROTOCOL 1).
+const BEAT_SOON_MIN: Duration = Duration::from_secs(10);
+
 /// rev 19 (PROTOCOL 13): the tuning of a rolling lease's CPU job.
 struct Tuning {
     space: tune::Space,
@@ -284,6 +291,14 @@ struct Tuning {
     /// since it started - one that finished its range stays counted until it ends, then with its last counters (a
     /// rotation is the crew's normal work); one that fails discards it.
     probe_members: Vec<(u32, (u64, u64, u64))>,
+    /// agent 0.3.13: since when the running measurement waits for game ids before its games in flight refilled (its
+    /// probe is held that long, `Probe::hold`).
+    hold_mark: Option<Instant>,
+    /// agent 0.3.13: a trial put off for want of game ids (`put_off_probe`): its layout runs on unmeasured and is the next
+    /// one measured - no handoff back to the incumbent meanwhile.
+    postponed: Option<Layout>,
+    /// agent 0.3.13: the lease is short of game ids and the tuner said it waits (once per shortage).
+    ids_wait: bool,
 }
 
 /// rev 19: a layout handoff in progress, before the next worker starts: the main worker was told `finish`.
@@ -1131,6 +1146,7 @@ impl Engine {
                 extend_inflight: false,
                 next_extend: Instant::now(),
                 backoff: Backoff::default(),
+                refused: false,
                 def,
                 def_inflight: false,
                 def_reported: false,
@@ -1256,6 +1272,9 @@ impl Engine {
             fixed,
             crew_cap: tune::MAX_WORKERS_JSON,
             probe_members: Vec::new(),
+            hold_mark: None,
+            postponed: None,
+            ids_wait: false,
             bounds: (settings.workers, d.max_workers),
             gpu: false,
             gpu_start: (false, 0),
@@ -1375,6 +1394,9 @@ impl Engine {
             fixed,
             crew_cap: tune::MAX_WORKERS_JSON,
             probe_members: Vec::new(),
+            hold_mark: None,
+            postponed: None,
+            ids_wait: false,
             bounds: (set, max_workers),
             gpu: true,
             gpu_start: (g.vendor.eq_ignore_ascii_case("nvidia"), batch),
@@ -1557,9 +1579,12 @@ impl Run {
         }
         // rev 15 (PROTOCOL 10.6)
         if let Some(r) = &self.roll {
-            // (rev 19, PROTOCOL 13.5: the crew's games in flight in all, and its workers)
+            // (rev 19, PROTOCOL 13.5: the crew's games in flight in all, and its workers; agent 0.3.13: with the games of the
+            // workers finishing theirs - a handoff's old worker, a member that played its range -, which play them beside
+            // the new ones: the coordinator's in-flight limit, rev 21, must leave the new worker its games beside them)
             let crew: Vec<&Mate> = self.mates.iter().filter(|m| m.active()).collect();
-            let inflight = self.conc.map(|c| c + crew.iter().map(|m| m.layout.conc).sum::<u64>());
+            let draining: u64 = self.mates.iter().filter(|m| m.finishing && m.end_ev.is_none()).filter_map(|m| m.in_flight).sum();
+            let inflight = self.conc.map(|c| c + crew.iter().map(|m| m.layout.conc).sum::<u64>() + draining);
             s.insert("inflight".into(), json!(inflight));
             s.insert("released".into(), json!(r.released));
             if !crew.is_empty() || self.tuning.as_ref().is_some_and(|t| t.current.workers > 1) {
@@ -1860,6 +1885,75 @@ impl Run {
         self.tail_tick(eng, &t, must_pause);
     }
 
+    /// agent 0.3.13 (PROTOCOL 10.4, 10.6): the released ids a rolling lease's workers still hold - the ones they play or
+    /// will play: the main worker's range less its finished games (also while it finishes them for a handoff or a
+    /// restart: its unstarted ids are the next worker's), a crew member's likewise, a worker finishing its games only
+    /// those in flight (its unstarted ids are another worker's, spare or given up; its whole range while it may still give
+    /// them to the spare ranges), and the spare ranges a crew member can still play. The rest of the released ids are
+    /// finished or given up - the games in flight of a worker that ended them or failed, ids no worker will play - and go
+    /// back to the pool when the lease closes (`done`'s unfinished ids are worked out from the credited ones). None: not a
+    /// rolling job.
+    fn ids_held(&self) -> Option<u64> {
+        let r = self.roll.as_ref().filter(|r| r.active)?;
+        let mut held = 0u64;
+        // (the main worker, unless it ended and no worker follows it)
+        if self.main_exit.is_none() || r.restart.is_some() {
+            let fin = self.progress.map_or(0, |(g, _)| g);
+            held += r.released.saturating_sub(r.offset).saturating_sub(fin);
+        }
+        for m in self.mates.iter().filter(|m| m.end_ev.is_none()) {
+            let (fin, started) = m.counters.map_or((0, None), |(_, g, st)| (g, Some(st)));
+            let range = m.end.saturating_sub(m.offset).saturating_sub(fin);
+            held += match (m.finishing && m.reclaim.is_none(), started, m.in_flight) {
+                (true, Some(st), _) => range.min(st.saturating_sub(fin)),
+                (true, None, Some(n)) => range.min(n),
+                _ => range,
+            };
+        }
+        if self.crew_target() > 1 {
+            let per = self.conc.unwrap_or(1).max(1);
+            held += self.spare.iter().filter(|&&(a, b)| b - a >= RUNWAY_INFLIGHTS * per).map(|&(a, b)| b - a).sum::<u64>();
+        }
+        Some(held.min(r.released))
+    }
+
+    /// The beats' `progress.games_done`: the games the lease's workers finished; agent 0.3.13, a rolling lease: the
+    /// released ids it is done with - finished or given up (`ids_held`) - when more. The coordinator counts a rolling
+    /// lease's unfinished ids as its released ids less the more of this and its credited ones (rev 21, PROTOCOL 10.4):
+    /// given-up ids counted as unfinished until the lease closed made its in-flight limit refuse every id (agents
+    /// 0.3.6-0.3.12: a DirectML PC's handoffs each ended a worker's last games, ~8 games an hour).
+    fn games_done_report(&self) -> u64 {
+        match (self.roll.as_ref(), self.ids_held()) {
+            (Some(r), Some(held)) => self.games_done.max(r.released.saturating_sub(held)),
+            _ => self.games_done,
+        }
+    }
+
+    /// agent 0.3.13: a worker started or ended: the next beat goes out soon (`BEAT_SOON_MIN` after the last at the
+    /// earliest), so the coordinator's in-flight limit sees the lease's games in flight and the ids it is done with
+    /// before the new worker's first ask - not up to a beat interval later.
+    fn beat_soon(&mut self) {
+        if self.roll.is_none() {
+            return;
+        }
+        let now = Instant::now();
+        let last = self.beat_due.checked_sub(Duration::from_secs(self.lease.beat_s.max(1))).unwrap_or(now);
+        self.beat_due = self.beat_due.min((last + BEAT_SOON_MIN).max(now));
+    }
+
+    /// agent 0.3.13: the lease waits for game ids its worker asked for that the coordinator didn't release (a `wait_s`:
+    /// its in-flight limit or the run's quota; or a failed call).
+    fn ids_refused(&self) -> bool {
+        self.roll.as_ref().is_some_and(|r| r.active && !r.finishing && r.refused && r.want_more)
+    }
+
+    /// agent 0.3.13: the lease is short of game ids: refused (`ids_refused`) while its main worker's games in flight
+    /// aren't full - fewer than `tune::REFILL_SHARE` of them, what a trial's fresh worker must reach to be measured.
+    fn ids_short(&self) -> bool {
+        let need = ((tune::REFILL_SHARE * self.conc.unwrap_or(1).max(1) as f64).floor() as u64).max(1);
+        self.ids_refused() && self.progress.is_none_or(|(g, st)| st.saturating_sub(g) < need)
+    }
+
     /// A beat when one is due (on its own thread; the answer comes back as an event).
     fn maybe_beat(&mut self, eng: &Engine, paused: bool) {
         if !self.beat_inflight && Instant::now() >= self.beat_due && !matches!(self.after, Some(After::Cancel | After::Revoked)) {
@@ -1867,7 +1961,7 @@ impl Run {
             self.beat_due = Instant::now() + Duration::from_secs(self.lease.beat_s.max(1));
             let body = BeatReq {
                 state: if paused { "paused" } else { "running" }.into(),
-                progress: Progress { games_done: self.games_done, games_total: games_total(&self.lease) },
+                progress: Progress { games_done: self.games_done_report(), games_total: games_total(&self.lease) },
                 stats: self.merged_stats(),
                 // rev 15 (PROTOCOL 10.6): the newest generation the worker plays
                 gen: self.roll.as_ref().and(self.prep.ckpt.as_ref()).map(|(c, _)| c.gen),
@@ -2024,20 +2118,25 @@ impl Run {
         }
         let (lo, released) = lo_released.expect("rolling");
         // the ids the new worker plays: after every released id when its predecessor died; else the released ids it
-        // never started (its `end`'s unfinished tail)
+        // never started - its `end`'s unfinished tail, the range ending at the released ids' end (agent 0.3.13: also when
+        // other ranges come before it - a worker that ended its games in flight, `quit`, leaves their ids scattered: never
+        // credited, they are given up, its unstarted tail isn't; 0.3.6-0.3.12 took fresh ids after the released ones then,
+        // giving the tail up too)
         let tail = self
             .end_ev
             .as_ref()
             .and_then(|e| e.get("unfinished"))
             .and_then(|u| u.get("gids"))
             .map(crate::util::parse_ranges)
-            .filter(|g| g.len() == 1 && g[0].1 == lo + released && g[0].0 >= lo + r.offset)
-            .map(|g| g[0].0 - lo);
+            .and_then(|g| g.iter().copied().max_by_key(|&(_, b)| b))
+            .filter(|&(a, b)| b == lo + released && a >= lo + r.offset)
+            .map(|(a, _)| a - lo);
         r.offset = if rs.burn { released } else { tail.unwrap_or(released) };
         if rs.count {
             r.restarts += 1;
         }
         r.want_more = false;
+        r.refused = false;
         r.next_extend = Instant::now();
         r.peak_mb = 0;
         let gpu = r.gpu;
@@ -2081,6 +2180,7 @@ impl Run {
             t.probe = None;
             t.probe_load = None;
             t.probe_members.clear();
+            t.postponed = None;
             if rs.measure {
                 t.start_probe(t.current.total_conc(), &timings);
             }
@@ -2126,6 +2226,7 @@ impl Run {
                 self.mark = CpuMark::take(&self.worker);
                 self.sample = (self.mark, Instant::now());
                 self.show_tuning(eng);
+                self.beat_soon();
                 true
             }
             Err(e) => {
@@ -2241,6 +2342,7 @@ impl Run {
                 let d = r.backoff.delay_for(&e);
                 log::warn!("lease {id}: asking for more game ids failed ({e}); again in {d:?}");
                 r.next_extend = Instant::now() + d;
+                r.refused = true;
                 return;
             }
             Err(e) => {
@@ -2262,6 +2364,7 @@ impl Run {
             log::info!("lease {id}: {} more game ids released ({} in all)", a.games - r.released, a.games);
             r.released = a.games;
             r.want_more = false;
+            r.refused = false;
             let total = a.games;
             self.lease.job["games"] = json!(total);
             self.plan.job.insert("games".into(), json!(total));
@@ -2284,6 +2387,7 @@ impl Run {
         } else if let Some(w) = a.wait_s {
             log::info!("lease {id}: no game ids now ({}); asking again in {w} s", a.reason.as_deref().unwrap_or("wait"));
             r.next_extend = r.next_extend.max(Instant::now() + Duration::from_secs(w.min(3600)));
+            r.refused = true;
         }
     }
 
@@ -3102,11 +3206,43 @@ impl Run {
         }
         let (leaves, games, started) = t.probe_members.iter().fold((0, 0, 0), |(l, g, s), (_, (a, b, c))| (l + a, g + b, s + c));
         let Some((probe, since)) = t.probe.as_mut() else { return };
-        match probe.sample(since.elapsed().as_secs_f64(), leaves, games, started) {
+        let verdict = probe.sample(since.elapsed().as_secs_f64(), leaves, games, started);
+        let held = probe.held();
+        match verdict {
             Verdict::Pending => {}
             Verdict::Rate(r, ph) => self.end_probe(eng, Ok((r, ph))),
+            // (agent 0.3.13: one that waited for game ids measured nothing for want of them: put off, not discarded)
+            Verdict::Invalid(why) if held => self.put_off_probe(eng, &why),
             Verdict::Invalid(why) => self.end_probe(eng, Err(why)),
         }
+    }
+
+    /// agent 0.3.13: a trial that waited for game ids (`Probe::hold`) and measured nothing - its games in flight didn't
+    /// refill in time - is put off, not discarded: the coordinator held the ids back (its in-flight limit, the run's
+    /// quota), which says nothing about the layout, and a handoff back to the incumbent would end games for nothing. Its
+    /// worker plays on, nothing is counted against the layout, and it is the next one measured (afresh: a new worker)
+    /// once the lease's games in flight are full again (`ids_short`), not before `retry` from now. Agents 0.3.4-0.3.12
+    /// discarded it ("no measurement") and handed the job over to the incumbent, again and again on a DirectML PC.
+    fn put_off_probe(&mut self, eng: &mut Engine, why: &str) {
+        let id = self.lease.lease_id.clone();
+        let retry = 2 * (eng.cfg.timings.tune_warm + eng.cfg.timings.tune_window);
+        let Some(t) = self.tuning.as_mut() else { return };
+        if t.probe.take().is_none() {
+            return;
+        }
+        t.probe_members.clear();
+        t.probe_load = None;
+        t.hold_mark = None;
+        t.postponed = Some(t.current);
+        t.revert_due = false;
+        t.no_trial_before = Instant::now() + retry;
+        let line = format!(
+            "the trial of {} is put off: the coordinator released too few game ids to fill its games in flight ({why}); it plays on and is measured again once ids come",
+            t.current.describe_on(t.gpu)
+        );
+        log::info!("lease {id}: {line}");
+        eng.worker_log.write_line(&format!("tuning [{id}]: {line}"));
+        self.show_tuning(eng);
     }
 
     /// A measurement's end: recorded or discarded, remembered, the drainers going on. A rate counts only when the
@@ -3311,7 +3447,21 @@ impl Run {
             match why {
                 Some(w) => self.end_probe(eng, Err(w)),
                 None => {
+                    // agent 0.3.13: time spent waiting for game ids before the games in flight refilled is the
+                    // coordinator's, not the layout's: the trial gets it on top (and is put off, not discarded, if it
+                    // measures nothing)
+                    let waiting = self.ids_refused();
                     let tu = self.tuning.as_mut().expect("checked");
+                    let now = Instant::now();
+                    match (waiting, tu.probe.as_mut()) {
+                        (true, Some((p, _))) if !p.refilled() => {
+                            if let Some(at) = tu.hold_mark {
+                                p.hold(now.duration_since(at).as_secs_f64());
+                            }
+                            tu.hold_mark = Some(now);
+                        }
+                        _ => tu.hold_mark = None,
+                    }
                     if tu.last_ping.elapsed() >= t.tune_ping {
                         tu.last_ping = Instant::now();
                         // (every worker the measurement counts: their counters are summed)
@@ -3349,6 +3499,22 @@ impl Run {
         if !running || !rolling_ok || self.draining() || self.started.elapsed() < t.tune_warm || !settled {
             return;
         }
+        // agent 0.3.13: no handoff while the lease is short of game ids (refused, its games in flight not full): a trial's
+        // new worker couldn't fill its games in flight either - measured nothing, it was discarded and the job handed back,
+        // the old workers' last games ended for nothing each time (agents 0.3.4-0.3.12). The job plays on as it is.
+        if self.ids_short() {
+            let id = self.lease.lease_id.clone();
+            if let Some(tu) = self.tuning.as_mut().filter(|tu| !tu.ids_wait) {
+                tu.ids_wait = true;
+                let line = "trials wait: the coordinator releases too few game ids to keep the games in flight full";
+                log::info!("lease {id}: {line}");
+                eng.worker_log.write_line(&format!("tuning [{id}]: {line}"));
+            }
+            return;
+        }
+        if let Some(tu) = self.tuning.as_mut() {
+            tu.ids_wait = false;
+        }
         // agent 0.3.7: a GPU job's trials wait for its memory plan's early reading (`calibrate`; a cost remembered from an
         // earlier lease counts): the start is picked again for the measured plan (the crew it holds), and trials under the
         // platform's default cost would measure single workers of ~140 games that the plan then drops - each trial's fresh
@@ -3365,6 +3531,11 @@ impl Run {
         }
         let wanted = tu.entry.wanted(&tu.space);
         let next = if !fixed && strict && !uncalibrated && !tu.revert_due && Instant::now() >= tu.no_trial_before { tu.entry.plan(&tu.space) } else { None };
+        // (agent 0.3.13: a trial put off for want of game ids runs on until it is measured afresh - no handoff back to the
+        // incumbent meanwhile, which would end games for nothing)
+        if next.is_none() && tu.postponed == Some(tu.current) {
+            return;
+        }
         let (target, measure) = match next {
             Some(l) => (l, true),
             None if tu.current != wanted && (!fixed || wanted.conc > tu.current.conc) => (wanted, strict && !fixed),
@@ -3410,6 +3581,7 @@ impl Run {
         self.crew_changed = Instant::now();
         let tu = self.tuning.as_mut().expect("tuning");
         tu.handoffs.push(Instant::now());
+        tu.postponed = None;
         tu.handoff = Some(Handoff { next, measure, since: Instant::now(), reads: Vec::new(), last_ping: None });
     }
 
@@ -3504,7 +3676,8 @@ impl Run {
             end_ev: self.end_ev.take(),
             eof: std::mem::take(&mut self.eof),
             last_msg: Instant::now(),
-            in_flight: None,
+            // (agent 0.3.13: its games in flight as its last status said - the beats count them, `merged_stats`)
+            in_flight: self.progress.map(|(g, st)| st.saturating_sub(g)),
             tail: started.map(|_| first),
             finishing: true,
             offset: old_offset,
@@ -3530,6 +3703,7 @@ impl Run {
         if let Some(r) = self.roll.as_mut() {
             r.offset = first - lo;
             r.want_more = false;
+            r.refused = false;
             r.next_extend = Instant::now();
             r.peak_mb = 0;
         }
@@ -3567,6 +3741,7 @@ impl Run {
             }
         }
         self.show_tuning(eng);
+        self.beat_soon();
     }
 
     /// agent 0.3.5: a handoff's trial whose worker starts now while no trial may run (the computer got busy or used): the
@@ -3771,6 +3946,7 @@ impl Run {
                 t.load = None;
             }
             self.show_tuning(eng);
+            self.beat_soon();
         }
     }
 
@@ -4628,6 +4804,7 @@ impl Run {
         });
         self.crew_changed = Instant::now();
         self.show_tuning(eng);
+        self.beat_soon();
     }
 
     /// A new member takes the tail's place: the main worker becomes a member keeping its range (every id released so
@@ -4697,6 +4874,7 @@ impl Run {
         if let Some(r) = self.roll.as_mut() {
             r.offset = released;
             r.want_more = false;
+            r.refused = false;
             r.next_extend = Instant::now();
             r.peak_mb = 0;
         }
@@ -4720,6 +4898,7 @@ impl Run {
         self.mark = CpuMark::take(&self.worker);
         self.sample = (self.mark, Instant::now());
         self.show_tuning(eng);
+        self.beat_soon();
     }
 }
 

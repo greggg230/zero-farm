@@ -1337,6 +1337,8 @@ pub struct Probe {
     refill: Option<(f64, f64)>,
     /// Where the window starts: (s, leaves).
     from: Option<(f64, f64)>,
+    /// agent 0.3.13: seconds the trial waited for game ids before its games in flight refilled (`hold`).
+    held: f64,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1351,7 +1353,27 @@ impl Probe {
     /// `warm`, `window`: seconds (`window` only for the first measurement of a search, `phase` None).
     pub fn new(conc: u64, phase: Option<Phase>, warm: f64, window: f64) -> Probe {
         let scale = phase.map_or(1.0, |p| (conc as f64 / p.conc.max(1) as f64).max(1.0));
-        Probe { conc: conc.max(1), phase, warm, window, max_s: 4.0 * (warm + window) * scale + 30.0 * warm.min(1.0), last: None, refill: None, from: None }
+        Probe { conc: conc.max(1), phase, warm, window, max_s: 4.0 * (warm + window) * scale + 30.0 * warm.min(1.0), last: None, refill: None, from: None, held: 0.0 }
+    }
+
+    /// agent 0.3.13: the games in flight refilled (the window may start).
+    pub fn refilled(&self) -> bool {
+        self.refill.is_some()
+    }
+
+    /// agent 0.3.13: the lease waited `secs` for game ids the coordinator didn't release (its in-flight limit, the run's
+    /// quota) before the games in flight refilled: the trial may take that much longer (the time is the coordinator's,
+    /// not the layout's), and if it measures nothing it is put off, not discarded (`held`).
+    pub fn hold(&mut self, secs: f64) {
+        if self.refill.is_none() && secs > 0.0 {
+            self.max_s += secs;
+            self.held += secs;
+        }
+    }
+
+    /// agent 0.3.13: the trial waited for game ids before its games in flight refilled.
+    pub fn held(&self) -> bool {
+        self.held > 0.0
     }
 
     /// The worker's counters at `t` seconds after it started: `leaves` (cumulative), `games` (finished), `started`.
@@ -1634,6 +1656,24 @@ mod tests {
         }
         assert_eq!(e.state, State::Tuned);
         assert_eq!(e.incumbent, start, "mean 10,275 is under 3 % over the start");
+    }
+
+    /// agent 0.3.13: a trial that waits for game ids before its games in flight refill gets that time on top of its
+    /// longest wait, and says it waited; one that refilled is not held any more.
+    #[test]
+    fn a_probe_waiting_for_game_ids_is_held() {
+        let mut p = Probe::new(32, None, 1.0, 2.0);
+        // (16 of 32 in flight: no refill; the longest wait 4 x 3 + 30 = 42 s)
+        assert_eq!(p.sample(41.0, 1000, 0, 16), Verdict::Pending);
+        p.hold(20.0);
+        assert!(p.held() && !p.refilled());
+        assert_eq!(p.sample(50.0, 1200, 0, 16), Verdict::Pending, "held 20 s: no timeout at 50 s");
+        assert!(matches!(p.sample(63.0, 1300, 0, 16), Verdict::Invalid(_)), "62 s at most");
+        // a refilled probe isn't held
+        let mut q = Probe::new(32, None, 1.0, 2.0);
+        assert_eq!(q.sample(1.0, 100, 0, 32), Verdict::Pending);
+        q.hold(30.0);
+        assert!(q.refilled() && !q.held());
     }
 
     #[test]

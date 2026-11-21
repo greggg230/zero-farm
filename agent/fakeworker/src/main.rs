@@ -26,7 +26,12 @@
 //!  "vram_per_row_mb": 0,       //   rows (conc / groups, rounded up) once its sessions exist (0 while yielded)
 //!  "vram_oom_rows": null,      // agent 0.3.4: batches of more rows than this fail at the start like a GPU out of
 //!                              //   memory (ONNX Runtime's CUDA allocator's fatal error, exit 2)
-//!  "rate": null}               // rolling: leaves per second by layout (below)
+//!  "rate": null,               // rolling: leaves per second by layout (below)
+//!  "lag": 0,                   // rolling with `rate`: the `lag` oldest games in flight finish last (a real worker's
+//!                              //   games end out of order: `quit` leaves scattered unfinished ids)
+//!  "game_leaves": 0}           // rolling with `rate`, > 0: a game ends each time the worker played this many more
+//!                              //   leaves (instead of every `game_ms`): fewer games in flight finish fewer games a
+//!                              //   second, as on DirectML, whose every call costs the same however few rows it has
 //! ```
 //!
 //! `rate` (rev 19, the agent's layout tuning): `{"leaves_s": 1000, "best": {"threads": 4, "infer_workers": 2,
@@ -227,6 +232,8 @@ struct Cfg {
     vram_base_mb: u64,
     vram_per_row_mb: u64,
     vram_oom_rows: Option<u64>,
+    lag: u64,
+    game_leaves: u64,
 }
 
 impl Cfg {
@@ -272,6 +279,8 @@ impl Cfg {
             vram_base_mb: u("vram_base_mb", 0),
             vram_per_row_mb: u("vram_per_row_mb", 0),
             vram_oom_rows: o("vram_oom_rows"),
+            lag: u("lag", 0),
+            game_leaves: u("game_leaves", 0),
         }
     }
 }
@@ -564,6 +573,7 @@ fake crash at game {gid:?}");
         if gids.is_empty() {
             return;
         }
+        gids.sort_unstable();
         let name = format!("shard-{}.bin", self.seq);
         let body = format!("fake shard seq={} gids={:?} gen={:?} ui_limits={}\n", self.seq, gids, self.gen, ui_limits());
         let _ = std::fs::create_dir_all(&self.out_dir);
@@ -651,6 +661,10 @@ fake crash at game {gid:?}");
         let mut next = 0u64;
         let mut low_for = None;
         let model = self.leaves_s.is_some();
+        // (with a rate model: the ids in flight, oldest first, and how many were started - the next game to finish is
+        // the `lag`-th oldest in flight)
+        let mut flight: std::collections::VecDeque<u64> = std::collections::VecDeque::new();
+        let mut pushed = 0u64;
         self.conc = conc;
         loop {
             // (with a rate model: `conc` games in flight; `finish` plays them to the end, starting none)
@@ -660,22 +674,35 @@ fake crash at game {gid:?}");
                 Stop::Finish if model && next < self.started => {}
                 _ => break,
             }
+            while model && pushed < self.started {
+                flight.push_back(pushed);
+                pushed += 1;
+            }
             if next < self.games && (!model || next < self.started) {
                 let started = if model { self.started } else { next + 1 };
                 if matches!(self.stop, Stop::No) && self.games - started < conc && low_for != Some(self.games) {
                     low_for = Some(self.games);
                     self.out.send(json!({"ev": "low", "started": started, "games": self.games}));
                 }
-                self.work(self.cfg.game_ms);
+                if model && self.cfg.game_leaves > 0 {
+                    // (a game ends once the worker played `game_leaves` more leaves: at its rate x the share in flight)
+                    let target = self.leaves + self.cfg.game_leaves as f64;
+                    while self.leaves < target && !matches!(self.stop, Stop::Quit) {
+                        self.work(20);
+                    }
+                } else {
+                    self.work(self.cfg.game_ms);
+                }
                 if matches!(self.stop, Stop::Quit) {
                     break;
                 }
-                unflushed.push(base + next);
+                let rel = if model { flight.remove((self.cfg.lag as usize).min(flight.len().saturating_sub(1))).unwrap_or(next) } else { next };
+                unflushed.push(base + rel);
                 first_fin.get_or_insert_with(Instant::now);
                 next += 1;
                 self.done += 1;
                 self.out.send(json!({"ev": "fin", "n": 1}));
-                self.after_game_hooks_gid(Some(base + next - 1));
+                self.after_game_hooks_gid(Some(base + rel));
                 if self.cfg.mem_grow_until.is_none_or(|u| self.done <= u) && self.cfg.mem_grow_mb > 0 {
                     self.mem.commit(self.cfg.mem_grow_mb, &self.out, self.cfg.oom_abort);
                     self.note_mem();
@@ -698,7 +725,9 @@ fake crash at game {gid:?}");
             Stop::Quit => "quit",
             _ => "finish",
         };
-        let rest: Vec<u64> = if model && !matches!(self.stop, Stop::Quit) { (base + self.started.max(next)..base + self.games).collect() } else { (base + next..base + self.games).collect() };
+        // (a rate model's games in flight - none after `finish`, which plays them to the end - and its unstarted ids)
+        let mut rest: Vec<u64> = if model { flight.iter().map(|&i| base + i).chain(base + self.started.max(next)..base + self.games).collect() } else { (base + next..base + self.games).collect() };
+        rest.sort_unstable();
         let unfinished = if rest.is_empty() { Value::Null } else { json!({"gids": ranges(&rest)}) };
         eprintln!("fakeworker: rolling job ended ({reason}): {next} of {} released ids played", self.games);
         self.out.send(json!({"ev": "end", "reason": reason, "stats": self.stats(), "unfinished": unfinished}));

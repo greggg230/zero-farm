@@ -4,6 +4,21 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's: `agent-macos-v<version>`).
 
+## Unreleased (0.3.13)
+
+- **Graphics cards with slow games no longer stall on game numbers.** The farm hands each computer only as many game
+  numbers as it has games running, plus a few. Whenever Zero Farm switched setups while timing them, it cut the old job
+  program's last games short, and the farm went on counting those games as still running until the whole job ended. On
+  a DirectML card, whose games take many minutes, a few switches were enough for the farm to stop handing out new game
+  numbers: each new job program started with nothing to play, its timing run could never start and was thrown away, and
+  the card made about 8 games an hour. Zero Farm now tells the farm straight away which games it has given up, hands
+  the unplayed games of a stopped job program to the next one, and tells the farm promptly when job programs start and
+  stop. In a test that copies that card, the job went from about a tenth of its normal speed to about its normal speed.
+- **Timing runs wait for game numbers instead of giving up.** When the farm holds back game numbers (it limits how many
+  each computer has, and each round of training has a limit too), Zero Farm no longer starts timing a new setup, and a
+  timing run already under way waits for the numbers rather than being counted as a failure and switching back. The
+  card keeps playing the games it has, and the setup is timed once the numbers come again.
+
 ## Unreleased (0.3.12)
 
 - **Graphics cards running DirectML start from a setup that suits it.** DirectML, which AMD cards (and some NVIDIA

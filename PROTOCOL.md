@@ -1345,6 +1345,28 @@ A rolling lease is a self-play lease (section 3) plus
   headroom while a lease below its batch waited out a 60 s `quota` answer and played fewer games at once. Before
   rev 21 an agent whose worker kept saying `low` (agents 0.3.6-0.3.8 seen holding 8 to 20 x their games in flight)
   took every free id of the generation's quota, and other machines got `no_work`.
+- **What the agent reports for the limit** (agents from 0.3.13; no wire change - the same fields, the coordinator's rule
+  as above). A rolling lease's beats say what it really holds:
+  - `progress.games_done` = the released ids the lease is **done with**: finished, or given up - the games in flight of
+    a worker that ended them (`quit`, 13.2) or failed, ids no worker will play (a handoff's old worker's unstarted ids
+    taken fresh, a spare range too short for a member, 13.5) - i.e. its released ids less the ones its workers still hold
+    (each worker's range less its finished games; a worker finishing its games: those in flight; the spare ranges a
+    member can still play), when that is more than the games finished. Given-up ids still go back to the pool only when
+    the lease closes (`done`'s `unfinished`, worked out from the credited ids); the beats just stop counting them as
+    held (the buffer's rate, which the coordinator reads from the same count, grows by their share: a few ids; the run's
+    quota still counts them as leased until the lease closes, as before). Agents 0.3.6-0.3.12 counted finished games
+    only, so every given-up id stayed unfinished for the limit until the
+    lease closed: a DirectML PC's lease of 2026-11-21 (one worker of 457 games in flight, ~5 leaves/s a game, ~800 s
+    a game) ended a worker's last games at each of its tuner's handoffs, reached its limit (457 + 58) with 513 given-up
+    ids, and from then on was released 1-2 ids a time: each new worker started with none, its trial measured nothing
+    (13.2) - ~8 games an hour.
+  - Stats `inflight` also counts the games in flight of workers finishing theirs (a handoff's old worker, a crew member
+    that played its range, 13.5): they play them beside the new worker, whose games in flight the limit must leave room
+    for (before 0.3.13 a new worker got only the buffer until the drain ended - for a DirectML drain, longer than a trial).
+  - A beat goes out as soon as a worker starts or ends (at most one per 10 s, the beat bucket), so the limit sees the new
+    picture before the new worker's first ask, not up to a beat interval later. The ask stays about 2 x the games in flight
+    of the layout the lease runs or is handing over to (a crew's whole), which is how the coordinator learns a new
+    layout's games in flight before its first beat.
 
 ### 10.5 The worker (aw/1, feature `rolling`)
 
@@ -1417,6 +1439,10 @@ A rolling lease is a self-play lease (section 3) plus
     The new worker's job line has the lease's latest network, an `out_dir` of its own, `gid_base` = the first released
     id its predecessor never started (the single tail range of its `end`'s `unfinished`; anything else: the end of the
     released ids) and `games` = the released ids from there; `extend` totals count from its `gid_base`. Nothing is lost.
+    **Agents from 0.3.13:** the range of `unfinished` that ends at the released ids' end, also when other ranges come
+    before it: a worker that ended its games in flight (`quit`, 13.2) leaves their ids scattered among finished ones -
+    never credited, those are given up (10.4 **What the agent reports**) -, but its unstarted tail is played by the next
+    worker (0.3.6-0.3.12 gave it up too and took fresh ids after the released ones).
   - A worker that runs into the limit - its fatal `error` or its stderr says an allocation failed (ONNX Runtime's "bad
     allocation", Rust's "memory allocation of N bytes failed", ...), or it exits without `end` with the job's peak at
     97% of the limit or more - is started again the same way, its games in flight lost: the new worker's ids start at
@@ -1500,8 +1526,9 @@ A rolling lease is a self-play lease (section 3) plus
     it failed to allocate below 90 % of its memory limit - raises the plan per row (to what it held, at least a quarter
     more, remembered) and is started again with fewer games in flight (its games in flight lost; a restart, at most 4; the
     memory per game untouched); a crew member's makes the next members smaller. Reported once per lease.
-- Stats add `inflight` (the chosen `conc`; after a restart the current worker's) and `released` (the lease's released
-  ids); a GPU job's (agents from 0.3.4) `vram_mb`: its workers' video memory as read.
+- Stats add `inflight` (the chosen `conc`; after a restart the current worker's; agents from 0.3.13 add the games in flight
+  of workers finishing theirs, 10.4) and `released` (the lease's released ids); a GPU job's (agents from 0.3.4)
+  `vram_mb`: its workers' video memory as read.
 
 ### 10.7 Results, staleness and closing
 
@@ -1932,7 +1959,9 @@ before rev 19, eval, fuzz and classic jobs are unchanged; GPU jobs are tuned fro
   worker finishing its games whose memory the next worker waits for - a handoff's next worker, a restart, a crew's next
   member, when it would fit without the workers finishing theirs - ends its last games (`quit`) once it has finished
   for 2 minutes or only an eighth of its games in flight (at most 4) are left; their ids go back with the lease (`done`'s
-  unfinished ids are worked out from the credited ones: each id credited or returned, none played twice). A drain ends
+  unfinished ids are worked out from the credited ones: each id credited or returned, none played twice; agents from
+  0.3.13 count them as done in the beats at once, 10.4, and a restart's next worker plays the ended worker's unstarted
+  tail, 10.6). A drain ends
   in its longest games at a few rows a batch: the 4070 Ti PC's start drained for 303 s beside the first member of its
   crew, the second waiting for its memory all along (a safety net; 0.3.2 handed a job over to the same layout 3 times
   in 7 minutes). A trial that can't be measured any more when its worker would start (the machine got busy or used):
@@ -1967,6 +1996,23 @@ before rev 19, eval, fuzz and classic jobs are unchanged; GPU jobs are tuned fro
   handoff), and the trial is tried again at a later idle period (after the incumbent is back and at least 2 x (20 + 75)
   s later); a layout discarded 3 times is skipped. Every measurement records other programs' mean load over it
   (`state/tuning.json` `measured[].load`, 0.3.3).
+- **Short of game ids** (agents from 0.3.13). A trial's fresh worker can be measured only once its games in flight
+  refilled, which takes game ids; the coordinator may hold them back (its in-flight limit, the run's quota: `wait_s`,
+  10.4). The lease is **short of ids** while its last extension released nothing (a `wait_s` or a failed call) and its
+  main worker's games in flight are below the refill share (98 %) of its `conc`.
+  - No handoff starts while the lease is short of ids - no trial, no handoff back to the incumbent, no larger layout -:
+    a new worker couldn't fill its games in flight either. The job plays on as it is ("trials wait" in the log) and the
+    tuner goes on once its games in flight are full again.
+  - A running trial waiting for ids before its games in flight refilled gets that time on top of its longest wait (the
+    time is the coordinator's, not the layout's). If it still measures nothing (it never refilled, or not before the
+    window's game progress), it is **put off**, not discarded: nothing is counted against the layout, its worker plays on
+    (no handoff back to the incumbent), and the same layout is the next measured - afresh, by a handoff to a new worker -
+    once the lease is no longer short of ids and at least 2 x (20 + 75) s later.
+  - Agents 0.3.4-0.3.12 discarded such a trial ("no measurement after 410 s") and handed the job back, every handoff
+    ending the old worker's last games: the DirectML PC of 10.4 handed its job over every ~10 minutes for an hour,
+    measuring nothing. NVIDIA PCs on the same run played on at full speed (fast games: their drains and refills fit a
+    trial), though a crew's trial of one worker could starve the same way (the crew's unused spare ranges and drainers'
+    games counted unfinished; the in-flight limit's model in the agent's tests never let 0.3.12 tune such a search).
 - **The search.** Coordinates in order: workers (one; the job's games in flight and rows per batch kept, each kind of
   thread rescaled to its budget for the new count, 13.5), batch size (two thirds of the groups / half again as many),
   search threads (an eighth of their cap), threads per inference session (one), sessions (one, their threads kept),
@@ -2022,7 +2068,8 @@ before rev 19, eval, fuzz and classic jobs are unchanged; GPU jobs are tuned fro
   runtime and network the best layout, its rate and state, the machines and runs. The admin page shows "Tuned layouts
   by hardware class" and "Tuned layouts by machine" (a crew's layout as "2 workers x (...)").
 - Lease stats (beats, `done`) of a rolling lease served by several workers add `workers` (how many play new games) and
-  `inflight` is all of theirs. The coordinator keeps both with the lease's Stats from rev 21 (the in-flight limit, 10.4).
+  `inflight` is all of theirs (agents from 0.3.13: with the games in flight of workers finishing theirs, 10.4). The
+  coordinator keeps both with the lease's Stats from rev 21 (the in-flight limit, 10.4).
 
 ### 13.5 Several workers per lease
 

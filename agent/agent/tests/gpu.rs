@@ -633,6 +633,12 @@ fn dml_report(g: &Gpu) -> Value {
 /// The harness of a PC with `g` (GPU work allowed) and a DirectML-only runtime pack signed for its vendor (`gpu` {vendor,
 /// [dml]}), the fakeworker build requiring it, whose probe and bench report DirectML passing on `g`.
 fn dml_harness(g: Gpu, workers: Option<u32>, autotune: bool) -> (H, Gpus) {
+    let report = dml_report(&g);
+    dml_harness_with(g, workers, autotune, report)
+}
+
+/// `dml_harness` with the probe and bench `report`.
+fn dml_harness_with(g: Gpu, workers: Option<u32>, autotune: bool, report: Value) -> (H, Gpus) {
     let mut h = H::new();
     h.version = "0.3.12".into();
     h.signals.real_starvation = false;
@@ -654,8 +660,8 @@ fn dml_harness(g: Gpu, workers: Option<u32>, autotune: bool) -> (H, Gpus) {
     let wdir = h.dir.path().join("wdml");
     std::fs::create_dir_all(&wdir).unwrap();
     std::fs::copy(mockcoord::testkit::bin("fakeworker"), wdir.join("fakeworker.exe")).unwrap();
-    std::fs::write(wdir.join("probe.json"), dml_report(&g).to_string()).unwrap();
-    std::fs::write(wdir.join("probe_model.json"), dml_report(&g).to_string()).unwrap();
+    std::fs::write(wdir.join("probe.json"), report.to_string()).unwrap();
+    std::fs::write(wdir.join("probe_model.json"), report.to_string()).unwrap();
     let mut t = template(Kind::Worker, "fake-dml");
     t.game = Some("fake".into());
     t.aw = Some(1);
@@ -794,3 +800,162 @@ fn a_directml_job_under_a_small_memory_limit_runs_one_worker_of_directmls_batch(
     assert!(h.crashes().is_empty(), "{:?}", h.crashes());
 }
 
+// ---------- agent 0.3.13 (PROTOCOL 10.4, 10.6, 13.2): a lease the coordinator's in-flight limit holds keeps playing ----------
+
+/// The coordinator's in-flight limit (rev 21) at test speed: a buffer of at least 16 ids or 2 s of the lease's rate (the
+/// real 120 s; these games are ~60 x faster), asked again at the agent's next extension (the real `wait_s` 20).
+fn in_flight_limit(h: &H) {
+    h.mock.with(|s| s.inflight_cap = Some(mockcoord::InflightCap { buffer_min: 16, buffer_s: 2.0, wait_s: 0 }));
+}
+
+/// The fake as a DirectML PC's worker of 2026-11-21, its games long: a game ends each time the worker played 150 more
+/// leaves (1,000 leaves/s with all 64 games in flight: ~9.6 s a game, ~6.7 games a second; a few games in flight finish
+/// few - DirectML's every call costs the same), its 8 oldest games in flight finishing last (a real worker's games end out
+/// of order, so a worker that ends its games leaves scattered ids), 300 MB + 4 MB a game committed.
+fn slow_dml_fake() -> Value {
+    let mut f = dml_fake(20, json!([1.0]));
+    (f["game_leaves"], f["lag"], f["mem_base_mb"], f["mem_per_game_mb"]) = (json!(150), json!(8), json!(300), json!(4));
+    f
+}
+
+/// A DirectML PC with one worker per job (the owner's setting; the PC's memory plan held one), a 1,300 MB job limit: one
+/// worker of 64 games in flight fits its plan (700 + 4 x 64 MB), a second one beside it never does - a handoff's next
+/// worker waits for the old one's memory, which ends its last games (as on the PC) -, and the in-flight limit.
+fn slow_dml_harness() -> (H, Gpus) {
+    // (DirectML well ahead of the CPU at this job's 64-row batches, so the measured choice takes it)
+    let mut report = dml_report(&amd16());
+    report["results"][1]["rows_per_s_by_batch"] = json!({"1": 500.0, "8": 3000.0, "32": 5000.0, "128": 6000.0, "512": 7000.0, "1024": 7638.0});
+    let (h, g) = dml_harness_with(amd16(), Some(1), true, report);
+    h.machine.lock().unwrap().settings.max_ram_mb = Some(1_300);
+    std::fs::create_dir_all(h.layout.state()).unwrap();
+    std::fs::write(h.layout.state().join("rolling_memory.json"), json!({format!("{RUN}/{}/gpu", g.alt): 4, format!("{RUN}/{}/gpu_base", g.alt): 300}).to_string()).unwrap();
+    in_flight_limit(&h);
+    (h, g)
+}
+
+/// The extension answers of lease `id`: (ids released, answers refused).
+fn id_answers(h: &H, id: &str) -> (usize, usize) {
+    h.mock.with(|s| {
+        let a: Vec<&Value> = s.extend_answers.iter().filter(|(l, _)| l == id).map(|(_, a)| a).collect();
+        (a.iter().filter(|a| a.get("wait_s").is_none() && a.get("finish").is_none()).count(), a.iter().filter(|a| a.get("wait_s").is_some()).count())
+    })
+}
+
+/// A DirectML PC's lease of 2026-11-21 (agent 0.3.12, a live run): one worker of 457 games in flight, the tuner
+/// trying one group / two groups. Every handoff's old worker ended its last games (the next worker waited for its memory)
+/// and their ids stayed unfinished at the coordinator until the lease closed, so its in-flight limit soon refused the
+/// lease every id: each new worker started with none (at the same first id again and again), its trial never filled its
+/// games in flight and was discarded after 410 s - "no measurement" -, and the job was handed over again: ~8 games an
+/// hour. Now the beats count ids no worker will play as done, the next worker plays the old one's unstarted ids, no trial
+/// starts while the lease's games in flight aren't full, and a trial starved of ids is put off, not discarded: the lease
+/// keeps finishing games at about its full rate, and every id is credited or returned.
+#[test]
+fn a_directml_lease_under_the_in_flight_limit_keeps_finishing_games_instead_of_churning_trials() {
+    let (mut h, g) = slow_dml_harness();
+    h.push(gpu_lease(&h, &g, "l_SV", &slow_dml_fake(), json!(64), 10_000_000));
+    h.start();
+    assert!(wait(|| !job_lines(&h).is_empty()), "{}", h.agent_log());
+    let first = h.job_line();
+    assert_eq!((first["providers"].clone(), first["conc"].as_u64()), (json!(["dml", "cpu"]), Some(64)), "{first}");
+    let t0 = Instant::now();
+    std::thread::sleep(Duration::from_secs(45));
+    let secs = t0.elapsed().as_secs_f64();
+    let (credited, again) = credits(&h, "l_SV");
+    let (granted, refused) = id_answers(&h, "l_SV");
+    let log = crew_log(&h);
+    let no_measure = log.lines().filter(|l| l.contains("is discarded: no measurement") || l.contains("is discarded: the games in flight didn't refill")).count();
+    let (all, measured) = handoffs(&h, "l_SV");
+    eprintln!(
+        "{credited} games credited in {secs:.0} s ({:.1}/s; full rate ~6.7/s), {granted} id grants, {refused} refusals, {} handoffs ({} measured), {no_measure} trials discarded without a measurement\n{log}",
+        credited as f64 / secs,
+        all.len(),
+        measured.len()
+    );
+    assert_eq!(again, 0, "an id played twice");
+    assert_eq!(no_measure, 0, "a trial discarded for want of game ids:\n{log}");
+    assert!(credited as f64 >= 3.0 * secs, "the lease starved: {credited} games in {secs:.0} s\n{log}");
+    // every next worker played its predecessor's unstarted ids (0.3.12 started each with none after the first handoffs)
+    let lines = job_lines(&h);
+    assert!(lines.len() >= 2 && lines.iter().skip(1).all(|j| j["games"].as_u64().unwrap_or(0) > 0), "{:?}", lines.iter().map(range_of).collect::<Vec<_>>());
+    h.stop();
+    let done = h.wait_done("l_SV");
+    ids_accounted(&h, "l_SV", &done);
+    assert!(h.crashes().is_empty(), "{:?}", h.crashes());
+}
+
+/// A trial whose new worker gets no game ids (the run's quota fills up as it starts): agents 0.3.4-0.3.12 discarded the
+/// trial once it measured nothing and handed the job back to the incumbent, ending games each time. Now the trial waits
+/// for the ids on top of its time, and measuring nothing for want of them it is put off, not discarded: its worker plays
+/// on, no handoff starts while the lease is short of ids, and once they come the same layout is measured afresh.
+#[test]
+fn a_trial_starved_of_game_ids_is_put_off_and_measured_once_ids_come() {
+    let (mut h, g) = slow_dml_harness();
+    // (half the games in flight finish last: a worker that ends its games leaves its successor a short tail, too few to
+    // fill its games in flight without more ids)
+    let mut fk = slow_dml_fake();
+    fk["lag"] = json!(32);
+    h.push(gpu_lease(&h, &g, "l_PO", &fk, json!(64), 10_000_000));
+    h.start();
+    // the start is measured; the first trial is handed over to - and the run's quota fills up as its worker starts
+    assert!(wait(|| !handoffs(&h, "l_PO").1.is_empty()), "{}", crew_log(&h));
+    h.mock.with(|s| s.quota_full = true);
+    let trial = handoffs(&h, "l_PO").1[0].clone();
+    let layout = trial.split("handing the job over to ").nth(1).unwrap().trim_end_matches(" (a measured trial)").to_string();
+    assert!(wait(|| crew_log(&h).contains("is put off")), "{}", crew_log(&h));
+    let log = crew_log(&h);
+    assert!(log.contains(&format!("the trial of {layout} is put off")), "{log}");
+    assert!(!log.contains("is discarded"), "{log}");
+    // no handoff while the lease is short of ids: the trial's worker plays on
+    let n = handoffs(&h, "l_PO").0.len();
+    std::thread::sleep(Duration::from_secs(5));
+    assert_eq!(handoffs(&h, "l_PO").0.len(), n, "a handoff while short of ids: {}", crew_log(&h));
+    assert!(crew_log(&h).contains("trials wait"), "{}", crew_log(&h));
+    // ids again: the same layout is measured afresh (never handed back to the incumbent unmeasured)
+    h.mock.with(|s| s.quota_full = false);
+    assert!(wait(|| crew_log(&h).contains(&format!("{layout} measured"))), "{}", crew_log(&h));
+    let log = crew_log(&h);
+    assert!(!log.contains("is discarded") && !log.contains("the incumbent, not measured"), "{log}");
+    let after: Vec<String> = handoffs(&h, "l_PO").1.into_iter().skip(1).collect();
+    assert!(after.first().is_some_and(|l| l.contains(&layout)), "the trial measured afresh: {after:?}\n{log}");
+    h.stop();
+    let done = h.wait_done("l_PO");
+    ids_accounted(&h, "l_PO", &done);
+    assert!(h.crashes().is_empty(), "{:?}", h.crashes());
+}
+
+/// The coordinator's in-flight limit leaves a CUDA job's tuning as it was (its games are short and its ids keep coming):
+/// the same search as without the limit (`the_tuner_chooses_the_gpu_layout_and_reports_its_worker_count`) - the start's
+/// three workers, two found faster -, no trial discarded, every id credited or returned. (A crew's new tail starts with no
+/// ids, and each member holds a range of twice its games in flight, so a crew may wait a moment for ids under the limit:
+/// a handoff then waits - "trials wait" - and a crew's trial may be put off once and measured afresh.) Agents 0.3.6-0.3.12
+/// never tuned it under the limit: going from a crew to one worker, the crew's unused spare ranges and the drainers'
+/// games stayed unfinished for the limit, and each such trial was discarded unfilled, as were the crew trials after it.
+#[test]
+fn the_in_flight_limit_leaves_a_cuda_jobs_tuning_unchanged() {
+    let (mut h, g) = harness(12_282, None, true);
+    seed_memory(&h, &g, 4);
+    in_flight_limit(&h);
+    h.push(gpu_lease(&h, &g, "l_GC", &fake(40, json!([1.0, 1.4, 1.2])), json!(96), 1_000_000));
+    let t0 = Instant::now();
+    h.start();
+    assert!(
+        h.mock.wait(Duration::from_secs(180), |_| tuning_entry(&h)["state"] == "tuned"),
+        "not tuned after {:?}: {}\n{}",
+        t0.elapsed(),
+        tuning_entry(&h),
+        crew_log(&h)
+    );
+    let e = tuning_entry(&h);
+    assert_eq!(e["start"]["workers"], 3, "{e}");
+    assert_eq!(e["incumbent"]["workers"], 2, "two pay most: {e}\n{}", crew_log(&h));
+    assert_eq!(e["incumbent"]["conc"], 48, "{e}");
+    let log = crew_log(&h);
+    assert!(!log.contains("is discarded"), "{log}");
+    let (granted, refused) = id_answers(&h, "l_GC");
+    eprintln!("tuned after {:?}: {granted} id grants, {refused} refusals, {} trial(s) put off", t0.elapsed(), log.matches("is put off").count());
+    assert!(refused > 0, "the limit held the lease");
+    h.stop();
+    let done = h.wait_done("l_GC");
+    ids_accounted(&h, "l_GC", &done);
+    assert!(h.crashes().is_empty(), "{:?}", h.crashes());
+}
