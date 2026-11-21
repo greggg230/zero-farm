@@ -783,10 +783,30 @@ pub struct Key {
 /// per-lease fields left out) and the model file's size in MiB (the network's shape; its generations keep it). A new
 /// generation of the same run keeps it; another architecture or other settings change it. Rev 20 (PROTOCOL 14.4): a model
 /// variant's name too (a variant graph is laid out apart from the default graph; without one the fingerprint is as before).
+/// Agent 0.3.14: without the settings' `setting_classes` - the trainer's list of every setting it knows and its class,
+/// which changes with the trainer's version and not with how the worker plays: a run forked by a newer trainer, its play
+/// settings the same, got a new fingerprint and searched its layout again from the start (2026-11-21: legacy-meta3-r1's
+/// list lacks 7 trainer settings its forks' have). Keys remembered with the fingerprint of before are found by
+/// `net_fingerprint_legacy` (`Cache::find`).
 pub fn net_fingerprint(template: &Map<String, Value>, model_size: Option<u64>, variant: Option<&str>) -> String {
+    fingerprint(template, model_size, variant, true)
+}
+
+/// agent 0.3.14: the fingerprint of agents 0.3.1-0.3.13 (with the settings' `setting_classes`), which their keys in
+/// `state/tuning.json` were remembered by (`Cache::find`).
+pub fn net_fingerprint_legacy(template: &Map<String, Value>, model_size: Option<u64>, variant: Option<&str>) -> String {
+    fingerprint(template, model_size, variant, false)
+}
+
+fn fingerprint(template: &Map<String, Value>, model_size: Option<u64>, variant: Option<&str>, drop_classes: bool) -> String {
     let mut t = template.clone();
     for k in ["gid_base", "games", "seed", "first", "count"] {
         t.remove(k);
+    }
+    if drop_classes {
+        if let Some(Value::Object(s)) = t.get_mut("settings") {
+            s.remove("setting_classes");
+        }
     }
     let mut text = format!("{}|{}", zerofarm_common::protocol::canonical_json(&Value::Object(t)), model_size.map_or(-1, |s| (s >> 20) as i64));
     if let Some(v) = variant {
@@ -1202,6 +1222,17 @@ impl Cache {
 
     pub fn get(&self, key: &Key) -> Option<&Entry> {
         self.entries.iter().find(|e| &e.key == key)
+    }
+
+    /// agent 0.3.14: `key`'s entry, else the one agents 0.3.1-0.3.13 remembered for it under the network fingerprint
+    /// `legacy_net` (`net_fingerprint_legacy`), re-keyed to `key` (saved under it from then on), so an update keeps every
+    /// tuned layout.
+    pub fn find(&self, key: &Key, legacy_net: &str) -> Option<Entry> {
+        if let Some(e) = self.get(key) {
+            return Some(e.clone());
+        }
+        let old = Key { net: legacy_net.to_string(), ..key.clone() };
+        self.get(&old).map(|e| Entry { key: key.clone(), ..e.clone() })
     }
 
     /// Replaces (or adds) `e`'s key.
@@ -2329,6 +2360,38 @@ mod tests {
         let before = format!("{}|{}", zerofarm_common::protocol::canonical_json(&json!({"settings": {"sims": 8}})), 40);
         assert_eq!(a, zerofarm_common::hash::sha256_hex(before.as_bytes())[..16], "the fingerprint of before rev 20");
         assert_eq!(a.len(), 16);
+    }
+
+    /// agent 0.3.14: a fork whose trainer knows more settings (a longer `setting_classes`), its play settings the same, keeps
+    /// the network's fingerprint - and with it the tuned layout; a key remembered with the fingerprint of before is found.
+    #[test]
+    fn a_fork_with_the_same_play_settings_keeps_its_tuned_layout() {
+        let t = |v: Value| v.as_object().unwrap().clone();
+        let parent = t(json!({"settings": {"sims": 64, "setting_classes": {"sims": "play", "lr": "trainer"}}, "gid_base": 1, "games": 4, "seed": 9}));
+        let fork = t(json!({"settings": {"sims": 64, "setting_classes": {"sims": "play", "lr": "trainer", "pool_variants": "trainer"}}, "gid_base": 5}));
+        let other = t(json!({"settings": {"sims": 16, "setting_classes": {"sims": "play", "lr": "trainer"}}}));
+        let size = Some(40 << 20);
+        assert_eq!(net_fingerprint(&parent, size, None), net_fingerprint(&fork, size, None), "the trainer's list of settings doesn't count");
+        assert_ne!(net_fingerprint(&parent, size, None), net_fingerprint(&other, size, None), "play settings do");
+        assert_eq!(net_fingerprint(&parent, size, None), net_fingerprint(&t(json!({"settings": {"sims": 64}})), size, None));
+        assert_ne!(net_fingerprint_legacy(&parent, size, None), net_fingerprint_legacy(&fork, size, None), "agents 0.3.1-0.3.13 counted it");
+        // the legacy fingerprint is the one of before 0.3.14, byte for byte
+        let before = format!("{}|{}", zerofarm_common::protocol::canonical_json(&json!({"settings": {"sims": 64, "setting_classes": {"sims": "play", "lr": "trainer"}}})), 40);
+        assert_eq!(net_fingerprint_legacy(&parent, size, None), zerofarm_common::hash::sha256_hex(before.as_bytes())[..16]);
+        // a tuned entry an older agent saved under the parent's legacy fingerprint: found for the parent (re-keyed), and
+        // for the fork once the parent's lease saved it under the new key
+        let new_key = Key { net: net_fingerprint(&parent, size, None), ..key() };
+        let mut tuned = Entry::new(Key { net: net_fingerprint_legacy(&parent, size, None), ..key() }, "parent", Layout { workers: 2, threads: 12, infer_workers: 4, infer_threads: 3, groups: 6, conc: 1152 }, false, 7);
+        tuned.state = State::Tuned;
+        let mut c = Cache { v: 1, entries: vec![tuned.clone()] };
+        assert!(c.get(&new_key).is_none(), "not under the new fingerprint");
+        let found = c.find(&new_key, &net_fingerprint_legacy(&parent, size, None)).expect("the legacy key");
+        assert_eq!((found.key.clone(), found.state, found.incumbent, found.run.as_str()), (new_key.clone(), State::Tuned, tuned.incumbent, "parent"));
+        assert!(c.find(&new_key, &net_fingerprint_legacy(&fork, size, None)).is_none(), "the fork's legacy fingerprint is another");
+        c.put(found);
+        let for_fork = c.find(&Key { net: net_fingerprint(&fork, size, None), ..key() }, &net_fingerprint_legacy(&fork, size, None)).expect("the new key");
+        assert_eq!((for_fork.state, for_fork.incumbent), (State::Tuned, tuned.incumbent));
+        assert!(c.find(&Key { net: net_fingerprint(&other, size, None), ..key() }, &net_fingerprint_legacy(&other, size, None)).is_none(), "other play settings search afresh");
     }
 
     /// Statuses every `dt` s of a worker at `rate(p)` leaves/s (p: leaves per game in flight), its games refilled from

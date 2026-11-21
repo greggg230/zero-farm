@@ -208,7 +208,9 @@ the tuning half of `lease.rs` measure the CPU layout of rolling self-play jobs o
   (set by the search's first measurement: refill, 20 s, 75 s), pinging it every 2 s. Why not wall time: a fresh rolling
   worker's rate falls as its games grow, and at a fixed time more games in flight look better than they are (the
   module doc has the numbers).
-- **Cache** `state/tuning.json` per (build, runtime, network fingerprint, hardware, OS, tuner version), 16 keys; weekly
+- **Cache** `state/tuning.json` per (build, runtime, network fingerprint, hardware, OS, tuner version), 16 keys (0.3.14:
+  the fingerprint leaves the settings' `setting_classes` out, `tune::net_fingerprint`; a key saved with the one of
+  before is found by `net_fingerprint_legacy`, `tune::Cache::find`, and saved under the new key); weekly
   check of runner-up vs incumbent. Lease requests report it (`tuning`, feature `tuning`); the tray (Windows) and
   `ZeroFarm status` (macOS) show the job's layout. `autotune` (default on; macOS `ZeroFarm set autotune off`) turns all
   of it off: the fixed rules of before.
@@ -507,7 +509,9 @@ extension: the entry defaults to the one file in `<dir>` without one (`--entry` 
   its predecessor never started, its own results directory); a worker that runs into the limit (an allocation failure,
   or Windows' job peak at the limit) is started again the same way, its games in flight lost and reported once; at most
   4 restarts a lease; the cost per game measured is kept per run and CPU / GPU in `state\rolling_memory.json` and plans
-  the run's next leases. The
+  the run's next leases (0.3.14: a run with no entry of its own plans with the highest entry another run has for the
+  same worker build and CPU / GPU - `rolling::Learned::find`, also for the base and the video memory -; the lease's
+  plan line says whose: "measured here with run X (the same worker build)"). The
   worker's `low` asks `POST /v1/lease/{id}/extend` for 2 x `conc` (at most every 10 s; `wait_s`, `finish`, a lost
   lease and errors handled); beats carry `gen`, and a newer generation's definition is verified off the lease's
   thread as at grant (`jobplan.rs` `Fetch::recheck`, the same template required) before its checkpoint is fetched and

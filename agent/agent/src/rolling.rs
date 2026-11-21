@@ -340,24 +340,80 @@ pub fn planned_base(reading_mb: u64, gpu: bool) -> u64 {
 /// memory per game (zero-core fix/worker-memory: 13.1 -> 2.5 MB a game on the Mac) gets the games in flight it holds.
 /// It goes up at once (`raise`) and down from steady readings with a margin (`steady`); the lease that measured it plans
 /// with it from then on (lease.rs).
+///
+/// **agent 0.3.14: a run not measured here borrows its worker build's measurement** (`find`). 0.3.3-0.3.13 looked up the
+/// run's own key only, so every new run name - an experiment's fork, an A/B arm - started each PC at the platform's
+/// default although the PC had measured the same worker build on another run (2026-11-21: both forks of the day began at
+/// 45 MB a game, 268 games in flight on a 16 GB PC, where the build needs ~3). Each figure (the cost per game, the base,
+/// the video memory per row) is now the run's own entry when it has one, else the highest entry another run has for the
+/// same worker build and figure (provider class included), else the default. Not one key per build: the memory a game
+/// takes also follows the run's play settings (simulations per move, the decks and so the game's length), which the build
+/// doesn't fix - one shared figure would go up and down between two runs of a build, each switch to the hungrier run a
+/// worker over its plan. The highest is the cautious pick (the file keeps no time, so "the newest" isn't known), and the
+/// run's own readings take over from it as before: a rise is remembered for the run at once, a steady reading below what
+/// it borrowed lowers it. Writes stay per run; existing entries are read as they are.
 pub struct Learned;
+
+/// The video memory per batch row figure (`Learned::vram_plan`).
+const VRAM_FIGURE: &str = "vram";
+
+/// agent 0.3.14: a figure `Learned` plans with and, when it is another run's (`Learned::find`), that run's name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Found {
+    pub value: u64,
+    pub from: Option<String>,
+}
 
 impl Learned {
     fn path(layout: &Layout) -> PathBuf {
         layout.state().join("rolling_memory.json")
     }
 
-    fn key(run: &str, build: &str, gpu: bool) -> String {
-        format!("{run}/{build}/{}", if gpu { "gpu" } else { "cpu" })
+    /// The provider class's figure name: the cost per game `cpu` / `gpu`.
+    fn class(gpu: bool) -> &'static str {
+        if gpu {
+            "gpu"
+        } else {
+            "cpu"
+        }
+    }
+
+    fn entry_key(run: &str, build: &str, figure: &str) -> String {
+        format!("{run}/{build}/{figure}")
     }
 
     pub fn load(layout: &Layout) -> BTreeMap<String, u64> {
         std::fs::read(Self::path(layout)).ok().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or_default()
     }
 
-    /// The measured per-game cost of `run` with worker build `build` on the CPU or a GPU (None: never measured here).
+    /// agent 0.3.14: `figure` of `run` with worker build `build`: the run's own entry, else the highest entry another run
+    /// has for that build and figure (ties: the first run name), else None.
+    pub fn find(m: &BTreeMap<String, u64>, run: &str, build: &str, figure: &str) -> Option<Found> {
+        if let Some(&v) = m.get(&Self::entry_key(run, build, figure)) {
+            return Some(Found { value: v, from: None });
+        }
+        let tail = format!("/{build}/{figure}");
+        let mut best: Option<Found> = None;
+        for (k, &v) in m {
+            if let Some(other) = k.strip_suffix(tail.as_str()) {
+                if best.as_ref().is_none_or(|b| v > b.value) {
+                    best = Some(Found { value: v, from: Some(other.to_string()) });
+                }
+            }
+        }
+        best
+    }
+
+    /// The per-game cost `run` with worker build `build` is planned with on the CPU or a GPU - its own measurement, else
+    /// (agent 0.3.14) another run's of the same build (`find`); None: the build was never measured here.
     pub fn get(layout: &Layout, run: &str, build: &str, gpu: bool) -> Option<u64> {
-        Self::load(layout).get(&Self::key(run, build, gpu)).copied()
+        Self::find(&Self::load(layout), run, build, Self::class(gpu)).map(|f| f.value)
+    }
+
+    /// agent 0.3.14: the run whose measurement of `build` a job of `run` plans its cost per game with, when `run` has
+    /// none of its own here (None: its own, or none at all).
+    pub fn borrowed(layout: &Layout, run: &str, build: &str, gpu: bool) -> Option<String> {
+        Self::find(&Self::load(layout), run, build, Self::class(gpu)).and_then(|f| f.from)
     }
 
     /// The platform's default cost of a job on the CPU or a GPU (a build not measured here).
@@ -371,7 +427,7 @@ impl Learned {
 
     /// What a job of `run` with worker build `build` is planned with: the measured base (agent 0.3.6; the default's when
     /// there is none) and the measured per-game cost (the default's when there is none), and whether the per-game cost was
-    /// measured.
+    /// measured (agent 0.3.14: either may be another run's of the same build, `find`).
     pub fn plan(layout: &Layout, run: &str, build: &str, gpu: bool, ram_mb: u64) -> MemPlan {
         let d = Self::default_cost(gpu);
         let m = Self::get(layout, run, build, gpu);
@@ -379,47 +435,49 @@ impl Learned {
         MemPlan { ram_mb, cost: MemCost { base_mb: base, per_game_mb: m.unwrap_or(d.per_game_mb).max(1) }, measured: m.is_some() }
     }
 
-    fn base_key(run: &str, build: &str, gpu: bool) -> String {
-        format!("{run}/{build}/{}_base", if gpu { "gpu" } else { "cpu" })
+    fn base_figure(gpu: bool) -> String {
+        format!("{}_base", Self::class(gpu))
     }
 
-    /// agent 0.3.6: the worker's measured base (MB) for `run` / `build` on the CPU or a GPU (None: not measured here).
+    /// agent 0.3.6: the worker's measured base (MB) for `run` / `build` on the CPU or a GPU (None: not measured here;
+    /// agent 0.3.14: another run's of the same build when `run` has none, `find`).
     pub fn base(layout: &Layout, run: &str, build: &str, gpu: bool) -> Option<u64> {
-        Self::load(layout).get(&Self::base_key(run, build, gpu)).copied()
+        Self::find(&Self::load(layout), run, build, &Self::base_figure(gpu)).map(|f| f.value)
     }
 
     /// agent 0.3.6: a base reading (`base_reading`): remembered when it is lower than what is planned with (the stored
-    /// value, else the default) by more than `BASE_TOLERANCE` -> the value planned with from now on. Only lower: a reading
-    /// holds the games' first memory too (more with more games in flight), and a base above the default is in the cost
-    /// per game measured over it.
+    /// value - agent 0.3.14: or the one borrowed, `find` -, else the default) by more than `BASE_TOLERANCE` -> the value
+    /// planned with from now on. Only lower: a reading holds the games' first memory too (more with more games in flight),
+    /// and a base above the default is in the cost per game measured over it.
     pub fn set_base(layout: &Layout, run: &str, build: &str, gpu: bool, reading_mb: u64) -> Option<u64> {
         let mut m = Self::load(layout);
-        let k = Self::base_key(run, build, gpu);
-        let now = m.get(&k).copied().unwrap_or(Self::default_cost(gpu).base_mb);
+        let figure = Self::base_figure(gpu);
+        let now = Self::find(&m, run, build, &figure).map_or(Self::default_cost(gpu).base_mb, |f| f.value);
         let v = reading_mb.max(MIN_BASE_MB);
         if v as f64 >= now as f64 * (1.0 - BASE_TOLERANCE) {
             return None;
         }
-        m.insert(k, v);
+        m.insert(Self::entry_key(run, build, &figure), v);
         Self::save(layout, &m);
         Some(v)
     }
 
-    /// Records `per_game_mb` for `run` / `build` when it is more than what is planned with now (the stored value, else
-    /// the default) -> true when it was.
+    /// Records `per_game_mb` for `run` / `build` when it is more than what is planned with now (the stored value - agent
+    /// 0.3.14: or the one borrowed -, else the default) -> true when it was.
     pub fn raise(layout: &Layout, run: &str, build: &str, gpu: bool, per_game_mb: u64) -> bool {
-        Self::raise_key(layout, Self::key(run, build, gpu), Self::default_cost(gpu).per_game_mb, per_game_mb)
+        Self::raise_figure(layout, run, build, Self::class(gpu), Self::default_cost(gpu).per_game_mb, per_game_mb)
     }
 
     /// agent 0.3.3: a steady reading (`steady_reading`) of `reading_kb` KB per game: remembered as the reading x
     /// `LEARN_MARGIN` in MB (agent 0.3.9: rounded to the nearest MB from the KB reading - 0.3.3-0.3.8 rounded the reading
     /// up to a whole MB and the product up again; at least 1) when that is less than what is planned with now (the stored
-    /// value, else the default) -> the new value when it was lowered. Rises go through `raise`, at once.
+    /// value - agent 0.3.14: or the one borrowed -, else the default) -> the new value when it was lowered. Rises go
+    /// through `raise`, at once.
     pub fn steady(layout: &Layout, run: &str, build: &str, gpu: bool, reading_kb: u64) -> Option<u64> {
         // (never under the reading rounded up - what `raise` compares with: 1.1 MB x 1.2 rounds to 1, and the next
         // reading's 2 would raise it again at once)
         let v = ((reading_kb as f64 * LEARN_MARGIN / 1024.0).round() as u64).max(reading_kb.div_ceil(1024)).max(1);
-        Self::lower_key(layout, Self::key(run, build, gpu), Self::default_cost(gpu).per_game_mb, v)
+        Self::lower_figure(layout, run, build, Self::class(gpu), Self::default_cost(gpu).per_game_mb, v)
     }
 
     /// agent 0.3.5: an early reading (`early_reading`) of `reading_kb` KB per game: remembered as the reading x
@@ -427,65 +485,52 @@ impl Learned {
     /// it was lowered.
     pub fn early(layout: &Layout, run: &str, build: &str, gpu: bool, reading_kb: u64) -> Option<u64> {
         let v = ((reading_kb.max(1) as f64 * EARLY_MARGIN / 1024.0).ceil() as u64).max(1);
-        Self::lower_key(layout, Self::key(run, build, gpu), Self::default_cost(gpu).per_game_mb, v)
+        Self::lower_figure(layout, run, build, Self::class(gpu), Self::default_cost(gpu).per_game_mb, v)
     }
 
-    /// `v` stored under `k` when lower than what is planned with now (the stored value, else `default`) -> `v` when it was.
-    fn lower_key(layout: &Layout, k: String, default: u64, v: u64) -> Option<u64> {
+    /// `v` stored as `run`'s `figure` when lower than what is planned with now (`find`, else `default`) -> `v` when it was.
+    fn lower_figure(layout: &Layout, run: &str, build: &str, figure: &str, default: u64, v: u64) -> Option<u64> {
         let mut m = Self::load(layout);
-        let now = m.get(&k).copied().unwrap_or(default);
+        let now = Self::find(&m, run, build, figure).map_or(default, |f| f.value);
         if v >= now {
             return None;
         }
-        m.insert(k, v);
+        m.insert(Self::entry_key(run, build, figure), v);
         Self::save(layout, &m);
         Some(v)
     }
 
     /// agent 0.3.4: a GPU job's video memory per batch row over `GPU_VRAM`'s base, per run and worker build (key
-    /// `<run>/<build_id>/vram`), calibrated as the memory per game: a build not measured here is planned with `GPU_VRAM`;
-    /// more is remembered at once (`vram_raise`), less from steady readings with the margin (`vram_steady`). -> (the cost,
-    /// whether it was measured here).
+    /// `<run>/<build_id>/vram`; agent 0.3.14: another run's of the same build when `run` has none, `find`), calibrated as
+    /// the memory per game: a build not measured here is planned with `GPU_VRAM`; more is remembered at once
+    /// (`vram_raise`), less from steady readings with the margin (`vram_steady`). -> (the cost, whether it was measured
+    /// here).
     pub fn vram_plan(layout: &Layout, run: &str, build: &str) -> (VramCost, bool) {
-        let m = Self::load(layout).get(&Self::vram_key(run, build)).copied();
+        let m = Self::find(&Self::load(layout), run, build, VRAM_FIGURE).map(|f| f.value);
         (VramCost { per_row_mb: m.unwrap_or(GPU_VRAM.per_row_mb).max(1), ..GPU_VRAM }, m.is_some())
-    }
-
-    fn vram_key(run: &str, build: &str) -> String {
-        format!("{run}/{build}/vram")
     }
 
     /// Records `per_row_mb` of video memory when it is more than what is planned with now -> true when it was.
     pub fn vram_raise(layout: &Layout, run: &str, build: &str, per_row_mb: u64) -> bool {
-        Self::raise_key(layout, Self::vram_key(run, build), GPU_VRAM.per_row_mb, per_row_mb)
+        Self::raise_figure(layout, run, build, VRAM_FIGURE, GPU_VRAM.per_row_mb, per_row_mb)
     }
 
     /// A steady reading of `reading_mb` of video memory per row, remembered with the margin when lower -> the new value.
     pub fn vram_steady(layout: &Layout, run: &str, build: &str, reading_mb: u64) -> Option<u64> {
-        Self::steady_key(layout, Self::vram_key(run, build), GPU_VRAM.per_row_mb, reading_mb)
+        let v = ((reading_mb as f64 * LEARN_MARGIN).ceil() as u64).max(1);
+        Self::lower_figure(layout, run, build, VRAM_FIGURE, GPU_VRAM.per_row_mb, v)
     }
 
-    fn raise_key(layout: &Layout, k: String, default: u64, v: u64) -> bool {
+    /// `v` stored as `run`'s `figure` when higher than what is planned with now (`find`, else `default`) -> true when it was.
+    fn raise_figure(layout: &Layout, run: &str, build: &str, figure: &str, default: u64, v: u64) -> bool {
         let mut m = Self::load(layout);
-        let now = m.get(&k).copied().unwrap_or(default);
+        let now = Self::find(&m, run, build, figure).map_or(default, |f| f.value);
         if v <= now {
             return false;
         }
-        m.insert(k, v);
+        m.insert(Self::entry_key(run, build, figure), v);
         Self::save(layout, &m);
         true
-    }
-
-    fn steady_key(layout: &Layout, k: String, default: u64, reading_mb: u64) -> Option<u64> {
-        let mut m = Self::load(layout);
-        let now = m.get(&k).copied().unwrap_or(default);
-        let v = ((reading_mb as f64 * LEARN_MARGIN).ceil() as u64).max(1);
-        if v >= now {
-            return None;
-        }
-        m.insert(k, v);
-        Self::save(layout, &m);
-        Some(v)
     }
 
     fn save(layout: &Layout, m: &BTreeMap<String, u64>) {
@@ -763,7 +808,7 @@ mod tests {
         assert!(!Learned::raise(&layout, "r", "b1", false, cpu_cost().per_game_mb), "not over the default: nothing to remember");
         assert!(Learned::raise(&layout, "r", "b1", false, cpu_cost().per_game_mb + 2));
         assert_eq!(Learned::get(&layout, "r", "b1", true), Some(75));
-        assert_eq!(Learned::get(&layout, "other", "b1", true), None);
+        assert_eq!(Learned::borrowed(&layout, "r", "b1", true), None, "its own");
         let p = Learned::plan(&layout, "r", "b1", true, 10_000);
         assert_eq!((p.cost.per_game_mb, p.cost.base_mb, p.measured), (75, GPU_COST.base_mb, true));
         // a new worker build starts fresh: the platform's default
@@ -773,6 +818,70 @@ mod tests {
         std::fs::write(layout.state().join("rolling_memory.json"), r#"{"r/cpu": 99}"#).unwrap();
         assert_eq!(Learned::plan(&layout, "r", "b1", false, 10_000).cost, cpu_cost());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// agent 0.3.14: a run this PC never measured (a fork, an A/B arm) plans with what another run measured with the same
+    /// worker build and provider class - the highest such figure -, not with the platform's default; its own readings take
+    /// over from there and never change the other run's.
+    #[test]
+    fn a_new_run_plans_with_its_worker_builds_measurement() {
+        let dir = std::env::temp_dir().join(format!("zf-rolling-borrow-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let layout = Layout::new(&dir);
+        // what agents 0.3.3-0.3.13 left: the parent's figures (a 16 GB PC's CPU job), another run's of the build, a GPU's
+        std::fs::create_dir_all(layout.state()).unwrap();
+        std::fs::write(
+            layout.state().join("rolling_memory.json"),
+            r#"{"parent/b1/cpu":3,"parent/b1/cpu_base":500,"games2x/b1/cpu":4,"parent/b1/gpu":2,"parent/b1/vram":3,"old/b0/cpu":9,"mac-test/cpu":16}"#,
+        )
+        .unwrap();
+        // the forks of 2026-11-21: 0.3.13 planned them at the platform's default (45 MB a game on Windows)
+        let fork = Learned::plan(&layout, "fork", "b1", false, 16_384);
+        assert_eq!(fork.cost, MemCost { base_mb: 500, per_game_mb: 4 }, "the highest of the build's CPU figures, and its base");
+        assert!(fork.measured);
+        assert_eq!(Learned::borrowed(&layout, "fork", "b1", false), Some("games2x".to_string()));
+        assert_eq!(cpu_shape(Inflight::N(5000), 4, fork).0, ram_cap(16_384, fork.cost), "a measured plan caps a run's number too");
+        assert!(ram_cap(16_384, fork.cost) > ram_cap(16_384, cpu_cost()));
+        // the provider class and the build count: the GPU's own figure; another build, or none, the default
+        let g = Learned::plan(&layout, "fork", "b1", true, 16_384);
+        assert_eq!((g.cost.per_game_mb, g.cost.base_mb, g.measured), (2, GPU_COST.base_mb, true));
+        assert_eq!(Learned::plan(&layout, "fork", "b2", false, 16_384), MemPlan { ram_mb: 16_384, cost: cpu_cost(), measured: false });
+        assert_eq!(Learned::borrowed(&layout, "fork", "b2", false), None);
+        assert_eq!(Learned::vram_plan(&layout, "fork", "b1"), (VramCost { per_row_mb: 3, ..GPU_VRAM }, true));
+        assert_eq!(Learned::vram_plan(&layout, "fork", "b2"), (GPU_VRAM, false));
+        // the fork's own readings compare with what it borrowed and are its own from then on
+        assert!(!Learned::raise(&layout, "fork", "b1", false, 4), "no more than the 4 it plans with");
+        assert!(Learned::raise(&layout, "fork", "b1", false, 6), "above the 4 borrowed (below the default 45: 0.3.13 kept nothing)");
+        assert_eq!((Learned::get(&layout, "fork", "b1", false), Learned::borrowed(&layout, "fork", "b1", false)), (Some(6), None));
+        assert_eq!(Learned::get(&layout, "parent", "b1", false), Some(3), "the parent's own unchanged");
+        assert_eq!(Learned::get(&layout, "arm", "b1", false), Some(6), "the next new run borrows the highest, now the fork's");
+        assert_eq!(Learned::steady(&layout, "arm", "b1", false, 2048), Some(2), "a steady reading below the 6 borrowed: 2.4 -> 2");
+        assert_eq!(Learned::get(&layout, "fork", "b1", false), Some(6), "the fork's own unchanged");
+        assert_eq!(Learned::early(&layout, "arm2", "b1", true, 3072), None, "6 is no lower than the 2 borrowed");
+        assert_eq!(Learned::early(&layout, "arm2", "b1", true, 512), Some(1));
+        assert_eq!(Learned::set_base(&layout, "arm3", "b1", false, 490), None, "within 5 % of the 500 borrowed, not of the default");
+        assert_eq!(Learned::set_base(&layout, "arm3", "b1", false, 400), Some(400));
+        assert_eq!(Learned::base(&layout, "parent", "b1", false), Some(500));
+        assert!(!Learned::vram_raise(&layout, "arm4", "b1", 3) && Learned::vram_raise(&layout, "arm4", "b1", 4));
+        assert_eq!(Learned::vram_steady(&layout, "arm5", "b1", 1), Some(2), "1 x 1.2 rounded up, below the 4 borrowed");
+        // nothing was rewritten: every key of before still there
+        let m = Learned::load(&layout);
+        for k in ["parent/b1/cpu", "parent/b1/cpu_base", "games2x/b1/cpu", "parent/b1/gpu", "parent/b1/vram", "old/b0/cpu", "mac-test/cpu"] {
+            assert!(m.contains_key(k), "{k}");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_takes_the_runs_own_figure_else_the_builds_highest() {
+        let m: BTreeMap<String, u64> =
+            [("a/b/cpu", 5), ("c/b/cpu", 7), ("d/b/cpu", 7), ("e/b/cpu_base", 900), ("f/bb/cpu", 99), ("/b/cpu", 1), ("x/y/b/cpu", 2)].iter().map(|(k, v)| (k.to_string(), *v)).collect();
+        assert_eq!(Learned::find(&m, "a", "b", "cpu"), Some(Found { value: 5, from: None }), "its own, though lower");
+        assert_eq!(Learned::find(&m, "new", "b", "cpu"), Some(Found { value: 7, from: Some("c".into()) }), "the highest; a tie: the first name");
+        assert_eq!(Learned::find(&m, "new", "b", "cpu_base"), Some(Found { value: 900, from: Some("e".into()) }), "per figure");
+        assert_eq!(Learned::find(&m, "new", "b", "gpu"), None);
+        assert_eq!(Learned::find(&m, "new", "bb", "cpu"), Some(Found { value: 99, from: Some("f".into()) }), "another build is no match: whole names");
+        assert_eq!(Learned::find(&m, "", "b", "cpu"), Some(Found { value: 1, from: None }), "a lease without a run");
     }
 
     #[test]

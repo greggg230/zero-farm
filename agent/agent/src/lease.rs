@@ -992,7 +992,8 @@ impl Engine {
         // measurement when it has one)
         let limit_mb = caps.ram_mb.max(256);
         let run_name = lease.run.clone().unwrap_or_default();
-        // (agent 0.3.3: per run and worker build - a build not measured here starts from the platform's default)
+        // (agent 0.3.3: per run and worker build - a build not measured here starts from the platform's default; agent
+        // 0.3.14: a run not measured here plans with another run's measurement of the same build, `Learned::find`)
         let build_id = lease.build.build_id.clone();
         let mem = (Learned::plan(&self.cfg.layout, &run_name, &build_id, false, limit_mb), Learned::plan(&self.cfg.layout, &run_name, &build_id, true, limit_mb));
         let choice = self.choose_providers(lease, &plan, &prep, d.gpu && !self.profile.gpus.is_empty(), caps.threads, mem, need.as_ref(), roll.as_ref().map(|(s, _)| s));
@@ -1000,15 +1001,21 @@ impl Engine {
         let gpu_choice = plan_providers.0 != ["cpu"];
         if roll.is_some() {
             let m = if gpu_choice { mem.1 } else { mem.0 };
-            log::info!(
-                "lease {id}: {} games in flight in {} groups (memory: {} MB limit, {} MB + {} MB per game{})",
+            let source = match (m.measured, Learned::borrowed(&self.cfg.layout, &run_name, &build_id, gpu_choice)) {
+                (true, Some(from)) => format!(", measured here with run {from} (the same worker build)"),
+                (true, None) => ", measured here".to_string(),
+                (false, _) => String::new(),
+            };
+            let line = format!(
+                "{} games in flight in {} groups (memory: {} MB limit, {} MB + {} MB per game{source})",
                 choice.conc.unwrap_or(0),
                 choice.groups.unwrap_or(0),
                 limit_mb,
                 m.cost.base_mb,
                 m.cost.per_game_mb,
-                if m.measured { ", measured here" } else { "" }
             );
+            log::info!("lease {id}: {line}");
+            self.worker_log.write_line(&format!("memory [{id}]: {line}"));
         }
         if plan_providers.0 != ["cpu"] {
             log::info!("lease {id}: providers {:?} on {}", plan_providers.0, plan_providers.1["name"].as_str().unwrap_or("?"));
@@ -1219,10 +1226,14 @@ impl Engine {
         // or fixed by the owner's `workers`
         let space = tune::Space::new(&d, settings.cpu_threads, settings.workers, conc_min, conc_max, Some(mem));
         let run = lease.run.clone().unwrap_or_default();
+        // (agent 0.3.14: the network's fingerprint without the trainer's `setting_classes`; a key remembered with the one of
+        // before is found by it, `tune::Cache::find`)
+        let (model_size, variant) = (prep.ckpt.as_ref().and_then(|(_, f)| f.model_size), prep.ckpt.as_ref().and_then(|(c, _)| c.variant.as_deref()));
+        let legacy_net = tune::net_fingerprint_legacy(&plan.job, model_size, variant);
         let key = tune::Key {
             build: lease.build.build_id.clone(),
             runtime: lease.runtime.as_ref().map(|r| r.build_id.clone()),
-            net: tune::net_fingerprint(&plan.job, prep.ckpt.as_ref().and_then(|(_, f)| f.model_size), prep.ckpt.as_ref().and_then(|(c, _)| c.variant.as_deref())),
+            net: tune::net_fingerprint(&plan.job, model_size, variant),
             // (an owner's fixed worker count is searched apart from "auto")
             hw: match settings.workers {
                 Some(n) => format!("{} | workers {n}", tune::hw_fingerprint(p)),
@@ -1234,8 +1245,8 @@ impl Engine {
         let now = zerofarm_common::now_unix();
         let start = space.fit(d.layout_for(d.workers.clamp(space.workers_min, space.workers_max), conc, groups));
         let fixed = !settings.autotune;
-        let mut entry = match tune::Cache::load(&self.cfg.layout).get(&key).filter(|_| !fixed) {
-            Some(e) => e.clone(),
+        let mut entry = match tune::Cache::load(&self.cfg.layout).find(&key, &legacy_net).filter(|_| !fixed) {
+            Some(e) => e,
             None if fixed => tune::Entry::new(key, &run, start, false, now),
             None => match tune::hint_layout(lease.tuning_hint.as_ref().filter(|_| hint_ok), &space) {
                 Some(h) => {
@@ -1350,10 +1361,14 @@ impl Engine {
         let luid = choice.gpu.get("luid").and_then(Value::as_str).unwrap_or("");
         let g = p.gpus.iter().find(|g| g.luid.as_deref().is_some_and(|l| l.eq_ignore_ascii_case(luid))).cloned().unwrap_or_default();
         let hw = tune::gpu_fingerprint(p, &g, &provider);
+        // (agent 0.3.14: the network's fingerprint without the trainer's `setting_classes`; a key remembered with the one of
+        // before is found by it, `tune::Cache::find`)
+        let (model_size, variant) = (prep.ckpt.as_ref().and_then(|(_, f)| f.model_size), prep.ckpt.as_ref().and_then(|(c, _)| c.variant.as_deref()));
+        let legacy_net = tune::net_fingerprint_legacy(&plan.job, model_size, variant);
         let key = tune::Key {
             build: lease.build.build_id.clone(),
             runtime: lease.runtime.as_ref().map(|r| r.build_id.clone()),
-            net: tune::net_fingerprint(&plan.job, prep.ckpt.as_ref().and_then(|(_, f)| f.model_size), prep.ckpt.as_ref().and_then(|(c, _)| c.variant.as_deref())),
+            net: tune::net_fingerprint(&plan.job, model_size, variant),
             hw: match settings.workers {
                 Some(n) => format!("{hw} | workers {n}"),
                 None => hw,
@@ -1364,8 +1379,8 @@ impl Engine {
         };
         let now = zerofarm_common::now_unix();
         let start = space.gpu_start(g.vendor.eq_ignore_ascii_case("nvidia"), batch);
-        let mut entry = match tune::Cache::load(&self.cfg.layout).get(&key).filter(|_| !fixed) {
-            Some(e) => e.clone(),
+        let mut entry = match tune::Cache::load(&self.cfg.layout).find(&key, &legacy_net).filter(|_| !fixed) {
+            Some(e) => e,
             None => tune::Entry::new(key, &run, start, false, now),
         };
         entry.run = run;

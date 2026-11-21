@@ -4,6 +4,21 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's: `agent-macos-v<version>`).
 
+## Unreleased (0.3.14)
+
+- **A new training run starts with what the computer already knows about its program.** Zero Farm measures how much
+  memory each game of a job program takes on the computer, and plans how many games to run at once from that. It kept
+  the measurement per training run, so every new run - and the owner starts new ones often, to try ideas out - began
+  at a cautious guess of 45 MB a game until it had measured again, although the job program was the very same one: on
+  a 16 GB PC that meant a few hundred games at once where the program needs about 3 MB a game, for the first hour or
+  more of each new run. A run the computer hasn't measured now starts from what it measured for the same job program
+  in another run (the largest such figure, to be safe), and its own measurements take over from there.
+- **The best setup found is kept for a copy of a run.** Zero Farm remembers the fastest setup it found for each job
+  program and network. A copy of a run made with a newer version of the owner's tools counted as a different network,
+  because the run's description lists every setting those tools know - including ones that have nothing to do with how
+  games are played - and its setup was searched for again from the start. That list no longer counts; setups found by
+  earlier versions are kept.
+
 ## Unreleased (0.3.13)
 
 - **Graphics cards with slow games no longer stall on game numbers.** The farm hands each computer only as many game

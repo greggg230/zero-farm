@@ -434,26 +434,30 @@ fn a_worker_near_its_memory_limit_finishes_its_games_and_goes_on_with_fewer() {
 
 /// Agent 0.3.3 (findings of 2026-11-19: the plan follows the evidence, per worker build): what this PC measured for the
 /// run with the lease's worker build plans "auto" - 120 MB a game, or 2 (below the platform's 45 / 18: a fixed worker
-/// build's) - while a measurement of another build, or 0.3.2's key without a build, leaves the platform's default.
+/// build's) - while a measurement of another build, or 0.3.2's key without a build, leaves the platform's default. Agent
+/// 0.3.14: so does another run's measurement of the lease's worker build when the run has none here (a fork, an A/B arm:
+/// 0.3.3-0.3.13 planned those at the default), and the lease says whose it is.
 #[test]
 fn the_remembered_cost_per_game_plans_the_games_in_flight() {
     let limit = 3000;
     let (auto_n, _) = farm_agent::rolling::cpu_auto();
     let default = farm_agent::rolling::cpu_cost();
-    for (name, stored, per) in [
-        ("this build, more", Some(true), 120u64),
-        ("this build, less", Some(true), 2),
-        ("another build", Some(false), 120),
-        ("0.3.2's key", None, 120),
-        ("nothing", None, 0),
+    for (name, stored, per, planned) in [
+        ("this build, more", "own", 120u64, true),
+        ("this build, less", "own", 2, true),
+        ("another run, this build", "other run", 120, true),
+        ("another build", "other build", 120, false),
+        ("0.3.2's key", "0.3.2", 120, false),
+        ("nothing", "", 0, false),
     ] {
         let mut h = H::new();
         h.machine.lock().unwrap().settings.max_ram_mb = Some(limit);
         if per > 0 {
             let key = match stored {
-                Some(true) => mem_key(&h),
-                Some(false) => format!("{RUN}/0123456789abcdef01234567/cpu"),
-                None => format!("{RUN}/cpu"),
+                "own" => mem_key(&h),
+                "other run" => format!("parent-run/{}/cpu", h.build_id),
+                "other build" => format!("{RUN}/0123456789abcdef01234567/cpu"),
+                _ => format!("{RUN}/cpu"),
             };
             std::fs::create_dir_all(h.layout.state()).unwrap();
             std::fs::write(h.layout.state().join("rolling_memory.json"), json!({key: per}).to_string()).unwrap();
@@ -463,10 +467,20 @@ fn the_remembered_cost_per_game_plans_the_games_in_flight() {
         h.start();
         assert!(wait(|| h.job_line_n(0).is_some()), "{name}: {}", h.agent_log());
         let j = h.job_line();
-        let cost = farm_agent::rolling::MemCost { per_game_mb: if stored == Some(true) { per } else { default.per_game_mb }, ..default };
+        let cost = farm_agent::rolling::MemCost { per_game_mb: if planned { per } else { default.per_game_mb }, ..default };
         let want = farm_agent::rolling::ram_cap(limit, cost).min(auto_n);
         assert_eq!(j["conc"].as_u64(), Some(want), "{name}: (0.85 x {limit} - {}) / {} MB a game: {j}", cost.base_mb, cost.per_game_mb);
+        let log = h.agent_log();
+        let line = log.lines().find(|l| l.contains("games in flight in") && l.contains("MB per game")).unwrap_or_else(|| panic!("{name}: no plan line: {log}")).to_string();
+        match stored {
+            "other run" => assert!(line.contains("measured here with run parent-run (the same worker build)"), "{name}: {line}"),
+            "own" => assert!(line.ends_with(", measured here)"), "{name}: {line}"),
+            _ => assert!(!line.contains("measured here"), "{name}: {line}"),
+        }
         h.stop();
+        if stored == "other run" {
+            assert_eq!(learned(&h)[format!("parent-run/{}/cpu", h.build_id)], per, "the parent's own entry stays: {}", learned(&h));
+        }
     }
 }
 

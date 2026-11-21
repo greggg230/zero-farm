@@ -1467,7 +1467,15 @@ A rolling lease is a self-play lease (section 3) plus
   - **Self-calibrating** (agents from 0.3.3). The measured cost per game is remembered per run, **worker build** and
     CPU / GPU job in `state\rolling_memory.json` (keys `<run>/<build_id>/cpu|gpu`; 0.2.14-0.3.2 kept one value per run,
     `<run>/cpu`, only ever raised and planned as the more of it and the default - those keys, measured with the builds of
-    before, are not read). A build not measured here is planned with the platform's default cost (above; macOS 11.5),
+    before, are not read). **Agents from 0.3.14:** a run not measured here is planned with another run's measurement of
+    the same worker build and provider class - the highest such entry (`<other run>/<build_id>/cpu|gpu`; the same for
+    the base and the video memory below) -, and its own entries take over as they are measured: compared with what it
+    borrowed, a rise is remembered for the run at once and a steady reading below it lowers it; entries stay per run
+    (the memory a game takes also follows the run's play settings - simulations, decks -, so one value per build would
+    go up and down between two runs of it), and none is rewritten. 0.3.3-0.3.13 planned every new run name - an
+    experiment's fork, an A/B arm - at the default, though the PC had measured the build: both forks of 2026-11-21
+    started at 45 MB a game, a few hundred games in flight on a 16 GB PC where the build needs ~3. A build not measured
+    here (by any run) is planned with the platform's default cost (above; macOS 11.5),
     which came from the builds of before and is conservative; a measured build with what was measured, below the default
     too (zero-core's native worker fixed on 2026-11-19 needs ~2.5 MB a game where the builds of before needed 13-16). It
     is raised at once: whenever a worker commits more per game than planned, at each restart and when a lease ends. It
@@ -1496,7 +1504,7 @@ A rolling lease is a self-play lease (section 3) plus
     exist (it names a provider) with games started and none finished is a base reading: the runtime and the network,
     its games barely begun. The lease's lowest reading is remembered per run, worker build and provider class (key
     `<run>/<build_id>/gpu_base`) when more than 5 % below what is planned with (the default's 1,800 MB, or what is
-    stored; never raised - a reading holds the games' first memory too, more with more games in flight, and a base above
+    stored - agents from 0.3.14: or borrowed from another run of the build, above; never raised - a reading holds the games' first memory too, more with more games in flight, and a base above
     the default is in the cost per game measured over it), and planned with at once, as a lower cost per game is (the
     worker bounds, the layouts held back, the start). The 4070 Ti PC's 0.3.5 lease (round 5, 2026-11-20): planned at
     1,800 MB + 4 MB a game per worker under a 9.3 GB limit, a crew of two never fitted beside the running worker.
@@ -1521,7 +1529,7 @@ A rolling lease is a self-play lease (section 3) plus
     none). The budget: 85 % of the dedicated memory less that. Without the adapter's size: one worker.
   - A worker is planned at 1,024 MB + 2 MB per row of its biggest batch (games in flight / groups), until this PC
     measured the run's own with the lease's worker build (`state\rolling_memory.json` key `<run>/<build_id>/vram`, MB per
-    row over the base), calibrated as the memory per game: higher at once, lower from steady readings x 1.2 when the lease
+    row over the base; agents from 0.3.14: else another run's of the build, as the cost per game), calibrated as the memory per game: higher at once, lower from steady readings x 1.2 when the lease
     ends. (The 4070 Ti PC: the whole GPU, its desktop included, held 709 MB with one worker of 128 in flight, 1,605 MB with
     512 in one group, 2,557 MB with three workers of 384 - about half the plan.)
   - Readings, at most once a second: each worker's dedicated memory from Windows' `\GPU Process Memory(*)\Dedicated
@@ -2048,7 +2056,10 @@ before rev 19, eval, fuzz and classic jobs are unchanged; GPU jobs are tuned fro
   tuner version 2; a GPU job's 3 from agent 0.3.8, a DirectML job's 4 from agent 0.3.12): the start,
   the incumbent, every measurement, the window, the search's state. The network's fingerprint is the first 16 hex of the
   sha256 of the job template's canonical JSON without its per-lease fields, `|`, the model file's size in MiB (a run's
-  generations keep it; another architecture or other settings change it); the hardware's is the CPU brand, cores,
+  generations keep it; another architecture or other settings change it; agents from 0.3.14 leave the settings'
+  `setting_classes` out - the trainer's list of the settings it knows, which changes with the trainer's version, not
+  with play: a run forked by a newer trainer with the same play settings searched its layout again - and find a key
+  remembered with the fingerprint of before by that one, saving it under the new key); the hardware's is the CPU brand, cores,
   logical processors, performance and efficiency cores and RAM in GiB. At most 16 keys (the least recently changed go).
 - A key not seen is searched; a tuned key's leases start with its incumbent and run no trial, except a weekly check:
   the runner-up (the best other layout measured) and the incumbent measured afresh, the runner-up taken at 3 % faster.
@@ -2304,6 +2315,13 @@ set the run's alternate's `model` (the CUDA alternate: `"model": "gpu"`) and the
 it: GPU machines play its default model.
 
 ## Changes
+- v1 rev 23, agent 0.3.14 (2026-11-21; no wire change): **a run not measured here plans with its worker build's
+  measurement** (10.6 **Self-calibrating**): the cost per game, the base and the video memory per row of a run with no
+  entry of its own on the PC are another run's of the same worker build and provider class (the highest), not the
+  platform's default; entries stay per run, existing ones are read as they are. **The tuner's network fingerprint
+  leaves out `setting_classes`** (13.3), finding keys of before by the old fingerprint. Why: every experiment fork and
+  A/B arm cold-started each PC's memory plan at the default (2026-11-21, both forks: 45 MB a game where the build needs
+  ~3), and a fork made by a newer trainer searched its tuned layout again.
 - v1 rev 22, agent 0.3.12 (2026-11-20; no wire change): **DirectML jobs start from DirectML's own layout** (13.1
   **DirectML**, 9.6 **DirectML candidates**). A GPU job whose provider is `dml`, on any vendor's GPU, targets up to 3
   workers of 1,152 games in flight in two groups of 576 rows (within the lease's block) and starts the most workers that
