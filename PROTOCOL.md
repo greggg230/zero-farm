@@ -7,7 +7,8 @@ A change to anything here is a protocol change: bump the version it belongs to a
 bottom.
 
 Versions: HTTP API `v1` (path prefix), agent↔worker protocol `aw/1`, network files `zero-onnx/1`,
-manifests `manifest/1`. Current revision: v1 rev 23 (section 12.2, a batch's CPU capacity counts only PCs of a platform its
+manifests `manifest/1`. Current revision: v1 rev 24 (section 15, the priority lane: waiting eval work takes machines from
+fuzz and rolling self-play, canary machines first; rev 23: section 12.2, a batch's CPU capacity counts only PCs of a platform its
 run has a build for; rev 22: section 9.8, AMD GPUs with DirectML only and the owner's GPU vendors off; rev 21: section 10.4, the in-flight limit of rolling leases; rev 20: section 14, model variants per generation; rev 19: section 13, layout tuning and
 several workers per lease; rev 18: section 12, hardware routing; rev 17: section 11, platforms: macOS on Apple silicon).
 
@@ -179,7 +180,8 @@ Response, exactly one of:
 - `{"lease": Lease}`
 - `{"wait_s": 300, "reason": "no_work" | "paused_by_admin" | "too_many_leases" | "outside_hours"}`
   (`outside_hours` is the agent's own; the coordinator never sends it; `too_many_leases`, rev 6:
-  the machine already holds `MAX_ACTIVE_LEASES` live leases, default 2)
+  the machine already holds `MAX_ACTIVE_LEASES` live leases, default 2; rev 24: `no_work` says 60 while eval work is
+  about to need the machine, section 15.2)
 - `{"update": {"min_agent": "0.4.0"}}` → the agent updates itself (section 6) before asking again.
   Sent when the agent is older than the `min_agent` of its channel's latest release, or older than
   the `min_agent` of a build it would otherwise be given and the channel's latest release is new
@@ -208,7 +210,8 @@ sized to about 450 s of this machine's measured rate for that job (ids per runni
 past leases; its hardware class's average before it has one; 16 games / 10 eval games / 20000
 seeds before either), unless the run sets `games_per_lease` / the campaign sets `chunk` (rev 18: an `auto` eval
 lease on the CPU gets at least 2 games per thread, section 12.3). Rev 18: after fuzz, tier 3, a PC's self-play that it
-would play on its CPU while the run has a GPU version (section 12.1). Every
+would play on its CPU while the run has a GPU version (section 12.1). Rev 24: waiting eval work also takes busy machines
+- a fuzz lease's or a rolling self-play lease's - at their next beat or extension (section 15). Every
 lease covers one contiguous id range.
 
 ```json
@@ -244,7 +247,8 @@ a definition lease normally keeps its gen (a new gen comes with a new definition
 reaches new leases); eval leases never switch. `cancel`: stop now, discard (sent when the run or campaign was
 paused, or the run dropped that job kind; the lease is closed, so later calls get 410).
 `give_back`: finish uploading finished games, then `done` with `given_back: true` (also sent, as a
-backstop, once a lease has reported `paused` for longer than `slack_s`). A beat for an expired or
+backstop, once a lease has reported `paused` for longer than `slack_s`; rev 24: to a fuzz lease whose machine an eval
+batch waits for, section 15.3). A beat for an expired or
 cancelled lease → 410 `gone`; a lease id that isn't this machine's → 404 `not_found`. A lease
 that misses 3 beats expires and its unfinished ids go back to the pool.
 
@@ -421,7 +425,7 @@ tools also send an Access service token (`CF-Access-Client-Id`, `CF-Access-Clien
 | `GET /v1/admin/machines` · `POST /v1/admin/machine/{id}/revoke` | revoking cancels the machine's active leases at once (their ids go back to the pool) → `{"ok": true, "cancelled"}` |
 | `POST /v1/admin/machine/{id}` | `{"name"?, "channel"?, "paused"?, "unblock"?}`; a paused machine gets `wait_s` / `paused_by_admin`; `"unblock": true` (rev 5) lifts the machine's build blocks (`/v1/crash` kind `blocked`) and answers `{"ok": true, "unblocked": n}` |
 | `POST /v1/admin/pause` | `{"paused": true \| false}`: farm-wide, no new leases while paused |
-| `POST /v1/admin/routing` | rev 18: `{"on": bool, "eval_horizon_s": 0..604800, "eval_games_per_thread": 0..16}`, any of them; the others keep their values → `{"ok": true, "on", "eval_horizon_s", "eval_games_per_thread"}`. `GET /v1/admin/routing` → the same fields and `"stored"` (false: never set, the defaults). Section 12 |
+| `POST /v1/admin/routing` | rev 18: `{"on": bool, "eval_horizon_s": 0..604800, "eval_games_per_thread": 0..16}`, rev 24: `"priority_lane": "off" \| "canary" \| "all"`, `"eval_stall_s": 0..86400`; any of them; the others keep their values → `{"ok": true, "on", "eval_horizon_s", "eval_games_per_thread", "priority_lane", "eval_stall_s"}`. `GET /v1/admin/routing` → the same fields and `"stored"` (false: never set, the defaults). Sections 12, 15.6 |
 | `POST /v1/admin/evict` | rev 12: `{"builds": ["<build_id>", ...]}` (at most 64; `[]` clears it) replaces the evict list → `{"ok": true, "builds"}` (deduplicated). `GET /v1/admin/evict` → `{"builds"}`. It rides on every `GET /v1/agent/latest` (section 3) |
 | `POST /v1/admin/gpu_vendors_off` | rev 22: `{"vendors": ["amd"]}` (vendor names `[a-z0-9]{1,32}`, at most 8; `[]` clears it) replaces the list of GPU vendors the owner turned off → `{"ok": true, "vendors"}` (deduplicated); settings key `gpu_vendors_off`, no migration. `GET /v1/admin/gpu_vendors_off` → `{"vendors"}`. It rides on every `GET /v1/agent/latest` (section 3); what it does: section 9.8. Admin CLI: `npm run admin -- gpu-vendors-off [amd \| none]` |
 | `POST /v1/admin/diag` | `{"machine_id" \| "class", "kind": "sweep" \| "profile" \| "stability" \| "logs", "params"}` → `{"requests": [{"id", "machine_id"}]}`. `class` = a hardware class as the stats show it (`"<cpu> / <gpu or 'no gpu'>"`). `logs` goes out as `upload_diag`; the others become `diag` leases (`params.build_id` or `params.run` picks the build) |
@@ -1327,6 +1331,8 @@ A rolling lease is a self-play lease (section 3) plus
   leases are also cancelled at their next beat, section 4), or (2026-11-19) the run's current definition no longer
   lists the lease's worker build (the run was re-pinned: its results would be refused and it can't switch
   generations; the agent asks for a fresh lease with the current builds).
+- `{"games": total, "finish": true, "reason": "yield"}` (rev 24, section 15.4): an eval batch waits for this machine, before
+  or after `until`; the agent finishes as for the other reasons (it reads `finish`, and only logs `reason`).
 - **Renewal.** Past `until`, the coordinator renews the lease (`until` += `max_s`, and the answer releases ids as
   usual) unless something else is waiting for this machine, in the order section 3 picks work: a diagnostics request
   for it; an eval batch of an active run with unissued ids; a fuzz campaign with a `share` that is below it (5.4);
@@ -1819,7 +1825,9 @@ second, PROTOCOL 3), else its average over every eval it played, else nothing (n
 is unissued). A deferred batch ranks after the PC's self-play (rank 1.5: still tier 1, before fuzz; never earlier than
 a background share puts it, section 5.3), so the PC gets it when its self-play has no headroom. On a rolling lease's
 renewal a deferred batch counts only while the lease's own generation has no headroom (the lease would only wait).
-`eval_horizon_s` 0: never deferred (eval before self-play everywhere, as before).
+`eval_horizon_s` 0: never deferred (eval before self-play everywhere, as before). Rev 24: for a PC the priority lane applies
+to, a CPU PC busy on fuzz counts only when the lane frees it, and a batch nobody has taken for `eval_stall_s` is behind
+(section 15.5).
 
 The horizon is the latency the owner accepts: GPU PCs help a batch until what is left would take the CPU PCs at most
 that long, so a batch takes at most about `eval_horizon_s` longer than with every PC on it.
@@ -2314,7 +2322,144 @@ set the run's alternate's `model` (the CUDA alternate: `"model": "gpu"`) and the
 `PUT /v1/admin/run/{run}` before the first definition with variants. A gen whose variant isn't ready is registered without
 it: GPU machines play its default model.
 
+## 15. The priority lane (rev 24; coordinator only, no migration, no agent change)
+
+**Why.** Short analysis campaigns (5.3) sat 24 and ~45 minutes before any PC took them (2026-11-21): an idle PC asked
+again only every 300 s; a fuzz lease was never asked back (a campaign's first fuzz lease, at the 20,000-seed default
+before any rate exists, ran 56 minutes); a rolling self-play lease re-decided only at renewal (10.4, every `max_s`); and
+a PC playing self-play on its GPU deferred the batch (12.2) on the strength of CPU PCs that were busy elsewhere. The lane
+lets waiting eval work take machines within a beat or an extension, inside the shares the runs already have, the canary
+machines first.
+
+### 15.1 The priority model
+
+**Free machines** take work in section 3's order, unchanged: diagnostics; tier 1 (a run's evaluation, then its
+self-play - rev 13/14: a background job or a fuzz campaign with a `share` first only within it; rev 18: a GPU self-play
+PC's batch only when behind); tier 2 (fuzz, the backfill; a GPU-preferring job on a PC that isn't GPU-eligible); tier 3
+(CPU self-play of a run with a GPU version, 12.1).
+
+**Busy machines** (rev 24): only **waiting eval work** preempts - a run's current eval batch with unissued ids that comes
+first in the machine's order (a live run's evaluation, no `share`; an analysis campaign within its `share`; never a
+deferred batch, never one past its share while the machine is on tier-1 work). Who takes a busy machine from whom,
+highest first:
+
+| level | work | takes busy machines from | its leases are taken by |
+|---|---|---|---|
+| 1 | waiting eval work (tier 1, rank 0) | levels 2-5: a fuzz lease at its next beat (15.3); a rolling self-play lease at its next extension, within the batch's share (15.4) | nobody (eval leases run to their end) |
+| 2 | a run's self-play (tier 1); a fuzz campaign within its `share` (5.4) | nobody (a rolling lease's renewal, 10.4, gives way to higher work at `until`, as before) | level 1 (rolling self-play; fuzz) |
+| 3 | fuzz, the backfill (tier 2) | nobody | level 1 |
+| 4 | CPU self-play of a run with a GPU version (tier 3) | nobody | level 1 (rolling, within the share) |
+| 5 | reserved: a backfill tier for standing low-priority work while no live run needs a platform (an experiment queue) | nobody | every level above (see below) |
+
+Classic self-play leases (about 7.5 minutes of work), eval leases and diagnostics leases are never preempted; self-play
+and fuzz never preempt anything. **The slot for a backfill tier**: its jobs would rank below tier 3 (a tier 4), get a
+free machine only when nothing above has work for it, and be taken back by *any* waiting work above them, not eval
+alone - the decision of 15.3 with "the first candidate that would be granted before the lease's own job is an eval
+batch" widened to "is any job" (a self-play with headroom, fuzz, eval), answered by `give_back` at a beat (any lease
+kind) or `finish` at a rolling extension, and marked `pending` `yield:<scope>` as here. Nothing in rev 24 depends on it.
+
+### 15.2 Idle machines ask again sooner
+
+A `no_work` answer (section 3) says `wait_s` 60 instead of 300 while eval work is about to need the machine:
+- an eval batch it could play (every check of section 3: platform, builds, agent version, definition, `needs`, disk)
+  had unissued ids at the offer but none was granted to it, or has none now while leases of it are still out (their ids
+  come back when a lease expires, is given back or ends with a held pair, 5.2);
+- or an active run without self-play and without a batch, put (created or changed) within the last 600 s, with a
+  default build or an alternate of the machine's platform: a campaign registering its networks before its batch (5.3).
+
+For every machine while `priority_lane` is not "off" (15.6). The reason stays `no_work`. Agents honour any `wait_s` up to
+300 s, so every agent version asks after 60 s; the lease bucket (section 1) allows one request per 5 s on average, so this
+is a twelfth of it.
+
+### 15.3 A fuzz lease gives its machine back
+
+At a fuzz lease's beat (`running`, nothing pending, the lane applies to the machine), the coordinator works out the
+machine's order as section 3 would for a new lease request now - from the caps, `gpu_allowed`, `gpu_games`, profile and
+agent version of its last `/v1/lease`, every job kind, nothing cached, its own lease not counted - and walks it from the
+top to the lease's own campaign: a self-play without headroom is skipped (it would not be granted); the first job that
+would be granted must be an eval batch with unissued ids (anything else - a self-play with headroom, another campaign's
+fuzz - ends the check: the lane covers eval only); and the batch must still come first with its machines on their way
+counted as its leases, and be able to use one more machine (15.4). Then the beat answers `give_back` and the lease is
+marked `pending` = `yield:<the batch's scope>` (`yield:run:<run>`); its later beats answer `give_back` too (a lost
+answer is repeated). Not when the lease will be done within 120 s at its own pace (seeds done per running second so far,
+from this beat's `progress` or the last), and not while the machine or the farm is paused.
+
+The agent (every version: `give_back` → the worker gets `quit`) stops between seeds; the worker's `end` names the seeds
+it did not play; the agent uploads the final fuzz result whose `x-ids` are the seeds the lease covered (5.1), then `done`
+with `given_back: true` (its uploader sends `done` only once every result of the lease is uploaded, and `done` lists them). The covered seeds stay credited, the rest go
+back to the campaign's pool (section 3, `done`), and the agent asks for a lease at once and gets the batch. Seeds in play
+at `quit` are lost and played again: a few seconds of fuzz.
+
+### 15.4 A rolling self-play lease finishes at its next extension
+
+At every extension of a rolling lease (10.4), before or after `until` (the lease active with nothing pending, nothing
+paused, the lane applies), the coordinator decides as in 15.3 with the lease's own self-play in place of the campaign,
+and two limits:
+- **its share**: the batch, with its machines on their way counted as its leases, still comes before the lease's
+  self-play (a background batch past its share, 5.3, or a deferred one, 12.2, takes no machine); for a background batch
+  (`share` set), also every background job's (a run job with a `share`) active leases and machines on their way, with
+  this one, are at most `share` x the runs' active self-play and eval leases - several campaigns of 0.25 together take no
+  more of a live run than one does (a fresh lease request still applies each one's share alone, rev 13);
+- **what it can use**: the batch's machines on their way (live leases marked `yield:<its scope>`), with this one, are at
+  most ceil(unissued games / this machine's lease size for the batch) (section 3's sizing: `games_per_lease`, 450 s of
+  its rate, 9.4's GPU size, 12.3's CPU floor). A 64-game campaign in leases of 16 takes at most 4 machines, whatever its
+  share.
+
+The answer is then `{"games": total, "finish": true, "reason": "yield"}` and the lease is marked `pending` =
+`yield:<scope>`; later extensions answer `finish` with `state` (10.4), beats go on as before. The agent (every version
+from 0.2.13: `finish` → its worker gets `finish`) starts no new game, finishes the games in flight, uploads, closes with
+`done` (not given back) and asks for a lease, which gets the batch. A finish lasts as long as the lease's longest game in
+flight - on 2026-11-21 about 2-8 minutes on CUDA PCs, 11-16 on a DirectML PC, 5-25 on Macs - and the batch counts the
+machine as on its way until the lease closes. Agents extend every 10-20 s while running, so the decision comes within
+about 20 s of the batch appearing. The renewal (10.4: past `until`, `finish` with `max_s` when other work waits) is
+unchanged, for every machine.
+
+### 15.5 Eval deferral under the lane
+
+For a PC the lane applies to, rev 18's deferral (12.2) reads capacity differently (for other PCs 12.2 is unchanged):
+- a CPU PC that holds a live fuzz lease counts only when the lane applies to it too (its fuzz is given back at its next
+  beat, 15.3); otherwise it is busy until that lease ends - on 2026-11-21 a GPU PC on a 56-minute fuzz lease, `gpu_play`
+  0 from its last offer, counted at its eval rate and kept a 32-game campaign deferred for a GPU laptop;
+- **stall**: a batch is behind, whatever the capacity says, once it is older than `eval_stall_s` (default 180) and no
+  lease of it is active or was issued in the last `eval_stall_s`: the CPU PCs counted for it are not taking it. 0: no
+  such rule.
+
+Not changed: the horizon (a short campaign may still take up to `eval_horizon_s` on CPU PCs that do take it - lower
+`eval_horizon_s` for quicker campaigns), PCs on other eval or self-play leases (they come free at their lease's end or
+renewal), and each waiting batch counting the same CPU PCs (the stall rule catches the batches they don't reach).
+
+### 15.6 The owner's setting (canary first)
+
+`POST /v1/admin/routing` (section 4) `priority_lane`: `"off"` | `"canary"` | `"all"` (default `"canary"`, also when the
+setting was stored before rev 24), `eval_stall_s` 0..86400 (default 180).
+- `"off"`: rev 23 exactly - no preemption, 12.2's deferral, `no_work` 300.
+- `"canary"`: 15.3, 15.4 and 15.5 only for machines whose channel (`machines.channel`, `POST /v1/admin/machine/{id}`) is
+  canary; 15.2 for every machine.
+- `"all"`: all of it for every machine.
+
+A decision made stays made when the setting changes: a lease already marked `yield:` keeps answering `give_back` /
+`finish`. CLI: `npm run admin -- routing '{"priority_lane": "all"}'`.
+
+### 15.7 Wire and agents
+
+No new field, endpoint or migration. `give_back` (section 3) and `finish` (10.4) are existing answers; `"yield"` is a new
+value of the extension's `reason`, a free string agents only log (every agent from 0.2.13 acts on `finish` whatever the
+reason); `wait_s` 60 is within every agent's 300 s cap. `leases.pending` gains the value `yield:<scope>` (internal).
+Checked against agents 0.3.10 (the macOS stable of before 2026-11-21), 0.3.13 and 0.3.14: `lease.rs` (`on_beat`
+`give_back` → `stop`, `on_extend` `finish` → `roll_finish`, `finish()` for the fuzz final result), `engine.rs` (a new
+`/v1/lease` right after any lease ends; `wait_s` honoured up to `max_wait`).
+
 ## Changes
+- v1 rev 24 (2026-11-21; coordinator only, every agent version; no migration; owner setting `priority_lane`, default
+  `"canary"`): **the priority lane** (section 15). While a run's eval batch with unissued ids comes first for a machine,
+  a fuzz lease's next beat answers `give_back` (not within 120 s of its end) and a rolling self-play lease's next
+  extension answers `finish` with `reason` `"yield"` - within the batch's share (every background job together) and never
+  more machines than its unissued games over the machine's lease size; leases on their way are marked `pending`
+  `yield:<scope>`. `no_work` says 60 s while eval work is about to need the machine. Under the lane the eval deferral
+  counts a CPU PC busy on fuzz only when the lane frees it, and a batch nobody took or worked on for `eval_stall_s` (180)
+  is behind. `"canary"`: preemption and the deferral change only on canary machines (the 60 s poll everywhere); `"all"`;
+  `"off"`: rev 23 exactly. Why: test campaigns sat 24 and ~45 minutes behind a 56-minute fuzz lease, rolling leases that
+  re-decide only at renewal, and a deferral counting busy PCs as capacity.
 - v1 rev 23, agent 0.3.14 (2026-11-21; no wire change): **a run not measured here plans with its worker build's
   measurement** (10.6 **Self-calibrating**): the cost per game, the base and the video memory per row of a run with no
   entry of its own on the PC are another run's of the same worker build and provider class (the highest), not the

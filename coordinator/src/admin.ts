@@ -40,10 +40,13 @@ import {
   DRIVER_RE,
   GPU_MODES,
   MAX_ALTERNATES,
+  type HwRouting,
   MAX_EVAL_GAMES_PER_THREAD,
   MAX_EVAL_HORIZON_S,
+  MAX_EVAL_STALL_S,
   MAX_EVICT,
   MAX_VENDORS_OFF,
+  PRIORITY_LANES,
   type Routing,
   VENDOR_PROVIDERS,
   VENDOR_RE,
@@ -1038,12 +1041,16 @@ export async function getVendorsOff(c: Ctx): Promise<Response> {
 export async function routing(c: Ctx): Promise<Response> {
   await authAdmin(c);
   const b = await readJson(c.req);
-  for (const k of Object.keys(b)) if (!["on", "eval_horizon_s", "eval_games_per_thread"].includes(k)) throw bad(`${k}: unknown field`);
+  const fields = ["on", "eval_horizon_s", "eval_games_per_thread", "priority_lane", "eval_stall_s"];
+  for (const k of Object.keys(b)) if (!fields.includes(k)) throw bad(`${k}: unknown field`);
   const cur = hwRoutingOf((await c.env.DB.prepare(`SELECT value FROM settings WHERE key = 'hw_routing'`).first<{ value: string }>())?.value ?? null);
-  const next = {
+  const next: HwRouting = {
     on: bool(b.on, "on", { optional: true }) ?? cur.on,
     eval_horizon_s: int(b.eval_horizon_s, "eval_horizon_s", { optional: true, min: 0, max: MAX_EVAL_HORIZON_S }) ?? cur.eval_horizon_s,
     eval_games_per_thread: num(b.eval_games_per_thread, "eval_games_per_thread", { optional: true, min: 0, max: MAX_EVAL_GAMES_PER_THREAD }) ?? cur.eval_games_per_thread,
+    // rev 24 (PROTOCOL 15.6): the priority lane's canary gate, and its stall rule (15.5)
+    priority_lane: oneOf(b.priority_lane, "priority_lane", PRIORITY_LANES, { optional: true }) ?? cur.priority_lane,
+    eval_stall_s: int(b.eval_stall_s, "eval_stall_s", { optional: true, min: 0, max: MAX_EVAL_STALL_S }) ?? cur.eval_stall_s,
   };
   await c.env.DB.prepare(`INSERT OR REPLACE INTO settings (key, value) VALUES ('hw_routing', ?)`).bind(JSON.stringify(next)).run();
   return json({ ok: true, ...next });

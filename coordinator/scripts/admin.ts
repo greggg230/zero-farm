@@ -56,7 +56,8 @@ CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET, an Access service token)
   diag (--machine <id> | --class <text>) <sweep|profile|stability|logs> [--params JSON]
   diag-list [--machine <id>]
   stats
-  routing [JSON|-]                                 hardware routing (rev 18): show, or set {on, eval_horizon_s, eval_games_per_thread}
+  routing [JSON|-]                                 hardware routing (rev 18): show, or set {on, eval_horizon_s, eval_games_per_thread,
+                                                   priority_lane: off|canary|all, eval_stall_s} (rev 24, PROTOCOL 15)
   gpu-vendors-off [VENDOR[,VENDOR...]|none]        GPU vendors turned off (rev 22, PROTOCOL 9.8): show, set (e.g. amd),
                                                    or clear (none); agents from 0.3.11 run CPU work only on those GPUs
   external <report.json|->                         a reporter's numbers for own machines (admin page only)
@@ -340,7 +341,8 @@ async function main(argv: string[]): Promise<void> {
       return print(await api("GET", "/v1/admin/stats"));
     case "routing":
       // rev 18 (PROTOCOL 12): `routing` shows the hardware-routing setting; `routing '{"eval_horizon_s": 900}'` changes
-      // the fields it names (`routing -` reads the JSON from stdin)
+      // the fields it names (`routing -` reads the JSON from stdin); rev 24 (PROTOCOL 15): `routing '{"priority_lane":
+      // "all"}'` widens the priority lane from the canary machines to every machine, `"off"` turns it off
       if (!pos.length) return print(await api("GET", "/v1/admin/routing"));
       return print(await api("POST", "/v1/admin/routing", pos[0] === "-" ? readConfig("-") : JSON.parse(pos[0])));
     case "gpu-vendors-off": {
