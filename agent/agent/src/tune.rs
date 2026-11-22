@@ -71,6 +71,11 @@ pub const DML_TUNER_VERSION: u32 = 4;
 /// worker + 2-3 MB a game, 11.4 GB) the rule starts 3 x 912 at 2 MB a game and 2 x 1,152 at 3 MB, where 0.3.15 started
 /// 3 x 704 / 3 x 608 / 3 x 384 (the bench's batch 1,024 or 512).
 pub const CUDA_CREW: bool = true;
+/// agent 0.3.16: a CUDA crew (`CUDA_CREW`) runs at least this many workers where the memory plans hold them (each with
+/// `rolling::DML_MIN_CONC` games in flight): one worker's evaluator thread caps it - on the 4070 Ti PC one worker of
+/// 1,796-2,048 games in flight played 14.5-17.0k leaves/s, every crew of two or three 20-28k -, and the tuner's trial of
+/// one worker cost a handoff that quit ~1,200 games in flight (the crew's memory) and ~9 minutes at its rate.
+pub const CUDA_CREW_MIN_WORKERS: u32 = 2;
 /// agent 0.3.16: CUDA crews' keys (`CUDA_CREW`) searched again from their new start.
 pub const CUDA_CREW_TUNER_VERSION: u32 = 5;
 /// Worker processes a lease's job may run (searched and set) at most; a hint or a report may say up to `MAX_WORKERS_JSON`.
@@ -496,6 +501,16 @@ impl Space {
         }
         s.bound_workers(workers, max_workers);
         s
+    }
+
+    /// agent 0.3.16: a CUDA crew's floor (`CUDA_CREW_MIN_WORKERS`) where `n` workers each keep `rolling::DML_MIN_CONC`
+    /// games in flight under the memory plans and the bounds allow it; else the bounds as they are.
+    pub fn cuda_crew_floor(&mut self) {
+        let n = CUDA_CREW_MIN_WORKERS;
+        let holds = self.mem_room(n).is_none_or(|r| r >= crate::rolling::DML_MIN_CONC) && self.fits(n);
+        if holds && self.workers_max >= n {
+            self.workers_min = self.workers_min.max(n);
+        }
     }
 
     /// The worker bounds: the owner's `workers` (`set`), else 1 to `max` (the cores' and RAM's), never more than the
@@ -2170,6 +2185,15 @@ mod tests {
         assert_eq!(at2.gpu_start(true, 1024), glay(3, 2, 2, 912));
         let at3 = dml_space(13_470, 1_992, 3, 9_831, 6, None);
         assert_eq!(at3.gpu_start(true, 1024), glay(2, 3, 2, 1152));
+        // the floor of two workers (`CUDA_CREW_MIN_WORKERS`): both plans hold two
+        let (mut f2, mut f3) = (at2.clone(), at3.clone());
+        f2.cuda_crew_floor();
+        f3.cuda_crew_floor();
+        assert_eq!((f2.workers_min, f2.workers_max, f3.workers_min, f3.workers_max), (2, 3, 2, 3));
+        // a memory plan that holds one worker only: no floor
+        let mut tight = dml_space(4_000, 1_992, 3, 9_831, 6, None);
+        tight.cuda_crew_floor();
+        assert_eq!(tight.workers_min, 1);
         // 0.3.15's start on the same plans, for the record
         let old = |c| Space::new_gpu(6, None, 3, crate::rolling::gpu_target(crate::rolling::Inflight::Auto, 1024), false, Some((13_470, crate::rolling::MemCost { base_mb: 1_992, per_game_mb: c })), Some((9_831, crate::rolling::GPU_VRAM))).gpu_start(true, 1024);
         assert_eq!((old(2), old(3)), (glay(3, 2, 2, 704), glay(3, 2, 2, 608)));

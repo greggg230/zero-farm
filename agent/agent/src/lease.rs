@@ -1440,11 +1440,15 @@ impl Engine {
         let max_workers = tune::MAX_WORKERS.min(p.cores.max(1));
         let run_n = matches!(setup.gpu, crate::rolling::Inflight::N(_));
         let vram_plan = vram.map(|v| (v.budget_mb, v.cost));
-        let space = if crew {
+        let mut space = if crew {
             tune::Space::new_dml(threads, set, max_workers, target, run_n, Some(mem), vram_plan)
         } else {
             tune::Space::new_gpu(threads, set, max_workers, target, run_n, Some(mem), vram_plan)
         };
+        // (agent 0.3.16: an NVIDIA CUDA crew whose memory holds two workers never tries one - `tune::CUDA_CREW_MIN_WORKERS`)
+        if crew && !dml && set.is_none() {
+            space.cuda_crew_floor();
+        }
         let run = lease.run.clone().unwrap_or_default();
         let luid = choice.gpu.get("luid").and_then(Value::as_str).unwrap_or("");
         let g = p.gpus.iter().find(|g| g.luid.as_deref().is_some_and(|l| l.eq_ignore_ascii_case(luid))).cloned().unwrap_or_default();
