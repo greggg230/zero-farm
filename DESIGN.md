@@ -466,6 +466,11 @@ a replay-to-rows function in Rust (`new_game` → `step` → `encode`) the train
 A per-game equivalence test pins it: for N self-play games, shard rows written directly ==
 rows rebuilt from their records, bit for bit.
 
+**Branch games** (2026-11-21, PROTOCOL 16): a run that branches its self-play games (zero-core `selfplay_branch`)
+gets `records/2` files - a branch is one more line under its game's id, carrying the game's moves to the branch
+point, in the game's file - so the coordinator, which credits ids, needs no change, and the trainer replays a branch
+with its game's record.
+
 ## 7. Trainer side (zero-core)
 
 A new remote kind `pool:<run>` in zero-core's remote self-play, on top of `feat/multi-remote`

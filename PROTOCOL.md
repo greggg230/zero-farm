@@ -2469,7 +2469,43 @@ Checked against agents 0.3.10 (the macOS stable of before 2026-11-21), 0.3.13 an
 `give_back` → `stop`, `on_extend` `finish` → `roll_finish`, `finish()` for the fuzz final result), `engine.rs` (a new
 `/v1/lease` right after any lease ends; `wait_s` honoured up to `max_wait`).
 
+## 16. Branch games in self-play records (`records/2`; no wire change, no migration, no agent change)
+
+**Why.** A run may branch its self-play games (zero-core `selfplay_branch`, its docs/az.md 24 and 72): a share of the
+games each spawn a second game from a copy of their state at one of their decisions - the near-tie rule (72) at a
+decision the search could not separate from a credible runner-up, the branch playing that runner-up. Before this a
+worker refused the setting, so such a run's self-play could not use the farm. A branch game has no game id of its own:
+it is the second game of its game's id.
+
+**The records file** (rev 8's format, 5 above) of a job with branched games says `"records": 2` in its header (a job
+without them writes `"records": 1`, byte for byte as before). A branch game is one more line under its game's `gid`,
+with its game's seed, **every real move from the game's start** - its game's first `branch.from` moves, then its own
+(a near-tie branch's first own move is its runner-up `branch.alt`) - and a `branch` block (`from`, where it branched,
+its deviation moves, `alt`, `merged`). A near-tie branch that reached a state equivalent to one of its game's later
+ones ended there (`merged`: its decisions after the deviation); its `result` and `margin` are its game's. The worker
+writes **a game and its branch into the same file, the game first**: it cuts no file between them (by size or by
+`flush_s`); only the job's end writes a game whose branch never came. The file's `games` counts lines (branches
+included); `gids` and `x-ids` list each game id once.
+
+**Crediting.** Unchanged, and the reason nothing else changes: the coordinator credits ids. An id is credited to the
+first chunk that reports it, so a game and its branch - one id, one file - are credited together, once; a later copy
+of the id (a re-issued lease's) is a duplicate whole, its branch line with it (`dup_ids`: the trainer skips every line
+of those ids). A lease's measured rate and `fin` count ids. **The trainer** replays a branch with its game's record
+from the same chunk (zero-core `replay_branch`: the shared moves checked against the game's, a merged branch's
+borrowed outcome against the game's and its last state against the game's later states) and refuses the chunk if a
+branch comes without its game or in a `records/1` file. It counts each accepted game, a branch included, as one of the
+iteration's games, so its `accept` total (4) can exceed the ids it was credited, and the quota stops on that total:
+`headroom` may read below 0. Test: coordinator `test/branch_records.test.ts`.
+
+**Builds.** Only a worker build that classifies `selfplay_branch` as a play setting (zero-core with records/2) passes
+the run's `check-config`; an older build refuses the setting, and the pool refuses the run at its start (zero-core
+docs/az.md 70), never plays it without branches.
+
 ## Changes
+- No rev (2026-11-21; no wire change, no migration, no agent change; zero-core `feat/neartie-branches`): **branch games
+  in self-play records** (16): a worker build of a run with `selfplay_branch` writes `"records": 2` files holding each
+  branch game under its game's id, in its game's file; the coordinator credits ids as before (a game and its branch
+  once, a later copy a duplicate whole); the trainer counts branches as games in `accept`.
 - v1 rev 24 (2026-11-21; coordinator only, every agent version; no migration; owner setting `priority_lane`, default
   `"canary"`): **the priority lane** (section 15). While a run's eval batch with unissued ids comes first for a machine,
   a fuzz lease's next beat answers `give_back` (not within 120 s of its end) and a rolling self-play lease's next
