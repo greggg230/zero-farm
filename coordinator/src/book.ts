@@ -35,6 +35,7 @@ import {
 } from "./definitions";
 import { intersect, normalize, parseRanges, subtract, total, type Range } from "./ranges";
 import { storedPlatform } from "./platform";
+import { runFresh } from "./fresh";
 import { type Alternate, type CampaignAlternate, type GpuMode, type Provider, YIELD_PREFIX, requiresRuntimeOf, yieldTarget } from "./routing";
 import {
   HttpError,
@@ -585,6 +586,9 @@ export interface GrantReq {
   // Rev 15 (PROTOCOL 10.2): the agent takes rolling leases (ROLLING_AGENT or newer, `features: ["rolling"]`): a
   // self-play lease of a run with `selfplay.rolling` set is then rolling. Ignored for every other lease.
   rolling?: boolean;
+  // Rev 26 (PROTOCOL 18): the agent is sent the run's freshness budget (FRESH_AGENT or newer, a machine the owner's
+  // `fresh_cap` names): a rolling lease carries `fresh_s` when the run has one.
+  fresh?: boolean;
 }
 
 // Rev 15 (PROTOCOL 10.3): what a rolling lease adds.
@@ -594,6 +598,7 @@ export interface RollingLease {
   until: number;
   max_s: number;
   flush_s: number;
+  fresh_s?: number; // rev 26 (PROTOCOL 18): the run's freshness budget (seconds a game may last); absent: none
 }
 
 export interface Lease {
@@ -754,12 +759,15 @@ async function grantRunGames(env: Env, req: GrantReq): Promise<Lease | null> {
       const cnt = (x: "auto" | number) => (x === "auto" ? ROLLING_AUTO_INFLIGHT : x);
       relHiAt = range[0] + Math.min(st.headroom, range[1] - range[0], Math.max(cnt(r.inflight), cnt(r.gpu_inflight)));
       stmts.push(db.prepare(`UPDATE runs SET next_gid = ? WHERE run = ? AND next_gid = ?`).bind(range[1], run.run, run.next_gid));
+      // Rev 26 (PROTOCOL 18): the run's freshness budget, for an agent that is sent it
+      const fresh = req.fresh ? await runFresh(db, run.run, sp, req.now) : null;
       rolling = {
         block: [range[0], range[1]],
         inflight: { cpu: r.inflight, gpu: r.gpu_inflight },
         until: req.now + r.max_s,
         max_s: r.max_s,
         flush_s: r.flush_s,
+        ...(fresh !== null ? { fresh_s: fresh } : {}),
       };
     } else {
       const took = await poolTake(db, scope, pool, n);
