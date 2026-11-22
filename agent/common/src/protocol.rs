@@ -178,6 +178,24 @@ pub struct Rolling {
     /// The longest a finished game waits in the worker before it is uploaded.
     #[serde(default)]
     pub flush_s: u64,
+    /// rev 26 (PROTOCOL 18): the run's freshness budget - the seconds a game may last for its rows to reach the trainer
+    /// within the run's staleness window; the agent caps the job's games in flight at about its completed-games rate x
+    /// this (`fresh.rs`). Absent (or anything but a positive integer): none, the agent's choice as before.
+    #[serde(default, deserialize_with = "fresh_value", skip_serializing_if = "Option::is_none")]
+    pub fresh_s: Option<u64>,
+}
+
+/// rev 26 (PROTOCOL 18): a freshness budget as given - a positive integer, else none (lenient: a value the agent can't use
+/// never caps anything).
+fn fresh_value<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<u64>, D::Error> {
+    Ok(Value::deserialize(d)?.as_u64().filter(|&n| n > 0))
+}
+
+/// rev 26 (PROTOCOL 18.2): the budget in a beat or extension answer: absent (`None`, an older coordinator or a machine
+/// not sent one): unchanged; `null` or anything but a positive integer: `Some(None)`, no budget any more; a number:
+/// `Some(Some(n))`.
+fn fresh_update<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Option<u64>>, D::Error> {
+    Ok(Some(Value::deserialize(d)?.as_u64().filter(|&n| n > 0)))
 }
 
 /// The run's games in flight for a CPU and a GPU job: a number (1 to 4,096) or `"auto"` (the agent's choice).
@@ -206,6 +224,9 @@ pub struct ExtendResp {
     pub finish: bool,
     #[serde(default)]
     pub reason: Option<String>,
+    /// rev 26 (PROTOCOL 18.2): the run's freshness budget now (`fresh_update`: absent - unchanged; null - none).
+    #[serde(default, deserialize_with = "fresh_update", skip_serializing_if = "Option::is_none")]
+    pub fresh_s: Option<Option<u64>>,
 }
 
 /// rev 6 (PROTOCOL 7): where a lease's signed definition is (`defs/<kind>/<id>/<version>/
@@ -307,6 +328,9 @@ pub struct BeatResp {
     pub definition: Option<DefinitionRef>,
     #[serde(default)]
     pub upload_diag: Option<Vec<String>>,
+    /// rev 26 (PROTOCOL 18.2): a rolling lease's freshness budget now (`fresh_update`: absent - unchanged; null - none).
+    #[serde(default, deserialize_with = "fresh_update")]
+    pub fresh_s: Option<Option<u64>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -477,6 +501,16 @@ mod tests {
         assert!(serde_json::from_str::<Lease>(&serde_json::to_string(&e_classic()).unwrap()).unwrap().rolling.is_none());
         let x: ExtendResp = serde_json::from_str(r#"{"games": 40, "wait_s": 60, "reason": "quota"}"#).unwrap();
         assert_eq!((x.games, x.wait_s, x.finish), (40, Some(60), false));
+        // rev 26 (PROTOCOL 18): the freshness budget - absent: none / unchanged; null or junk: none; a positive integer
+        assert_eq!((ro.fresh_s, x.fresh_s), (None, None));
+        let f = |j: &str| serde_json::from_str::<ExtendResp>(&format!(r#"{{"games": 1, "fresh_s": {j}}}"#)).unwrap().fresh_s;
+        assert_eq!((f("270"), f("null"), f("0"), f("-5"), f("1.5"), f("\"x\"")), (Some(Some(270)), Some(None), Some(None), Some(None), Some(None), Some(None)));
+        let b: BeatResp = serde_json::from_str(r#"{"action": "continue", "fresh_s": 157}"#).unwrap();
+        assert_eq!(b.fresh_s, Some(Some(157)));
+        assert_eq!(serde_json::from_str::<BeatResp>(r#"{"action": "continue"}"#).unwrap().fresh_s, None);
+        let rl: Rolling = serde_json::from_str(r#"{"block": [0, 10], "fresh_s": 292}"#).unwrap();
+        assert_eq!(rl.fresh_s, Some(292));
+        assert_eq!(serde_json::from_str::<Rolling>(r#"{"block": [0, 10], "fresh_s": "soon"}"#).unwrap().fresh_s, None);
         let b = serde_json::to_value(BeatReq { state: "running".into(), progress: Progress::default(), stats: Stats::new(), gen: None }).unwrap();
         assert!(b.get("gen").is_none(), "classic beats are unchanged");
         let c = CrashReq { kind: "blocked".into(), os_error: Some(4551), ..Default::default() };

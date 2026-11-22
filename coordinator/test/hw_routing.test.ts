@@ -313,7 +313,7 @@ describe("rolling self-play and hardware routing (rev 18)", () => {
 
 describe("GET/POST /v1/admin/routing (rev 18)", () => {
   // (rev 24, PROTOCOL 15.6: `priority_lane` and `eval_stall_s` ride along; their own checks are in priority_lane.test.ts)
-  const LANE = { priority_lane: "canary", eval_stall_s: 180 };
+  const LANE = { priority_lane: "canary", eval_stall_s: 180, fresh_cap: "canary" }; // rev 24; rev 26: fresh_cap
   it("defaults, partial updates, validation", async () => {
     expect(ok(await admin("GET", "/v1/admin/routing"))).toEqual({ on: true, eval_horizon_s: 1800, eval_games_per_thread: 2, ...LANE, stored: false });
     expect(ok(await routing({ eval_horizon_s: 900 }))).toEqual({ ok: true, on: true, eval_horizon_s: 900, eval_games_per_thread: 2, ...LANE });

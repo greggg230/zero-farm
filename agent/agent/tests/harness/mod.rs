@@ -103,6 +103,7 @@ pub fn fast_timings() -> Timings {
         tune_handoff_window: Duration::from_secs(3),
         early_calibration: Duration::from_millis(500),
         drain_tail: Duration::from_secs(1),
+        fresh_window: Duration::from_secs(2),
     }
 }
 

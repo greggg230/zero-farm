@@ -16,6 +16,16 @@ version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's:
   while Zero Farm is not running. Nothing changes on friends' computers: the setting is off unless set, and their own
   settings keep their limits (except that a fixed number of job programs may now be up to 8).
 
+## Unreleased (0.3.17)
+
+- **Fewer games at once where too many would arrive too late to count.** The training program only keeps a game's
+  positions while the network that played them is a few versions old, so a game that takes longer than about 5-10
+  minutes loses its first positions. Zero Farm used to raise the number of games a computer plays at once as far as it
+  made the computer faster, which on some computers made every game take 10-25 minutes, and up to 72 % of their
+  positions were thrown away. When the server says how long a game may take for a run, Zero Farm now measures how many
+  games the computer finishes per second and plays no more games at once than finish within that time (never fewer than
+  enough to keep the graphics card or processor busy). A computer whose games already finish in time is unchanged.
+
 ## Unreleased (0.3.16)
 
 - **More games at once on NVIDIA graphics cards, and no more costly layout trials there.** On a computer with an NVIDIA
