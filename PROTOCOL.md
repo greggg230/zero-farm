@@ -2564,36 +2564,55 @@ Worked out per run, never per machine, from the run's checkpoint registrations (
   D1 with the lease's Stats). Admin: `GET /v1/admin/run/{run}` adds `fresh_s` (the run's budget now, whoever is sent it;
   null: none).
 
-### 18.3 The agent (0.3.17)
+### 18.3 The agent (0.3.17; the estimator of 0.3.18)
 
 - **The cap.** A rolling lease's job with a tuned layout (13.1: every GPU job, a CPU job whose worker counts) caps its
-  games in flight in all - every worker's, 13.5 - at `max(floor, rate x fresh_s)`:
-  - `rate`: the lease's own completed games per running second (every worker's `fin`s; paused, starved and slept time
-    left out) over the last 300 s of running time, or a longer window up to 1,800 s until it holds 16 finished games (a
-    CPU laptop's 32 games in flight at ~20 minutes a game finish ~8 in 5 minutes); measured only from once a whole
-    turnover of the layout finished (as many games as it keeps in flight): a fresh worker starts every game at once, so its
-    first game length finishes few games and would read as a slow rate. No rate yet: no cap yet (13.1's start).
+  games in flight in all - every worker's, 13.5 - at `max(floor, fresh_s x leaves/s / leaves per game)`. A worker
+  searches one leaf per game in flight per batch, so its games share its leaves equally and a game ends once it has had
+  its own number of leaves (its moves x the run's simulations - the run's, not the machine's): a game lasts
+  `leaves per game x games in flight / leaves per second`, and the cap is that latency set to `fresh_s` (Little's law,
+  the completion rate written as leaves/s / leaves per game). Neither needs a steady state:
+  - **leaves per game**, at the p75 game: from each worker's **first wave** - a fresh worker starts its games in flight
+    at once, and each of them has had `x` = the sum over its statuses of (new leaves / games in flight) leaves; once 75 %
+    of that many games finished, `x` is the p75 game's leaves. The leaves are shared equally while it drains after
+    `finish` too, so a lease that ends before its first waves do (a ~9-minute lease, then a ~7-minute drain) still gives a
+    sample per worker. Workers under 16 games in flight give none.
+  - **leaves/s**: the lease's workers' leaves (their statuses' increments) over the last 300 s of running time while it
+    plays new games (paused, starved, slept, finishing and handing-over time left out).
+  - No leaves per game or no leaves/s yet: no cap yet (13.1's start). Agent 0.3.17 used completed games over 300 s, only
+    once a whole turnover of the layout had finished: on runs whose leases last ~9 minutes plus a ~7-minute drain it never
+    measured (a canary 4070 Ti PC, 2026-11-22: three leases, no cap, 20-23 % of its rows stale).
   - `floor`: 128 games in flight on a GPU (two batches of 64 rows), 16 on the CPU (two groups of the Windows tuner's
     smallest batch); and a capped crew runs fewer workers rather than workers of fewer than 64 (GPU) / 8 (CPU) games each,
     never fewer than its bounds' least (a CUDA crew's two, 13.1; the owner's fixed `workers`). Low enough to bind on a
     fast CUDA crew: 3 x 1,152 at ~5.6 games a second comes down to ~880 at a 157 s budget.
   - Each worker gets its share of the cap; a GPU worker's groups are the rule's for its games (two once each keeps 256
     rows), a CPU worker keeps its groups where its batches allow (as where the memory plan cuts its games, 10.6).
-- **Re-evaluated** at every tick as the budget and the rate change, with hysteresis: a new cap replaces the running one
-  only when it differs from it by more than 15 %; after a change that moves the layout wanted, the next decision waits for
-  a turnover of that layout. A budget that goes (`null`) removes the cap.
+- **Remembered** (agent 0.3.18), per run, worker build, runtime pack and provider (`state\rolling_fresh.json`, key
+  `<run>/<build_id>/<runtime build_id or ->/<provider>`): the leaves per game samples (the median of the last 8 is
+  planned with) and the leaves/s with the games in flight it was measured at (written at most once a minute). Only leases
+  with a budget learn.
+- **A lease starts AT the cap** (agent 0.3.18): under its budget, a key with both remembered starts its layout capped at
+  `fresh_s` x the remembered leaves/s / leaves per game - no handoff down, which would end games - and corrects the cap
+  with its own leaves/s once measured. So on short leases the cap binds from the second lease of a run on this PC (the
+  first lease learns from its drain). The remembered leaves/s was measured at the layout of then: where the cap cuts the
+  games in flight a lot, the GPU plays fewer leaves/s, and the lease's own measurement may lower the cap once more.
+- **Re-evaluated** at every tick as the budget, the leaves/s and the leaves per game change, with hysteresis: a new cap
+  replaces the running one only when it differs from it by more than 15 %; after a change that moves the layout wanted,
+  the next decision waits for a new 300-s leaves/s window. A budget that goes (`null`) removes the cap.
 - **Within the tuner.** The cap bounds the tuner's space (13.1): no layout over it is planned, tried or handed over to,
   and no trial starts while it holds the incumbent back (every candidate would be cut to it). A running layout over the
   cap is handed over to the capped one by 13.2's handoff (one drain at a time, at most 6 an hour, never while the lease is
   short of ids; the old workers finish their games in flight, a drain past `drain_tail` ends its last ones as in 13.2) - a
   fixed layout's too (`autotune` off, CUDA crews), which is otherwise handed over only to more games (10.6). When the cap
   rises or goes, the layout wanted grows back the same way.
-- **Never remembered.** The cap is the lease's (its run's pace, its own rate): tuning entries (13.3) are bound to and
-  compare their layouts in the space without it, so a capped layout's measurements are its own and the next lease starts
-  from the remembered layout, capped again once it has measured its own rate. Reports (13.4) carry the uncapped incumbent.
-- **Log:** one line per decision - `freshness: games may last S s and the lease finishes R games/s: at most N games in
-  flight - capping the job at <layout> (M games in flight without the cap)` (or `not binding`), and one when the budget
-  goes.
+- **Not in the tuning entries.** Tuning entries (13.3) are bound to and compare their layouts in the space without the
+  cap, so a capped layout's measurements are its own; the cap's inputs live in their own file (above). Reports (13.4)
+  carry the uncapped incumbent.
+- **Log:** one line per decision - `freshness: games may last S s; the lease plays R leaves/s and a game takes P leaves
+  (p75): at most N games in flight - capping the job at <layout> (M games in flight without the cap)` (or `not binding`),
+  one at a lease's start from what is remembered (`... starting at most N games in flight - <layout>`), one per first-wave
+  sample, and one when the budget goes.
 - **No budget** (a coordinator before rev 26, a machine the owner's setting leaves out, a run with too little history): no
   cap, exactly as before. A rolling job without a tuned layout is never capped.
 
@@ -2609,6 +2628,13 @@ per-machine stale counters (zero-core `farm_pool` `by_machine`, its docs/az.md 5
 dropped as stale, before and after.
 
 ## Changes
+- v1 rev 26, agent 0.3.18 (2026-11-22; no wire change, no coordinator change): **the freshness cap on short leases**
+  (18.3). The cap is `fresh_s` x the lease's leaves/s / the p75 game's leaves, the latter from each worker's first wave
+  (leaves per game in flight summed over its statuses until 75 % of its first games finished - also through a drain),
+  both remembered per run, worker build, runtime and provider (`state\rolling_fresh.json`); a lease of a key with both
+  remembered starts at the capped layout. Why: 0.3.17's estimator (completed games over 300 s after a whole turnover)
+  never measured on runs whose leases last ~9 minutes plus a ~7-minute drain - a canary 4070 Ti PC ran three leases
+  without a cap, 20-23 % of its rows stale.
 - v1 rev 26, agent 0.3.17 (2026-11-22; coordinator: no migration, Worker var `FRESH_AGENT` default 0.3.17, owner setting
   `fresh_cap` default `"canary"`): **the freshness budget** (section 18). A rolling lease carries `rolling.fresh_s` - from
   the run's pace, floor(0.75 x (`max_stale` + 1) x the median gap of its last 9 checkpoint registrations - `flush_s` -
