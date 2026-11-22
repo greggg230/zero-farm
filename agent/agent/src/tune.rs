@@ -88,24 +88,20 @@ pub const CUDA_CREW_TUNER_VERSION: u32 = 5;
 /// Worker processes a lease's job may run (searched and set) at most; a hint or a report may say up to `MAX_WORKERS_JSON`.
 pub const MAX_WORKERS: u32 = 3;
 pub const MAX_WORKERS_JSON: u32 = 8;
-/// PROTOCOL 13.6 (the owner machine): the owner's fixed `workers` may be up to this many (before: `MAX_WORKERS`), and an
-/// owner machine's GPU crew rule (`Settings::owner`) chooses up to this many where the cores, the memory and the video
-/// memory hold them. Friends' automatic worker counts stay within `MAX_WORKERS`.
+/// PROTOCOL 13.6 (the owner machine): the owner's fixed `workers` may be up to this many (before: `MAX_WORKERS`). Friends'
+/// automatic worker counts stay within `MAX_WORKERS`; an owner machine's GPU job chooses one by itself (`gpu_max_workers`).
 pub const MAX_SET_WORKERS: u32 = MAX_WORKERS_JSON;
-/// PROTOCOL 13.6: an owner machine's GPU crew has at most one worker per this many physical cores (the 4070 Ti PC's
-/// measured best was 3 workers on 4 cores at 1.5 search threads per core shared, ~2 search threads a worker; a 24-core
-/// PC: 8).
-pub const OWNER_CORES_PER_GPU_WORKER: u32 = 3;
 
 /// PROTOCOL 13.6: the most workers a GPU job's crew may choose by itself on a machine with `cores` physical cores: friends'
-/// `MAX_WORKERS` (and one per core), an owner machine's up to `MAX_SET_WORKERS` (one per `OWNER_CORES_PER_GPU_WORKER`
-/// cores, at least `MAX_WORKERS` where the cores allow).
+/// `MAX_WORKERS` (and one per core); an owner machine's one - separate worker processes on one GPU time-slice it on
+/// Windows and don't overlap (the owner's desktop GPU, 2026-11-22: 3 processes 33.5k rows/s at 90 % GPU use against 1
+/// process with 3 sessions 42.9k), so its crew is the owner's fixed `workers` or none. (Unreleased drafts chose up to
+/// `MAX_SET_WORKERS`, one per 3 physical cores.)
 pub fn gpu_max_workers(cores: u32, owner: bool) -> u32 {
-    let cores = cores.max(1);
     if owner {
-        (cores / OWNER_CORES_PER_GPU_WORKER).max(MAX_WORKERS.min(cores)).clamp(1, MAX_SET_WORKERS)
+        1
     } else {
-        MAX_WORKERS.min(cores)
+        MAX_WORKERS.min(cores.max(1))
     }
 }
 /// N > 1 workers share this many times the cores per kind of thread (search, inference): per worker
@@ -2752,11 +2748,11 @@ mod tests {
     }
 
     /// PROTOCOL 13.6: the workers a GPU job's crew may choose by itself - friends' PCs as before (at most 3, one per core),
-    /// an owner machine up to 8, one per 3 physical cores.
+    /// an owner machine one (a fixed `workers` up to 8 stays possible).
     #[test]
-    fn an_owner_machines_crew_may_have_up_to_eight_workers_friends_three() {
-        for (cores, friend, owner) in [(1, 1, 1), (2, 2, 2), (4, 3, 3), (8, 3, 3), (12, 3, 4), (16, 3, 5), (24, 3, 8), (64, 3, 8)] {
-            assert_eq!((gpu_max_workers(cores, false), gpu_max_workers(cores, true)), (friend, owner), "{cores} cores");
+    fn an_owner_machines_gpu_job_chooses_one_worker_friends_three() {
+        for (cores, friend) in [(1, 1), (2, 2), (4, 3), (8, 3), (12, 3), (24, 3), (64, 3)] {
+            assert_eq!((gpu_max_workers(cores, false), gpu_max_workers(cores, true)), (friend, 1), "{cores} cores");
         }
         assert_eq!(MAX_SET_WORKERS, 8);
     }
@@ -2773,31 +2769,21 @@ mod tests {
         s
     }
 
-    /// PROTOCOL 13.6: an owner machine's CUDA crew rule chooses more than 3 workers when the cores and memory allow - each
-    /// with DirectML's 1,152 games in flight in two groups, down to 768 where the memory plans hold less, then a worker
-    /// fewer -, the search threads shared; a friend's PC with the same hardware keeps 3 x 1,152.
+    /// PROTOCOL 13.6: an owner machine's CUDA job chooses no crew by itself - one worker of DirectML's 1,152 games in flight
+    /// in two groups, all the search threads -; a friend's PC with the same hardware keeps 3 x 1,152.
     #[test]
-    fn an_owner_machines_cuda_crew_chooses_up_to_eight_workers() {
-        // room for everything: 8 x 1,152 (9,216 games in flight in all, over one worker's 4,096), 4 search threads each
+    fn an_owner_machines_cuda_job_chooses_one_worker() {
         let roomy = desktop_space(100_000, 2, 30_000, true);
-        assert_eq!((roomy.workers_min, roomy.workers_max, roomy.target), (2, 8, 9216));
-        let l = roomy.gpu_start(true, 512);
-        assert_eq!(l, glay(8, 4, 2, 1152));
-        assert_eq!(l.total_conc(), 9216);
+        assert_eq!((roomy.workers_min, roomy.workers_max), (1, 1));
+        assert_eq!(roomy.gpu_start(true, 512), glay(1, 32, 2, 1152));
         // a friend's PC: as before
         let friend = desktop_space(100_000, 2, 30_000, false);
         assert_eq!((friend.workers_max, friend.target), (3, 3456));
         assert_eq!(friend.gpu_start(true, 512), glay(3, 10, 2, 1152));
-        // a 32 GB GPU with 12 GB kept for the trainer (85 % of 32,607 MB less 12,288: 15,427 MB) at the default 1 GB + 2 MB a
-        // row: 8 workers' batches hold 452 rows - 8 x 904, two groups of 452 (each over 768)
+        // a 32 GB GPU with 12 GB kept for the trainer (85 % of 32,607 MB less 12,288: 15,427 MB): one worker still
         let budget = crate::rolling::vram_budget_kept(32_607, 1_500, 12_288);
         assert_eq!(budget, 15_427);
-        assert_eq!(desktop_space(100_000, 2, budget, true).gpu_start(true, 512), glay(8, 4, 2, 904));
-        // the memory plan short (40 GB at 3 MB a game: 752 games each for 8, 955 for 7): fewer games each first, then a
-        // worker fewer - 7 x 955 (the video memory holds 2 x 589 rows each for 7)
-        assert_eq!(desktop_space(40_000, 3, budget, true).gpu_start(true, 512), glay(7, 4, 2, 955));
-        // a 4-core owner box is a friend's 4070 Ti crew: 3 at most
-        assert_eq!(gpu_max_workers(4, true), 3);
+        assert_eq!(desktop_space(100_000, 2, budget, true).gpu_start(true, 512).workers, 1);
     }
 
     /// PROTOCOL 13.6: the owner's fixed GPU layout (`autotune` off: `workers`, `worker_inflight`, `worker_groups`,

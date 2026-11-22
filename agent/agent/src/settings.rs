@@ -84,8 +84,9 @@ pub struct Settings {
     /// owner at the keyboard don't hold it back), no GPU busy gate (the trainer's own GPU use doesn't yield the workers;
     /// the temperature rule stays), workers at normal priority without EcoQoS, the idle memory floor (an eighth of RAM,
     /// at least 4 GB) whether the PC is in use or not, a job memory cap of three quarters of the RAM unless `max_ram_mb`
-    /// is set, a GPU crew of up to `tune::MAX_SET_WORKERS` workers, and `OWNER_GPU_RESERVE_MB` of video memory kept for
-    /// the trainer unless `gpu_reserve_mb` is set. Written to `machine.json` only when on. Never set on friends' PCs.
+    /// is set, one GPU worker process unless `workers` is set (several processes on one GPU take turns on it; a fixed
+    /// crew of up to `tune::MAX_SET_WORKERS` stays possible), and `OWNER_GPU_RESERVE_MB` of video memory kept for the
+    /// trainer unless `gpu_reserve_mb` is set. Written to `machine.json` only when on. Never set on friends' PCs.
     #[serde(skip_serializing_if = "is_false")]
     pub owner: bool,
     /// PROTOCOL 13.6: video memory (MB) kept for other programs on a GPU job's adapter - the trainer's peak and the
