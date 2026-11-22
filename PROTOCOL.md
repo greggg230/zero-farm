@@ -2600,8 +2600,11 @@ Worked out per run, never per machine, from the run's checkpoint registrations (
 ### 18.4 The owner's setting (canary first)
 
 `fresh_cap` in the hardware-routing setting (12, `POST /v1/admin/routing`; `scripts/admin.ts routing '{"fresh_cap":
-"all"}'`): `"off"` - no budget sent to anyone (exactly as before rev 26); `"canary"` (default) - machines of the canary channel
-only; `"all"` - every machine. Agents before `FRESH_AGENT` are never sent it. The yardstick for widening it is the pool's
+"all"}'`): `"off"` - no budget sent to anyone; `"canary"` (default) - machines of the canary channel
+only; `"all"` - every machine. Agents before `FRESH_AGENT` are never sent it and their answers keep exactly the keys of
+before. An agent from `FRESH_AGENT` that the setting leaves out gets `fresh_s: null` in its rolling leases' beat and
+extension answers (none in a new lease's `rolling`), so setting `"off"` - the kill switch - or moving a machine off
+canary lifts a cap it already holds at its next answer. The yardstick for widening it is the pool's
 per-machine stale counters (zero-core `farm_pool` `by_machine`, its docs/az.md 54.8): each machine's share of its rows
 dropped as stale, before and after.
 

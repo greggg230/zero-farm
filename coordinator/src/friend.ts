@@ -1083,14 +1083,15 @@ function freshFor(freshAgent: string, agent: string | null, hw: HwRouting, m: Ma
   return !!agent && isSemver(agent) && cmpSemver(agent, freshAgent) >= 0 && freshApplies(hw, m.channel);
 }
 
-// A rolling self-play lease's freshness budget for the beat and extension answers: undefined when the machine isn't sent
-// one (the answer keeps exactly its keys of before); else the run's budget now (null: none - not active, not rolling, or
-// too little history).
+// A rolling self-play lease's freshness budget for the beat and extension answers: undefined for an agent before
+// FRESH_AGENT (the answer keeps exactly its keys of before); null for a newer agent the owner's `fresh_cap` leaves out
+// (so turning it off, or a machine moved off canary, lifts a cap the agent already holds - 18.4); else the run's
+// budget now (null: none - not active, not rolling, or too little history).
 async function leaseFresh(c: Ctx, m: MachineRow, run: string | null): Promise<number | null | undefined> {
   const agent = m.agent_version;
   // (the agent's version first: no read for an older agent)
   if (!run || !agent || !isSemver(agent) || cmpSemver(agent, config(c.env).freshAgent) < 0) return undefined;
-  if (!freshFor(config(c.env).freshAgent, agent, await hwSetting(c.env.DB), m)) return undefined;
+  if (!freshFor(config(c.env).freshAgent, agent, await hwSetting(c.env.DB), m)) return null;
   const r = await book.getRun(c.env.DB, run);
   const sp = r && r.state === "active" ? parseJson<book.SelfplayCfg | null>(r.selfplay, null) : null;
   return runFresh(c.env.DB, run, sp, c.now);

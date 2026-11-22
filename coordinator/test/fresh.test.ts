@@ -147,33 +147,33 @@ describe("rolling leases carry the budget (18.2)", () => {
     expect(ok(await admin("GET", "/v1/admin/run/young")).fresh_s).toBe(null);
   });
 
-  it("older agents, machines fresh_cap leaves out, and fresh_cap off get the answers of before", async () => {
+  it("older agents get the answers of before; newer ones fresh_cap leaves out (or off) get null, lifting a cap", async () => {
     await pacedRun("fr", 9, 120);
     const canary = await enroll("c", { channel: "canary" });
     const stable = await enroll("s");
     const keysOf = (x: any) => Object.keys(x).sort();
-    for (const [m, agent] of [
-      [canary, OLD],
-      [stable, FRESH],
-    ] as const) {
-      const l = await rollingLease(m, agent);
-      expect("fresh_s" in l.rolling).toBe(false);
-      const b = ok(await beatAs(m, l.lease_id, agent));
-      expect("fresh_s" in b).toBe(false);
-      expect(keysOf(b)).toEqual(["action", "checkpoint", "expires_at"]);
-      const x = ok(await extend(m, l.lease_id, agent));
-      expect("fresh_s" in x).toBe(false);
-    }
+    // an agent before FRESH_AGENT: exactly the keys of before
+    const lo = await rollingLease(canary, OLD);
+    expect("fresh_s" in lo.rolling).toBe(false);
+    const bo = ok(await beatAs(canary, lo.lease_id, OLD));
+    expect(keysOf(bo)).toEqual(["action", "checkpoint", "expires_at"]);
+    expect("fresh_s" in ok(await extend(canary, lo.lease_id, OLD))).toBe(false);
+    // a newer agent on a machine fresh_cap leaves out: no budget at grant, null in the answers
+    const ls = await rollingLease(stable, FRESH);
+    expect("fresh_s" in ls.rolling).toBe(false);
+    expect(ok(await beatAs(stable, ls.lease_id, FRESH)).fresh_s).toBe(null);
+    expect(ok(await extend(stable, ls.lease_id, FRESH)).fresh_s).toBe(null);
     // "all": a stable machine too
     ok(await routing({ fresh_cap: "all" }));
     const stable2 = await enroll("s2");
     const l = await rollingLease(stable2, FRESH);
     expect(l.rolling.fresh_s).toBe(270);
     expect(ok(await beatAs(stable2, l.lease_id, FRESH)).fresh_s).toBe(270);
-    // "off": nobody, the running lease's answers lose the key
+    // "off": nobody - the running lease's answers say null, so an agent holding a cap drops it (the kill switch)
     ok(await routing({ fresh_cap: "off" }));
-    expect("fresh_s" in ok(await beatAs(stable2, l.lease_id, FRESH))).toBe(false);
-    expect("fresh_s" in ok(await extend(stable2, l.lease_id, FRESH))).toBe(false);
+    expect(ok(await beatAs(stable2, l.lease_id, FRESH)).fresh_s).toBe(null);
+    expect(ok(await extend(stable2, l.lease_id, FRESH)).fresh_s).toBe(null);
+    expect("fresh_s" in ok(await beatAs(canary, lo.lease_id, OLD))).toBe(false);
   });
 
   it("is per run: two runs of different paces give their own budgets on the same machine", async () => {
