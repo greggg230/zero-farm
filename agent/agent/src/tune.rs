@@ -59,6 +59,20 @@ pub const GPU_TUNER_VERSION: u32 = 3;
 /// trials (discarded whenever the PC wasn't idle); their incumbents would keep a lease from ever starting the crew. Other
 /// GPU jobs' keys keep `GPU_TUNER_VERSION`.
 pub const DML_TUNER_VERSION: u32 = 4;
+/// agent 0.3.16: an NVIDIA GPU's CUDA job starts from the crew rule of DirectML's start (`Space::dml_start`, the target
+/// `rolling::dml_target`: up to 3 workers of `rolling::DML_CONC` games in flight in two groups, each down to
+/// `rolling::DML_MIN_CONC` where the memory plans hold less before the crew has a worker fewer) instead of the most workers
+/// sharing two of the bench's full batches. The farm's CUDA worker is bound by ONNX Runtime's host side (~1,200 kernels
+/// launched one by one a call, ~20 ms of a CPU thread whatever the batch), so each worker wants big batches, and more
+/// games in flight in all pay until a worker's evaluator thread is busy all the time. Measured on the 4070 Ti PC
+/// (4 cores / 8 threads, 2026-11-22, the released CUDA worker, the fp16 variant, leaves/s; the trainer's torch path
+/// 32.9k): 3 x 384 in one group 20.0k, 3 x 704 in two (0.3.15's start there) 23.5k, 3 x 912 26.4k, 3 x 1,150 28.1k,
+/// 2 x 1,244 (3 search threads each) 25.2k, 2 x 1,866 24.9k, 1 x 2,048 17.0k: with that PC's memory plan (1.99 GB a
+/// worker + 2-3 MB a game, 11.4 GB) the rule starts 3 x 912 at 2 MB a game and 2 x 1,152 at 3 MB, where 0.3.15 started
+/// 3 x 704 / 3 x 608 / 3 x 384 (the bench's batch 1,024 or 512).
+pub const CUDA_CREW: bool = true;
+/// agent 0.3.16: CUDA crews' keys (`CUDA_CREW`) searched again from their new start.
+pub const CUDA_CREW_TUNER_VERSION: u32 = 5;
 /// Worker processes a lease's job may run (searched and set) at most; a hint or a report may say up to `MAX_WORKERS_JSON`.
 pub const MAX_WORKERS: u32 = 3;
 pub const MAX_WORKERS_JSON: u32 = 8;
@@ -1243,7 +1257,7 @@ impl Cache {
 
     /// The coordinator's `tuning` (PROTOCOL 13): the most recently changed measured entries, at most `MAX_REPORTS`.
     pub fn reports(&self) -> Vec<Value> {
-        let mut es: Vec<&Entry> = self.entries.iter().filter(|e| [TUNER_VERSION, GPU_TUNER_VERSION, DML_TUNER_VERSION].contains(&e.key.tuner)).collect();
+        let mut es: Vec<&Entry> = self.entries.iter().filter(|e| [TUNER_VERSION, GPU_TUNER_VERSION, DML_TUNER_VERSION, CUDA_CREW_TUNER_VERSION].contains(&e.key.tuner)).collect();
         es.sort_by_key(|e| std::cmp::Reverse(e.t));
         es.iter().filter_map(|e| e.report()).take(MAX_REPORTS).collect()
     }
@@ -2145,6 +2159,22 @@ mod tests {
     /// agent 0.3.12 (PROTOCOL 13.1 **DirectML**): a DirectML job starts from DirectML's own layout on any vendor's GPU -
     /// three workers of 1,152 games in flight in two groups of 576 rows where the memory plans hold it (the 4070 Ti PC's
     /// measured best, 3 x 1,150: 12.0k leaves/s) -, never the one small worker 0.3.11 started a GPU other than NVIDIA's with.
+    /// agent 0.3.16 (`CUDA_CREW`): an NVIDIA GPU's CUDA job starts from DirectML's crew rule - on the 4070 Ti PC's memory
+    /// plan (a 13,470 MB limit, 1,992 MB a worker; 9,831 MB of video memory, 6 search threads) 3 x 912 at 2 MB a game
+    /// (measured 26.4k leaves/s; 0.3.15's start there 3 x 704, 23.5k) and 2 x 1,152 at 3 MB (2 x 1,244 measured 25.2k;
+    /// 0.3.15: 3 x 608), where 0.3.15's bench-shaped start shared two of the bench's 1,024-row batches by three workers.
+    #[test]
+    fn an_nvidia_cuda_job_starts_from_the_crew_rule() {
+        assert!(CUDA_CREW);
+        let at2 = dml_space(13_470, 1_992, 2, 9_831, 6, None);
+        assert_eq!(at2.gpu_start(true, 1024), glay(3, 2, 2, 912));
+        let at3 = dml_space(13_470, 1_992, 3, 9_831, 6, None);
+        assert_eq!(at3.gpu_start(true, 1024), glay(2, 3, 2, 1152));
+        // 0.3.15's start on the same plans, for the record
+        let old = |c| Space::new_gpu(6, None, 3, crate::rolling::gpu_target(crate::rolling::Inflight::Auto, 1024), false, Some((13_470, crate::rolling::MemCost { base_mb: 1_992, per_game_mb: c })), Some((9_831, crate::rolling::GPU_VRAM))).gpu_start(true, 1024);
+        assert_eq!((old(2), old(3)), (glay(3, 2, 2, 704), glay(3, 2, 2, 608)));
+    }
+
     #[test]
     fn a_directml_job_starts_from_directmls_crew_on_any_vendor() {
         // a 12 GB GPU, 4 cores (6 search threads), a 24,000 MB limit, 3 MB a game measured: 3 x 1,152, 2 search threads each

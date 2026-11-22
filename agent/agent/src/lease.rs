@@ -1425,7 +1425,12 @@ impl Engine {
         // (agent 0.3.12: a DirectML job, any vendor, targets DirectML's crew - up to 3 workers of 1,152 games in flight in
         // two groups, within the lease's block -, not two of the bench's full batches)
         let dml = provider == "dml";
-        let target = if dml { crate::rolling::dml_target(setup.gpu, setup.hi - setup.lo) } else { crate::rolling::gpu_target(setup.gpu, batch) };
+        // (agent 0.3.16: an NVIDIA GPU's CUDA job too - `tune::CUDA_CREW`: the crew rule of DirectML's start, 3 workers of
+        // 1,152 games in flight in two groups, fewer games each where the memory plan holds less, then fewer workers -
+        // not two of the bench's full batches shared by the most workers)
+        let nvidia_cuda = provider == "cuda" && choice.gpu.get("vendor").and_then(Value::as_str).is_some_and(|v| v.eq_ignore_ascii_case("nvidia"));
+        let crew = dml || (nvidia_cuda && tune::CUDA_CREW);
+        let target = if crew { crate::rolling::dml_target(setup.gpu, setup.hi - setup.lo) } else { crate::rolling::gpu_target(setup.gpu, batch) };
         // (no video memory plan: one worker; `autotune` off without the owner's count: one)
         let set = match (vram.is_some(), fixed) {
             (false, _) => Some(1),
@@ -1435,7 +1440,7 @@ impl Engine {
         let max_workers = tune::MAX_WORKERS.min(p.cores.max(1));
         let run_n = matches!(setup.gpu, crate::rolling::Inflight::N(_));
         let vram_plan = vram.map(|v| (v.budget_mb, v.cost));
-        let space = if dml {
+        let space = if crew {
             tune::Space::new_dml(threads, set, max_workers, target, run_n, Some(mem), vram_plan)
         } else {
             tune::Space::new_gpu(threads, set, max_workers, target, run_n, Some(mem), vram_plan)
@@ -1458,7 +1463,13 @@ impl Engine {
             },
             os: p.os.clone(),
             // (agent 0.3.12: DirectML's keys searched again from its own start)
-            tuner: if dml { tune::DML_TUNER_VERSION } else { tune::GPU_TUNER_VERSION },
+            tuner: if dml {
+                tune::DML_TUNER_VERSION
+            } else if crew {
+                tune::CUDA_CREW_TUNER_VERSION
+            } else {
+                tune::GPU_TUNER_VERSION
+            },
         };
         let now = zerofarm_common::now_unix();
         let start = space.gpu_start(g.vendor.eq_ignore_ascii_case("nvidia"), batch);
