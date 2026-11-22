@@ -76,6 +76,16 @@
 //! it) after the first unflushed one. A `checkpoint` is self-tested (`selftest` with `gen`: the file exists and
 //! matches the `sha256` the agent sent) before the switch. Without the feature `rolling` is ignored and `extend` is
 //! answered with a non-fatal `error`.
+//!
+//! **As the torch pack's python** (PROTOCOL 19; a copy named `python\python.exe` in a test runtime pack): started with
+//! interpreter flags first. `-I -B -X utf8 -c <code> ... --json FILE` is the agent's torch probe: it writes the pack's
+//! `python\torch_probe.json` (next to the exe) as the report - `{"exit": N}` there exits N without one, `{"hang": true}`
+//! never answers - else a report with no CUDA device. `-I -B -X utf8 -u <dir>\worker_main.py <args>` is a torch worker
+//! behind `zf-pyshim.exe`: it runs as the fakeworker with `<args>` (`serve`), its build directory being the script's (its
+//! `build_id`, `startup.json`). Either way one stderr line says what it got: `fakeworker: python <flags> script=<path>
+//! runtime_dir=<ZEROFARM_RUNTIME_DIR> cuda_visible_devices=<CUDA_VISIBLE_DEVICES>`. Other flags: exit 2.
+//! `<args>` = `shimtest exit N` (print the arguments and exit N), `shimtest echo` (copy one stdin line to stdout),
+//! `shimtest sleep FILE` (write the pid to FILE, then sleep a minute): zf-pyshim's own tests.
 
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
@@ -111,6 +121,78 @@ fn ui_limits() -> String {
     }
 }
 
+/// The worker build's directory: the exe's, or (as the torch pack's python, PROTOCOL 19) the script's.
+static HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+fn home() -> PathBuf {
+    HOME.get().cloned().unwrap_or_else(|| std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default())
+}
+
+/// PROTOCOL 19: the fakeworker started as the torch pack's python (flags first). Handles the probe (`-c`) and
+/// `shimtest` itself (exits); for a worker script returns the fakeworker's own arguments, its home set to the script's
+/// directory.
+fn python_mode(args: &[String]) -> Vec<String> {
+    let env = |k: &str| std::env::var(k).unwrap_or_default();
+    let c = args.iter().position(|a| a == "-c");
+    let flags_end = c.unwrap_or_else(|| args.iter().skip(1).position(|a| !a.starts_with('-') && a != "utf8").map_or(args.len(), |i| i + 1));
+    let flags = args[1..flags_end].join(" ");
+    let script = if c.is_some() { "<code>".to_string() } else { args.get(flags_end).cloned().unwrap_or_default() };
+    eprintln!(
+        "fakeworker: python {flags} script={script} runtime_dir={} cuda_visible_devices={}",
+        env("ZEROFARM_RUNTIME_DIR"),
+        env("CUDA_VISIBLE_DEVICES")
+    );
+    if let Some(c) = c {
+        if args[1..c] != ["-I", "-B", "-X", "utf8"] {
+            eprintln!("fakeworker: python: unexpected flags for the probe: {flags}");
+            std::process::exit(2);
+        }
+        let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default();
+        let report: Value = std::fs::read_to_string(exe_dir.join("torch_probe.json"))
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_else(|| json!({"probe": "torch/1", "python": "3.13.0", "torch": "2.11.0+cu128", "cuda": "12.8", "available": false, "devices": []}));
+        if report["hang"] == true {
+            std::thread::sleep(Duration::from_secs(600));
+        }
+        if let Some(n) = report["exit"].as_i64() {
+            std::process::exit(n as i32);
+        }
+        if let Some(i) = args.iter().position(|a| a == "--json") {
+            std::fs::write(&args[i + 1], report.to_string()).unwrap();
+        }
+        std::process::exit(0);
+    }
+    if args[1..flags_end] != ["-I", "-B", "-X", "utf8", "-u"] || script.is_empty() {
+        eprintln!("fakeworker: python: expected -I -B -X utf8 -u <script> <args>, got {flags} {script}");
+        std::process::exit(2);
+    }
+    let _ = HOME.set(Path::new(&script).parent().map(Path::to_path_buf).unwrap_or_default());
+    let rest: Vec<String> = std::iter::once(args[0].clone()).chain(args[flags_end + 1..].iter().cloned()).collect();
+    if rest.get(1).map(String::as_str) == Some("shimtest") {
+        match rest.get(2).map(String::as_str) {
+            Some("exit") => {
+                println!("{}", json!({"argv": args, "runtime_dir": env("ZEROFARM_RUNTIME_DIR"), "cwd": std::env::current_dir().unwrap_or_default()}));
+                std::process::exit(rest.get(3).and_then(|n| n.parse().ok()).unwrap_or(0));
+            }
+            Some("echo") => {
+                let mut line = String::new();
+                let _ = std::io::stdin().read_line(&mut line);
+                print!("{line}");
+                let _ = std::io::stdout().flush();
+                std::process::exit(0);
+            }
+            Some("sleep") => {
+                std::fs::write(rest.get(3).expect("sleep FILE"), std::process::id().to_string()).unwrap();
+                std::thread::sleep(Duration::from_secs(60));
+                std::process::exit(0);
+            }
+            _ => std::process::exit(64),
+        }
+    }
+    rest
+}
+
 struct Out;
 impl Out {
     fn send(&self, v: Value) {
@@ -121,8 +203,7 @@ impl Out {
 }
 
 fn build_id() -> String {
-    let exe = std::env::current_exe().unwrap_or_default();
-    let m = exe.parent().map(|d| d.join("manifest.json")).unwrap_or_default();
+    let m = home().join("manifest.json");
     match std::fs::read(&m) {
         Ok(b) => sha256_hex(&b)[..24].to_string(),
         Err(_) => "unknown".into(),
@@ -889,12 +970,16 @@ fake crash at game {gid:?}");
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().collect();
+    let mut args: Vec<String> = std::env::args().collect();
+    // PROTOCOL 19: as the torch pack's python behind zf-pyshim.exe (or the agent's torch probe)
+    if args.get(1).is_some_and(|a| a.starts_with('-')) {
+        args = python_mode(&args);
+    }
     // `probe-providers ... --json FILE` (PROTOCOL 8, 9.6): writes the build's `probe.json` (next to the exe) as the
     // report, else one where only the CPU passes; the arguments it got go to the log.
     if args.get(1).map(String::as_str) == Some("probe-providers") {
         eprintln!("fakeworker: probe-providers {}", args[2..].join(" "));
-        let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default();
+        let exe_dir = home();
         // with --model (a job's network: the bench), the build's `probe_model.json` when it has one
         let on_model = args.iter().any(|a| a == "--model") && exe_dir.join("probe_model.json").exists();
         let report = std::fs::read_to_string(exe_dir.join(if on_model { "probe_model.json" } else { "probe.json" })).unwrap_or_else(|_| {
@@ -914,7 +999,7 @@ fn main() {
         eprintln!("usage: fakeworker serve");
         std::process::exit(64);
     }
-    let exe_dir = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)).unwrap_or_default();
+    let exe_dir = home();
     if let Ok(s) = std::fs::read_to_string(exe_dir.join("startup.json")) {
         let v: Value = serde_json::from_str(&s).unwrap_or(json!({}));
         if let Some(ms) = v.get("hello_delay_ms").and_then(Value::as_u64) {

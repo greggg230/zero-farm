@@ -59,8 +59,11 @@ pub struct SpawnOpts<'a> {
     pub log: Arc<RotatingFile>,
     pub tag: String,
     /// A verified runtime pack directory: put first on the worker's DLL search path and passed
-    /// as `ZEROFARM_RUNTIME_DIR`.
+    /// as `ZEROFARM_RUNTIME_DIR` (absolute: the cache's own path). PROTOCOL 19: a torch worker build's `zf-pyshim.exe`
+    /// finds the pack's python there.
     pub runtime_dir: Option<&'a Path>,
+    /// PROTOCOL 19: more environment variables for the worker (a torch job's `CUDA_VISIBLE_DEVICES`).
+    pub env: &'a [(String, String)],
 }
 
 #[cfg(windows)]
@@ -197,6 +200,9 @@ impl WorkerProc {
             joined.push(path);
             cmd.env("PATH", joined).env("ZEROFARM_RUNTIME_DIR", rt);
         }
+        for (k, v) in opts.env {
+            cmd.env(k, v);
+        }
         let mut child = cmd
             .args(opts.args)
             .current_dir(opts.cwd)
@@ -236,8 +242,13 @@ impl WorkerProc {
         stdin.flush()
     }
 
+    /// Suspends the worker and every process it started (PROTOCOL 19: a torch worker's python behind `zf-pyshim.exe`
+    /// does the work, not the shim).
     pub fn suspend(&mut self) -> bool {
         let ok = nt_suspend(self.child.as_raw_handle() as HANDLE);
+        for h in self.others(windows_sys::Win32::System::Threading::PROCESS_SUSPEND_RESUME) {
+            nt_suspend(h.0);
+        }
         if ok {
             self.suspended = true;
         }
@@ -246,10 +257,57 @@ impl WorkerProc {
 
     pub fn resume(&mut self) -> bool {
         let ok = nt_resume(self.child.as_raw_handle() as HANDLE);
+        for h in self.others(windows_sys::Win32::System::Threading::PROCESS_SUSPEND_RESUME) {
+            nt_resume(h.0);
+        }
         if ok {
             self.suspended = false;
         }
         ok
+    }
+
+    /// PROTOCOL 19: the pids of every live process of the worker's job - the worker and anything it started (a torch
+    /// worker's python behind `zf-pyshim.exe`, whose GPU use and memory are the lease's). `[pid]` when Windows doesn't
+    /// say.
+    pub fn pids(&self) -> Vec<u32> {
+        use windows_sys::Win32::System::JobObjects::{JobObjectBasicProcessIdList, QueryInformationJobObject, JOBOBJECT_BASIC_PROCESS_ID_LIST};
+        // (a header and room for 255 ids: a worker's job holds a handful)
+        let mut buf = vec![0u64; 1 + 255];
+        let ok = unsafe {
+            QueryInformationJobObject(self.job.0, JobObjectBasicProcessIdList, buf.as_mut_ptr() as *mut core::ffi::c_void, (buf.len() * 8) as u32, std::ptr::null_mut())
+        };
+        if ok == 0 {
+            return vec![self.pid];
+        }
+        // SAFETY: the buffer is 8-byte aligned and at least the struct's size; the ids follow its header in place.
+        let list = unsafe { &*(buf.as_ptr() as *const JOBOBJECT_BASIC_PROCESS_ID_LIST) };
+        let n = (list.NumberOfProcessIdsInList as usize).min(255);
+        let ids = unsafe { std::slice::from_raw_parts(list.ProcessIdList.as_ptr(), n) };
+        let mut out: Vec<u32> = vec![self.pid];
+        out.extend(ids.iter().map(|&p| p as u32).filter(|&p| p != self.pid && p != 0));
+        out
+    }
+
+    /// Handles (with `access`) of the job's other live processes: what the worker started - not the console host
+    /// Windows attaches to a console program started without a console (`conhost.exe`, a few MB, in the worker's job
+    /// since Windows 7), which is the system's, not the worker's.
+    fn others(&self, access: u32) -> Vec<Handle> {
+        use windows_sys::Win32::System::Threading::{OpenProcess, QueryFullProcessImageNameW, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION};
+        let conhost = |h: HANDLE| {
+            let mut buf = [0u16; 1024];
+            let mut n = buf.len() as u32;
+            let ok = unsafe { QueryFullProcessImageNameW(h, PROCESS_NAME_WIN32, buf.as_mut_ptr(), &mut n) } != 0;
+            ok && String::from_utf16_lossy(&buf[..n as usize]).rsplit(['\\', '/']).next().is_some_and(|f| f.eq_ignore_ascii_case("conhost.exe"))
+        };
+        self.pids()
+            .into_iter()
+            .filter(|&p| p != self.pid)
+            .filter_map(|p| {
+                let h = unsafe { OpenProcess(access | PROCESS_QUERY_LIMITED_INFORMATION, 0, p) };
+                (!h.is_null()).then(|| Handle(h))
+            })
+            .filter(|h| !conhost(h.0))
+            .collect()
     }
 
     pub fn is_suspended(&self) -> bool {
@@ -285,8 +343,23 @@ impl WorkerProc {
         }
     }
 
-    /// CPU time (user + kernel) the worker process has used, in ms.
+    /// CPU time (user + kernel) the worker has used, in ms: its job's - the worker and anything it started (PROTOCOL
+    /// 19: a torch worker's python behind `zf-pyshim.exe`; a native worker is its job's only process).
     pub fn cpu_ms(&self) -> u64 {
+        use windows_sys::Win32::System::JobObjects::{JobObjectBasicAccountingInformation, QueryInformationJobObject, JOBOBJECT_BASIC_ACCOUNTING_INFORMATION};
+        let mut info: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            QueryInformationJobObject(
+                self.job.0,
+                JobObjectBasicAccountingInformation,
+                &mut info as *mut _ as *mut core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok != 0 {
+            return (info.TotalUserTime.max(0) as u64 + info.TotalKernelTime.max(0) as u64) / 10_000;
+        }
         use windows_sys::Win32::Foundation::FILETIME;
         use windows_sys::Win32::System::Threading::GetProcessTimes;
         let z = || FILETIME { dwLowDateTime: 0, dwHighDateTime: 0 };
@@ -298,14 +371,21 @@ impl WorkerProc {
         (ft(&k) + ft(&u)) / 10_000
     }
 
-    /// The worker's committed private memory now (MB): what the job's memory limit counts (the worker is the job's
-    /// only process). None when Windows doesn't say (the worker has exited).
+    /// The worker's committed private memory now (MB): what the job's memory limit counts - the worker's and (PROTOCOL
+    /// 19) that of every process it started (a torch worker's python behind `zf-pyshim.exe`; a native worker is its
+    /// job's only process). None when Windows doesn't say (the worker has exited).
     pub fn commit_mb(&self) -> Option<u64> {
         use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX};
-        let mut c: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
-        c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
-        let ok = unsafe { GetProcessMemoryInfo(self.child.as_raw_handle() as HANDLE, &mut c as *mut _ as *mut PROCESS_MEMORY_COUNTERS, c.cb) };
-        (ok != 0).then_some((c.PrivateUsage as u64) >> 20)
+        use windows_sys::Win32::System::Threading::{PROCESS_QUERY_LIMITED_INFORMATION, PROCESS_VM_READ};
+        let private = |h: HANDLE| -> Option<u64> {
+            let mut c: PROCESS_MEMORY_COUNTERS_EX = unsafe { std::mem::zeroed() };
+            c.cb = std::mem::size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+            let ok = unsafe { GetProcessMemoryInfo(h, &mut c as *mut _ as *mut PROCESS_MEMORY_COUNTERS, c.cb) };
+            (ok != 0).then_some(c.PrivateUsage as u64)
+        };
+        let main = private(self.child.as_raw_handle() as HANDLE)?;
+        let rest: u64 = self.others(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ).iter().filter_map(|h| private(h.0)).sum();
+        Some((main + rest) >> 20)
     }
 
     /// The most memory the job (the worker and anything it started) ever committed (MB), from Windows' own

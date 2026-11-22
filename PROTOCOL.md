@@ -7,7 +7,8 @@ A change to anything here is a protocol change: bump the version it belongs to a
 bottom.
 
 Versions: HTTP API `v1` (path prefix), agent↔worker protocol `aw/1`, network files `zero-onnx/1`,
-manifests `manifest/1`. Current revision: v1 rev 26 (section 18, the freshness budget: a rolling lease's games in flight
+manifests `manifest/1`. Current revision: v1 rev 27 (section 19, opt-in runtimes per machine: the torch runtime pack and
+worker, offered only to machines the owner opted in; rev 26: section 18, the freshness budget: a rolling lease's games in flight
 capped so its games last no longer than the run's staleness window allows; rev 24: section 15, the priority lane: waiting
 eval work takes machines from fuzz and rolling self-play, canary machines first; rev 23: section 12.2, a batch's CPU capacity counts only PCs of a platform its
 run has a build for; rev 22: section 9.8, AMD GPUs with DirectML only and the owner's GPU vendors off; rev 21: section 10.4, the in-flight limit of rolling leases; rev 20: section 14, model variants per generation; rev 19: section 13, layout tuning and
@@ -424,7 +425,7 @@ tools also send an Access service token (`CF-Access-Client-Id`, `CF-Access-Clien
 | `GET /v1/admin/campaign/{id}` · `GET …/results?after=` · `POST …/ack` | config (rev 14: with `share`) + `cursor`, `seeds_done`, `seeds_leased`, `active_leases`, `pool`, `failures`, `sites`; results and ack as for runs (`ids` are seeds) |
 | `GET /v1/admin/campaign/{id}/failures?after=&limit=` | → `{"failures": [{"id", "seed", "mode", "site", "panic", "repro", "output_tail", "build_id", "engine_commit", "machine_id", "lease_id", "first_of_site", "t"}], "cursor"}` (section 5.1; one row per (seed, site)) |
 | `GET /v1/admin/machines` · `POST /v1/admin/machine/{id}/revoke` | revoking cancels the machine's active leases at once (their ids go back to the pool) → `{"ok": true, "cancelled"}` |
-| `POST /v1/admin/machine/{id}` | `{"name"?, "channel"?, "paused"?, "unblock"?}`; a paused machine gets `wait_s` / `paused_by_admin`; `"unblock": true` (rev 5) lifts the machine's build blocks (`/v1/crash` kind `blocked`) and answers `{"ok": true, "unblocked": n}` |
+| `POST /v1/admin/machine/{id}` | `{"name"?, "channel"?, "paused"?, "unblock"?, "opt_in"?, "opt_in_add"?, "opt_in_remove"?}`; a paused machine gets `wait_s` / `paused_by_admin`; `"unblock": true` (rev 5) lifts the machine's build blocks (`/v1/crash` kind `blocked`) and answers `{"ok": true, "unblocked": n}`; rev 27 (19.2): the machine's opt-in runtimes, answered as `"opt_in": [...]` |
 | `POST /v1/admin/pause` | `{"paused": true \| false}`: farm-wide, no new leases while paused |
 | `POST /v1/admin/routing` | rev 18: `{"on": bool, "eval_horizon_s": 0..604800, "eval_games_per_thread": 0..16}`, rev 24: `"priority_lane": "off" \| "canary" \| "all"`, `"eval_stall_s": 0..86400`; any of them; the others keep their values → `{"ok": true, "on", "eval_horizon_s", "eval_games_per_thread", "priority_lane", "eval_stall_s"}`. `GET /v1/admin/routing` → the same fields and `"stored"` (false: never set, the defaults). Sections 12, 15.6 |
 | `POST /v1/admin/evict` | rev 12: `{"builds": ["<build_id>", ...]}` (at most 64; `[]` clears it) replaces the evict list → `{"ok": true, "builds"}` (deduplicated). `GET /v1/admin/evict` → `{"builds"}`. It rides on every `GET /v1/agent/latest` (section 3) |
@@ -2257,12 +2258,14 @@ machine; friends' defaults don't change.
   - **A job memory cap of three quarters of the RAM** unless `max_ram_mb` is set (friends: half).
   - **Normal priority**: workers run at NORMAL_PRIORITY_CLASS without EcoQoS (macOS: nice 0), CPU and GPU jobs alike -
     the priority of the trainer's own self-play. Provider probes stay at below-normal priority.
-  - **A bigger GPU crew**: the crew rule (13.1 **DirectML**, **CUDA crews**) chooses up to 8 workers, at most one per 3
-    physical cores (a 24-core PC: 8; a 4-core one: 3, as a friend's), each with 1,152 games in flight in two groups
-    where the memory plans hold it - the "auto" target is 1,152 for each worker the crew may have (8 x 1,152 = 9,216),
-    at most the lease's block -, fewer games each down to 768 where they hold less, then a worker fewer. One worker
-    never runs more than 4,096 games; a crew's total may (at most 8 x 4,096). The search threads are shared as before
-    (1.5 per physical core, at most the logical processors: 32 there, 4 each for 8 workers).
+  - **One GPU worker unless set**: a GPU job on an owner machine chooses no crew by itself - one worker process, 1,152
+    games in flight in two groups for "auto" where the memory plans hold it (the crew rule's per-worker share, 13.1) -
+    unless the owner sets `workers` (below). Separate worker processes on one GPU time-slice it on Windows and don't
+    overlap (the owner's desktop GPU, 2026-11-22: 3 processes 33.5k rows/s at 90 % GPU use against 1 process with 3 sessions 42.9k), so a
+    multi-process crew is not recommended there; the capability stays (a fixed `workers` up to 8, each up to 4,096 games,
+    a crew's total up to 8 x 4,096). The search threads are shared as before (1.5 per physical core, at most the logical
+    processors). (Unreleased drafts of 13.6 chose up to 8 workers by themselves, one per 3 physical cores.) A torch job
+    (section 19) runs one worker whatever `workers` says.
   - **Video memory kept for the trainer**: `gpu_reserve_mb` (below), 12,288 MB unless set.
   - Trials (13.2) stay as strict as anyone's (idle, no fullscreen, quiet): with the trainer's load they would rarely
     run, which is one more reason to pin the layout (below). CUDA crews run no trials anyway.
@@ -2271,8 +2274,8 @@ machine; friends' defaults don't change.
   hold at the reading (10.6 **Video memory**: the lease's start, and every reading while it runs). Set it to the most
   the trainer and the desktop hold at once: with the trainer resident the reading is already near it, between its
   steps the reserve keeps its room. The 95 % rule (a worker gives way when the adapter's memory in use reaches 95 %)
-  still applies. On a 32 GB GPU (32,607 MB) with 12,288 kept: 15,427 MB for the crew (8 workers' batches of 452 rows at the
-  default 1 GB + 2 MB a row, until the run's own cost is measured).
+  still applies. On a 32 GB GPU (32,607 MB) with 12,288 kept: 15,427 MB for the job's workers (at the default 1 GB + 2 MB
+  a row, until the run's own cost is measured).
 - **A fixed GPU layout** (any machine, `autotune` off; all optional): `workers` (1 to 8 - before, 1 to 3 -, the crew's
   size), `worker_inflight` (1 to 4,096 games in flight per worker; default: the crew rule's share), `worker_groups` (1
   or 2 per worker; default: the rule's - two once each holds 256 rows) and `worker_threads` (search threads per worker;
@@ -2282,8 +2285,8 @@ machine; friends' defaults don't change.
   where a worker's base doesn't fit (then fewer workers, each with its `worker_threads`); a batch over the video memory
   plan's rows is split in two groups first. The owner's games in flight win over a run's number (`gpu_inflight`) on
   this machine. The fixed layout is the GPU job's only: a CPU job keeps 13.1's rules (`workers` up to 8 there too).
-- **Wire.** None: the coordinator sees one rolling lease, its extensions and chunks, as for any crew (13.5). A crew of
-  6 x 1,152 asks for about 2 x 6,912 ids an extension; Stats `inflight` / `workers` say what it holds (the in-flight
+- **Wire.** None: the coordinator sees one rolling lease, its extensions and chunks, as for any crew (13.5). A fixed crew
+  of 6 x 1,152 (possible, not recommended on one GPU) asks for about 2 x 6,912 ids an extension; Stats `inflight` / `workers` say what it holds (the in-flight
   limit, 10.4, follows them). A run whose generation quota (`quota` x (1 + `slack`)) is not well above the crew's games
   in flight is throttled by its own quota (`wait_s` `quota`): many games in flight also make each game span more
   generations (the run's `max_stale`).
@@ -2685,7 +2688,169 @@ canary lifts a cap it already holds at its next answer. The yardstick for wideni
 per-machine stale counters (zero-core `farm_pool` `by_machine`, its docs/az.md 54.8): each machine's share of its rows
 dropped as stale, before and after.
 
+## 19. Opt-in runtimes per machine: the torch runtime (rev 27; coordinator migration 0017, Worker var `TORCH_AGENT`; agents from 0.3.19)
+
+**Why.** The owner's decision of 2026-11-22: farm machines are configurable per machine, and the owner's own two
+machines (two desktops with big NVIDIA GPUs) play farm self-play with PyTorch - the trainer's own
+self-play path - instead of the native ONNX worker, which reaches about 0.4x of the trainer's torch self-play on the
+bigger of them. Friends' PCs keep the native worker: no machine gets the torch pack unless the owner opts it in. Everything reuses
+section 9's mechanisms (a runtime pack with a hardware requirement, one signed worker manifest per pack, run alternates,
+the probe cache) and section 14's model variants; what is new is an opt-in name on packs, alternates and machines, a
+provider name, and a small launcher for python workers.
+
+### 19.1 The torch runtime pack (`opt_in`, provider `torch-cuda`)
+
+```json
+{"manifest": 1, "kind": "runtime", "version": "torch-2.11.0-cu128-py313", "min_agent": "0.3.19",
+ "gpu": {"vendor": "nvidia", "min_driver": "570.65", "providers": ["torch-cuda"]}, "opt_in": "torch", "files": [...]}
+```
+
+- `opt_in` (optional, runtime manifests with `gpu` only): a name (`[a-z0-9-]{1,32}`); the pack is leased only to
+  machines the owner opted in to that name (19.2), default or alternate alike. `farm-release sign --opt-in NAME` writes
+  it and needs `--min-agent 0.3.19` or newer.
+- `torch-cuda`: a provider name (PROTOCOL 3, 8) for PyTorch with CUDA - not an ONNX Runtime provider. A pack whose
+  `gpu.providers` names it has `opt_in` and no other provider (agents refuse the manifest otherwise; the coordinator
+  refuses to register it, 400). `torch-cuda` is never among a machine's `providers` (the union of ONNX Runtime probes,
+  section 8); it appears only in `runtime_providers[<torch pack>]`. A run's `providers` allowlist (section 8) that names
+  providers must name `torch-cuda` for a torch alternate to be offered (9.4 condition 3; `GET /v1/admin/run` says so in
+  the alternate's `problems`).
+- Files: a Windows embeddable CPython (`python\python.exe`, the minor version the worker build's `_engine.pyd` is built
+  for) with its site-packages: torch (CUDA build), numpy and every module zero-core's play path imports; zstd copies and
+  multipart uploads as 9.3. Python itself must find its site-packages (the embeddable distribution's `._pth` file lists
+  them); the pack holds exactly its manifest's files, so nothing may be written into it at run time (19.4's `-B`).
+- Size: an opt-in runtime manifest may list up to 20,000 files in up to 8 MiB (every other manifest: 2,000 files, 1 MiB,
+  as before); the coordinator checks such a manifest's files against R2 list results (sizes, and the sha256 checksum an
+  upload stored) rather than one HEAD per file. Agents from 0.3.19 read manifests of up to 8 MiB.
+- Built by mtg-zero `tools/farm_build.py --runtime --pack torch` (lane A), like the DirectML-only pack.
+
+The **torch worker build** of a commit is a `kind: worker` manifest whose `requires_runtime` is the torch pack and whose
+`entry` is `zf-pyshim.exe` (19.4); its files are the commit's zero-core `python/zero/**`, the game package, `_engine.pyd`,
+`worker_main.py` and `zf-pyshim.exe`. Its weights per generation are a model variant named `torch` (section 14, format
+`torch-weights/1`); a run lists the alternate first (19.3).
+
+### 19.2 Per-machine opt-in (coordinator, migration 0017)
+
+- `machines.opt_in`: a JSON list of opt-in names (at most 8; NULL: none). The one source of truth, set by the owner,
+  changeable remotely, with nothing to do on the machine itself.
+- `POST /v1/admin/machine/{id}` takes `"opt_in": [names] | null` (replaces the list), `"opt_in_add": name` or
+  `"opt_in_remove": name` (one name; not together with `opt_in`), each 400 on a malformed name, more than 8 names or a
+  repeated one, and answers `{"ok": true, "opt_in": [the list now]}`. Admin CLI:
+  `npm run admin -- machine <id> opt-in torch` / `npm run admin -- machine <id> opt-out torch`.
+- `GET /v1/admin/machines` and the stats' machines list `opt_in` (`[]`: none); the admin page shows it under the
+  machine's agent version; the stats' `limits` add `torch_agent`.
+- An opt-out takes effect from the machine's next lease (a running lease keeps its build and pack until it ends).
+
+### 19.3 Leases (coordinator)
+
+- `PUT /v1/admin/run/{run}`: an alternate's `when` may name `opt_in`; it must equal the `opt_in` of the alternate's
+  runtime pack, and an alternate of an opt-in pack must name it (400 otherwise). `when.vendor` still defaults to the
+  pack's `gpu.vendor`. `GET /v1/admin/run` shows `when.opt_in`, and an alternate with one adds `opt_in_notes`: the agent
+  version it needs and the machines opted in now (none yet, or their names and ids).
+- An alternate with `when.opt_in` qualifies (9.4) only for an agent of at least `TORCH_AGENT` (Worker var, default
+  0.3.19) on a machine whose `opt_in` holds the name, in addition to every condition of 9.4 (GPU allowed, the vendor's
+  adapter and driver from the pack's `gpu`, the job's allowlist, the probe cache, disk, blocks, `min_agent`, the
+  definition). A runtime pack with `opt_in` - a run's default or an alternate's - is never leased to any other machine or
+  agent. Everyone else falls through to the next alternate (CUDA, DirectML) or the default, exactly as before.
+- Probe cache (9.4 condition 4): the torch pack's entry in `runtime_providers` is `["torch-cuda"]` once its probe passed
+  on the machine and `[]` when it failed (never offered again for those adapters and drivers, as for any pack).
+- An opt-in alternate is not the run's GPU version for hardware routing (12.1): it serves the opted-in machines only.
+- A run that plays torch on the farm lists e.g. `alternates: [{"build_id": <torch worker>, "runtime": <torch pack>,
+  "when": {"vendor": "nvidia", "opt_in": "torch"}, "model": "torch"}, <the CUDA alternate>, ...]`, its definition
+  authorizes the torch build for `selfplay` only (the torch worker plays no eval yet), and its `pool_variants` register
+  the `torch` variant per gen.
+
+### 19.4 `zf-pyshim.exe` (the torch worker build's entry)
+
+A small Rust program built in this repository (`agent/pyshim`, crate `zf-pyshim`), shipped as a file of every torch
+worker build. The agent starts it exactly like `mtgz-worker.exe`: `<entry> serve`, the work directory as its current
+directory, aw/1 JSON lines on stdin/stdout, in the lease's job object at the job's priority. It:
+
+1. reads `ZEROFARM_RUNTIME_DIR` (set by the agent, absolute, for every worker it starts - the runtime pack's cache
+   directory; agents set it for every worker with a runtime since rev 7, harmless for native workers);
+2. runs `%ZEROFARM_RUNTIME_DIR%\python\python.exe -I -B -X utf8 -u <the shim's own directory>\worker_main.py <its own
+   arguments>` with stdin, stdout and stderr inherited and the same current directory: `-I` isolated mode (no
+   `PYTHON*` variables, no user site-packages; the script's directory is not put on `sys.path`, so `worker_main.py` puts
+   its own directory there itself), `-B` no `.pyc` files written (the agent re-verifies every build directory before a
+   worker starts and would otherwise find files its manifest doesn't list, and download the build again), `-X utf8`,
+   `-u` unbuffered stdout/stderr;
+3. first puts itself in a job object of its own with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` (nested in the agent's job,
+   whose memory limit and UI restrictions still hold), so python and anything it starts end when the shim is killed -
+   also by a `TerminateProcess` of the shim alone; if Windows refuses that job, a warning on stderr and python still ends
+   with the agent's job;
+4. exits with python's exit code;
+5. fails loudly before python runs: one stderr line starting `zf-pyshim:` and exit 3 (`ZEROFARM_RUNTIME_DIR` unset,
+   empty, relative or not a directory, or no `python\python.exe` in it), 4 (no `worker_main.py` next to the shim) or 5
+   (python could not be started).
+
+It is built with the agent workspace (`cargo build --release -p zf-pyshim` in `agent/`:
+`target\release\zf-pyshim.exe`); a torch worker build copies that file in, and its sha256 changes with each build of the
+shim (it is a file of the worker build like any other, signed with it).
+
+### 19.5 The agent (0.3.19)
+
+- **Manifests.** Runtime manifests with `opt_in` and the `torch-cuda` provider are accepted (19.1's rules). The guard
+  (9.5) applies unchanged: GPU work allowed, an NVIDIA adapter with the driver, the pack neither failed here nor held.
+- **The probe.** Before the first job line of the first lease that uses the torch pack on these adapters and drivers
+  (never between leases: the pack has no `probe-providers`), while GPU work is allowed: the pack's python, `python.exe -I
+  -B -X utf8 -c <a tiny check> --json <file>` in a job object (below-normal priority, 16 GB memory limit, at most 300 s),
+  under 9.8's in-progress marker (`kind` "probe", `worker` "python") and its unfinished-probe rules. The check imports
+  torch, reports the python, torch and CUDA versions and `torch.cuda.is_available()`, and for each CUDA device its
+  name, UUID and memory and a 256 x 256 float32 matmul on the device against the CPU's (relative difference at most 1e-3,
+  finite). A device passes on the profile's NVIDIA adapter of the same name. The record (`state\probes.json`) lists
+  `torch-cuda` when a device passed, else nothing; a report is the verdict (a failed check or torch failing to import
+  marks the pack bad for these adapters and drivers, 9.5/9.6); a python that can't start, crashes or doesn't answer is a
+  probe that failed to run (tried again after a day). The profile's `runtime_providers[<pack>]` follows (19.3). No
+  bench: a torch job runs on the GPU its probe passed, or not at all.
+- **The job.** `providers` `["torch-cuda"]` and `gpu` = that adapter (the one with the most video memory if several
+  passed); the worker's environment adds `CUDA_VISIBLE_DEVICES=GPU-<uuid>` of its device (so the worker's `cuda:0` is
+  the adapter chosen). Games in flight: the run's number (the lease's `rolling.inflight.gpu`, 10.3) in the template's
+  groups (at most 2), or "auto" 2,048 in two groups (`rolling::TORCH_CONC`; a run should set its own number), both cut by
+  the memory plans and bounded by the freshness cap (18.3); a classic lease's as 9.6's GPU candidates
+  (`min(games, max(conc, 512))`). A torch job whose probe didn't pass, whose allowlist leaves out `torch-cuda`, or when
+  GPU work isn't allowed is refused (`done` `refused: "runtime"`, the start-failure wait), never run on the CPU, and a
+  pack that failed is removed from the cache after the lease.
+- **One worker process.** A torch job runs exactly one worker process per GPU - its concurrency is internal (`conc`) -,
+  whatever the owner's `workers`, `autotune` or the crew rules (13.1, 13.6) say: separate processes on one GPU
+  time-slice it on Windows and don't overlap (the owner's desktop GPU, 2026-11-22: 3 processes 33.5k rows/s at 90 % GPU use, 1 process
+  with 3 sessions 42.9k). Its layout is fixed (no trials, nothing remembered); the owner's `worker_inflight`,
+  `worker_groups` and `worker_threads` apply to that one worker; the memory plan and the video memory plan use the
+  worker's own measured use (10.6).
+- **The worker's processes.** A worker's CPU time, committed memory, suspend/resume and the GPU use counted as the
+  lease's (the busy gate's "other programs", the video memory plan) are its job's - the shim and python and anything
+  else it started - not the started process's alone (agents from 0.3.19, every worker; the console host Windows puts
+  in a console program's job, `conhost.exe`, is left out of the memory and suspend/resume: a native worker reads as
+  before).
+- Owner-machine mode (13.6) applies unchanged otherwise (no busy gate, normal priority, the video memory reserve).
+- Everything else - leases, rolling, generation switches with the `torch` variant (14.4), uploads, yield / finish / quit
+  - is aw/1 (section 5, 10.5) as for any worker.
+
+### 19.6 Deploy order and the owner's steps
+
+1. Coordinator rev 27 (migration 0017 before the Worker; `TORCH_AGENT` 0.3.19). Nothing changes for anyone until a pack
+   with `opt_in` is registered and a machine opted in.
+2. An agent from 0.3.19 on the owner's machines (canary first).
+3. The torch pack and a torch worker build registered, a run's torch alternate put, then
+   `npm run admin -- machine <id> opt-in torch` for each of the two machines (`machines` shows their ids).
+4. To stop: `opt-out torch` (from the next lease), or take the alternate off the run.
+
 ## Changes
+- v1 rev 27, agent 0.3.19 (2026-11-22; coordinator migration 0017 `machines.opt_in`, Worker var `TORCH_AGENT` default
+  0.3.19; unreleased): **opt-in runtimes per machine - the torch runtime** (section 19). Runtime manifests may carry
+  `opt_in` (a name; `farm-release sign --opt-in`, `min_agent` 0.3.19+); the provider `torch-cuda` (only in an opt-in pack,
+  alone); opt-in manifests up to 20,000 files / 8 MiB, registration reads R2 list results. Machines get `opt_in` lists
+  (`POST /v1/admin/machine/{id}` `opt_in` / `opt_in_add` / `opt_in_remove`; CLI `machine <id> opt-in|opt-out <name>`;
+  shown in machines, stats, the admin page). Alternates may name `when.opt_in` (equal to the pack's, 400 otherwise) and
+  qualify only on opted-in machines with agents from `TORCH_AGENT`; an opt-in pack goes nowhere else, default or
+  alternate. `zf-pyshim.exe` (new crate `agent/pyshim`): the torch worker build's entry, running the pack's python on
+  `worker_main.py` (`-I -B -X utf8 -u`, stdio inherited, its own kill-on-close job, exit code forwarded, exits 3/4/5 on a
+  missing runtime/python, script, start). Agent 0.3.19: the torch probe (the pack's python on a PyTorch CUDA check, under
+  the probe marker; `runtime_providers` `["torch-cuda"]` / `[]`), the torch job (`torch-cuda` on the probed adapter,
+  `CUDA_VISIBLE_DEVICES` its UUID, refused rather than run on the CPU), one worker process for a torch job whatever the
+  crew settings, and a worker's CPU, memory, suspend and GPU use counted over its job's processes. Why: the owner's two
+  machines play self-play with the trainer's own torch path (the native worker reaches ~0.4x of it on the owner's desktop GPU);
+  friends' PCs never get the pack unless opted in. Also (13.6, unreleased): an owner machine's GPU job no longer chooses
+  a crew of up to 8 workers by itself - one worker unless the owner sets `workers` (processes on one GPU time-slice it
+  on Windows).
 - No rev (2026-11-22; no wire change, no migration; agent only, unreleased): **owner machine** (13.6): the owner's setting
   `owner` (work whenever not paused, no GPU busy gate, the idle memory floor, normal priority, a GPU crew of up to 8
   workers, 12 GB of video memory kept), `gpu_reserve_mb`, and a fixed GPU layout (`workers` up to 8, `worker_inflight`,

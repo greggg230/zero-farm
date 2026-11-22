@@ -10,11 +10,17 @@ version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's:
   can now also play all of their practice games through Zero Farm, on the same graphics card. `owner on` makes Zero Farm
   work there whenever it isn't paused - also while the owner uses the computer or a fullscreen app runs -, share the
   graphics card with the training program instead of stepping aside for it (the temperature limit stays), run its job
-  programs at normal priority, run up to 8 of them at once on a big card, and keep 12 GB of the card's memory free for
-  the training program (`gpu_reserve_mb` changes that). A fixed layout can be set too: how many job programs, how many
-  games each, in one or two groups, and how many search threads each. On Windows these are set with `farm-agent set`
-  while Zero Farm is not running. Nothing changes on friends' computers: the setting is off unless set, and their own
-  settings keep their limits (except that a fixed number of job programs may now be up to 8).
+  programs at normal priority, run one job program on the graphics card (several programs on one card take turns
+  rather than work at once), and keep 12 GB of the card's memory free for the training program (`gpu_reserve_mb` changes
+  that). A fixed layout can be set too: how many job programs, how many games each, in one or two groups, and how many
+  search threads each. On Windows these are set with `farm-agent set` while Zero Farm is not running. Nothing changes on
+  friends' computers: the setting is off unless set, and their own settings keep their limits (except that a fixed
+  number of job programs may now be up to 8).
+- **PyTorch practice games on computers the farm owner picks.** A computer the owner opts in on the server can play its
+  practice games with the same PyTorch program the training uses, which is much faster on big NVIDIA cards than Zero
+  Farm's own program. Zero Farm downloads that program's files (a Python with PyTorch) only for such a computer, checks
+  once that PyTorch can use the graphics card, and then runs one such program for the job. Friends' computers never get
+  it unless the owner opts one in; nothing else changes for them.
 
 ## Unreleased (0.3.18)
 

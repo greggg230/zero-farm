@@ -444,6 +444,8 @@ struct SpawnSpec {
     log: Arc<zerofarm_common::rotlog::RotatingFile>,
     tag: String,
     runtime_dir: Option<PathBuf>,
+    /// PROTOCOL 19: a torch job's `CUDA_VISIBLE_DEVICES` (its probe's device), else nothing.
+    env: Vec<(String, String)>,
 }
 
 impl SpawnSpec {
@@ -461,6 +463,7 @@ impl SpawnSpec {
                 log: self.log.clone(),
                 tag: self.tag.clone(),
                 runtime_dir: self.runtime_dir.as_deref(),
+                env: &self.env,
             },
             move |m| {
                 let _ = tx.send(Ev::Worker(gen, m));
@@ -855,6 +858,10 @@ impl Engine {
             log::info!("lease {id}: runtime pack {} may use none of this PC's GPUs (an AMD GPU runs DirectML only, never with Windows ML's catalog): the CPU only", rt.build_id);
         }
         let gpu_ok = gpu_ok && !held && sc.is_some();
+        // PROTOCOL 19: the torch pack - its own probe (the pack's python), no bench, its GPU or nothing
+        if rt.manifest.is_torch() {
+            return self.choose_torch(lease, plan, rt, gpu_ok, mem, roll);
+        }
         if let (true, Some(sc)) = (gpu_ok && !self.profile.gpus.is_empty() && crate::probe::find(&crate::probe::load(&self.cfg.layout), &rt.build_id, &akey).is_none(), sc.as_ref()) {
             log::info!("lease {id}: probing the execution providers of runtime pack {} (new here) with worker build {}", rt.build_id, prep.build.build_id);
             self.set_status(Phase::Working, "checking the GPU", Some(describe_job(lease)));
@@ -949,6 +956,94 @@ impl Engine {
         }
         log::info!("lease {id}: providers {:?} ({}); rows/s at the batch size {:?}; a GPU pays from {:?} games", c.providers, c.why, c.rows_per_s, c.gpu_games);
         c
+    }
+
+    /// PROTOCOL 19: the choice for a torch pack. Before the first job line of the first lease that uses the pack here (the
+    /// GPU allowed now), its probe: the pack's python on a tiny PyTorch CUDA check (`probe::run_torch`, under the probe
+    /// marker), recorded like any pack's probe (`torch-cuda` or nothing). Then `torch-cuda` on the NVIDIA adapter it passed
+    /// on (`probe::torch_target`), with the run's games in flight for one worker (`rolling::torch_shape`); no bench and
+    /// no CPU side - `providers` `["cpu"]` here means the job can't run (the lease is refused).
+    #[allow(clippy::too_many_arguments)]
+    fn choose_torch(&mut self, lease: &Lease, plan: &Plan, rt: &VerifiedBuild, gpu_ok: bool, mem: (MemPlan, MemPlan), roll: Option<&Setup>) -> crate::probe::Choice {
+        let id = lease.lease_id.clone();
+        let akey = crate::probe::adapters_key(&self.profile.gpus);
+        if gpu_ok && crate::probe::find(&crate::probe::load(&self.cfg.layout), &rt.build_id, &akey).is_none() {
+            log::info!("lease {id}: checking PyTorch's CUDA with runtime pack {} (new here)", rt.build_id);
+            self.set_status(Phase::Working, "checking the GPU", Some(describe_job(lease)));
+            let (stop_pump, pump) = self.beat_pump(lease);
+            let control = self.control.clone();
+            let stop = move || control.quitting();
+            let p = crate::probe::run_torch(&self.cfg.layout, &rt.build_id, &rt.dir, &self.profile.gpus, self.worker_log.clone(), crate::probe::TORCH_PROBE_TIMEOUT, &stop);
+            stop_pump.store(true, Ordering::SeqCst);
+            let _ = pump.join();
+            if p.error.as_deref() != Some("stopped") {
+                let devices: Vec<String> = p
+                    .results
+                    .iter()
+                    .map(|r| format!("{} {}{}", r.adapter.as_deref().unwrap_or("?"), if r.ok { "PASS" } else { "FAIL" }, r.why.as_deref().map(|w| format!(" ({w})")).unwrap_or_default()))
+                    .collect();
+                let line = format!(
+                    "torch probe of runtime pack {}: {}{}",
+                    rt.build_id,
+                    if p.providers.is_empty() { "failed".to_string() } else { p.providers.join(", ") },
+                    match (&p.error, devices.is_empty()) {
+                        (Some(e), _) => format!(" - {e}"),
+                        (None, false) => format!(" - {}", devices.join("; ")),
+                        (None, true) => " - no CUDA device".to_string(),
+                    }
+                );
+                log::info!("lease {id}: {line}");
+                self.worker_log.write_line(&format!("probe: {line}"));
+                crate::probe::record(&self.cfg.layout, p);
+                self.profile = (self.profile_fn)();
+                self.profile_refreshed = Instant::now();
+            }
+        }
+        let probes = crate::probe::load(&self.cfg.layout);
+        let probe = crate::probe::find(&probes, &rt.build_id, &crate::probe::adapters_key(&self.profile.gpus));
+        let (games, conc, groups) = Self::job_shape(plan);
+        let none = |why: String| crate::probe::Choice {
+            providers: vec!["cpu".into()],
+            gpu: Value::Null,
+            conc: None,
+            groups: None,
+            gpu_games: None,
+            batch_rows: 0,
+            rows_per_s: Default::default(),
+            gpu_rows: Default::default(),
+            why,
+        };
+        let Some((gpu, _)) = crate::probe::torch_target(probe, &self.profile.gpus, lease.providers.as_deref(), gpu_ok) else {
+            let why = match probe {
+                _ if !gpu_ok => "the GPU may not be used now".to_string(),
+                _ if lease.providers.as_deref().is_some_and(|a| !a.iter().any(|x| x == crate::probe::TORCH_PROVIDER)) => {
+                    format!("the job's providers allowlist leaves out {}", crate::probe::TORCH_PROVIDER)
+                }
+                None => "no torch probe here".to_string(),
+                Some(p) if p.error.is_some() => format!("its probe failed to run: {}", p.error.as_deref().unwrap_or("")),
+                Some(p) => {
+                    let why: Vec<String> = p.results.iter().filter_map(|r| r.why.clone()).collect();
+                    format!("PyTorch's CUDA check failed on this PC's GPU{}", if why.is_empty() { String::new() } else { format!(": {}", why.join("; ")) })
+                }
+            };
+            return none(why);
+        };
+        let (c, g) = match roll {
+            Some(r) => crate::rolling::torch_shape(r.gpu, groups, mem.1),
+            None => (games.min(conc.max(crate::probe::GPU_CONC)).max(1), groups.clamp(1, crate::rolling::GPU_MAX_GROUPS)),
+        };
+        let name = gpu["name"].as_str().unwrap_or("?").to_string();
+        crate::probe::Choice {
+            providers: vec![crate::probe::TORCH_PROVIDER.into()],
+            gpu,
+            conc: Some(c),
+            groups: Some(g),
+            gpu_games: None,
+            batch_rows: crate::probe::batch_rows(c, if roll.is_some() { u64::MAX } else { games }, g),
+            rows_per_s: Default::default(),
+            gpu_rows: Default::default(),
+            why: format!("{} on {name}: the torch pack's probe passed here", crate::probe::TORCH_PROVIDER),
+        }
     }
 
     fn prepare(&mut self, lease: &Lease, plan: &Plan) -> Result<Prepared, CacheError> {
@@ -1095,6 +1190,26 @@ impl Engine {
         let build_id = lease.build.build_id.clone();
         let mem = (Learned::plan(&self.cfg.layout, &run_name, &build_id, false, limit_mb), Learned::plan(&self.cfg.layout, &run_name, &build_id, true, limit_mb));
         let choice = self.choose_providers(lease, &plan, &prep, d.gpu && !self.profile.gpus.is_empty(), caps.threads, mem, need.as_ref(), roll.as_ref().map(|(s, _)| s));
+        // PROTOCOL 19: a torch job runs on the GPU its probe passed, or not at all (its worker has no CPU path); a pack whose
+        // probe failed here is removed afterwards (not offered again for these adapters and drivers, 9.4 condition 4)
+        let torch = prep.runtime.as_ref().is_some_and(|r| r.manifest.is_torch());
+        let mut worker_env: Vec<(String, String)> = Vec::new();
+        if let (true, Some(rt)) = (torch, prep.runtime.as_ref()) {
+            if choice.providers != [crate::probe::TORCH_PROVIDER] {
+                let akey = crate::probe::adapters_key(&self.profile.gpus);
+                if crate::probe::pack_bad(&crate::probe::load(&self.cfg.layout), &rt.build_id, &akey, Some(&[crate::probe::TORCH_PROVIDER.to_string()]), zerofarm_common::now_unix()) {
+                    self.evict_after.push(format!("builds/{}", rt.build_id));
+                }
+                let _ = zerofarm_common::fsutil::remove_dir_all_retry(&work, Duration::from_secs(5));
+                return self.refuse_as(lease, &format!("torch runtime pack {} can't run here: {}", rt.build_id, choice.why), "runtime");
+            }
+            // (its probe's CUDA device, by UUID: the worker's cuda:0 is the adapter chosen)
+            let probes = crate::probe::load(&self.cfg.layout);
+            let probe = crate::probe::find(&probes, &rt.build_id, &crate::probe::adapters_key(&self.profile.gpus));
+            if let Some((_, Some(uuid))) = crate::probe::torch_target(probe, &self.profile.gpus, lease.providers.as_deref(), true) {
+                worker_env.push(("CUDA_VISIBLE_DEVICES".into(), crate::probe::cuda_visible(&uuid)));
+            }
+        }
         let plan_providers = (choice.providers.clone(), choice.gpu.clone());
         let gpu_choice = plan_providers.0 != ["cpu"];
         if roll.is_some() {
@@ -1184,6 +1299,7 @@ impl Engine {
             log: self.worker_log.clone(),
             tag: id.clone(),
             runtime_dir: prep.runtime.as_ref().map(|r| r.dir.clone()),
+            env: worker_env,
         };
         let spawn = match self.cfg.test_spawn_error.filter(|_| cfg!(debug_assertions)) {
             Some(code) => Err(std::io::Error::from_raw_os_error(code)),
@@ -1492,20 +1608,36 @@ impl Engine {
         let nvidia_cuda = provider == "cuda" && choice.gpu.get("vendor").and_then(Value::as_str).is_some_and(|v| v.eq_ignore_ascii_case("nvidia"));
         // (tests of the bench-shaped start, which other GPUs keep: ZEROFARM_TEST_LEGACY_GPU_START, debug builds only)
         let legacy = crate::test_env("ZEROFARM_TEST_LEGACY_GPU_START").is_some();
-        let crew = dml || (nvidia_cuda && tune::CUDA_CREW && !legacy);
+        // (PROTOCOL 19: a torch job is ONE worker process - its concurrency is internal (`conc`); processes on one GPU
+        // time-slice it on Windows and don't overlap - whatever the owner's `workers`, `autotune` or the crew rules say;
+        // no in-lease trials: the layout is fixed, its games in flight following the memory plans and the freshness cap)
+        let torch = provider == crate::probe::TORCH_PROVIDER;
+        let fixed = fixed || torch;
+        let crew = !torch && (dml || (nvidia_cuda && tune::CUDA_CREW && !legacy));
         // (no video memory plan: one worker; `autotune` off without the owner's count: one)
         let set = match (vram.is_some(), fixed) {
+            _ if torch => Some(1),
             (false, _) => Some(1),
             (true, true) => Some(settings.workers.unwrap_or(1)),
             (true, false) => settings.workers,
         };
-        // (PROTOCOL 13.6: an owner machine's crew up to `tune::MAX_SET_WORKERS`, one per 3 physical cores; friends' up to
-        // `tune::MAX_WORKERS`, one per core, as before)
-        let max_workers = tune::gpu_max_workers(p.cores, settings.owner);
+        if torch && settings.workers.is_some_and(|n| n > 1) {
+            log::info!("lease {}: a torch job runs one worker process: the owner's workers {} applies to other GPU jobs", lease.lease_id, settings.workers.unwrap_or(1));
+        }
+        // (PROTOCOL 13.6: an owner machine chooses one worker by itself - its crew is the owner's fixed `workers` or none;
+        // friends' up to `tune::MAX_WORKERS`, one per core, as before)
+        let max_workers = if torch { 1 } else { tune::gpu_max_workers(p.cores, settings.owner) };
         // (PROTOCOL 13.6: a crew's "auto" target is `rolling::DML_CONC` for each worker it may have - an owner machine's
         // crew, or the owner's fixed count above 3; else 3 x 1,152 as before)
         let crew_n = set.unwrap_or(if settings.owner { max_workers } else { crate::rolling::DML_WORKERS });
-        let target = if crew { crate::rolling::dml_target_for(setup.gpu, setup.hi - setup.lo, crew_n) } else { crate::rolling::gpu_target(setup.gpu, batch) };
+        let target = if torch {
+            // (PROTOCOL 19: the torch shape's games in flight - the run's number or `rolling::TORCH_CONC` - no bench batch)
+            choice.conc.unwrap_or(crate::rolling::TORCH_CONC)
+        } else if crew {
+            crate::rolling::dml_target_for(setup.gpu, setup.hi - setup.lo, crew_n)
+        } else {
+            crate::rolling::gpu_target(setup.gpu, batch)
+        };
         let run_n = matches!(setup.gpu, crate::rolling::Inflight::N(_));
         let vram_plan = vram.map(|v| (v.budget_mb, v.cost));
         let mut space = if crew {
@@ -1519,9 +1651,14 @@ impl Engine {
         if fixed && (settings.worker_inflight.is_some() || settings.worker_groups.is_some() || settings.worker_threads.is_some()) {
             space.pin(set.unwrap_or(1), settings.worker_inflight, settings.worker_groups, settings.worker_threads);
         }
+        // (PROTOCOL 19: a torch worker's groups are the torch shape's unless the owner pinned them; its batches may be
+        // as big as its games in flight)
+        if torch && space.fixed_groups == 0 {
+            space.fixed_groups = choice.groups.unwrap_or(1).clamp(1, crate::rolling::GPU_MAX_GROUPS);
+        }
         if settings.owner {
             log::info!(
-                "lease {}: owner machine: no GPU busy gate, workers at normal priority, a crew of up to {} workers, {} MB of video memory kept for other programs",
+                "lease {}: owner machine: no GPU busy gate, workers at normal priority, {} GPU worker(s) at most, {} MB of video memory kept for other programs",
                 lease.lease_id,
                 space.workers_max,
                 settings.gpu_reserve()
@@ -1561,7 +1698,7 @@ impl Engine {
             },
         };
         let now = zerofarm_common::now_unix();
-        let start = space.gpu_start(g.vendor.eq_ignore_ascii_case("nvidia"), batch);
+        let start = space.gpu_start(g.vendor.eq_ignore_ascii_case("nvidia"), if torch { tune::GPU_BATCH_MAX } else { batch });
         let mut entry = match tune::Cache::load(&self.cfg.layout).find(&key, &legacy_net).filter(|_| !fixed) {
             Some(e) => e,
             None => tune::Entry::new(key, &run, start, false, now),
@@ -3374,8 +3511,9 @@ impl Run {
     /// agent 0.3.4: the lease's workers' pids (the main one while it runs, every one beside it): their GPU use is the
     /// lease's, never other programs' (the GPU busy rule, PROTOCOL 8).
     fn worker_pids(&self) -> Vec<u32> {
-        let main = (self.main_exit.is_none()).then_some(self.worker.pid);
-        main.into_iter().chain(self.mates.iter().map(|m| m.worker.pid)).collect()
+        // (PROTOCOL 19: every process of each worker's job - a torch worker's python behind zf-pyshim.exe does its GPU work)
+        let main = if self.main_exit.is_none() { self.worker.pids() } else { Vec::new() };
+        main.into_iter().chain(self.mates.iter().flat_map(|m| m.worker.pids())).collect()
     }
 
     /// The crew's size wanted now: the layout's workers, at most what this lease may still run; 1 without tuning.
@@ -4826,15 +4964,18 @@ impl Run {
         }
         let pids = self.worker_pids();
         let m = eng.signals.gpu_memory(v.luid, &pids);
-        let of = |pid: u32| m.as_ref().map_or(0, |m| m.of(pid));
+        // (PROTOCOL 19: a worker's video memory is its job's processes' - a torch worker's python behind zf-pyshim.exe holds it)
+        let of = |w: &WorkerProc| m.as_ref().map_or(0, |m| w.pids().into_iter().map(|p| m.of(p)).sum::<u64>());
         let paused = matches!(self.state, WState::Paused(_) | WState::Yielding(_));
         let main_live = self.main_exit.is_none() && self.job_sent && !paused;
-        self.vram_mb = if self.main_exit.is_none() { of(self.worker.pid).max(if paused { 0 } else { self.stats_vram }) } else { 0 };
-        let mut pdh_ours = if self.main_exit.is_none() { of(self.worker.pid) } else { 0 };
+        let main_pdh = if self.main_exit.is_none() { of(&self.worker) } else { 0 };
+        self.vram_mb = if self.main_exit.is_none() { main_pdh.max(if paused { 0 } else { self.stats_vram }) } else { 0 };
+        let mut pdh_ours = main_pdh;
         for d in &mut self.mates {
             let held = d.yielded || d.yield_at.is_some();
-            d.vram_mb = of(d.worker.pid).max(if held { 0 } else { d.stats_vram });
-            pdh_ours += of(d.worker.pid);
+            let pdh = of(&d.worker);
+            d.vram_mb = pdh.max(if held { 0 } else { d.stats_vram });
+            pdh_ours += pdh;
         }
         let ours = self.vram_mb + self.mates.iter().map(|d| d.vram_mb).sum::<u64>();
         // (Windows' view of our workers replaced by the more of it and theirs)

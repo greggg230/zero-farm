@@ -14,6 +14,7 @@ plus its launcher, its installer and the desktop's release tool. The wire contra
 | `release` | `farm-release.exe` | desktop tool: keygen (release and data keys), key backup (export-key / import-key), sign, verify, publish, release-agent, installer build, GitHub releases (through `gh`), define (signed definitions) |
 | `fakeworker` | `fakeworker.exe`, `fakeagent.exe`, `fakelauncher.exe`, `fakegh.exe` | test binaries: an aw/1 worker with scripted behaviours (self-play, fuzz and eval: per-network self-tests, eval rows), scripted stand-ins for the agent, for a new launcher and for the GitHub CLI |
 | `mockcoord` | lib | in-process mock coordinator (PROTOCOL rev 2) and a test kit (dev-dependency only) |
+| `pyshim` | `zf-pyshim.exe` | PROTOCOL 19.4: the entry of a torch worker build - runs `worker_main.py` on the torch runtime pack's python (`%ZEROFARM_RUNTIME_DIR%\python\python.exe -I -B -X utf8 -u`), stdio inherited, a kill-on-close job of its own, python's exit code; shipped inside torch worker builds (mtg-zero `farm_build`) |
 
 ## Build
 
@@ -21,7 +22,12 @@ plus its launcher, its installer and the desktop's release tool. The wire contra
 cd agent
 cargo build --workspace                                  # debug, everything
 cargo build --release -p farm-agent -p zerofarm-launcher # what ships
+cargo build --release -p zf-pyshim                       # PROTOCOL 19.4: target\release\zf-pyshim.exe, a file of torch worker builds
 ```
+
+`zf-pyshim.exe` is not part of the agent's package: mtg-zero's `tools/farm_build.py` (the torch step) copies the release
+build into each torch worker build next to `worker_main.py`, and signs it with the build (its sha256 changes with every
+build of the shim; it is a file of the worker build like any other).
 
 Builds go to the default `target/` (set `CARGO_TARGET_DIR` to put them elsewhere). Rust 1.95
 MSVC; ring needs the MSVC C compiler (Visual Studio Build Tools).
@@ -97,6 +103,8 @@ ones (`install_macos`, the footprint / signals / token / CLI unit tests) come in
 | `agent/tests/lifecycle` | 38 | whole leases with the real fakeworker and the mock: download + verify, run, yield/suspend/resume, give-back after slack, upload retries after injected 503s, restart with pending results, orphaned leases, cancel, crash, hang, fatal error, slow yield, no hello, fuzz failures + summary, checkpoint switch, expiry, coordinator give-back, tampered / unknown-key / bad-signature builds, disk cap, profile resend, revoked token (only the coordinator's own `revoked`), an unknown token kept (tray "can't sign in", one try then a wait), a WAF's 403/401 HTML on lease requests, uploads and beats retried as network errors, quit event, launcher events, rev 2 (stale chunks, `done` missing, `upload_diag`, repeated checkpoints, duplicate ids, `x-farm-agent`); rev 3: starvation past slack gives back, brief starvation counted and kept, pause + starvation add up, availability recorded, the worker job's UI restrictions; rev 17: a build of another platform refused before anything but its manifest is downloaded (`refused: "platform"`, one `definition` report, the start-failure wait) |
 | `agent/tests/definitions` | 5 | signed definitions (PROTOCOL 7): the job line is the signed template + per-lease fields + the agent's own fields only (a coordinator's `prefix`, `models`, `out_dir`, `runtime_dir`, `threads`, settings dropped or overwritten), the definition remembered; an eval definition's seats and networks (the coordinator's seats ignored); a mid-lease network the definition doesn't name never fetched; refusals (`done` with `refused`, a `definition` report once per reason, a wait): signed with the release key, tampered bytes, an older version, another run's definition, expired, a build or runtime it doesn't name, a checkpoint hash, a job kind it has no template for, per-lease fields out of range; a legacy lease's allowlist (the review's UNC `models` and `prefix` never reach the worker; a path or a kind mismatch refuses it); a declared checkpoint size over the disk cap never downloaded |
 | `agent/tests/rolling` | 13 | rolling self-play leases (rev 15, PROTOCOL 10) with the fakeworker's rolling mode: `features: ["rolling"]` in lease requests; the job line's `rolling`, `flush_s`, `conc` / `groups` (the run's number, "auto" on the CPU) and released `games`; an extension of 2 x `conc` per `low` until the block is used up (`finish`), every id credited once, Stats `inflight` / `released`, beats with `gen`; `wait_s` honoured; the coordinator's `finish` (unfinished = released ids not played); a new generation with a verified definition switched to in place (`checkpoint` with `sha256`, self-tested, fetched once, the version remembered, chunks with the new `x-gen`); a changed template and a definition that fails a check finishing the lease (the latter reported once); a worker without the feature running it as a classic lease (no `extend`); a ready agent update finishing it, then exit 75; a 410 on an extension stopping it like a lost lease; classic leases unchanged; memory (0.2.14, the fakeworker committing real memory against the job's limit): a worker that runs into the limit with a fatal "bad allocation" or a silent abort started again with fewer games (ids after the released ones, its own `out_dir`, the lost ids unfinished, every id credited once, one crash report), the measured cost remembered and capping the run's next lease; a worker past 92 % finishing its games and the lease going on with fewer from the first id it never started, nothing lost, no crash report; 0.3.14: another run's measurement of the build planning a new run; 0.3.15 (`lease::Watch`): a worker that plays nothing more while still sending `status` started again (reported once, the lease playing on), and no false alarm for a slow worker (games longer than `stall_after`) or a pause longer than it |
+| `agent/tests/torch` | 2 (Windows) | PROTOCOL 19: the torch pack and a torch worker build behind the real `zf-pyshim.exe`, the fakeworker as the pack's python: the torch probe before the first job line, one worker (an owner machine set for 6) with `torch-cuda` on the probed adapter, `ZEROFARM_RUNTIME_DIR` and `CUDA_VISIBLE_DEVICES` in its environment, every id credited or unfinished once, both builds verifying afterwards; a pack whose probe finds no CUDA refusing the lease (`refused: "runtime"`), removed, and refused next time without a download |
+| `pyshim/tests/shim` | 4 | `zf-pyshim.exe` with the fakeworker as python: `-I -B -X utf8 -u <dir>\worker_main.py <args>`, the current directory, stdin/stdout through, the exit code forwarded, exits 3/4 with a `zf-pyshim:` line, python killed with the shim (Windows) |
 | `agent/tests/owner` | 1 (Windows) | an owner machine (PROTOCOL 13.6): a fixed crew of 6 CUDA fakeworkers (128 games in flight in 2 groups, 2 search threads each, 2 GB of video memory kept) set through the settings' `set`, starting as set and playing on while the owner types, a fullscreen app runs and another program keeps the GPU 90 % busy past the busy gate's 30 s: nothing yielded, every id credited or unfinished once |
 | `agent/tests/gpu` | 10 (Windows) | agent 0.3.4, rolling GPU leases (PROTOCOL 10.6, 13, 13.5) with a CUDA fakeworker: a crew at the bench target (3 x 384 on a 4070 Ti, search threads shared, no `infer_*`, each worker a third of the memory limit, no hint), the games in flight raised within the lease once the memory measured fits (128-ish -> 1,024), every member yielding its video memory and resuming, a member's crash, the video memory plan (a small GPU: one worker; another program filling the GPU: one gives way, none joins until it fits), a worker out of video memory restarted with smaller batches (learned per row, the memory per game untouched), the tuner choosing the worker count (reported); 0.3.5: an uncalibrated start (9.5 GB cap, ~2 MB a game) reaching a crew of 2 x 512 within seconds without a handoff loop, a trial that can't run when its worker starts counted as discarded; 0.3.6: a crew forming under a 9.3 GB cap with workers of 1.5 GB and 2 MB a game (the base measured, the start picked again, the draining start's last games ended, ids exact); 0.3.15: a worker whose resume fails (zero-core's non-fatal `error`, then frozen: `resume_error`) started again with smaller batches, and a crew whose resumes fail (main worker restarted, member replaced) |
 | `agent/tests/variants` | 6 | agent 0.3.5, model variants per generation (PROTOCOL 14): a self-play lease whose checkpoint names a `variant` gets that file (`model-<name>.onnx`, cached next to the gen's reference set, only it fetched) as the job line's `model`, the next lease request lists `<run>/<gen>/<name>` in `cached.ckpts`; refusals (`refused: "definition"`, nothing downloaded): a variant the definition doesn't sign, the default's hash under a variant's name or the reverse, a name that isn't one, a variant on a legacy lease; a variant file of another size never used; an eval lease's `models` with one gen's variant and another's default; a rolling lease switching in place to the next gen's variant (the `checkpoint` op's `model` and `sha256`) and then to a default; a rolling switch to a variant the new definition doesn't sign finishing the lease, reported once |
@@ -317,9 +325,10 @@ The farm owner's own desktop plays its runs' self-play through the farm beside t
 - **The idle memory floor always** (`policy::mem_floor_for`, used by `decide` and `Engine::caps`): an eighth of RAM.
 - **A job memory cap of three quarters of the RAM** unless `max_ram_mb` is set (`Settings::ram_cap_mb`).
 - **Normal priority**, no EcoQoS (`SpawnOpts::normal_priority`, `worker.rs` / `worker_unix.rs`); probes unchanged.
-- **A GPU crew of up to 8** (`tune::gpu_max_workers`: one per 3 physical cores, friends' stays 3) with an "auto" target
-  of 1,152 games in flight per worker it may have (`rolling::dml_target_for`, at most `rolling::MAX_CREW_INFLIGHT` in
-  all; one worker at most 4,096, `Space::fit`).
+- **One GPU worker unless set** (`tune::gpu_max_workers` is 1 on an owner machine; friends' stays 3): worker processes on
+  one GPU time-slice it on Windows and don't overlap (the owner's desktop GPU: 3 processes 33.5k rows/s against 1 process with 3
+  sessions 42.9k), so the owner machine runs no crew by itself; a fixed `workers` up to 8 is still possible (below), not
+  recommended on one GPU. A torch job (PROTOCOL 19) runs one worker whatever `workers` says.
 - **12 GB of video memory kept** (`settings::OWNER_GPU_RESERVE_MB`) unless `gpu_reserve_mb` says otherwise:
   `rolling::vram_budget_kept` plans the crew within 85 % of the adapter less the more of the reserve and other
   programs' use, at the lease's start and at every reading (`Vram::reserve_mb`).
@@ -328,11 +337,11 @@ Any machine may also set `gpu_reserve_mb` and, with `autotune` off, a **fixed GP
 `worker_inflight`, `worker_groups` (1-2), `worker_threads` (`tune::Space::pin`: exactly that layout, no trials, the
 memory plans cutting each worker's games but not their count unless a worker's video memory base doesn't fit).
 
-On Windows, with Zero Farm quit from the tray (the running agent would write its own settings back), e.g. a fixed
-6-worker crew of 1,152 games in flight in two groups with 12 GB kept for the trainer:
+On Windows, with Zero Farm quit from the tray (the running agent would write its own settings back), e.g. one worker
+of 2,048 games in flight in two groups with 12 GB kept for the trainer:
 
 ```
-farm-agent set owner on autotune off workers 6 worker_inflight 1152 worker_groups 2 gpu_reserve_mb 12288
+farm-agent set owner on autotune off worker_inflight 2048 worker_groups 2 gpu_reserve_mb 12288
 farm-agent settings
 ```
 
@@ -341,7 +350,33 @@ status` says so. Tests: `policy::tests` (`an_owner_machine_*`), `settings::tests
 `tune::tests` (`an_owner_machines_*`, `the_owners_fixed_layout_*`), `rolling::tests` (`video_memory_kept_*`,
 `a_bigger_crews_target`), and `tests/owner.rs` (a fixed crew of six CUDA fakeworkers set through `set_by_name`, playing
 on through 34 s of a 90 %-busy GPU, the owner at the keyboard and a fullscreen app: nothing yielded, every id
-accounted for).
+accounted for - the capability; not a recommended layout).
+
+## Torch runtime (PROTOCOL 19, unreleased, agent 0.3.19)
+
+An opt-in runtime pack (`opt_in: "torch"`, `gpu` NVIDIA with the provider `torch-cuda`) holds an embeddable python with
+torch; a torch worker build's `entry` is `zf-pyshim.exe` (crate `pyshim`). The coordinator leases them only to machines
+the owner opted in (`npm run admin -- machine <id> opt-in torch`) with agents from `TORCH_AGENT`.
+
+- **Manifests** (`common/src/manifest.rs`): `opt_in` (runtime packs with `gpu` only), `torch-cuda` alone and only in an
+  opt-in pack (`Manifest::is_torch`), manifests up to 8 MiB (`MAX_MANIFEST_BYTES`). `farm-release sign --opt-in NAME`
+  (needs `--min-agent 0.3.19`).
+- **Probe** (`probe::run_torch`, `TORCH_PROBE_PY`): the pack's `python\python.exe -I -B -X utf8 -c <check> --json <file>`
+  before the first job line of the first lease that uses the pack here (never between leases: `next_probe` skips torch
+  packs), under the probe marker; `torch_from_report` records `torch-cuda` or nothing (a report is a verdict, `benched`),
+  `profile_providers` lists it in `runtime_providers` only. No bench.
+- **Job** (`Engine::choose_torch`, `rolling::torch_shape`): `providers` `["torch-cuda"]` on the adapter the probe passed
+  on (`probe::torch_target`), `CUDA_VISIBLE_DEVICES=GPU-<uuid>` in the worker's environment (`SpawnOpts::env`), the run's
+  games in flight (or "auto" 2,048) for ONE worker process (`gpu_tuning_for`: fixed, no crew, whatever `workers`); a job
+  that can't run torch is refused (`refused: "runtime"`), never run on the CPU.
+- **A worker's processes** (`worker.rs`): CPU time (job accounting), committed memory (every process of the job),
+  suspend/resume and the pids whose GPU use is the lease's (`WorkerProc::pids`) cover the shim's python too.
+- Tests: `probe::tests` (`a_torch_probe_record_*`, `a_torch_pack_without_python_*`), `rolling::tests`
+  (`torch_shape_*`), `manifest::tests::opt_in_and_the_torch_provider`, `tests/torch.rs` (the real shim and the
+  fakeworker as the pack's python: the probe before the first job line, one worker on an owner machine set for 6,
+  `ZEROFARM_RUNTIME_DIR` / `CUDA_VISIBLE_DEVICES`, both builds still verifying afterwards; a failed probe refusing the
+  lease and removing the pack), `pyshim/tests/shim.rs` (flags, arguments, stdio, exit codes, loud errors, python killed
+  with the shim).
 
 ## Install flow (`farm-agent install`, run by ZeroFarmSetup.exe)
 

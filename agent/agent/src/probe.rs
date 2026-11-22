@@ -18,6 +18,11 @@
 //! with one is pinned to a single adapter ([`scope`]: NVIDIA first, then AMD, then Intel), an AMD one gets `--providers
 //! dml,cpu` and no `--ensure-ready`, a pack that ships Windows ML's catalog ([`WINML_CATALOG_DLL`]) never touches it, and
 //! the measured choice never puts another provider on it - not even from a record an older agent kept.
+//!
+//! Agent 0.3.19 (PROTOCOL 19): the torch runtime pack (an opt-in pack whose `gpu` brings `torch-cuda`) is not ONNX
+//! Runtime: its probe runs the pack's own python on a tiny PyTorch check ([`run_torch`], [`TORCH_PROBE_PY`]) under the
+//! same in-progress marker, before the first job line of a lease that uses it (never between leases), and its record
+//! lists `torch-cuda` or nothing. There is no bench: a torch job runs on the GPU the probe passed, or not at all.
 
 use crate::worker::{SpawnOpts, WorkerMsg, WorkerProc};
 use serde::{Deserialize, Serialize};
@@ -54,6 +59,9 @@ pub struct Pass {
     pub rows_per_s: Option<f64>,
     #[serde(default)]
     pub why: Option<String>,
+    /// PROTOCOL 19 (a torch probe): the CUDA device's UUID (`GPU-...`), which a torch job's `CUDA_VISIBLE_DEVICES` names.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<String>,
 }
 
 /// A probe of one runtime pack on this PC's adapters.
@@ -92,8 +100,19 @@ impl Probe {
     /// Providers that passed here: the built-in probe's and those that passed on a job's network (never one a probe may
     /// not load: an older record's AMD providers don't count).
     pub fn passed(&self) -> Vec<String> {
+        // (PROTOCOL 19: a torch pack's record lists torch-cuda or nothing - no CPU: its worker never runs on the CPU)
+        if self.need.as_deref().is_some_and(is_torch_need) {
+            return self.providers.iter().filter(|p| *p == TORCH_PROVIDER).cloned().collect();
+        }
         ordered(self.providers.iter().chain(self.real.iter()).filter(|p| PROBE_PROVIDERS.contains(&p.as_str())).cloned())
     }
+}
+
+pub use zerofarm_common::manifest::TORCH_PROVIDER;
+
+/// PROTOCOL 19: a pack's GPU providers (its manifest's `gpu.providers`) are the torch pack's.
+pub fn is_torch_need(providers: &[String]) -> bool {
+    providers.iter().any(|p| p == TORCH_PROVIDER)
 }
 
 // ---------- 0.2.11: what a probe may load, where it runs, and probes the PC never finished ----------
@@ -797,6 +816,10 @@ pub fn next_probe(layout: &Layout, keys: &zerofarm_common::keys::TrustedKeys, gp
         }
         let rdir = layout.cache_builds().join(&rt);
         let Ok(rv) = verify_dir(&rdir, keys, &Expect { build_id: Some(&rt), kind: Some(Kind::Runtime), version: None }) else { continue };
+        // PROTOCOL 19: the torch pack has no `probe-providers`; its own probe runs in the lease that first uses it
+        if rv.manifest.is_torch() {
+            continue;
+        }
         // agent 0.3.11: no adapter this pack may use here (an AMD GPU and Windows ML's catalog): nothing to probe
         let Some(sc) = scope(gpus, off, &PackGpu::of(&rv.manifest)) else { continue };
         let entry = w.entry_path()?;
@@ -818,6 +841,7 @@ pub fn from_report(v: &Value, runtime: &str, adapters: &str, worker: &str, t: i6
             cpu_nodes: st["cpu_fallback_nodes"].as_array().map(|a| a.len() as u64),
             rows_per_s: r["rows_per_s"].as_f64(),
             why: r["why"].as_str().map(|s| s.chars().take(300).collect()),
+            uuid: None,
         });
     }
     let providers: Vec<String> = v["providers"].as_array().into_iter().flatten().filter_map(Value::as_str).map(String::from).collect();
@@ -883,7 +907,7 @@ pub fn run(
     if let Err(e) = mark(layout, &m) {
         return failed(e);
     }
-    let r = run_worker(layout, "probe", entry, &args, rdir, log, timeout, stop);
+    let r = run_worker(layout, "probe", entry, &args, rdir, log, timeout, stop, 4096);
     unmark(layout);
     match r {
         Ok(v) => from_report(&v, runtime, &akey, worker, now),
@@ -891,10 +915,183 @@ pub fn run(
     }
 }
 
+// ---------- PROTOCOL 19: the torch pack's probe ----------
+
+/// The torch pack's probe (`python -I -B -X utf8 -c <this> --json <file>`): the python and torch versions, CUDA's, and for
+/// each CUDA device its name, UUID and memory and a check - a 256 x 256 float32 matmul on the device against the CPU's (max
+/// abs difference over the largest result, at most 1e-3), finite. Any exception is reported as `error`. Prints nothing
+/// the agent reads but the JSON file.
+pub const TORCH_PROBE_PY: &str = r#"
+import json, sys, time
+out = {"probe": "torch/1", "python": sys.version.split()[0]}
+try:
+    import torch
+    out["torch"] = torch.__version__
+    out["cuda"] = torch.version.cuda
+    out["available"] = bool(torch.cuda.is_available())
+    devs = []
+    if out["available"]:
+        torch.backends.cuda.matmul.allow_tf32 = False
+        g = torch.Generator().manual_seed(0)
+        a = torch.randn(256, 256, generator=g, dtype=torch.float32)
+        b = torch.randn(256, 256, generator=g, dtype=torch.float32)
+        ref = a @ b
+        for i in range(torch.cuda.device_count()):
+            p = torch.cuda.get_device_properties(i)
+            d = {"index": i, "name": p.name, "uuid": str(getattr(p, "uuid", "") or "") or None, "total_mb": int(p.total_memory) >> 20, "cc": "%d.%d" % (p.major, p.minor)}
+            try:
+                t0 = time.perf_counter()
+                r = (a.to("cuda:%d" % i) @ b.to("cuda:%d" % i)).cpu()
+                torch.cuda.synchronize(i)
+                d["ms"] = round((time.perf_counter() - t0) * 1000, 1)
+                d["max_abs"] = float((r - ref).abs().max() / ref.abs().max())
+                d["ok"] = bool(torch.isfinite(r).all()) and d["max_abs"] <= 1e-3
+                if not d["ok"]:
+                    d["why"] = "the GPU's matmul differs from the CPU's"
+            except Exception as e:
+                d["ok"] = False
+                d["why"] = ("%s: %s" % (type(e).__name__, e))[:300]
+            devs.append(d)
+    out["devices"] = devs
+except Exception as e:
+    out["error"] = ("%s: %s" % (type(e).__name__, e))[:300]
+path = sys.argv[sys.argv.index("--json") + 1]
+with open(path, "w", encoding="utf-8") as f:
+    json.dump(out, f)
+"#;
+
+/// The pack's python (PROTOCOL 19: `python\python.exe` in the pack; `python/bin/python3` elsewhere).
+pub fn torch_python(rdir: &Path) -> PathBuf {
+    if cfg!(windows) {
+        rdir.join("python").join("python.exe")
+    } else {
+        rdir.join("python").join("bin").join("python3")
+    }
+}
+
+/// The torch probe's report -> a `Probe`: per CUDA device a `torch-cuda` pass on the profile's adapter of that name (the
+/// device's own name when none matches), `providers` `["torch-cuda"]` when a device passed on one of this PC's NVIDIA
+/// adapters, else none. A report is a verdict (`benched`): torch failing here is the pack failing on these adapters and
+/// drivers (PROTOCOL 9.5, 9.6), not unknown.
+pub fn torch_from_report(v: &Value, runtime: &str, adapters: &str, gpus: &[Gpu], t: i64) -> Probe {
+    let mut results = Vec::new();
+    for d in v["devices"].as_array().into_iter().flatten() {
+        let name = d["name"].as_str().unwrap_or("").to_string();
+        let adapter = gpus.iter().find(|g| g.vendor.eq_ignore_ascii_case("nvidia") && g.name.trim().eq_ignore_ascii_case(name.trim())).map(|g| g.name.clone());
+        let ok = d["ok"].as_bool().unwrap_or(false);
+        results.push(Pass {
+            provider: TORCH_PROVIDER.into(),
+            ok: ok && adapter.is_some(),
+            why: match (ok, &adapter) {
+                (true, None) => Some(format!("no NVIDIA adapter named {name:?} in this PC's profile")),
+                _ => d["why"].as_str().map(|s| s.chars().take(300).collect()),
+            },
+            adapter: Some(adapter.unwrap_or(name)),
+            max_abs: d["max_abs"].as_f64(),
+            cpu_nodes: None,
+            rows_per_s: None,
+            uuid: d["uuid"].as_str().filter(|u| !u.is_empty()).map(|u| u.chars().take(64).collect()),
+        });
+    }
+    let error = v["error"].as_str().map(|s| s.chars().take(300).collect::<String>());
+    let passed = error.is_none() && results.iter().any(|r| r.ok);
+    Probe {
+        runtime: runtime.into(),
+        adapters: adapters.into(),
+        worker: "python".into(),
+        t,
+        providers: if passed { vec![TORCH_PROVIDER.into()] } else { vec![] },
+        results,
+        // (the report is the verdict: the error is kept in the results' place, not as a probe that failed to run)
+        error: None,
+        need: Some(vec![TORCH_PROVIDER.into()]),
+        benched: true,
+        real: vec![],
+        rules: RULES,
+    }
+    .with_why(error)
+}
+
+impl Probe {
+    /// A torch probe's `error` from its report (torch failed to import or to start CUDA): one result saying so.
+    fn with_why(mut self, error: Option<String>) -> Probe {
+        if let Some(e) = error {
+            self.results.push(Pass { provider: TORCH_PROVIDER.into(), adapter: None, ok: false, max_abs: None, cpu_nodes: None, rows_per_s: None, why: Some(e), uuid: None });
+        }
+        self
+    }
+}
+
+/// How long the torch probe may take (python starting, torch importing, CUDA's first context).
+pub const TORCH_PROBE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Runs the torch pack's probe (PROTOCOL 19): the pack's python on [`TORCH_PROBE_PY`] in a job object (below-normal
+/// priority, a 16 GB memory limit: CUDA's libraries and context), at most `timeout`, under the in-progress marker
+/// (`kind` "probe", `worker` "python"). A python that can't start, crashes or doesn't answer is a probe that failed to
+/// run (`error`: tried again after a day); a report is the verdict.
+#[allow(clippy::too_many_arguments)]
+pub fn run_torch(layout: &Layout, runtime: &str, rdir: &Path, gpus: &[Gpu], log: Arc<RotatingFile>, timeout: Duration, stop: &dyn Fn() -> bool) -> Probe {
+    let now = zerofarm_common::now_unix();
+    let akey = adapters_key(gpus);
+    let failed = |e: String| Probe {
+        runtime: runtime.into(),
+        adapters: akey.clone(),
+        worker: "python".into(),
+        t: now,
+        providers: vec![],
+        results: vec![],
+        error: Some(e),
+        need: Some(vec![TORCH_PROVIDER.into()]),
+        benched: false,
+        real: vec![],
+        rules: RULES,
+    };
+    let python = torch_python(rdir);
+    if !python.is_file() {
+        return failed(format!("the torch pack has no {}", python.strip_prefix(rdir).unwrap_or(&python).display()));
+    }
+    let m = Inflight { kind: "probe".into(), runtime: runtime.into(), adapters: akey.clone(), worker: "python".into(), run: None, t: now };
+    if let Err(e) = mark(layout, &m) {
+        return failed(e);
+    }
+    let args = ["-I", "-B", "-X", "utf8", "-c", TORCH_PROBE_PY];
+    let r = run_worker(layout, "probe-torch", &python, &args, rdir, log, timeout, stop, 16384);
+    unmark(layout);
+    match r {
+        Ok(v) => torch_from_report(&v, runtime, &akey, gpus, now),
+        Err(e) => failed(e),
+    }
+}
+
+/// PROTOCOL 19: where a torch job runs - the adapter (the job line's `gpu`) with the most video memory among this PC's
+/// NVIDIA adapters on which the torch probe passed, and its CUDA device's UUID for `CUDA_VISIBLE_DEVICES` - or None (no
+/// probe passed, the GPU may not be used now, the lease's allowlist leaves out torch-cuda).
+pub fn torch_target(probe: Option<&Probe>, gpus: &[Gpu], allow: Option<&[String]>, gpu_ok: bool) -> Option<(Value, Option<String>)> {
+    let p = probe.filter(|p| p.error.is_none())?;
+    if !gpu_ok || allow.is_some_and(|a| !a.iter().any(|x| x == TORCH_PROVIDER)) {
+        return None;
+    }
+    let pass = |g: &Gpu| p.results.iter().find(|r| r.ok && r.provider == TORCH_PROVIDER && r.adapter.as_deref() == Some(g.name.as_str()));
+    let g = gpus.iter().filter(|g| g.vendor.eq_ignore_ascii_case("nvidia") && pass(g).is_some()).max_by_key(|g| g.vram_mb)?;
+    let uuid = pass(g).and_then(|r| r.uuid.clone());
+    Some((json!({"luid": g.luid.clone().unwrap_or_default(), "vendor": g.vendor, "name": g.name}), uuid))
+}
+
+/// PROTOCOL 19: a torch job's `CUDA_VISIBLE_DEVICES` for its device's UUID (torch prints `0a1b...`, CUDA wants
+/// `GPU-0a1b...`).
+pub fn cuda_visible(uuid: &str) -> String {
+    let u = uuid.trim();
+    if u.to_ascii_uppercase().starts_with("GPU-") {
+        u.to_string()
+    } else {
+        format!("GPU-{u}")
+    }
+}
+
 /// Runs `<entry> <args> --json <file>` in `work\<dir>` (a job object, the runtime pack first on the DLL path), at
 /// most `timeout` -> the JSON report; the readable report goes to the worker log. Err("stopped") when `stop`.
 #[allow(clippy::too_many_arguments)]
-fn run_worker(layout: &Layout, dir: &str, entry: &Path, args: &[&str], rdir: &Path, log: Arc<RotatingFile>, timeout: Duration, stop: &dyn Fn() -> bool) -> Result<Value, String> {
+fn run_worker(layout: &Layout, dir: &str, entry: &Path, args: &[&str], rdir: &Path, log: Arc<RotatingFile>, timeout: Duration, stop: &dyn Fn() -> bool, mem_limit_mb: u64) -> Result<Value, String> {
     let work = layout.work().join(dir);
     let _ = zerofarm_common::fsutil::remove_dir_all_retry(&work, Duration::from_secs(5));
     std::fs::create_dir_all(&work).map_err(|e| format!("work dir: {e}"))?;
@@ -904,7 +1101,7 @@ fn run_worker(layout: &Layout, dir: &str, entry: &Path, args: &[&str], rdir: &Pa
     all.extend(["--json", out_s.as_str()]);
     let t0 = Instant::now();
     let spawn = WorkerProc::spawn(
-        SpawnOpts { exe: entry, args: &all, cwd: &work, mem_limit_mb: 4096, cpu_job: false, normal_priority: false, log, tag: dir.into(), runtime_dir: Some(rdir) },
+        SpawnOpts { exe: entry, args: &all, cwd: &work, mem_limit_mb, cpu_job: false, normal_priority: false, log, tag: dir.into(), runtime_dir: Some(rdir), env: &[] },
         |_m: WorkerMsg| {},
     );
     let mut p = spawn.map_err(|e| format!("could not start the probe: {e}"))?;
@@ -988,7 +1185,7 @@ pub fn run_bench(
     if let Err(e) = mark(layout, &m) {
         return Ok(failed(e));
     }
-    let r = run_worker(layout, "bench", entry, &args, rdir, log, timeout, stop);
+    let r = run_worker(layout, "bench", entry, &args, rdir, log, timeout, stop, 4096);
     unmark(layout);
     match r {
         Ok(v) => Ok(bench_from_report(&v, runtime, &akey, spec.run, worker, spec.threads, now)),
@@ -1006,7 +1203,79 @@ mod tests {
     }
 
     fn pass(prov: &str, adapter: Option<&str>, ok: bool) -> Pass {
-        Pass { provider: prov.into(), adapter: adapter.map(String::from), ok, max_abs: None, cpu_nodes: None, rows_per_s: None, why: None }
+        Pass { provider: prov.into(), adapter: adapter.map(String::from), ok, max_abs: None, cpu_nodes: None, rows_per_s: None, why: None, uuid: None }
+    }
+
+    /// PROTOCOL 19: the torch probe's report -> its record (a verdict: `benched`), torch-cuda or nothing, the profile's
+    /// `runtime_providers` (`["torch-cuda"]` / `[]`, never in the global `providers`), the pack bad after a failed check.
+    #[test]
+    fn a_torch_probe_record_lists_torch_cuda_or_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let layout = Layout::new(d.path());
+        let mut nv = gpu("NVIDIA Test GPU", "nvidia", "000000000000d1f3");
+        nv.vram_mb = 32607;
+        let gpus = vec![nv.clone(), gpu("Intel(R) UHD Graphics 770", "intel", "00000000000000b2")];
+        let akey = adapters_key(&gpus);
+        let report = json!({"probe": "torch/1", "python": "3.13.14", "torch": "2.11.0+cu128", "cuda": "12.8", "available": true,
+            "devices": [{"index": 0, "name": "NVIDIA Test GPU", "uuid": "0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9", "total_mb": 32607, "ok": true, "max_abs": 1e-7}]});
+        let p = torch_from_report(&report, "torchpack", &akey, &gpus, 5);
+        assert_eq!(p.providers, vec![TORCH_PROVIDER.to_string()]);
+        assert_eq!(p.passed(), vec![TORCH_PROVIDER.to_string()], "no cpu: a torch worker never runs on the CPU");
+        assert!(p.benched && p.error.is_none() && p.need == Some(vec![TORCH_PROVIDER.into()]));
+        assert_eq!(p.results[0].adapter.as_deref(), Some("NVIDIA Test GPU"));
+        // where the job runs: that adapter, its device by UUID; not when the GPU may not be used or the allowlist says no
+        let (g, uuid) = torch_target(Some(&p), &gpus, None, true).unwrap();
+        assert_eq!(g["luid"], "000000000000d1f3");
+        assert_eq!(cuda_visible(uuid.as_deref().unwrap()), "GPU-0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9");
+        assert_eq!(cuda_visible("GPU-abc"), "GPU-abc");
+        assert!(torch_target(Some(&p), &gpus, None, false).is_none());
+        assert!(torch_target(Some(&p), &gpus, Some(&["cuda".into(), "cpu".into()]), true).is_none());
+        assert!(torch_target(Some(&p), &gpus, Some(&[TORCH_PROVIDER.into()]), true).is_some());
+        assert!(torch_target(None, &gpus, None, true).is_none());
+        record(&layout, p.clone());
+        let (all, per) = profile_providers(&layout, &gpus);
+        assert_eq!(all, vec!["cpu".to_string()], "torch-cuda is not an ONNX Runtime provider of this PC");
+        assert_eq!(per.unwrap()["torchpack"], vec![TORCH_PROVIDER.to_string()]);
+        assert!(!pack_bad(&load(&layout), "torchpack", &akey, Some(&[TORCH_PROVIDER.into()]), 5));
+        // a device of another name (no NVIDIA adapter of the profile): no pass
+        let other = json!({"available": true, "devices": [{"name": "Some Other GPU", "ok": true}]});
+        let q = torch_from_report(&other, "torchpack", &akey, &gpus, 6);
+        assert!(q.providers.is_empty() && q.results[0].why.as_deref().unwrap().contains("no NVIDIA adapter"));
+        // CUDA unavailable, a failed check, torch not importable: the verdict is no - the pack is bad here, listed with []
+        for bad in [
+            json!({"available": false, "devices": []}),
+            json!({"available": true, "devices": [{"name": "NVIDIA Test GPU", "ok": false, "why": "the GPU's matmul differs from the CPU's"}]}),
+            json!({"error": "ImportError: DLL load failed while importing _C"}),
+        ] {
+            let p = torch_from_report(&bad, "torchpack", &akey, &gpus, 7);
+            assert!(p.providers.is_empty() && p.passed().is_empty(), "{bad}");
+            record(&layout, p);
+            assert!(pack_bad(&load(&layout), "torchpack", &akey, Some(&[TORCH_PROVIDER.into()]), 7), "{bad}");
+            assert_eq!(profile_providers(&layout, &gpus).1.unwrap()["torchpack"], Vec::<String>::new(), "{bad}");
+            assert!(torch_target(find(&load(&layout), "torchpack", &akey), &gpus, None, true).is_none());
+        }
+        let e = torch_from_report(&json!({"error": "ImportError: x"}), "torchpack", &akey, &gpus, 7);
+        assert!(e.results.iter().any(|r| r.why.as_deref() == Some("ImportError: x")));
+    }
+
+    /// PROTOCOL 19: the torch probe runs the pack's python (no python: a probe that failed to run, tried again after a
+    /// day), and its marker is gone afterwards.
+    #[test]
+    fn a_torch_pack_without_python_fails_its_probe_to_run() {
+        let d = tempfile::tempdir().unwrap();
+        let layout = Layout::new(d.path());
+        let pack = d.path().join("pack");
+        std::fs::create_dir_all(&pack).unwrap();
+        let log = Arc::new(RotatingFile::new(d.path().join("worker.log"), 1 << 20, 1));
+        let gpus = vec![gpu("RTX 4070 Ti", "nvidia", "000000000000d1f3")];
+        let p = run_torch(&layout, "torchpack", &pack, &gpus, log, Duration::from_secs(5), &|| false);
+        assert!(p.error.as_deref().unwrap().contains("has no python"), "{p:?}");
+        assert!(p.providers.is_empty() && !p.benched);
+        assert!(!inflight_path(&layout).exists());
+        record(&layout, p);
+        let akey = adapters_key(&gpus);
+        assert!(pack_bad(&load(&layout), "torchpack", &akey, Some(&[TORCH_PROVIDER.into()]), zerofarm_common::now_unix()), "not again for a day");
+        assert!(!pack_bad(&load(&layout), "torchpack", &akey, Some(&[TORCH_PROVIDER.into()]), zerofarm_common::now_unix() + RETRY_S + 1));
     }
 
     #[test]

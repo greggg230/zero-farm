@@ -14,8 +14,9 @@ use std::path::{Component, Path, PathBuf};
 
 pub const MANIFEST_FILE: &str = "manifest.json";
 pub const SIG_FILE: &str = "manifest.json.minisig";
-/// Upper bound for a manifest file (they are a few KB).
-pub const MAX_MANIFEST_BYTES: u64 = 1 << 20;
+/// Upper bound for a manifest file (most are a few KB). Agent 0.3.19 (PROTOCOL 19): 8 MiB - an opt-in runtime pack (a
+/// python with its site-packages) lists thousands of files; the coordinator keeps every other manifest within 1 MiB.
+pub const MAX_MANIFEST_BYTES: u64 = 8 << 20;
 /// Upper bound for a signature file.
 pub const MAX_SIG_BYTES: u64 = 4096;
 
@@ -108,8 +109,21 @@ pub fn is_platform_name(s: &str) -> bool {
     !s.is_empty() && s.len() <= 32 && s.bytes().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
 }
 
-/// Provider names a manifest may list (PROTOCOL 3).
-pub const PROVIDERS: [&str; 7] = ["cpu", "tensorrt_rtx", "cuda", "migraphx", "amdgpu", "openvino", "dml"];
+/// Provider names a manifest may list (PROTOCOL 3). Agent 0.3.19 (PROTOCOL 19): `torch-cuda` - PyTorch with CUDA in an
+/// opt-in runtime pack ([`TORCH_PROVIDER`]), never an ONNX Runtime provider.
+pub const PROVIDERS: [&str; 8] = ["cpu", "tensorrt_rtx", "cuda", "migraphx", "amdgpu", "openvino", "dml", "torch-cuda"];
+
+/// PROTOCOL 19: the provider of the torch runtime pack: the trainer's own PyTorch CUDA path in a python worker. Only an
+/// opt-in pack (`opt_in`) brings it, and it is its only provider.
+pub const TORCH_PROVIDER: &str = "torch-cuda";
+/// PROTOCOL 19: the first agent that reads `opt_in` and the torch pack (`farm-release sign --opt-in` needs a `min_agent`
+/// of at least this; the coordinator's `TORCH_AGENT`).
+pub const OPT_IN_MIN_AGENT: &str = "0.3.19";
+
+/// PROTOCOL 19: a well-formed opt-in name (`[a-z0-9-]{1,32}`): a runtime manifest's `opt_in`.
+pub fn is_opt_in_name(s: &str) -> bool {
+    is_platform_name(s)
+}
 
 /// `have` >= `min` for dotted driver versions ("560.94" >= "527.41"; "32.0.15.6094"): numeric parts compared in
 /// order, missing parts 0. An empty version, or a part that isn't a number, is unknown: false.
@@ -170,6 +184,10 @@ pub struct Manifest {
     /// rev 17 (PROTOCOL 11.3): the platform the build is for; absent = `windows-x64` ([`Manifest::platform_name`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub platform: Option<String>,
+    /// PROTOCOL 19 (agent 0.3.19), runtime packs with `gpu` only: the pack is leased only to machines the owner opted in
+    /// to this name (the coordinator's `machines.opt_in`), e.g. `torch`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opt_in: Option<String>,
     pub files: Vec<FileEntry>,
 }
 
@@ -317,6 +335,18 @@ impl Manifest {
             if !new_enough {
                 return inv(&format!("a runtime manifest with gpu needs min_agent {ZST_MIN_AGENT} or newer"));
             }
+            // PROTOCOL 19: the torch pack is an opt-in pack, and torch-cuda is its only provider
+            if g.providers.iter().any(|p| p == TORCH_PROVIDER) && (self.opt_in.is_none() || g.providers.len() != 1) {
+                return inv(&format!("gpu.providers {TORCH_PROVIDER} comes alone, in an opt-in pack (opt_in)"));
+            }
+        }
+        if let Some(o) = &self.opt_in {
+            if !is_opt_in_name(o) {
+                return inv(&format!("opt_in {o:?} must be a name (a-z, 0-9, -; at most 32)"));
+            }
+            if self.kind != Kind::Runtime || self.gpu.is_none() {
+                return inv("only a runtime pack with gpu has opt_in");
+            }
         }
         // (a platform's `min_agent` 0.3.0 rule is `farm-release sign`'s: it keeps such builds from older agents, which
         // never run this check; an agent from 0.3.0 knows platforms whatever the build's `min_agent`)
@@ -348,6 +378,11 @@ impl Manifest {
     /// The platform the build is for (PROTOCOL 11.3): its `platform`, else `windows-x64`.
     pub fn platform_name(&self) -> &str {
         self.platform.as_deref().unwrap_or(PLATFORM_WINDOWS_X64)
+    }
+
+    /// PROTOCOL 19: a torch runtime pack - its `gpu` brings [`TORCH_PROVIDER`] (an opt-in pack; `validate` checked it).
+    pub fn is_torch(&self) -> bool {
+        self.gpu.as_ref().is_some_and(|g| g.providers.iter().any(|p| p == TORCH_PROVIDER))
     }
 }
 
@@ -528,6 +563,7 @@ mod tests {
             entry: Some("w.exe".into()),
             gpu: None,
             platform: None,
+            opt_in: None,
             files: vec![f.clone()],
         };
         assert!(m.validate().is_ok());
@@ -585,6 +621,7 @@ mod tests {
             entry: None,
             gpu: None,
             platform: None,
+            opt_in: None,
             files: vec![f],
         };
         assert!(m.validate().unwrap_err().to_string().contains("min_agent"), "zst before 0.2.10");
@@ -633,6 +670,7 @@ mod tests {
             entry: Some("mtgz-worker".into()),
             gpu: None,
             platform: None,
+            opt_in: None,
             files: vec![f],
         };
         assert!(m.validate().is_ok());
@@ -654,6 +692,55 @@ mod tests {
         // Manifests without it serialise as before (no "platform" key).
         m.platform = None;
         assert!(!String::from_utf8(serde_json::to_vec(&m).unwrap()).unwrap().contains("platform"));
+    }
+
+    /// PROTOCOL 19: `opt_in` on a runtime pack with `gpu` only; torch-cuda alone and only in an opt-in pack; manifests
+    /// without it read and serialise as before.
+    #[test]
+    fn opt_in_and_the_torch_provider() {
+        let f = FileEntry { path: "python/python.exe".into(), sha256: "0".repeat(64), size: 1, zst: None };
+        let mut m = Manifest {
+            manifest: 1,
+            kind: Kind::Runtime,
+            version: "torch-2.11.0-cu128-py313".into(),
+            created: 0,
+            game: None,
+            engine_commit: None,
+            core_commit: None,
+            profile: None,
+            aw: None,
+            zero_onnx: None,
+            min_agent: Some(OPT_IN_MIN_AGENT.into()),
+            requires_runtime: None,
+            entry: None,
+            gpu: Some(GpuNeed { vendor: "nvidia".into(), min_driver: Some("570.65".into()), providers: vec![TORCH_PROVIDER.into()] }),
+            platform: None,
+            opt_in: Some("torch".into()),
+            files: vec![f],
+        };
+        assert!(m.validate().is_ok());
+        assert!(m.is_torch());
+        let back = Manifest::parse(&serde_json::to_vec(&m).unwrap()).unwrap();
+        assert_eq!(back, m);
+        m.opt_in = None;
+        assert!(m.validate().unwrap_err().to_string().contains("opt-in"), "torch-cuda only in an opt-in pack");
+        m.opt_in = Some("torch".into());
+        m.gpu.as_mut().unwrap().providers = vec![TORCH_PROVIDER.into(), "cuda".into()];
+        assert!(m.validate().is_err(), "torch-cuda comes alone");
+        m.gpu.as_mut().unwrap().providers = vec!["cuda".into()];
+        assert!(m.validate().is_ok(), "another opt-in GPU pack");
+        assert!(!m.is_torch());
+        for bad in ["", "Torch", "to rch", &"x".repeat(33)] {
+            m.opt_in = Some(bad.to_string());
+            assert!(m.validate().is_err(), "{bad:?}");
+        }
+        m.opt_in = Some("torch".into());
+        m.gpu = None;
+        assert!(m.validate().is_err(), "opt_in needs gpu");
+        let old = r#"{"manifest":1,"kind":"runtime","version":"v","created":1,"files":[{"path":"a.dll","sha256":"0000000000000000000000000000000000000000000000000000000000000000","size":1}]}"#;
+        let m2 = Manifest::parse(old.as_bytes()).unwrap();
+        assert!(m2.opt_in.is_none() && !m2.is_torch());
+        assert!(!String::from_utf8(serde_json::to_vec(&m2).unwrap()).unwrap().contains("opt_in"));
     }
 
     #[test]

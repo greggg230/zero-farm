@@ -745,10 +745,45 @@ pub fn gpu_shape(setting: Inflight, rows: &BTreeMap<String, f64>, template_group
     }
 }
 
+/// PROTOCOL 19: a torch job's games in flight for "auto" - one worker process (internal concurrency via `conc`, the
+/// trainer's own batched search), two groups. A run that plays torch on the farm should set its own number (its trainer's
+/// self-play setting); "auto" is a start that the memory plan cuts and the freshness cap (18.3) bounds.
+pub const TORCH_CONC: u64 = 2048;
+
+/// PROTOCOL 19: a torch job's (conc, groups): the run's number (in the template's groups, at most two), or "auto"
+/// `TORCH_CONC` - both capped by memory as any GPU job's (`MemPlan::cap`) - in two groups once there are
+/// 2 x `GPU_SPLIT_MIN_ROWS` games (`gpu_groups`). No bench: a torch pack has none (its worker is not ONNX Runtime's).
+pub fn torch_shape(setting: Inflight, template_groups: u64, mem: MemPlan) -> (u64, u64) {
+    match setting {
+        Inflight::N(n) => {
+            let n = mem.cap(n, false);
+            (n, template_groups.clamp(1, GPU_MAX_GROUPS).min(n))
+        }
+        Inflight::Auto => {
+            let conc = mem.cap(TORCH_CONC, true);
+            (conc, gpu_groups(conc, conc))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn torch_shape_is_one_workers_games() {
+        let mem = MemPlan { ram_mb: 1 << 20, cost: GPU_COST, measured: false };
+        assert_eq!(torch_shape(Inflight::Auto, 1, mem), (TORCH_CONC, 2));
+        assert_eq!(torch_shape(Inflight::N(1024), 2, mem), (1024, 2));
+        assert_eq!(torch_shape(Inflight::N(1024), 5, mem), (1024, 2), "at most two groups");
+        assert_eq!(torch_shape(Inflight::N(300), 1, mem), (300, 1));
+        // the memory plan cuts "auto" (and a measured run's number)
+        let small = MemPlan { ram_mb: 8192, cost: GPU_COST, measured: true };
+        let (c, g) = torch_shape(Inflight::Auto, 1, small);
+        assert!((1..TORCH_CONC).contains(&c), "{c}");
+        assert!(g >= 1);
+    }
 
     fn rows(pts: &[(u64, f64)]) -> BTreeMap<String, f64> {
         pts.iter().map(|(n, r)| (n.to_string(), *r)).collect()

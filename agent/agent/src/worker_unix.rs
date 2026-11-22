@@ -65,6 +65,9 @@ impl WorkerProc {
             }
             cmd.env("DYLD_LIBRARY_PATH", joined).env("ZEROFARM_RUNTIME_DIR", rt);
         }
+        for (k, v) in opts.env {
+            cmd.env(k, v);
+        }
         cmd.args(opts.args).current_dir(opts.cwd).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).process_group(0);
         // SAFETY: setpriority(2) is async-signal-safe; it only lowers this child's own priority before exec.
         unsafe {
@@ -120,6 +123,11 @@ impl WorkerProc {
 
     pub fn is_suspended(&self) -> bool {
         self.suspended
+    }
+
+    /// The worker's pid (PROTOCOL 19's python workers run on Windows only; a group's other processes aren't listed).
+    pub fn pids(&self) -> Vec<u32> {
+        vec![self.pid]
     }
 
     fn reaped(&mut self) {

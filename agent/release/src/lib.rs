@@ -190,6 +190,9 @@ pub struct SignOpts {
     /// rev 17 (PROTOCOL 11.3): the platform the build is for (one of [`PLATFORMS`]); written into the manifest, which
     /// then needs `min_agent` 0.3.0 or newer. None: no `platform` field (= windows-x64, as before).
     pub platform: Option<String>,
+    /// PROTOCOL 19, runtime packs with a GPU requirement: the opt-in name (`--opt-in torch`); needs `min_agent`
+    /// `OPT_IN_MIN_AGENT` or newer. A pack that brings `torch-cuda` needs it.
+    pub opt_in: Option<String>,
 }
 
 /// Where `sign --zst` puts a build directory's compressed copies (next to it, so the build directory itself
@@ -295,10 +298,24 @@ pub fn sign(dir: &Path, opts: &SignOpts, key: &SigningKey) -> Result<(String, Ma
             t.min_agent = opts.min_agent.clone();
             t.entry = opts.entry.clone();
             t.gpu = opts.gpu.clone();
+            t.opt_in = opts.opt_in.clone();
         }
     }
     if opts.gpu.is_some() && kind != Kind::Runtime {
         return Err("--gpu-vendor/--gpu-providers: only a runtime pack declares the GPU it needs".into());
+    }
+    // PROTOCOL 19: an opt-in pack (the torch pack) - a runtime pack with a GPU requirement, for agents that read opt_in
+    if let Some(o) = &opts.opt_in {
+        if kind != Kind::Runtime || opts.gpu.is_none() {
+            return Err("--opt-in: only a runtime pack with --gpu-vendor/--gpu-providers is an opt-in pack".into());
+        }
+        if !zerofarm_common::manifest::is_opt_in_name(o) {
+            return Err(format!("--opt-in {o:?} must be a name (a-z, 0-9, -; at most 32)"));
+        }
+        let min = zerofarm_common::manifest::OPT_IN_MIN_AGENT;
+        if !t.min_agent.as_deref().is_some_and(|m| zerofarm_common::manifest::semver_at_least(m, min)) {
+            return Err(format!("--opt-in needs --min-agent {min} or newer (older agents don't read opt_in)"));
+        }
     }
     let new_enough = t.min_agent.as_deref().is_some_and(|m| zerofarm_common::manifest::semver_at_least(m, ZST_MIN_AGENT));
     if (opts.zst_level.is_some() || t.gpu.is_some()) && !new_enough {

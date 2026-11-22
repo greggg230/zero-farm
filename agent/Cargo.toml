@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["common", "launcher", "agent", "release", "fakeworker", "mockcoord"]
+members = ["common", "launcher", "agent", "release", "fakeworker", "mockcoord", "pyshim"]
 
 [workspace.package]
 edition = "2021"

@@ -1,0 +1,22 @@
+[package]
+name = "zf-pyshim"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "zf-pyshim.exe: the entry of a torch worker build - runs worker_main.py on the opt-in runtime pack's python (PROTOCOL 19.4)"
+
+[[bin]]
+name = "zf-pyshim"
+path = "src/main.rs"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Security", "Win32_System_Threading", "Win32_System_JobObjects"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+serde_json.workspace = true
+
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_System_Threading"] }

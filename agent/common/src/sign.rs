@@ -218,6 +218,7 @@ pub fn template(kind: Kind, version: &str) -> Manifest {
         entry: None,
         gpu: None,
         platform: None,
+        opt_in: None,
         files: vec![],
     }
 }
