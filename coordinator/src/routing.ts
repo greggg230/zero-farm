@@ -16,6 +16,9 @@ export const PROVIDER_VENDOR = {
   amdgpu: "amd",
   openvino: "intel",
   dml: "any",
+  // Rev 27 (PROTOCOL 19): PyTorch with CUDA in an opt-in runtime pack (`opt_in: "torch"`): the trainer's own self-play
+  // path in a python worker, not an ONNX Runtime provider. Offered only to machines the owner opted in.
+  "torch-cuda": "nvidia",
 } as const;
 export type Provider = keyof typeof PROVIDER_VENDOR;
 export const PROVIDERS = Object.keys(PROVIDER_VENDOR) as Provider[];
@@ -143,7 +146,8 @@ export interface GpuNeed {
 export interface Alternate {
   build_id: string;
   runtime: string;
-  when: { platform?: Platform; vendor?: string; min_driver?: string | null };
+  // rev 27 (PROTOCOL 19): `opt_in`, the pack's opt-in name: offered only to machines whose `opt_in` list holds it
+  when: { platform?: Platform; vendor?: string; min_driver?: string | null; opt_in?: string };
   model?: string;
 }
 export const altPlatform = (a: Alternate): Platform => storedPlatform(a.when.platform);
@@ -205,6 +209,35 @@ export function gpuNeedOf(manifestText: string | null | undefined): GpuNeed | nu
     min_driver: typeof g.min_driver === "string" ? g.min_driver : null,
     providers: Array.isArray(g.providers) ? (g.providers.filter(isProvider) as Provider[]) : [],
   };
+}
+
+// Rev 27 (PROTOCOL 19): opt-in names - a runtime manifest's `opt_in`, a machine's `opt_in` list, an alternate's
+// `when.opt_in`.
+export const OPT_IN_RE = /^[a-z0-9-]{1,32}$/;
+// At most this many names in a machine's `opt_in` list.
+export const MAX_OPT_IN = 8;
+// The provider that only opt-in packs may bring (PROTOCOL 19.1): a pack whose `gpu.providers` names it has `opt_in`.
+export const TORCH_PROVIDER = "torch-cuda";
+
+// Rev 27 (PROTOCOL 19): the `opt_in` of a runtime manifest (its stored JSON text), or null (none, or not a runtime).
+export function optInOf(manifestText: string | null | undefined): string | null {
+  if (!manifestText) return null;
+  try {
+    const m = JSON.parse(manifestText);
+    return m?.kind === "runtime" && typeof m.opt_in === "string" && OPT_IN_RE.test(m.opt_in) ? m.opt_in : null;
+  } catch {
+    return null;
+  }
+}
+
+// Rev 27: a machine's stored `opt_in` (its JSON text, or null: none) as a set of names.
+export function machineOptIns(text: string | null | undefined): Set<string> {
+  try {
+    const v = text ? JSON.parse(text) : [];
+    return new Set(Array.isArray(v) ? v.filter((x): x is string => typeof x === "string" && OPT_IN_RE.test(x)).slice(0, MAX_OPT_IN) : []);
+  } catch {
+    return new Set();
+  }
 }
 
 // The file paths of a manifest (its stored JSON text); [] when it can't be read.
@@ -283,8 +316,11 @@ export function servesVendor(p: Provider, vendor: string): boolean {
 
 // The GPU providers an alternate's pack brings that the job's allowlist allows (a pack without `gpu`: every GPU
 // provider the allowlist allows; rev 22, given the alternate's vendor: every one that can serve that vendor's GPUs).
+// Rev 27: torch-cuda only from a pack that declares it (an opt-in pack), never as "any GPU provider".
 export function altProviders(need: GpuNeed | null, allow: readonly string[] | null, vendor?: string): Provider[] {
-  const brings = need ? need.providers.filter(isGpuProvider) : PROVIDERS.filter((p) => isGpuProvider(p) && (!vendor || servesVendor(p, vendor)));
+  const brings = need
+    ? need.providers.filter(isGpuProvider)
+    : PROVIDERS.filter((p) => isGpuProvider(p) && p !== TORCH_PROVIDER && (!vendor || servesVendor(p, vendor)));
   return brings.filter((p) => !allow || allow.includes(p));
 }
 

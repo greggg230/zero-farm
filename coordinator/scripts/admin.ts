@@ -20,6 +20,9 @@ CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET, an Access service token)
   machines
   machine <machine_id> [--name N] [--channel stable|canary] [--paused true|false] [--unblock true]
                                                    --unblock: lift the builds it reported blocked
+  machine <machine_id> opt-in|opt-out <name>       opt-in runtimes per machine (rev 27, PROTOCOL 19): allow or
+                                                   withdraw an opt-in runtime pack (e.g. torch) on this machine;
+                                                   machines / stats show each machine's opt_in list
   revoke <machine_id>
   pause | resume                                   farm-wide: no new leases while paused
 
@@ -205,6 +208,12 @@ async function main(argv: string[]): Promise<void> {
       return print(await api("GET", "/v1/admin/machines"));
     case "machine":
       need(pos, 1, "machine <machine_id> [--name N] [--channel C] [--paused true|false] [--unblock true]");
+      // rev 27 (PROTOCOL 19): machine <id> opt-in|opt-out <name>
+      if (pos[1] === "opt-in" || pos[1] === "opt-out") {
+        need(pos, 3, "machine <machine_id> opt-in|opt-out <name>");
+        return print(await api("POST", `/v1/admin/machine/${pos[0]}`, pos[1] === "opt-in" ? { opt_in_add: pos[2] } : { opt_in_remove: pos[2] }));
+      }
+      if (pos.length > 1) throw new Fail(`machine: unknown subcommand ${pos[1]} (opt-in or opt-out)`);
       return print(
         await api("POST", `/v1/admin/machine/${pos[0]}`, {
           name: opt.name,

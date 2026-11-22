@@ -282,6 +282,20 @@ their games in flight - the log's `freshness:` lines, the lease Stats' `fresh_ca
 of rows dropped as stale in the pool's `by_machine` counters before and after; then the agent on stable and `fresh_cap`
 `"all"`. `GET /v1/admin/run/{run}` shows the run's budget (`fresh_s`).
 
+### Deploy notes: rev 27 (opt-in runtimes per machine: torch)
+
+Migration `0017_opt_in.sql` (`machines.opt_in`, a nullable JSON list) - apply it before the Worker. New var
+`TORCH_AGENT` (`0.3.19`, in `wrangler.jsonc`; set it to the agent release that carries PROTOCOL 19.5). Nothing changes
+for anyone until a runtime pack with `opt_in` is registered and a machine opted in: such a pack (and an alternate whose
+`when.opt_in` names it, which must equal the pack's) goes only to agents from `TORCH_AGENT` on machines whose `opt_in`
+holds the name. Order: the migration and the Worker; agent 0.3.19 on the owner's machines; register the torch pack
+(`farm-release sign --opt-in torch`, up to 20,000 files / 8 MiB of manifest - registration reads R2 list results, so
+upload the files with their `x-sha256` as `farm-release publish` does) and a torch worker build; put the run's torch
+alternate first (its `providers` allowlist, if any, must name `torch-cuda`); then
+`npm run admin -- machine <id> opt-in torch` for each machine (`npm run admin -- machines` lists ids and `opt_in`),
+`opt-out torch` to stop (from its next lease). `GET /v1/admin/run/{run}` lists the opted-in machines in the alternate's
+`opt_in_notes`; the admin page shows "opt-in: torch" under the machine.
+
 ### Cloudflare Access (security review H1)
 
 Access protects only the dashboard page, `/admin`. `/v1/admin` stays outside Access, so the CLI,

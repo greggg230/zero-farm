@@ -105,6 +105,7 @@ export interface BuildOpts {
   game?: string; // worker: default mtg
   profile?: string; // worker: default release
   extra_files?: string[]; // more files in the build (e.g. a runtime pack's DLLs, rev 22)
+  opt_in?: string; // runtime, rev 27 (PROTOCOL 19): an opt-in pack
 }
 
 // Uploads a manifest, its signature file and one file, and registers the build. Returns its id.
@@ -132,6 +133,7 @@ export async function makeBuild(o: BuildOpts = {}): Promise<string> {
   if (o.platform) manifest.platform = o.platform;
   if (o.requires_runtime) manifest.requires_runtime = o.requires_runtime;
   if (o.gpu) manifest.gpu = o.gpu;
+  if (o.opt_in) manifest.opt_in = o.opt_in;
   const extra = (o.extra_files ?? []).map((path) => ({ path, body: `extra ${path} ${o.tag ?? ""}` }));
   for (const x of extra) (manifest.files as unknown[]).push({ path: x.path, sha256: await sha256(x.body), size: new TextEncoder().encode(x.body).length });
   const text = JSON.stringify(manifest, null, 2);

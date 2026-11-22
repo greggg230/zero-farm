@@ -27,6 +27,8 @@ import {
   isGpuProvider,
   jobRank,
   kindRank,
+  machineOptIns,
+  optInOf,
   place,
   requiresRuntimeOf,
   runtimeProvidersOf,
@@ -576,6 +578,12 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
   const variantAware = defAware && cmpSemver(agent, cfg.variantAgent) >= 0;
   // Rev 22 (PROTOCOL 9.8): this agent reports AMD adapters and runs only DirectML on them: it may get AMD alternates.
   const amdAware = altAware && cmpSemver(agent, cfg.amdDmlAgent) >= 0;
+  // Rev 27 (PROTOCOL 19): this agent takes opt-in runtime packs (manifest `opt_in`, provider torch-cuda), and the opt-in
+  // names the owner allowed on this machine. An opt-in pack - an alternate's (`when.opt_in` is its name) or a run's
+  // default - goes only to such an agent on a machine whose list holds its name.
+  const torchAware = altAware && cmpSemver(agent, cfg.torchAgent) >= 0;
+  const optIns = machineOptIns(m.opt_in);
+  const optInOk = (name: string | null | undefined) => !name || (torchAware && optIns.has(name));
   // Where a job goes on this machine (PROTOCOL 8): GPU-eligible when it may use the GPU and
   // verified a provider the job allows, with the job's runtime pack if the profile says.
   const placeFor = (kind: "selfplay" | "eval" | "fuzz", r: Routing, runtime: string | null) =>
@@ -654,6 +662,8 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
   const needOf = (id: string | null) => (id ? gpuNeedOf(builds.get(id)?.manifest) : null);
   const packFits = (id: string | null) => {
     const need = needOf(id);
+    // (rev 27: an opt-in pack only where it is opted in)
+    if (!optInOk(optInOf(id ? builds.get(id)?.manifest : null))) return false;
     return !need || (altAware && vendorOk(need.vendor, builds.get(id!)?.manifest) && hasAdapter(machineProfile, need.vendor, [need.min_driver]));
   };
   // Rev 17 (PROTOCOL 11.4): a build's platform (one not registered counts as windows-x64; such a candidate is dropped
@@ -678,6 +688,9 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
         if (!bi || !ri || bi.kind !== "worker" || ri.kind !== "runtime") continue; // 6: registered
         if (platOf(a.build_id) !== platform || platOf(a.runtime) !== platform) continue;
         if (requiresRuntimeOf(bi.manifest) !== a.runtime) continue;
+        // rev 27 (PROTOCOL 19): an opt-in alternate (and any opt-in pack) only to an agent from TORCH_AGENT on a machine
+        // the owner opted in
+        if (!optInOk(a.when.opt_in) || !optInOk(optInOf(ri.manifest))) continue;
         const need = gpuNeedOf(ri.manifest);
         let eligible = true;
         if (!vendor) {
@@ -745,9 +758,13 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
   // asks: the run has that GPU version for the farm, not just for this agent).
   const usedVendor = (vendor: string, packManifest: string | null | undefined) =>
     !vendorsOff.has(vendor) && (!vendorRestricted(vendor) || vendorPackProblem(vendor, packManifest) === null);
+  // Rev 27 (PROTOCOL 19): an opt-in alternate is not the farm's GPU version (it serves the opted-in machines only).
   const hasGpuVersion = (r: book.RunRow) => {
     const need = needOf(r.runtime);
-    return altsOf(r).some((x) => !!x.when.vendor && usedVendor(x.when.vendor, builds.get(x.runtime)?.manifest)) || (need !== null && usedVendor(need.vendor, builds.get(r.runtime!)?.manifest));
+    return (
+      altsOf(r).some((x) => !!x.when.vendor && !x.when.opt_in && usedVendor(x.when.vendor, builds.get(x.runtime)?.manifest)) ||
+      (need !== null && usedVendor(need.vendor, builds.get(r.runtime!)?.manifest))
+    );
   };
   const active = new Map<string, number>((activeR.results as any[]).map((x) => [`${x.scope}|${x.kind}`, x.n]));
   // Rev 24 (PROTOCOL 15): the lane applies to this machine; background jobs' scopes (a run job with a `share`, 5.3).

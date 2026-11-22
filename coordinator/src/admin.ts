@@ -39,6 +39,12 @@ import {
   type Alternate,
   type CampaignAlternate,
   DRIVER_RE,
+  MAX_OPT_IN,
+  OPT_IN_RE,
+  machineOptIns,
+  optInOf,
+  altProviders,
+  storedRouting,
   GPU_MODES,
   MAX_ALTERNATES,
   type HwRouting,
@@ -403,14 +409,16 @@ export function alternatesOf(v: unknown): Alternate[] | null {
     const w = obj(o.when, `alternates[${i}].when`, { optional: true }) ?? {};
     // Rev 20 (PROTOCOL 14.3): a model variant its machines play; only the name is checked here (variants arrive per gen).
     const model = o.model === undefined || o.model === null ? undefined : str(o.model, `alternates[${i}].model`, { re: VARIANT_RE });
-    for (const k of Object.keys(w)) if (!["platform", "vendor", "min_driver"].includes(k)) throw bad(`alternates[${i}].when.${k}: unknown field`);
+    for (const k of Object.keys(w)) if (!["platform", "vendor", "min_driver", "opt_in"].includes(k)) throw bad(`alternates[${i}].when.${k}: unknown field`);
     const platform = w.platform === undefined || w.platform === null ? undefined : platformOf(w.platform, `alternates[${i}].when.platform`);
     const vendor = str(w.vendor, `alternates[${i}].when.vendor`, { optional: true, re: VENDOR_RE });
     const minDriver = str(w.min_driver, `alternates[${i}].when.min_driver`, { optional: true, re: DRIVER_RE });
+    // Rev 27 (PROTOCOL 19): the opt-in name of the alternate's pack (checked against the pack's own `opt_in` in altCheck)
+    const optIn = w.opt_in === undefined || w.opt_in === null ? undefined : str(w.opt_in, `alternates[${i}].when.opt_in`, { re: OPT_IN_RE });
     return {
       build_id: str(o.build_id, `alternates[${i}].build_id`, { re: BUILD_RE }),
       runtime: str(o.runtime, `alternates[${i}].runtime`, { re: BUILD_RE }),
-      when: { ...(platform ? { platform } : {}), vendor: vendor ?? "", ...(minDriver ? { min_driver: minDriver } : {}) },
+      when: { ...(platform ? { platform } : {}), vendor: vendor ?? "", ...(minDriver ? { min_driver: minDriver } : {}), ...(optIn ? { opt_in: optIn } : {}) },
       ...(model ? { model } : {}),
     };
   });
@@ -445,6 +453,15 @@ async function altCheck(db: D1Database, cfg: book.RunCfg): Promise<Alternate[] |
     }
     const pack = gpuNeedOf(text(a.runtime));
     if (pack && a.when.vendor && a.when.vendor !== pack.vendor) throw bad(`${at}.when.vendor is ${a.when.vendor}, but runtime ${a.runtime} is for ${pack.vendor} GPUs`);
+    // Rev 27 (PROTOCOL 19): `when.opt_in` names the pack's own `opt_in`, and an opt-in pack's alternate names it
+    const packOptIn = optInOf(text(a.runtime));
+    if ((a.when.opt_in ?? null) !== packOptIn) {
+      throw bad(
+        packOptIn
+          ? `${at}.when.opt_in must be "${packOptIn}": runtime ${a.runtime} is an opt-in pack (PROTOCOL 19)`
+          : `${at}.when.opt_in is "${a.when.opt_in}", but runtime ${a.runtime} has no opt_in (PROTOCOL 19)`,
+      );
+    }
     const vendor = a.when.vendor || pack?.vendor;
     if (!vendor) {
       if (a.when.platform === undefined) {
@@ -457,7 +474,12 @@ async function altCheck(db: D1Database, cfg: book.RunCfg): Promise<Alternate[] |
     if (platform !== DEFAULT_PLATFORM) throw bad(`${at}: no GPU work on ${platform} yet (PROTOCOL 11.5); a CPU alternate names no vendor`);
     const vp = vendorPackProblem(vendor, text(a.runtime));
     if (vp) throw bad(`${at}: ${vp}`);
-    out.push({ build_id: a.build_id, runtime: a.runtime, when: { vendor, ...(a.when.min_driver ? { min_driver: a.when.min_driver } : {}) }, ...(a.model ? { model: a.model } : {}) });
+    out.push({
+      build_id: a.build_id,
+      runtime: a.runtime,
+      when: { vendor, ...(a.when.min_driver ? { min_driver: a.when.min_driver } : {}), ...(packOptIn ? { opt_in: packOptIn } : {}) },
+      ...(a.model ? { model: a.model } : {}),
+    });
   }
   return out;
 }
@@ -630,9 +652,16 @@ async function alternatesStatus(
   r: book.RunRow,
   known?: Def | null,
   vendorsOff?: string[],
-): Promise<(Alternate & { problems: string[]; variant_notes?: string[]; gpu_notes?: string[] })[] | null> {
+): Promise<(Alternate & { problems: string[]; variant_notes?: string[]; gpu_notes?: string[]; opt_in_notes?: string[] })[] | null> {
   const alts = parseJson<Alternate[] | null>(r.alternates ?? null, null);
   if (!alts) return null;
+  // rev 27 (PROTOCOL 19): the machines opted in to each name (an alternate with when.opt_in goes only to them)
+  type OptRow = { machine_id: string; name: string; opt_in: string | null };
+  let optIns: OptRow[] | null = null;
+  const optedIn = async (name: string): Promise<OptRow[]> => {
+    optIns ??= (await c.env.DB.prepare(`SELECT machine_id, name, opt_in FROM machines WHERE opt_in IS NOT NULL AND revoked_at IS NULL ORDER BY created_at`).all<OptRow>()).results;
+    return optIns.filter((m) => machineOptIns(m.opt_in).has(name));
+  };
   const d = known === undefined ? await currentDef(c.env.DB, "run", r.run) : known;
   const off = vendorsOff ?? (await vendorsOffList(c.env.DB));
   let rows: book.CheckpointRow[] | null = null;
@@ -678,7 +707,35 @@ async function alternatesStatus(
       if (vp) problems.push(`not offered: ${vp}`);
       gpuNotes.push(`${vendor} GPUs run ${VENDOR_PROVIDERS[vendor].join(", ")} only; offered to agents from ${config(c.env).amdDmlAgent}`);
     }
-    out.push({ ...a, problems, ...(a.model ? { variant_notes: await notesFor(a.model) } : {}), ...(gpuNotes.length ? { gpu_notes: gpuNotes } : {}) });
+    // rev 27 (PROTOCOL 19): a GPU alternate whose pack's providers the job's allowlist leaves out is never offered (9.4
+    // condition 3; e.g. a torch alternate on a run whose `providers` lack "torch-cuda")
+    if (vendor) {
+      const rt = await c.env.DB.prepare(`SELECT manifest FROM builds WHERE build_id = ?`).bind(a.runtime).first<{ manifest: string }>();
+      const need = gpuNeedOf(rt?.manifest);
+      for (const k of ["selfplay", "eval"] as const) {
+        const job = parseJson<{ gpu?: unknown; providers?: unknown } | null>(r[k] ?? null, null);
+        if (!job) continue;
+        const routing = storedRouting(job.gpu, job.providers);
+        if (!altProviders(need, routing.providers, vendor).length) {
+          problems.push(`${k}: its providers allowlist allows none of the pack's GPU providers (${need?.providers.join(", ") || "none"}): not offered`);
+        }
+      }
+    }
+    const optNotes: string[] = [];
+    if (a.when.opt_in) {
+      const ms = await optedIn(a.when.opt_in);
+      optNotes.push(
+        `offered only to machines opted in to ${a.when.opt_in} (npm run admin -- machine <id> opt-in ${a.when.opt_in}) with agents from ${config(c.env).torchAgent}: ` +
+          (ms.length ? ms.map((m) => `${m.name} (${m.machine_id})`).join(", ") : "none yet"),
+      );
+    }
+    out.push({
+      ...a,
+      problems,
+      ...(a.model ? { variant_notes: await notesFor(a.model) } : {}),
+      ...(gpuNotes.length ? { gpu_notes: gpuNotes } : {}),
+      ...(optNotes.length ? { opt_in_notes: optNotes } : {}),
+    });
   }
   return out;
 }
@@ -947,6 +1004,7 @@ export async function machines(c: Ctx): Promise<Response> {
       profile: parseJson(m.profile, null),
       caps: parseJson(m.caps, null),
       paused: !!m.paused,
+      opt_in: [...machineOptIns(m.opt_in)], // rev 27 (PROTOCOL 19)
     })),
   });
 }
@@ -979,15 +1037,40 @@ export async function updateMachine(c: Ctx, id: string): Promise<Response> {
   const paused = bool(b.paused, "paused", { optional: true });
   const name = str(b.name, "name", { optional: true, min: 1, max: 64 });
   const unblock = bool(b.unblock, "unblock", { optional: true }) ?? false;
+  // Rev 27 (PROTOCOL 19): the machine's opt-in runtimes - `opt_in` replaces the list, `opt_in_add` / `opt_in_remove`
+  // add or remove one name
+  const optSet = b.opt_in === undefined ? undefined : optInList(b.opt_in);
+  const optAdd = str(b.opt_in_add, "opt_in_add", { optional: true, re: OPT_IN_RE });
+  const optRemove = str(b.opt_in_remove, "opt_in_remove", { optional: true, re: OPT_IN_RE });
+  if (optSet !== undefined && (optAdd || optRemove)) throw bad("opt_in replaces the list: not with opt_in_add or opt_in_remove");
   const r = await c.env.DB.prepare(
     `UPDATE machines SET channel = COALESCE(?, channel), paused = COALESCE(?, paused), name = COALESCE(?, name) WHERE machine_id = ?`,
   )
     .bind(channel ?? null, paused === undefined ? null : paused ? 1 : 0, name ?? null, id)
     .run();
   if (!r.meta.changes) throw notFound(`no machine ${id}`);
+  let optIn: string[] | undefined;
+  if (optSet !== undefined || optAdd || optRemove) {
+    const row = await c.env.DB.prepare(`SELECT opt_in FROM machines WHERE machine_id = ?`).bind(id).first<{ opt_in: string | null }>();
+    const cur = optSet !== undefined ? new Set(optSet) : machineOptIns(row?.opt_in);
+    if (optAdd) cur.add(optAdd);
+    if (optRemove) cur.delete(optRemove);
+    if (cur.size > MAX_OPT_IN) throw bad(`opt_in: at most ${MAX_OPT_IN} names`);
+    optIn = [...cur].sort();
+    await c.env.DB.prepare(`UPDATE machines SET opt_in = ? WHERE machine_id = ?`).bind(optIn.length ? JSON.stringify(optIn) : null, id).run();
+  }
   // Rev 5: lifts the builds this machine reported as blocked by Windows (/v1/crash kind blocked).
   const unblocked = unblock ? ((await c.env.DB.prepare(`DELETE FROM blocks WHERE machine_id = ?`).bind(id).run()).meta.changes ?? 0) : 0;
-  return json(unblock ? { ok: true, unblocked } : { ok: true });
+  return json({ ok: true, ...(unblock ? { unblocked } : {}), ...(optIn !== undefined ? { opt_in: optIn } : {}) });
+}
+
+// Rev 27 (PROTOCOL 19): a machine's `opt_in` list as put: opt-in names, at most MAX_OPT_IN, no repeats ([] or null: none).
+function optInList(v: unknown): string[] {
+  if (v === null) return [];
+  if (!Array.isArray(v) || v.length > MAX_OPT_IN) throw bad(`opt_in must be a list of at most ${MAX_OPT_IN} opt-in names ([] or null: none)`);
+  const names = v.map((x: unknown, i: number) => str(x, `opt_in[${i}]`, { re: OPT_IN_RE }));
+  if (new Set(names).size !== names.length) throw bad("opt_in names a runtime twice");
+  return names;
 }
 
 export async function pause(c: Ctx): Promise<Response> {
@@ -1148,7 +1231,7 @@ export async function stats(c: Ctx): Promise<Response> {
   const cfg = config(c.env);
   const [machinesR, leasesR, crashesR, thrR, runsR, campsR, recentCrashR, fuzzR, classR, pausedR, failCountR, releasesR, diagR, blocksR, batchesR, perMachineR, perScopeR, externalR] = await db.batch<any>([
     db.prepare(
-      `SELECT machine_id, name, class, channel, platform, agent_version, created_at, last_seen, revoked_at, paused, caps, presence, presence_t, tuning, tuning_t,
+      `SELECT machine_id, name, class, channel, platform, agent_version, created_at, last_seen, revoked_at, paused, caps, presence, presence_t, tuning, tuning_t, opt_in,
          json_extract(profile, '$.idle_h_day') AS idle_h_day, json_extract(profile, '$.on_h_day') AS on_h_day,
          json_extract(profile, '$.providers') AS providers, json_extract(profile, '$.gpus') AS gpus
        FROM machines ORDER BY created_at`,
@@ -1246,6 +1329,8 @@ export async function stats(c: Ctx): Promise<Response> {
       last_seen: m.last_seen,
       revoked: m.revoked_at !== null,
       paused: !!m.paused,
+      // Rev 27 (PROTOCOL 19): the opt-in runtimes the owner allowed on it.
+      opt_in: [...machineOptIns(m.opt_in)],
       // Rev 16: why an online agent isn't working (POST /v1/presence), while fresh.
       presence: presenceOf(m, c.now),
       // Rev 19 (PROTOCOL 13): the CPU layouts its agent tuned (its last report) and when it sent them.
@@ -1420,6 +1505,8 @@ export async function stats(c: Ctx): Promise<Response> {
       amd_dml_agent: cfg.amdDmlAgent,
       // rev 26 (PROTOCOL 18)
       fresh_agent: cfg.freshAgent,
+      // rev 27 (PROTOCOL 19)
+      torch_agent: cfg.torchAgent,
       data_keys: cfg.dataPubkeys.length,
       max_active_leases: cfg.maxActiveLeases,
       max_lease_chunks: cfg.maxLeaseChunks,

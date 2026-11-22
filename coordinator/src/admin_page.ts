@@ -231,7 +231,9 @@ function render(s) {
     // Rev 17 (PROTOCOL 11): the machine's platform under its hardware class.
     ["class", (m) => esc(m.class) + '<br><span class="muted">' + esc(m.platform || "windows-x64") + "</span>"],
     ["agent", (m) => esc(m.agent_version) + ' <span class="muted">' + esc(m.channel) + "</span>" +
-      (s.limits && m.agent_version && cmpVer(m.agent_version, s.limits.definition_agent) < 0 ? ' <span class="warn" title="older than the first agent that verifies definitions">legacy</span>' : "")],
+      (s.limits && m.agent_version && cmpVer(m.agent_version, s.limits.definition_agent) < 0 ? ' <span class="warn" title="older than the first agent that verifies definitions">legacy</span>' : "") +
+      // Rev 27 (PROTOCOL 19): the opt-in runtimes the owner allowed on it.
+      (Array.isArray(m.opt_in) && m.opt_in.length ? '<br><span class="muted" title="opt-in runtimes (PROTOCOL 19)">opt-in: ' + esc(m.opt_in.join(", ")) + "</span>" : "")],
     ["last seen", (m) => (m.revoked ? '<span class="bad">revoked</span>' : ago(m.last_seen, now)) + (m.paused ? ' <span class="warn">paused</span>' : "")],
     ["working on", (m) => esc(m.working_on || "")],
     ["caps", (m) => (m.caps ? m.caps.threads + " thr, " + Math.round(m.caps.ram_mb / 1024) + " GB" + (m.caps.gpu ? ", gpu" : "") : "") +

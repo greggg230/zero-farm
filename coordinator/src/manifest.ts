@@ -3,6 +3,7 @@
 // verifies the minisign signature, which agents verify again on every PC.
 
 import { PLATFORMS, type Platform, isPlatform } from "./platform";
+import { OPT_IN_RE, TORCH_PROVIDER } from "./routing";
 import { BUILD_RE, bad, cmpSemver, hex, isSemver, sha256Hex } from "./util";
 
 export interface ManifestFile {
@@ -26,6 +27,7 @@ export interface Manifest {
   requires_runtime?: string;
   entry?: string;
   platform?: Platform; // rev 17 (PROTOCOL 11.3): absent = windows-x64
+  opt_in?: string; // rev 27 (PROTOCOL 19): a runtime pack offered only to machines the owner opted in to this name
   files: ManifestFile[];
 }
 
@@ -38,6 +40,14 @@ export interface VerifiedBuild {
 }
 
 const MAX_MANIFEST = 1 << 20;
+const MAX_FILES = 2000;
+// Rev 27 (PROTOCOL 19): an opt-in runtime pack (a python with its site-packages: thousands of files) may list this many
+// files in a manifest of up to this many bytes; agents before TORCH_AGENT never get one.
+const MAX_OPT_IN_MANIFEST = 8 << 20;
+const MAX_OPT_IN_FILES = 20000;
+// From this many files the registration reads the uploaded objects' sizes and checksums with R2 list calls (1,000 a call)
+// instead of one HEAD per file.
+const LIST_FROM_FILES = 200;
 const PATH_RE = /^[A-Za-z0-9._\-]+(\/[A-Za-z0-9._\-]+)*$/;
 
 export function parseManifest(text: string, problems: string[]): Manifest | null {
@@ -64,7 +74,19 @@ export function parseManifest(text: string, problems: string[]): Manifest | null
     if (!Number.isInteger(m.aw)) problems.push("a worker needs aw (the agent-worker protocol it speaks)");
   }
   if ((m.kind === "worker" || m.kind === "agent") && typeof m.entry !== "string") problems.push(`${m.kind} needs entry`);
-  if (!Array.isArray(m.files) || m.files.length === 0 || m.files.length > 2000) {
+  // Rev 27 (PROTOCOL 19): `opt_in` (a runtime pack with a GPU requirement only), and the torch-cuda provider only in an
+  // opt-in pack - friends' machines never get one unless the owner opts them in.
+  const optIn = m.opt_in !== undefined;
+  if (optIn) {
+    if (typeof m.opt_in !== "string" || !OPT_IN_RE.test(m.opt_in)) problems.push("opt_in must be a name of 1-32 chars a-z, 0-9, -");
+    if (m.kind !== "runtime") problems.push("only a runtime pack has opt_in");
+    if (!m.gpu || typeof m.gpu !== "object") problems.push("an opt-in runtime pack needs a gpu requirement (PROTOCOL 19)");
+  }
+  if (m.gpu && Array.isArray(m.gpu.providers) && m.gpu.providers.includes(TORCH_PROVIDER) && !optIn) {
+    problems.push(`a runtime pack that brings ${TORCH_PROVIDER} needs opt_in (PROTOCOL 19)`);
+  }
+  const maxFiles = optIn && m.kind === "runtime" ? MAX_OPT_IN_FILES : MAX_FILES;
+  if (!Array.isArray(m.files) || m.files.length === 0 || m.files.length > maxFiles) {
     problems.push("files must be a non-empty list");
     return problems.length ? null : m;
   }
@@ -99,7 +121,7 @@ export async function verifyBuild(bucket: R2Bucket, buildId: string, pubkeys: st
   const problems: string[] = [];
   const mobj = await bucket.get(`builds/${buildId}/manifest.json`);
   if (!mobj) throw bad(`builds/${buildId}/manifest.json is not uploaded`);
-  if (mobj.size > MAX_MANIFEST) throw bad("manifest.json is larger than 1 MB");
+  if (mobj.size > MAX_OPT_IN_MANIFEST) throw bad("manifest.json is larger than 8 MB");
   const bytes = new Uint8Array(await mobj.arrayBuffer());
   const digest = await sha256Hex(bytes);
   if (digest.slice(0, 24) !== buildId) {
@@ -108,11 +130,24 @@ export async function verifyBuild(bucket: R2Bucket, buildId: string, pubkeys: st
   const text = new TextDecoder().decode(bytes);
   const m = parseManifest(text, problems);
   if (!m) throw bad("manifest.json is not a valid manifest/1", { problems });
+  // (rev 27: only an opt-in runtime pack may be bigger than 1 MB)
+  if (mobj.size > MAX_MANIFEST && !(m.kind === "runtime" && m.opt_in)) throw bad("manifest.json is larger than 1 MB");
 
+  // Rev 27: a manifest of many files (an opt-in python pack) is checked against R2 list results (sizes, and the sha256
+  // checksum where the upload stored one), one call per 1,000 objects, instead of one HEAD per file.
+  const listed = new Map<string, R2Object>();
+  if (m.files.length >= LIST_FROM_FILES) {
+    let cursor: string | undefined;
+    do {
+      const page = await bucket.list({ prefix: `builds/${buildId}/`, cursor, limit: 1000 });
+      for (const o of page.objects) listed.set(o.key, o);
+      cursor = page.truncated ? page.cursor : undefined;
+    } while (cursor);
+  }
   let size = 0;
   for (const f of m.files) {
     const key = `builds/${buildId}/${f.path}`;
-    const head = await bucket.head(key);
+    const head = listed.size ? (listed.get(key) ?? null) : await bucket.head(key);
     if (!head) {
       problems.push(`${f.path}: not uploaded`);
       continue;
