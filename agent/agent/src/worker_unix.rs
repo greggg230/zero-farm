@@ -49,7 +49,7 @@ impl WorkerProc {
     /// Starts `<exe> <args>` (`serve`) in `cwd`, in a process group of its own, at its nice value. Every stdout line is
     /// delivered to `on_msg` from a reader thread (then `Eof` when the pipe closes).
     pub fn spawn(opts: SpawnOpts, on_msg: impl Fn(WorkerMsg) + Send + 'static) -> std::io::Result<WorkerProc> {
-        let nice = if crate::test_worker_normal_priority() {
+        let nice = if crate::test_worker_normal_priority() || opts.normal_priority {
             0
         } else if opts.cpu_job {
             NICE_CPU

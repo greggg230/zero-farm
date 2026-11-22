@@ -7,6 +7,8 @@
 //! farm-agent uninstall [--root DIR] [--reg-name NAME] [--shortcut-dir DIR] [--quiet]
 //! farm-agent enroll    --invite CODE [--name NAME] [--root DIR] [--coordinator URL]
 //! farm-agent profile | keys | version
+//! farm-agent settings  [--root DIR]                      print every setting as `set` takes it
+//! farm-agent set KEY VALUE [KEY VALUE ...] [--root DIR]  change settings while Zero Farm is not running (PROTOCOL 13.6)
 //! ```
 //!
 //! `keys` prints every trusted key, one per line: `release <key id> <public key>` (manifests) and
@@ -54,7 +56,6 @@ struct Args {
     cmd: String,
     flags: Vec<(String, Option<String>)>,
     /// Arguments after the command that are not flags (macOS CLI: `pause 30`, `set cpu_threads 12`).
-    #[cfg_attr(windows, allow(dead_code))]
     pos: Vec<String>,
 }
 
@@ -611,6 +612,38 @@ fn main() {
         "install" => cmd_install(&args),
         "uninstall" => cmd_uninstall(&args),
         "enroll" => cmd_enroll(&args),
+        // Windows (PROTOCOL 13.6): settings without the tray - the owner machine's switch and fixed layout among them
+        #[cfg(windows)]
+        "settings" => {
+            let m = Machine::load(&Layout::new(root(&args)));
+            for k in farm_agent::settings::Settings::KEYS.iter().filter(|k| !matches!(**k, "mode")) {
+                println!("{}", m.settings.describe_key(k));
+            }
+            0
+        }
+        #[cfg(windows)]
+        "set" => {
+            let layout = Layout::new(root(&args));
+            let pairs: Vec<(String, String)> = args.pos.chunks(2).filter(|c| c.len() == 2).map(|c| (c[0].clone(), c[1].clone())).collect();
+            let running = zerofarm_common::names::instance_running("agent", &layout.root);
+            if args.pos.len() % 2 == 1 {
+                println!("usage: farm-agent set KEY VALUE [KEY VALUE ...] (keys: {})", farm_agent::settings::Settings::KEYS.join(", "));
+                2
+            } else {
+                match farm_agent::settings::Machine::set_offline(&layout, running, &pairs) {
+                    Ok(said) => {
+                        for s in said {
+                            println!("{s}");
+                        }
+                        0
+                    }
+                    Err(e) => {
+                        println!("{e}");
+                        1
+                    }
+                }
+            }
+        }
         // macOS: the headless CLI (the launcher forwards `ZeroFarm setup|status|pause|resume|set` here)
         #[cfg(target_os = "macos")]
         "setup" => cmd_setup(&args),

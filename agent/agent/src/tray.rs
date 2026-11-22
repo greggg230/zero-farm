@@ -277,6 +277,10 @@ impl Tray {
             add(MF_STRING, ID_PAUSE_FOREVER, "Pause until I resume");
             add(MF_STRING | if paused { 0 } else { MF_GRAYED }, ID_RESUME, "Resume");
             add(MF_SEPARATOR, 0, "");
+            // (PROTOCOL 13.6: an owner machine works whenever it is not paused, whatever "When to work" says)
+            if s.owner {
+                add(MF_STRING | MF_GRAYED, 5, "Owner machine: works whenever not paused, normal priority");
+            }
             let mode = CreatePopupMenu();
             let idle = wide("Only when I'm away (idle)");
             let always = wide("Always, at low priority");

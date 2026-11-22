@@ -304,6 +304,10 @@ pub fn cli_status(layout: &Layout) -> i32 {
             (None, false) => "auto: 1 (autotune off)".to_string(),
         }
     );
+    // PROTOCOL 13.6: the owner machine's switch
+    if s.owner {
+        println!("  owner machine: works whenever not paused, at normal priority, no GPU busy gate (`ZeroFarm set owner off` ends it)");
+    }
     // rev 19 (PROTOCOL 13): the layout of the current self-play job, else the last tuned one
     match st.as_ref().and_then(|v| v["tuning"].as_str()) {
         Some(t) => println!("  layout: {t}"),
@@ -313,7 +317,7 @@ pub fn cli_status(layout: &Layout) -> i32 {
             None => println!("  layout: not tuned yet (measured during the first self-play while the Mac is idle)"),
         },
     }
-    let when = if s.mode == crate::settings::Mode::Always {
+    let when = if s.effective().mode == crate::settings::Mode::Always {
         "also while the Mac is in use".to_string()
     } else {
         format!("only while the Mac is idle ({} min without input)", s.idle_minutes)
@@ -324,7 +328,7 @@ pub fn cli_status(layout: &Layout) -> i32 {
     println!("  {}", pause_text(&s.pause, now));
     println!(
         "  memory cap for jobs: {}",
-        s.max_ram_mb.map_or_else(|| format!("auto (half the RAM, {} MB)", s.ram_cap_mb(crate::signals::memory_mb().1)), |n| format!("{n} MB"))
+        s.max_ram_mb.map_or_else(|| format!("auto ({} the RAM, {} MB)", if s.owner { "three quarters of" } else { "half" }, s.ram_cap_mb(crate::signals::memory_mb().1)), |n| format!("{n} MB"))
     );
     if let Some(e) = st.as_ref().and_then(|v| v["last_error"].as_str()) {
         println!("  last error: {e}");

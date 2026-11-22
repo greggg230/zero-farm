@@ -904,7 +904,7 @@ fn run_worker(layout: &Layout, dir: &str, entry: &Path, args: &[&str], rdir: &Pa
     all.extend(["--json", out_s.as_str()]);
     let t0 = Instant::now();
     let spawn = WorkerProc::spawn(
-        SpawnOpts { exe: entry, args: &all, cwd: &work, mem_limit_mb: 4096, cpu_job: false, log, tag: dir.into(), runtime_dir: Some(rdir) },
+        SpawnOpts { exe: entry, args: &all, cwd: &work, mem_limit_mb: 4096, cpu_job: false, normal_priority: false, log, tag: dir.into(), runtime_dir: Some(rdir) },
         |_m: WorkerMsg| {},
     );
     let mut p = spawn.map_err(|e| format!("could not start the probe: {e}"))?;

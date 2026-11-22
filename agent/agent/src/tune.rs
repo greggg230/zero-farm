@@ -88,6 +88,26 @@ pub const CUDA_CREW_TUNER_VERSION: u32 = 5;
 /// Worker processes a lease's job may run (searched and set) at most; a hint or a report may say up to `MAX_WORKERS_JSON`.
 pub const MAX_WORKERS: u32 = 3;
 pub const MAX_WORKERS_JSON: u32 = 8;
+/// PROTOCOL 13.6 (the owner machine): the owner's fixed `workers` may be up to this many (before: `MAX_WORKERS`), and an
+/// owner machine's GPU crew rule (`Settings::owner`) chooses up to this many where the cores, the memory and the video
+/// memory hold them. Friends' automatic worker counts stay within `MAX_WORKERS`.
+pub const MAX_SET_WORKERS: u32 = MAX_WORKERS_JSON;
+/// PROTOCOL 13.6: an owner machine's GPU crew has at most one worker per this many physical cores (the 4070 Ti PC's
+/// measured best was 3 workers on 4 cores at 1.5 search threads per core shared, ~2 search threads a worker; a 24-core
+/// PC: 8).
+pub const OWNER_CORES_PER_GPU_WORKER: u32 = 3;
+
+/// PROTOCOL 13.6: the most workers a GPU job's crew may choose by itself on a machine with `cores` physical cores: friends'
+/// `MAX_WORKERS` (and one per core), an owner machine's up to `MAX_SET_WORKERS` (one per `OWNER_CORES_PER_GPU_WORKER`
+/// cores, at least `MAX_WORKERS` where the cores allow).
+pub fn gpu_max_workers(cores: u32, owner: bool) -> u32 {
+    let cores = cores.max(1);
+    if owner {
+        (cores / OWNER_CORES_PER_GPU_WORKER).max(MAX_WORKERS.min(cores)).clamp(1, MAX_SET_WORKERS)
+    } else {
+        MAX_WORKERS.min(cores)
+    }
+}
 /// N > 1 workers share this many times the cores per kind of thread (search, inference): per worker
 /// `cap x THREAD_BUDGET_MULTI / N` (the M4 Max's best: 2 x 12 on 16 cores). One worker keeps `cap`.
 pub const THREAD_BUDGET_MULTI: f64 = 1.5;
@@ -422,6 +442,18 @@ pub struct Space {
     /// each worker's share of an "auto" target is at most `rolling::DML_CONC` (`target_conc`).
     #[serde(default)]
     pub dml: bool,
+    /// PROTOCOL 13.6: a GPU job's games in flight per worker pinned by the owner (`worker_inflight`, `pin`): every
+    /// worker's start and most (`target_conc`, `top_conc`, `fit`), the memory plans cutting it as any start. 0: none.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub fixed_conc: u64,
+    /// PROTOCOL 13.6: a GPU job's groups per worker pinned by the owner (`worker_groups`; within 1 to
+    /// `rolling::GPU_MAX_GROUPS` and the batch bounds). 0: the rule's.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub fixed_groups: u64,
+}
+
+fn is_zero(n: &u64) -> bool {
+    *n == 0
 }
 
 /// agent 0.3.4: a GPU crew's share of the target games in flight is rounded up to a multiple of this (1,024 for three
@@ -462,6 +494,8 @@ impl Space {
             vram: None,
             target: 0,
             dml: false,
+            fixed_conc: 0,
+            fixed_groups: 0,
         };
         s.bound_workers(workers, d.max_workers);
         s
@@ -473,8 +507,11 @@ impl Space {
     /// batches up to `GPU_BATCH_MAX` rows in one or two groups, the workers (the owner's `workers`, else 1 to `max_workers`)
     /// as many as the memory plan `mem` and the video memory plan `vram` hold with the fewest games in flight allowed.
     pub fn new_gpu(threads: u32, workers: Option<u32>, max_workers: u32, target: u64, fixed: bool, mem: Option<(u64, crate::rolling::MemCost)>, vram: Option<(u64, crate::rolling::VramCost)>) -> Space {
-        let target = target.clamp(1, crate::rolling::MAX_INFLIGHT);
-        let (conc_min, conc_max) = if fixed { (target, target) } else { ((target / 2).max(1), ((target as f64 * GPU_CONC_OVER) as u64).min(crate::rolling::MAX_INFLIGHT).max(target)) };
+        // (PROTOCOL 13.6: a crew of more than 3 workers may target more than `MAX_INFLIGHT` in all; one worker never runs
+        // more than that, `fit`)
+        let target = target.clamp(1, crate::rolling::MAX_CREW_INFLIGHT);
+        let cap = crate::rolling::MAX_INFLIGHT.max(target);
+        let (conc_min, conc_max) = if fixed { (target, target) } else { ((target / 2).max(1), ((target as f64 * GPU_CONC_OVER) as u64).min(cap).max(target)) };
         let mut s = Space {
             max_search: threads.max(1),
             max_infer: threads.max(1),
@@ -490,6 +527,8 @@ impl Space {
             vram,
             target,
             dml: false,
+            fixed_conc: 0,
+            fixed_groups: 0,
         };
         s.bound_workers(workers, max_workers);
         s
@@ -510,6 +549,35 @@ impl Space {
         s
     }
 
+    /// PROTOCOL 13.6 (`autotune` off): the owner's fixed GPU layout - `workers` workers of `inflight` games in flight each
+    /// (`fixed_conc`; None: the space's rule) in `groups` groups (`fixed_groups`; None: the rule's) with `threads` search
+    /// threads each (None: the space's shared). The job's games in flight in all go from one a worker (the memory plans
+    /// cut each worker's games, never its count, as for any start: a calibration lifts them back, 10.6) to `workers` x
+    /// `inflight`; the workers are bound to `workers` (fewer only where a worker's base doesn't fit the memory plans,
+    /// `fits`).
+    pub fn pin(&mut self, workers: u32, inflight: Option<u64>, groups: Option<u64>, threads: Option<u32>) {
+        let n = workers.clamp(1, MAX_SET_WORKERS);
+        if let Some(t) = threads {
+            self.max_search = t.clamp(1, MAX_THREADS).saturating_mul(n);
+            self.max_infer = self.max_search;
+        }
+        if let Some(c) = inflight {
+            let c = c.clamp(1, crate::rolling::MAX_INFLIGHT);
+            self.fixed_conc = c;
+            self.target = (n as u64 * c).min(crate::rolling::MAX_CREW_INFLIGHT);
+            (self.conc_min, self.conc_max) = (n as u64, self.target);
+        }
+        if let Some(g) = groups {
+            self.fixed_groups = g.clamp(1, if self.gpu { crate::rolling::GPU_MAX_GROUPS } else { crate::rolling::MAX_INFLIGHT });
+        }
+        self.bound_workers(Some(n), n);
+        // (fewer workers than asked keep the threads each was asked for: a GPU job's workers share `max_search`)
+        if let Some(t) = threads.filter(|_| self.gpu) {
+            self.max_search = t.clamp(1, MAX_THREADS).saturating_mul(self.workers_max.max(1));
+            self.max_infer = self.max_search;
+        }
+    }
+
     /// agent 0.3.16: a CUDA crew's floor (`CUDA_CREW_MIN_WORKERS`) where `n` workers each keep `rolling::DML_MIN_CONC`
     /// games in flight under the memory plans and the bounds allow it; else the bounds as they are.
     pub fn cuda_crew_floor(&mut self) {
@@ -520,13 +588,14 @@ impl Space {
         }
     }
 
-    /// The worker bounds: the owner's `workers` (`set`), else 1 to `max` (the cores' and RAM's), never more than the
+    /// The worker bounds: the owner's `workers` (`set`; PROTOCOL 13.6: up to `MAX_SET_WORKERS`), else 1 to `max`
+    /// (the cores' and RAM's - the callers keep friends' within `MAX_WORKERS`, `gpu_max_workers`), never more than the
     /// memory plans hold (`fits`).
     pub fn bound_workers(&mut self, set: Option<u32>, max: u32) {
-        let fits = (1..=MAX_WORKERS_JSON).take_while(|&n| self.fits(n)).last().unwrap_or(1);
+        let fits = (1..=MAX_SET_WORKERS).take_while(|&n| self.fits(n)).last().unwrap_or(1);
         let (lo, hi) = match set {
-            Some(n) => (n.clamp(1, MAX_WORKERS).min(fits), n.clamp(1, MAX_WORKERS).min(fits)),
-            None => (1, max.clamp(1, MAX_WORKERS).min(fits)),
+            Some(n) => (n.clamp(1, MAX_SET_WORKERS).min(fits), n.clamp(1, MAX_SET_WORKERS).min(fits)),
+            None => (1, max.clamp(1, MAX_SET_WORKERS).min(fits)),
         };
         (self.workers_min, self.workers_max) = (lo.max(1), hi.max(1));
     }
@@ -567,6 +636,10 @@ impl Space {
     /// agent 0.3.4: a GPU job's games in flight per worker for a crew of `n`: its share of the target (rounded up to a
     /// multiple of `GPU_CONC_STEP` for N > 1: 1,024 is 1 x 1,024, 2 x 512, 3 x 384).
     pub fn target_conc(&self, n: u32) -> u64 {
+        // (PROTOCOL 13.6: the owner's pinned games in flight per worker, whatever the crew's size)
+        if self.fixed_conc > 0 {
+            return self.fixed_conc.min(crate::rolling::MAX_INFLIGHT);
+        }
         let n = n.max(1) as u64;
         // (agent 0.3.12: a DirectML job's "auto" share is DirectML's per worker - 1,152 for one, two or three of 3,456 -,
         // a run's number is shared as any GPU job's)
@@ -587,10 +660,12 @@ impl Space {
         let n = n.max(1);
         let conc = self.target_conc(n);
         let threads = self.search_cap(n);
-        let l = self.fit(Layout { workers: n, threads, infer_workers: 1, infer_threads: threads, groups: crate::rolling::gpu_groups(conc, batch), conc });
+        // (PROTOCOL 13.6: the owner's pinned groups per worker, else the rule's)
+        let groups = |conc: u64| if self.fixed_groups > 0 { self.fixed_groups } else { crate::rolling::gpu_groups(conc, batch) };
+        let l = self.fit(Layout { workers: n, threads, infer_workers: 1, infer_threads: threads, groups: groups(conc), conc });
         // (agent 0.3.5: the groups of the games in flight the memory plans leave - 0.3.4 kept the target's: 139 games in
         // flight in 2 groups of 70 rows on the 4070 Ti PC, where one batch of 139 is the rule's)
-        self.fit(Layout { groups: crate::rolling::gpu_groups(l.conc, batch), ..l })
+        self.fit(Layout { groups: groups(l.conc), ..l })
     }
 
     /// agent 0.3.4: a GPU job's starting crew (PROTOCOL 13.1): on an NVIDIA GPU the most workers (within the bounds) whose
@@ -667,7 +742,13 @@ impl Space {
         let workers = l.workers.clamp(self.workers_min.max(1), self.workers_max.max(self.workers_min).max(1));
         let (max_search, max_infer) = (self.search_cap(workers), self.infer_cap(workers));
         let n = workers as u64;
-        let (cmin, cmax) = (self.conc_min.max(1).div_ceil(n), (self.conc_max.max(self.conc_min).max(1) / n).max(1));
+        let (cmin, mut cmax) = (self.conc_min.max(1).div_ceil(n), (self.conc_max.max(self.conc_min).max(1) / n).max(1));
+        // (PROTOCOL 13.6: one worker runs at most `MAX_INFLIGHT` games, whatever a big crew's total; the owner's pinned
+        // games in flight per worker are the most)
+        cmax = cmax.min(crate::rolling::MAX_INFLIGHT);
+        if self.fixed_conc > 0 {
+            cmax = cmax.min(self.fixed_conc);
+        }
         let mut conc = l.conc.clamp(cmin.min(cmax), cmax);
         if let Some(room) = self.mem_room(workers) {
             conc = conc.min(room);
@@ -1537,7 +1618,7 @@ mod tests {
 
     /// The M4 Max's space: search and inference threads at most 16, sessions, 1,152-2,304 games in flight, 192-384 rows.
     fn space() -> Space {
-        Space { max_search: 16, max_infer: 16, sessions: true, conc_min: 1152, conc_max: 2304, batch_min: 192, batch_max: 384, workers_min: 1, workers_max: 1, mem: None, gpu: false, vram: None, target: 0, dml: false }
+        Space { max_search: 16, max_infer: 16, sessions: true, conc_min: 1152, conc_max: 2304, batch_min: 192, batch_max: 384, workers_min: 1, workers_max: 1, mem: None, gpu: false, vram: None, target: 0, dml: false, fixed_conc: 0, fixed_groups: 0 }
     }
 
     fn lay(threads: u32, w: u32, t: u32, groups: u64, conc: u64) -> Layout {
@@ -2331,7 +2412,9 @@ mod tests {
         assert_eq!((s.workers_min, s.workers_max), (1, 3), "auto: 1 to what the cores and RAM allow");
         let s = Space::new(&d, None, Some(2), 1152, 2304, Some((32_768, cost)));
         assert_eq!((s.workers_min, s.workers_max), (2, 2), "the owner's number");
-        assert_eq!(Space::new(&d, None, Some(9), 1152, 2304, None).workers_max, MAX_WORKERS);
+        // (PROTOCOL 13.6: the owner's number up to MAX_SET_WORKERS; the automatic bound stays 3)
+        assert_eq!(Space::new(&d, None, Some(9), 1152, 2304, None).workers_max, MAX_SET_WORKERS);
+        assert_eq!(Space::new(&d, None, Some(6), 1152, 2304, None).workers_max, 6);
         // a small memory limit: (0.85 x 6,000 - 1,024) / 9 = 452 games for one worker, 169 each for two - fewer than the
         // 1,152 the job needs at least: one worker only
         let small = Space::new(&d, None, None, 1152, 2304, Some((6000, cost)));
@@ -2533,6 +2616,103 @@ mod tests {
         // agent 0.3.10: 800 of the 2,000 busy CPU-ms not ours were interrupts and DPCs (drivers): 1,200 other
         let drivers = LoadMark { dpc_ms: 900, ..b };
         assert!((a.other_since(&drivers) - 0.075).abs() < 1e-9);
+    }
+
+    /// PROTOCOL 13.6: the workers a GPU job's crew may choose by itself - friends' PCs as before (at most 3, one per core),
+    /// an owner machine up to 8, one per 3 physical cores.
+    #[test]
+    fn an_owner_machines_crew_may_have_up_to_eight_workers_friends_three() {
+        for (cores, friend, owner) in [(1, 1, 1), (2, 2, 2), (4, 3, 3), (8, 3, 3), (12, 3, 4), (16, 3, 5), (24, 3, 8), (64, 3, 8)] {
+            assert_eq!((gpu_max_workers(cores, false), gpu_max_workers(cores, true)), (friend, owner), "{cores} cores");
+        }
+        assert_eq!(MAX_SET_WORKERS, 8);
+    }
+
+    /// A 24-core / 32-thread PC (36 search threads at 1.5 a core, capped at 32), a GPU job's memory plan
+    /// of `limit` MB at 1,992 MB + `per_game` MB a game, `vram` MB of video memory for the workers: an owner machine's CUDA
+    /// crew space (the target 8 x 1,152, at most 8 workers, at least 2), or a friend's on the same box.
+    fn desktop_space(limit: u64, per_game: u64, vram: u64, owner: bool) -> Space {
+        let mem = crate::rolling::MemCost { base_mb: 1992, per_game_mb: per_game };
+        let max = gpu_max_workers(24, owner);
+        let target = crate::rolling::dml_target_for(crate::rolling::Inflight::Auto, 65_536, if owner { max } else { crate::rolling::DML_WORKERS });
+        let mut s = Space::new_dml(32, None, max, target, false, Some((limit, mem)), Some((vram, crate::rolling::GPU_VRAM)));
+        s.cuda_crew_floor();
+        s
+    }
+
+    /// PROTOCOL 13.6: an owner machine's CUDA crew rule chooses more than 3 workers when the cores and memory allow - each
+    /// with DirectML's 1,152 games in flight in two groups, down to 768 where the memory plans hold less, then a worker
+    /// fewer -, the search threads shared; a friend's PC with the same hardware keeps 3 x 1,152.
+    #[test]
+    fn an_owner_machines_cuda_crew_chooses_up_to_eight_workers() {
+        // room for everything: 8 x 1,152 (9,216 games in flight in all, over one worker's 4,096), 4 search threads each
+        let roomy = desktop_space(100_000, 2, 30_000, true);
+        assert_eq!((roomy.workers_min, roomy.workers_max, roomy.target), (2, 8, 9216));
+        let l = roomy.gpu_start(true, 512);
+        assert_eq!(l, glay(8, 4, 2, 1152));
+        assert_eq!(l.total_conc(), 9216);
+        // a friend's PC: as before
+        let friend = desktop_space(100_000, 2, 30_000, false);
+        assert_eq!((friend.workers_max, friend.target), (3, 3456));
+        assert_eq!(friend.gpu_start(true, 512), glay(3, 10, 2, 1152));
+        // a 32 GB GPU with 12 GB kept for the trainer (85 % of 32,607 MB less 12,288: 15,427 MB) at the default 1 GB + 2 MB a
+        // row: 8 workers' batches hold 452 rows - 8 x 904, two groups of 452 (each over 768)
+        let budget = crate::rolling::vram_budget_kept(32_607, 1_500, 12_288);
+        assert_eq!(budget, 15_427);
+        assert_eq!(desktop_space(100_000, 2, budget, true).gpu_start(true, 512), glay(8, 4, 2, 904));
+        // the memory plan short (40 GB at 3 MB a game: 752 games each for 8, 955 for 7): fewer games each first, then a
+        // worker fewer - 7 x 955 (the video memory holds 2 x 589 rows each for 7)
+        assert_eq!(desktop_space(40_000, 3, budget, true).gpu_start(true, 512), glay(7, 4, 2, 955));
+        // a 4-core owner box is a friend's 4070 Ti crew: 3 at most
+        assert_eq!(gpu_max_workers(4, true), 3);
+    }
+
+    /// PROTOCOL 13.6: the owner's fixed GPU layout (`autotune` off: `workers`, `worker_inflight`, `worker_groups`,
+    /// `worker_threads`) runs exactly that - more than 4,096 games in flight in all, no rounding -, memory cutting each
+    /// worker's games (never their count) until a calibration lifts them back, and a worker fewer only where a worker's
+    /// video memory base doesn't fit.
+    #[test]
+    fn the_owners_fixed_layout_pins_workers_games_groups_and_threads() {
+        let mem = |per_game: u64| Some((40_000, crate::rolling::MemCost { base_mb: 1992, per_game_mb: per_game }));
+        let vram = |mb: u64| Some((mb, crate::rolling::GPU_VRAM));
+        let pinned = |per_game: u64, vram_mb: u64, inflight: Option<u64>, groups: Option<u64>| {
+            let target = crate::rolling::dml_target_for(crate::rolling::Inflight::Auto, 65_536, 6);
+            let mut s = Space::new_dml(32, Some(6), gpu_max_workers(24, true), target, false, mem(per_game), vram(vram_mb));
+            s.pin(6, inflight, groups, Some(5));
+            s
+        };
+        // 6 x 1,152 in two groups of 576, 5 search threads each: 6,912 games in flight in all
+        let s = pinned(3, 15_427, Some(1152), Some(2));
+        assert_eq!((s.workers_min, s.workers_max, s.target, s.fixed_conc, s.fixed_groups), (6, 6, 6912, 1152, 2));
+        let l = s.gpu_start(true, 512);
+        assert_eq!(l, glay(6, 5, 2, 1152));
+        assert_eq!((l.total_conc(), l.batch()), (6912, 576));
+        assert_eq!(s.top_conc(6), 1152, "the pinned games are the most a worker runs");
+        // no rounding to a multiple of 64; one group if asked
+        assert_eq!(pinned(3, 15_427, Some(1000), Some(2)).gpu_start(true, 512), glay(6, 5, 2, 1000));
+        assert_eq!(pinned(3, 30_000, Some(1152), Some(1)).gpu_start(true, 512), glay(6, 5, 1, 1152));
+        assert_eq!(pinned(3, 15_427, Some(1152), Some(1)).gpu_start(true, 512), glay(6, 5, 2, 1152), "a 1,152-row batch over the video memory plan's 773: two groups");
+        // without `worker_inflight`: the crew rule's games for the owner's count (the target 6 x 1,152), groups pinned
+        assert_eq!(pinned(3, 15_427, None, Some(2)).gpu_start(true, 512), glay(6, 5, 2, 1152));
+        // uncalibrated (the default 45 MB a game): six workers of what the memory holds - (0.85 x 40,000 / 6 - 1,992) / 45
+        // = 81 -, then lifted back to 1,152 once the plan holds it (lease.rs `calibrate`)
+        let old = pinned(45, 15_427, Some(1152), Some(2));
+        let start = old.gpu_start(true, 512);
+        assert_eq!((start.workers, start.conc), (6, 81), "memory cuts the games, never the workers: {start:?}");
+        let mut e = Entry::new(key(), "r", start, false, 0);
+        e.bind(&old);
+        let new = pinned(3, 15_427, Some(1152), Some(2));
+        e.lift_conc(&old, &new);
+        assert_eq!(e.wanted(&new), glay(6, 5, 2, 1152));
+        // the video memory holds four workers' bases only (5,000 MB at 1 GB + 2 MB a row): 4 x 226 in two groups of 113
+        let small = pinned(3, 5_000, Some(1152), Some(2));
+        assert_eq!((small.workers_min, small.workers_max), (4, 4));
+        assert_eq!(small.gpu_start(true, 512), glay(4, 5, 2, 226), "5 search threads each, as asked");
+        // one worker never runs more than 4,096 games, whatever a crew's total allows
+        let one = Space::new_gpu(8, Some(1), 8, 9216, false, None, None);
+        assert_eq!(one.fit(glay(1, 8, 2, 9000)).conc, crate::rolling::MAX_INFLIGHT);
+        // a friend's target unchanged: 3 x 1,152, `dml_target` as before
+        assert_eq!(crate::rolling::dml_target_for(crate::rolling::Inflight::Auto, 65_536, 2), crate::rolling::dml_target(crate::rolling::Inflight::Auto, 65_536));
     }
 
     #[test]

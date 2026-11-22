@@ -167,6 +167,13 @@ pub fn vram_budget(total_mb: u64, others_mb: u64) -> u64 {
     ((total_mb as f64 * VRAM_SHARE) as u64).saturating_sub(others_mb)
 }
 
+/// PROTOCOL 13.6: `vram_budget` with `reserve_mb` kept for other programs (the owner's `gpu_reserve_mb`: an owner
+/// machine's trainer, whose use comes and goes with its training phase): what other programs hold now or the reserve,
+/// the more. A reserve of 0 (friends' PCs) is `vram_budget` as before.
+pub fn vram_budget_kept(total_mb: u64, others_mb: u64, reserve_mb: u64) -> u64 {
+    vram_budget(total_mb, others_mb.max(reserve_mb))
+}
+
 /// The rows a batch of one of `n` workers sharing `budget_mb` may have at `cost` (0: not even its base fits).
 pub fn vram_rows(budget_mb: u64, n: u32, cost: VramCost) -> u64 {
     (budget_mb / n.max(1) as u64).saturating_sub(cost.base_mb) / cost.per_row_mb.max(1)
@@ -224,8 +231,11 @@ pub enum Inflight {
     Auto,
 }
 
-/// Most games in flight a run may set (PROTOCOL 10.1).
+/// Most games in flight a run may set (PROTOCOL 10.1), and one worker may run.
 pub const MAX_INFLIGHT: u64 = 4096;
+/// PROTOCOL 13.6: most games in flight a GPU crew may run in all (`tune::MAX_SET_WORKERS` workers of up to
+/// `MAX_INFLIGHT` each). A crew's target above `MAX_INFLIGHT` comes only from more than `DML_WORKERS` workers.
+pub const MAX_CREW_INFLIGHT: u64 = MAX_INFLIGHT * crate::tune::MAX_SET_WORKERS as u64;
 /// `flush_s` is kept within these bounds (PROTOCOL 10.1).
 pub const FLUSH_S: (u64, u64) = (10, 3600);
 
@@ -654,9 +664,20 @@ pub const DML_MIN_CONC: u64 = 768;
 /// (rev 21, 10.4) follows the agent's asks (about twice the crew's games in flight, a crew allowed twice its games in
 /// flight), so it doesn't bound the start.
 pub fn dml_target(setting: Inflight, block: u64) -> u64 {
+    dml_target_for(setting, block, DML_WORKERS)
+}
+
+/// PROTOCOL 13.6: `dml_target` for a crew of up to `workers` (at least `DML_WORKERS`): "auto" is `workers` x `DML_CONC`
+/// (an owner machine's crew of up to `tune::MAX_SET_WORKERS`, or the owner's fixed `workers` above 3), at most the
+/// lease's block and `MAX_CREW_INFLIGHT`.
+pub fn dml_target_for(setting: Inflight, block: u64, workers: u32) -> u64 {
     match setting {
         Inflight::N(n) => n,
-        Inflight::Auto => (DML_WORKERS as u64 * DML_CONC).min(block.max(1)).min(MAX_INFLIGHT),
+        Inflight::Auto => {
+            let n = workers.max(DML_WORKERS) as u64;
+            let cap = if n > DML_WORKERS as u64 { MAX_CREW_INFLIGHT } else { MAX_INFLIGHT };
+            (n * DML_CONC).min(block.max(1)).min(cap)
+        }
     }
 }
 
@@ -1045,6 +1066,33 @@ mod tests {
         assert_eq!(dml_shape(Inflight::Auto, 65_536, plan(16_000, 1800, 4, true)), (1152, 2), "3 x 683 doesn't keep 768: two of 1,152");
         assert_eq!(dml_shape(Inflight::Auto, 65_536, plan(4_000, 1800, 4, true)), (400, 1), "one worker of 400 in one batch");
         assert_eq!(dml_shape(Inflight::N(2048), 65_536, auto_gpu(8_000)), (1024, 2));
+    }
+
+    /// PROTOCOL 13.6: video memory kept for other programs (an owner machine's trainer): the more of what they hold now
+    /// and the reserve; a reserve of 0 is the plan of before.
+    #[test]
+    fn video_memory_kept_for_the_owners_trainer() {
+        // a 32 GB GPU (32,607 MB): 85 % is 27,715 MB
+        assert_eq!(vram_budget_kept(32_607, 1_500, 12_288), 27_715 - 12_288, "the trainer between its steps: the reserve");
+        assert_eq!(vram_budget_kept(32_607, 14_000, 12_288), 27_715 - 14_000, "holding more than the reserve: what it holds");
+        assert_eq!(vram_budget_kept(12_282, 500, 0), vram_budget(12_282, 500), "friends: no reserve, as before");
+        assert_eq!(vram_budget_kept(12_282, 500, 20_000), 0, "a reserve bigger than the GPU: no room");
+    }
+
+    /// PROTOCOL 13.6: a crew of more than 3 workers targets DirectML's 1,152 games in flight for each, past one worker's
+    /// 4,096 in all; friends' crews as before.
+    #[test]
+    fn a_bigger_crews_target() {
+        assert_eq!(dml_target_for(Inflight::Auto, 65_536, 3), 3456);
+        assert_eq!(dml_target_for(Inflight::Auto, 65_536, 1), 3456, "fewer than 3: the crew of 3's target, as before");
+        assert_eq!(dml_target_for(Inflight::Auto, 65_536, 6), 6912);
+        assert_eq!(dml_target_for(Inflight::Auto, 65_536, 8), 9216);
+        assert_eq!(dml_target_for(Inflight::Auto, 5_000, 8), 5000, "at most the lease's block");
+        assert_eq!(dml_target_for(Inflight::N(500), 65_536, 8), 500, "a run's number as it is");
+        assert_eq!(MAX_CREW_INFLIGHT, 8 * 4096);
+        // DirectML's rule over 8 workers: the most that each keep 768
+        assert_eq!(dml_crew(9216, false, 8, &|_| None), (8, 1152));
+        assert_eq!(dml_crew(9216, false, 8, &|n| Some(6000 / n as u64)), (7, 857));
     }
 
     #[test]

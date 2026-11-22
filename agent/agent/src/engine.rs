@@ -2,7 +2,7 @@
 //! meanwhile report crashes and launcher events, check for agent updates, keep the tray status.
 
 use crate::cache::Cache;
-use crate::policy::{decide, mem_floor_mb, Block, Decision, PolicyState};
+use crate::policy::{decide, Block, Decision, PolicyState};
 use crate::results::{ResultStore, Uploader};
 use crate::settings::{Settings, SharedMachine};
 use crate::signals::SignalSource;
@@ -410,8 +410,8 @@ impl Engine {
         // (the memory the signal source sees: the PC's, or the tests' own)
         let (avail, total) = self.signals.memory_mb();
         // (agent 0.3.6: the free memory less what is kept for the owner - an eighth of RAM while the PC is idle, a quarter
-        // else, at least 4 GB: `policy::mem_floor_now`)
-        let floor = if self.pc_idle { crate::policy::idle_mem_floor_mb(total) } else { mem_floor_mb(total) };
+        // else, at least 4 GB: `policy::mem_floor_now`; PROTOCOL 13.6: an owner machine's always an eighth)
+        let floor = crate::policy::mem_floor_for(self.pc_idle, &s, total);
         let ram_free = avail.saturating_sub(floor);
         Caps {
             threads: s.threads(self.profile.cores, self.profile.threads),

@@ -12,13 +12,18 @@
 //! | memory | keep ≥ max(4 GB, 25 %) free; below that: no work, and pressure ends a paused lease |
 //! | input idle | "idle only" mode: work after `idle_minutes` without input; any input → yield |
 //! | GPU present | no GPU work on a PC without a hardware GPU adapter |
-//! | other GPU process | no GPU work while others use > 10 % for 30 s (cleared after 30 s quiet) |
+//! | other GPU process | no GPU work while others use > 10 % for 30 s (cleared after 30 s quiet); not on an owner machine |
 //! | GPU temperature | no GPU work above 83 °C, resumes at ≤ 78 °C; no reading = no temperature rule |
 //!
 //! The GPU signals are vendor-neutral (signals.rs, PROTOCOL 8, DESIGN 8.5): "other use" is the
 //! Windows PDH `GPU Engine` utilisation of every process except Zero Farm's own, temperature the
 //! D3DKMT adapter performance data. A GPU whose driver gives no temperature (`temp_c: None`) has
 //! no temperature rule: only the driver's own thermal limits apply.
+//!
+//! **Owner machine** (`Settings::owner`, PROTOCOL 13.6): the farm owner's own PC, whose trainer shares the GPU with the
+//! workers. Input and fullscreen apps never hold work back (`Settings::effective`: "always", fullscreen ignored), the
+//! GPU busy gate is off (temperature still applies), and the memory floor is the idle one (an eighth of RAM, at least
+//! 4 GB) whether the PC is in use or not; pause, hours, power and the floor itself still apply.
 
 use crate::settings::{Mode, Settings};
 
@@ -182,15 +187,24 @@ pub fn pc_idle(s: &Signals, cfg: &Settings) -> bool {
 
 /// agent 0.3.6: the free memory to keep now: `idle_mem_floor_mb` while the PC is idle, else `mem_floor_mb`.
 pub fn mem_floor_now(s: &Signals, cfg: &Settings) -> u64 {
-    if pc_idle(s, cfg) {
-        idle_mem_floor_mb(s.mem_total_mb)
+    mem_floor_for(pc_idle(s, cfg), cfg, s.mem_total_mb)
+}
+
+/// The free memory to keep (`mem_floor_now`; `Engine::caps` takes the job's memory limit from the free memory above it):
+/// `idle_mem_floor_mb` while the PC is idle - and always on an owner machine (PROTOCOL 13.6: the owner coming back to
+/// the keyboard must not stop a crew whose limit was planned while the PC was idle) -, else `mem_floor_mb`.
+pub fn mem_floor_for(idle: bool, cfg: &Settings, total_mb: u64) -> u64 {
+    if idle || cfg.owner {
+        idle_mem_floor_mb(total_mb)
     } else {
-        mem_floor_mb(s.mem_total_mb)
+        mem_floor_mb(total_mb)
     }
 }
 
 pub fn decide(st: &mut PolicyState, s: &Signals, cfg: &Settings) -> Decision {
-    let gpu_state = update_gpu_state(st, s);
+    // (PROTOCOL 13.6: an owner machine works whenever it is not paused, whatever input and fullscreen apps say)
+    let cfg = &cfg.effective();
+    let gpu_state = update_gpu_state(st, s, cfg.gpu_busy_gate());
     let mem_pressure = s.mem_avail_mb < mem_floor_now(s, cfg);
     let block = if cfg.paused(s.now) {
         Some(Block::Paused)
@@ -224,11 +238,12 @@ pub fn decide(st: &mut PolicyState, s: &Signals, cfg: &Settings) -> Decision {
 /// outside the hours, low memory). Real work may go on without it (an owner's `work_when active`, `on_battery`); trials
 /// don't.
 pub fn tuning_allowed(s: &Signals, cfg: &Settings) -> bool {
-    let strict = Settings { mode: Mode::IdleOnly, on_battery: false, respect_fullscreen: true, ..cfg.clone() };
+    // (an owner machine's trials are as strict as anyone's: its `owner` implications are work rules, PROTOCOL 13.6)
+    let strict = Settings { mode: Mode::IdleOnly, on_battery: false, respect_fullscreen: true, owner: false, ..cfg.clone() };
     decide(&mut PolicyState::default(), s, &strict).work
 }
 
-fn update_gpu_state(st: &mut PolicyState, s: &Signals) -> Option<GpuBlock> {
+fn update_gpu_state(st: &mut PolicyState, s: &Signals, busy_gate: bool) -> Option<GpuBlock> {
     let Some(g) = &s.gpu else {
         *st = PolicyState::default();
         return Some(GpuBlock::NoGpu);
@@ -253,7 +268,9 @@ fn update_gpu_state(st: &mut PolicyState, s: &Signals) -> Option<GpuBlock> {
         // No reading (any more): no temperature rule, so an earlier "too hot" can't stick.
         None => st.hot = false,
     }
-    if st.other_busy {
+    // (PROTOCOL 13.6: an owner machine has no busy gate - its own trainer shares the GPU; the state is still kept, so the
+    // gate is right at once if the owner turns the mode off)
+    if st.other_busy && busy_gate {
         Some(GpuBlock::OtherProcess)
     } else if st.hot {
         Some(GpuBlock::TooHot)
@@ -507,5 +524,91 @@ mod tests {
         s.idle_s = 0;
         let r = decide(&mut st, &s, &cfg);
         assert!(!r.work && !r.gpu);
+    }
+
+    fn owner() -> Settings {
+        Settings { owner: true, ..Settings::default() }
+    }
+
+    /// PROTOCOL 13.6: an owner machine works while the owner is at the keyboard and while a fullscreen app runs (its
+    /// stored `work_when idle` notwithstanding); pause, hours, power and low memory still stop it.
+    #[test]
+    fn an_owner_machine_works_whatever_input_and_fullscreen_say() {
+        let mut s = Signals::all_clear(0);
+        s.idle_s = 0;
+        assert_eq!(d(&s, &Settings::default()).block, Some(Block::UserActive), "a friend's PC in use");
+        assert!(d(&s, &owner()).work, "the owner at the keyboard");
+        for n in [Notification::Busy, Notification::D3dFullscreen, Notification::Presentation, Notification::App] {
+            s.notification = n;
+            assert_eq!(d(&s, &Settings { mode: Mode::Always, ..Settings::default() }).block, Some(Block::Fullscreen), "{n:?}");
+            assert!(d(&s, &owner()).work, "{n:?}");
+        }
+        assert_eq!(d(&s, &Settings { pause: Pause::Indefinitely, ..owner() }).block, Some(Block::Paused));
+        let night = Settings { hours: Some(Hours { start_min: 0, end_min: 60 }), ..owner() };
+        assert_eq!(d(&s, &night).block, Some(Block::OutsideHours));
+        let mut battery = Signals::all_clear(0);
+        battery.on_ac = Some(false);
+        assert_eq!(d(&battery, &owner()).block, Some(Block::OnBattery), "power rules as set (`on_battery`)");
+        let mut low = Signals::all_clear(0);
+        low.mem_avail_mb = 1000;
+        let r = d(&low, &owner());
+        assert_eq!(r.block, Some(Block::LowMemory));
+        assert!(r.mem_pressure);
+        // trials stay strict: idle, no fullscreen
+        let mut busy = Signals::all_clear(0);
+        busy.idle_s = 0;
+        assert!(d(&busy, &owner()).work && !tuning_allowed(&busy, &owner()), "in use: work yes, trials no");
+        busy.idle_s = 3600;
+        busy.notification = Notification::D3dFullscreen;
+        assert!(d(&busy, &owner()).work && !tuning_allowed(&busy, &owner()), "fullscreen: work yes, trials no");
+        assert!(tuning_allowed(&Signals::all_clear(0), &owner()));
+    }
+
+    /// PROTOCOL 13.6: an owner machine keeps the idle memory floor (an eighth) while the owner is at the keyboard too: a
+    /// crew whose limit was planned while the PC was idle isn't stopped by the owner coming back.
+    #[test]
+    fn an_owner_machine_keeps_the_idle_memory_floor_while_in_use() {
+        let mut s = Signals::all_clear(0);
+        (s.mem_total_mb, s.mem_avail_mb, s.idle_s) = (65_536, 12_000, 0);
+        assert_eq!(mem_floor_now(&s, &owner()), 8192);
+        assert_eq!(mem_floor_now(&s, &Settings { mode: Mode::Always, ..Settings::default() }), 16_384, "a friend's 'always' PC in use: a quarter");
+        assert_eq!(d(&s, &Settings { mode: Mode::Always, ..Settings::default() }).block, Some(Block::LowMemory));
+        let r = d(&s, &owner());
+        assert!(r.work && !r.mem_pressure, "{r:?}");
+        assert_eq!((mem_floor_for(false, &owner(), 65_536), mem_floor_for(false, &Settings::default(), 65_536), mem_floor_for(true, &Settings::default(), 65_536)), (8192, 16_384, 8192));
+        s.mem_avail_mb = 8000;
+        assert_eq!(d(&s, &owner()).block, Some(Block::LowMemory), "below the eighth: still no work");
+    }
+
+    /// PROTOCOL 13.6: no GPU busy gate on an owner machine - its trainer using the GPU ~25 s of every ~95 s (or all the
+    /// time) never blocks GPU work -, the temperature rule kept; a friend's gate unchanged.
+    #[test]
+    fn an_owner_machine_has_no_gpu_busy_gate_but_keeps_the_temperature_rule() {
+        let (mut fst, mut ost) = (PolicyState::default(), PolicyState::default());
+        let mut s = Signals::all_clear(0);
+        // the trainer: 95 % busy for 25 s of every 95, for three iterations, then busy without a break
+        for t in 0..400 {
+            s.now = t;
+            let busy = t % 95 < 25 || t >= 285;
+            s.gpu = Some(GpuSignal { other_util_pct: if busy { 95 } else { 3 }, temp_c: Some(70) });
+            let o = decide(&mut ost, &s, &owner());
+            assert!(o.gpu && o.gpu_block.is_none(), "t={t}: {o:?}");
+            decide(&mut fst, &s, &Settings::default());
+        }
+        let f = decide(&mut fst, &s, &Settings::default());
+        assert_eq!(f.gpu_block, Some(GpuBlock::OtherProcess), "a friend's PC yields to the busy GPU");
+        // hot: blocked on the owner machine too, cleared at 78 °C
+        s.gpu = Some(GpuSignal { other_util_pct: 95, temp_c: Some(84) });
+        assert_eq!(decide(&mut ost, &s, &owner()).gpu_block, Some(GpuBlock::TooHot));
+        s.gpu = Some(GpuSignal { other_util_pct: 95, temp_c: Some(80) });
+        assert_eq!(decide(&mut ost, &s, &owner()).gpu_block, Some(GpuBlock::TooHot));
+        s.gpu = Some(GpuSignal { other_util_pct: 95, temp_c: Some(78) });
+        assert!(decide(&mut ost, &s, &owner()).gpu);
+        // the switch turned off: the gate is right at once (the busy state was kept)
+        assert_eq!(decide(&mut ost, &s, &Settings::default()).gpu_block, Some(GpuBlock::OtherProcess));
+        // "Use the GPU" off and no adapter still hold
+        assert_eq!(decide(&mut ost, &s, &Settings { gpu: false, ..owner() }).gpu_block, Some(GpuBlock::Disabled));
+        s.gpu = None;
+        assert_eq!(decide(&mut ost, &s, &owner()).gpu_block, Some(GpuBlock::NoGpu));
     }
 }

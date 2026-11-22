@@ -74,11 +74,40 @@ pub struct Settings {
     #[serde(skip_serializing_if = "is_true")]
     pub autotune: bool,
     /// rev 19 (PROTOCOL 13.5): worker processes per self-play job: `None` = auto (the tuner's choice, from what the
-    /// cores and memory allow; one with `autotune` off), else 1 to 3 (with `autotune` off a fixed layout of that many);
-    /// written to `machine.json` only when set.
+    /// cores and memory allow; one with `autotune` off), else 1 to 3 - owner-machine agents (PROTOCOL 13.6) to
+    /// `tune::MAX_SET_WORKERS` - (with `autotune` off a fixed layout of that many); written to `machine.json` only when
+    /// set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub workers: Option<u32>,
+    /// Owner machine (PROTOCOL 13.6): the farm owner's own PC, which plays its runs' self-play through the farm beside
+    /// the owner's trainer on the same GPU. Implies: work whenever not paused (`Mode::Always`; fullscreen apps and the
+    /// owner at the keyboard don't hold it back), no GPU busy gate (the trainer's own GPU use doesn't yield the workers;
+    /// the temperature rule stays), workers at normal priority without EcoQoS, the idle memory floor (an eighth of RAM,
+    /// at least 4 GB) whether the PC is in use or not, a job memory cap of three quarters of the RAM unless `max_ram_mb`
+    /// is set, a GPU crew of up to `tune::MAX_SET_WORKERS` workers, and `OWNER_GPU_RESERVE_MB` of video memory kept for
+    /// the trainer unless `gpu_reserve_mb` is set. Written to `machine.json` only when on. Never set on friends' PCs.
+    #[serde(skip_serializing_if = "is_false")]
+    pub owner: bool,
+    /// PROTOCOL 13.6: video memory (MB) kept for other programs on a GPU job's adapter - the trainer's peak and the
+    /// desktop's: the job's workers are planned within 85 % of the adapter less the more of this and what other programs
+    /// hold. `None`: `OWNER_GPU_RESERVE_MB` on an owner machine, else none (friends' plan as before).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub gpu_reserve_mb: Option<u64>,
+    /// PROTOCOL 13.6: a fixed GPU layout's games in flight per worker (with `autotune` off; `None`: the crew rule's).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_inflight: Option<u64>,
+    /// PROTOCOL 13.6: a fixed GPU layout's groups per worker, 1 or 2 (with `autotune` off; `None`: the rule's).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_groups: Option<u64>,
+    /// PROTOCOL 13.6: a fixed GPU layout's search threads per worker (with `autotune` off; `None`: the job's search
+    /// threads - `cpu_threads`, else 1.5 per physical core - shared by the workers).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub worker_threads: Option<u32>,
 }
+
+/// PROTOCOL 13.6: the video memory an owner machine keeps for its trainer unless `gpu_reserve_mb` says otherwise (MB) - a
+/// conservative guess until the trainer's own peak is measured.
+pub const OWNER_GPU_RESERVE_MB: u64 = 12 * 1024;
 
 fn is_false(b: &bool) -> bool {
     !*b
@@ -104,6 +133,11 @@ impl Default for Settings {
             keep_awake: true,
             autotune: true,
             workers: None,
+            owner: false,
+            gpu_reserve_mb: None,
+            worker_inflight: None,
+            worker_groups: None,
+            worker_threads: None,
         }
     }
 }
@@ -122,13 +156,59 @@ impl Settings {
         self.cpu_threads.unwrap_or(auto).clamp(1, logical.max(1))
     }
 
+    /// The job memory cap: `max_ram_mb`, else half the RAM (an owner machine: three quarters, PROTOCOL 13.6).
     pub fn ram_cap_mb(&self, total_mb: u64) -> u64 {
-        self.max_ram_mb.unwrap_or(total_mb / 2)
+        self.max_ram_mb.unwrap_or(if self.owner { total_mb / 4 * 3 } else { total_mb / 2 })
+    }
+
+    /// PROTOCOL 13.6: the settings the work rules see - an owner machine works whenever it is not paused (`Mode::Always`)
+    /// and fullscreen apps don't hold it back; everything else as set.
+    pub fn effective(&self) -> Settings {
+        if self.owner {
+            Settings { mode: Mode::Always, respect_fullscreen: false, ..self.clone() }
+        } else {
+            self.clone()
+        }
+    }
+
+    /// PROTOCOL 13.6: the GPU busy gate (PROTOCOL 8: another program over 10 % of the GPU for 30 s) applies - not on an
+    /// owner machine, whose trainer shares the GPU with the workers.
+    pub fn gpu_busy_gate(&self) -> bool {
+        !self.owner
+    }
+
+    /// PROTOCOL 13.6: job workers run at normal priority without EcoQoS (an owner machine; else idle / below normal).
+    pub fn normal_priority(&self) -> bool {
+        self.owner
+    }
+
+    /// PROTOCOL 13.6: video memory kept for other programs on a GPU job's adapter (MB): `gpu_reserve_mb`, else
+    /// `OWNER_GPU_RESERVE_MB` on an owner machine, else 0.
+    pub fn gpu_reserve(&self) -> u64 {
+        self.gpu_reserve_mb.unwrap_or(if self.owner { OWNER_GPU_RESERVE_MB } else { 0 })
     }
 
     /// The keys `ZeroFarm set <key> <value>` takes (macOS, PROTOCOL 11.5; the tray's settings on Windows).
     pub const KEYS: &'static [&'static str] =
-        &["cpu_threads", "work_when", "mode", "idle_minutes", "on_battery", "keep_awake", "hours", "max_ram_mb", "disk_cap_mb", "gpu", "autotune", "workers"];
+&[
+        "cpu_threads",
+        "work_when",
+        "mode",
+        "idle_minutes",
+        "on_battery",
+        "keep_awake",
+        "hours",
+        "max_ram_mb",
+        "disk_cap_mb",
+        "gpu",
+        "autotune",
+        "workers",
+        "owner",
+        "gpu_reserve_mb",
+        "worker_inflight",
+        "worker_groups",
+        "worker_threads",
+    ];
 
     /// `set <key> <value>`: changes one setting, or says why not. Returns how it reads now.
     pub fn set_by_name(&mut self, key: &str, value: &str) -> Result<String, String> {
@@ -155,7 +235,12 @@ impl Settings {
             "on_battery" => self.on_battery = flag(&v)?,
             "keep_awake" => self.keep_awake = flag(&v)?,
             "autotune" => self.autotune = flag(&v)?,
-            "workers" => self.workers = if auto(&v) { None } else { Some(number(&v, 1, crate::tune::MAX_WORKERS as u64)? as u32) },
+            "workers" => self.workers = if auto(&v) { None } else { Some(number(&v, 1, crate::tune::MAX_SET_WORKERS as u64)? as u32) },
+            "owner" => self.owner = flag(&v)?,
+            "gpu_reserve_mb" => self.gpu_reserve_mb = if auto(&v) { None } else { Some(number(&v, 0, 1 << 20)?) },
+            "worker_inflight" => self.worker_inflight = if auto(&v) { None } else { Some(number(&v, 1, crate::rolling::MAX_INFLIGHT)?) },
+            "worker_groups" => self.worker_groups = if auto(&v) { None } else { Some(number(&v, 1, crate::rolling::GPU_MAX_GROUPS)?) },
+            "worker_threads" => self.worker_threads = if auto(&v) { None } else { Some(number(&v, 1, crate::tune::MAX_THREADS as u64)? as u32) },
             "gpu" => self.gpu = flag(&v)?,
             "max_ram_mb" => self.max_ram_mb = if auto(&v) { None } else { Some(number(&v, 1024, 1 << 22)?) },
             "disk_cap_mb" => self.disk_cap_mb = number(&v, 1024, 1 << 24)?,
@@ -188,6 +273,11 @@ impl Settings {
             "keep_awake" => yes(self.keep_awake).to_string(),
             "autotune" => (if self.autotune { "on" } else { "off" }).to_string(),
             "workers" => self.workers.map_or("auto".to_string(), |n| n.to_string()),
+            "owner" => yes(self.owner).to_string(),
+            "gpu_reserve_mb" => self.gpu_reserve_mb.map_or(format!("auto ({} MB)", self.gpu_reserve()), |n| n.to_string()),
+            "worker_inflight" => self.worker_inflight.map_or("auto".to_string(), |n| n.to_string()),
+            "worker_groups" => self.worker_groups.map_or("auto".to_string(), |n| n.to_string()),
+            "worker_threads" => self.worker_threads.map_or("auto".to_string(), |n| n.to_string()),
             "gpu" => yes(self.gpu).to_string(),
             "max_ram_mb" => self.max_ram_mb.map_or("auto".to_string(), |n| n.to_string()),
             "disk_cap_mb" => self.disk_cap_mb.to_string(),
@@ -312,6 +402,25 @@ impl Machine {
         Ok(())
     }
 
+    /// Windows `farm-agent set KEY VALUE [KEY VALUE ...]` (PROTOCOL 13.6; macOS has `ZeroFarm set`, which reaches a running
+    /// agent): changes `state\machine.json` while the agent is not running - the tray's agent keeps its settings in memory
+    /// and would write them back. All pairs or none: the first bad one says why and nothing is saved. -> how each reads.
+    pub fn set_offline(layout: &Layout, agent_running: bool, pairs: &[(String, String)]) -> Result<Vec<String>, String> {
+        if agent_running {
+            return Err("Zero Farm is running: quit it from the tray icon first (it would write its own settings back), then set again".into());
+        }
+        if pairs.is_empty() {
+            return Err(format!("set KEY VALUE [KEY VALUE ...] (keys: {})", Settings::KEYS.join(", ")));
+        }
+        let mut m = Machine::load(layout);
+        let mut said = Vec::new();
+        for (k, v) in pairs {
+            said.push(m.settings.set_by_name(k, v)?);
+        }
+        m.save(layout).map_err(|e| format!("could not save {}: {e}", layout.machine_json().display()))?;
+        Ok(said)
+    }
+
     pub fn forget_enrollment(&mut self) {
         self.machine_id = None;
         self.token_dpapi = None;
@@ -402,7 +511,10 @@ mod tests {
         assert_eq!(s.set_by_name("workers", "auto").unwrap(), "workers auto");
         assert_eq!(s.workers, None);
         assert!(!serde_json::to_string(&s).unwrap().contains("workers"));
-        assert!(s.set_by_name("workers", "0").is_err() && s.set_by_name("workers", "4").is_err());
+        assert!(s.set_by_name("workers", "0").is_err() && s.set_by_name("workers", "9").is_err());
+        // PROTOCOL 13.6: a fixed crew of up to 8
+        assert_eq!(s.set_by_name("workers", "8").unwrap(), "workers 8");
+        assert_eq!(s.set_by_name("workers", "auto").unwrap(), "workers auto");
         assert_eq!(s.set_by_name("hours", "22:00-07:30").unwrap(), "hours 22:00-07:30");
         assert_eq!(s.hours, Some(Hours { start_min: 1320, end_min: 450 }));
         assert_eq!(s.set_by_name("hours", "off").unwrap(), "hours off");
@@ -448,5 +560,84 @@ mod tests {
         let m3 = Machine::load(&l);
         assert!(!m3.enrolled());
         assert!(l.state().join("machine.json.bad").exists());
+    }
+
+    /// PROTOCOL 13.6: the owner machine's switch and what it implies; friends' defaults untouched.
+    #[test]
+    fn the_owner_switch_implies_its_rules_and_friends_keep_theirs() {
+        let friend = Settings::default();
+        assert!(!friend.owner && friend.gpu_busy_gate() && !friend.normal_priority());
+        assert_eq!(friend.gpu_reserve(), 0, "friends' video memory plan as before");
+        assert_eq!(friend.ram_cap_mb(65_536), 32_768, "half the RAM");
+        assert_eq!(friend.effective(), friend, "nothing implied");
+        let mut s = Settings::default();
+        assert_eq!(s.set_by_name("owner", "on").unwrap(), "owner true");
+        assert!(s.owner && !s.gpu_busy_gate() && s.normal_priority());
+        let e = s.effective();
+        assert_eq!((e.mode, e.respect_fullscreen), (Mode::Always, false), "works whatever input and fullscreen apps say");
+        assert_eq!((s.mode, s.respect_fullscreen), (Mode::IdleOnly, true), "the stored settings are untouched (owner off restores them)");
+        assert_eq!(s.gpu_reserve(), OWNER_GPU_RESERVE_MB);
+        assert_eq!(OWNER_GPU_RESERVE_MB, 12_288);
+        assert_eq!(s.describe_key("gpu_reserve_mb"), "gpu_reserve_mb auto (12288 MB)");
+        assert_eq!(s.ram_cap_mb(65_536), 49_152, "three quarters of the RAM");
+        assert_eq!(s.set_by_name("max_ram_mb", "40000").unwrap(), "max_ram_mb 40000");
+        assert_eq!(s.ram_cap_mb(65_536), 40_000, "max_ram_mb still wins");
+        assert_eq!(s.set_by_name("gpu_reserve_mb", "8000").unwrap(), "gpu_reserve_mb 8000");
+        assert_eq!(s.gpu_reserve(), 8000);
+        assert_eq!(s.set_by_name("gpu_reserve_mb", "0").unwrap(), "gpu_reserve_mb 0");
+        assert_eq!(s.gpu_reserve(), 0, "an explicit 0 keeps nothing");
+        assert_eq!(Settings { gpu_reserve_mb: Some(4096), ..Settings::default() }.gpu_reserve(), 4096, "a friend may keep some too");
+        // the fixed GPU layout's knobs
+        assert_eq!(s.set_by_name("workers", "6").unwrap(), "workers 6");
+        assert_eq!(s.set_by_name("worker_inflight", "1152").unwrap(), "worker_inflight 1152");
+        assert_eq!(s.set_by_name("worker_groups", "2").unwrap(), "worker_groups 2");
+        assert_eq!(s.set_by_name("worker_threads", "5").unwrap(), "worker_threads 5");
+        assert_eq!((s.workers, s.worker_inflight, s.worker_groups, s.worker_threads), (Some(6), Some(1152), Some(2), Some(5)));
+        for (k, v) in [("worker_inflight", "0"), ("worker_inflight", "4097"), ("worker_groups", "3"), ("worker_groups", "0"), ("worker_threads", "0"), ("gpu_reserve_mb", "lots"), ("owner", "maybe")] {
+            assert!(s.set_by_name(k, v).is_err(), "{k} {v}");
+        }
+        // machine.json: written only when set; an old file reads as a friend's
+        let j = serde_json::to_string(&s).unwrap();
+        for k in ["\"owner\":true", "\"gpu_reserve_mb\":0", "\"worker_inflight\":1152", "\"worker_groups\":2", "\"worker_threads\":5"] {
+            assert!(j.contains(k), "{k} in {j}");
+        }
+        let back: Settings = serde_json::from_str(&j).unwrap();
+        assert_eq!(back, s);
+        let d = serde_json::to_string(&Settings::default()).unwrap();
+        for k in ["owner", "gpu_reserve_mb", "worker_inflight", "worker_groups", "worker_threads"] {
+            assert!(!d.contains(k), "{k} stays out of a friend's machine.json: {d}");
+        }
+        assert_eq!(s.set_by_name("worker_inflight", "auto").unwrap(), "worker_inflight auto");
+        assert_eq!(s.set_by_name("owner", "off").unwrap(), "owner false");
+        assert!(s.gpu_busy_gate() && s.effective().mode == Mode::IdleOnly);
+        for k in ["owner", "gpu_reserve_mb", "worker_inflight", "worker_groups", "worker_threads"] {
+            assert!(Settings::KEYS.contains(&k), "{k}");
+        }
+    }
+
+    /// PROTOCOL 13.6: Windows' `farm-agent set` changes machine.json only while the agent is not running, all pairs or
+    /// none.
+    #[test]
+    fn settings_are_set_offline_all_or_nothing_and_never_under_a_running_agent() {
+        let d = tempfile::tempdir().unwrap();
+        let l = Layout::new(d.path());
+        let mut m = Machine::load(&l);
+        m.machine_id = Some("m_X".into());
+        m.save(&l).unwrap();
+        let p = |v: &[(&str, &str)]| v.iter().map(|(a, b)| (a.to_string(), b.to_string())).collect::<Vec<_>>();
+        let owner = p(&[("owner", "on"), ("autotune", "off"), ("workers", "6"), ("worker_inflight", "1152"), ("worker_groups", "2"), ("gpu_reserve_mb", "12288")]);
+        assert!(Machine::set_offline(&l, true, &owner).unwrap_err().contains("quit it from the tray"));
+        assert!(!Machine::load(&l).settings.owner, "nothing saved under a running agent");
+        let bad = p(&[("owner", "on"), ("workers", "12")]);
+        assert!(Machine::set_offline(&l, false, &bad).is_err());
+        assert!(!Machine::load(&l).settings.owner, "a bad pair: nothing saved");
+        assert!(Machine::set_offline(&l, false, &[]).is_err());
+        let said = Machine::set_offline(&l, false, &owner).unwrap();
+        assert_eq!(said, ["owner true", "autotune off", "workers 6", "worker_inflight 1152", "worker_groups 2", "gpu_reserve_mb 12288"]);
+        let m = Machine::load(&l);
+        assert_eq!(m.machine_id.as_deref(), Some("m_X"), "the enrollment kept");
+        let s = &m.settings;
+        assert!(s.owner && !s.autotune);
+        assert_eq!((s.workers, s.worker_inflight, s.worker_groups, s.gpu_reserve_mb), (Some(6), Some(1152), Some(2), Some(12_288)));
     }
 }

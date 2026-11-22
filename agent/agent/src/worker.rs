@@ -53,6 +53,9 @@ pub struct SpawnOpts<'a> {
     pub mem_limit_mb: u64,
     /// CPU work: IDLE_PRIORITY_CLASS + EcoQoS. GPU work: BELOW_NORMAL, no EcoQoS.
     pub cpu_job: bool,
+    /// PROTOCOL 13.6 (an owner machine): NORMAL_PRIORITY_CLASS without EcoQoS, CPU and GPU work alike (macOS: nice 0) -
+    /// the owner's own self-play's priority.
+    pub normal_priority: bool,
     pub log: Arc<RotatingFile>,
     pub tag: String,
     /// A verified runtime pack directory: put first on the worker's DLL search path and passed
@@ -178,7 +181,7 @@ impl WorkerProc {
             BELOW_NORMAL_PRIORITY_CLASS, CREATE_NO_WINDOW, CREATE_SUSPENDED, IDLE_PRIORITY_CLASS,
         };
         let job = make_job(opts.mem_limit_mb)?;
-        let normal_for_tests = crate::test_worker_normal_priority();
+        let normal_for_tests = crate::test_worker_normal_priority() || opts.normal_priority;
         let prio = if normal_for_tests {
             windows_sys::Win32::System::Threading::NORMAL_PRIORITY_CLASS
         } else if opts.cpu_job {

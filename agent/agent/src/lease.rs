@@ -139,6 +139,9 @@ struct Vram {
     budget_mb: u64,
     /// Other programs' dedicated memory on the adapter at the start (MB; `rolling::VRAM_OTHERS_MB` when not measured).
     others_mb: u64,
+    /// PROTOCOL 13.6: video memory kept for other programs whatever they hold now (`Settings::gpu_reserve`: an owner
+    /// machine's trainer; 0 on friends' PCs) - every budget is `rolling::vram_budget_kept` with it.
+    reserve_mb: u64,
     cost: VramCost,
     /// The most a worker held per row of its batch over the base, and at its steady state (MB), and the most remembered
     /// at once (`Learned::vram_raise`).
@@ -425,6 +428,8 @@ struct SpawnSpec {
     exe: PathBuf,
     cwd: PathBuf,
     cpu_job: bool,
+    /// PROTOCOL 13.6: an owner machine's workers run at normal priority (`Settings::normal_priority`).
+    normal_priority: bool,
     log: Arc<zerofarm_common::rotlog::RotatingFile>,
     tag: String,
     runtime_dir: Option<PathBuf>,
@@ -441,6 +446,7 @@ impl SpawnSpec {
                 cwd: &self.cwd,
                 mem_limit_mb,
                 cpu_job: self.cpu_job,
+                normal_priority: self.normal_priority,
                 log: self.log.clone(),
                 tag: self.tag.clone(),
                 runtime_dir: self.runtime_dir.as_deref(),
@@ -1106,9 +1112,10 @@ impl Engine {
         let vram = if gpu_choice && roll.is_some() { self.vram_plan(lease, &choice) } else { None };
         if let Some(v) = &vram {
             let line = format!(
-                "video memory: {} MB on the GPU, {} MB used by other programs, {} MB for the job's workers at {} MB + {} MB per batch row{}",
+                "video memory: {} MB on the GPU, {} MB used by other programs{}, {} MB for the job's workers at {} MB + {} MB per batch row{}",
                 v.total_mb,
                 v.others_mb,
+                if v.reserve_mb > 0 { format!(" ({} MB kept for them: gpu_reserve_mb)", v.reserve_mb) } else { String::new() },
                 v.budget_mb,
                 v.cost.base_mb,
                 v.cost.per_row_mb,
@@ -1162,6 +1169,7 @@ impl Engine {
             exe: entry,
             cwd: work.clone(),
             cpu_job: plan_providers.0 == ["cpu"],
+            normal_priority: settings.normal_priority(),
             log: self.worker_log.clone(),
             tag: id.clone(),
             runtime_dir: prep.runtime.as_ref().map(|r| r.dir.clone()),
@@ -1390,11 +1398,14 @@ impl Engine {
         }
         let others = self.signals.gpu_memory(luid, &[]).map_or(crate::rolling::VRAM_OTHERS_MB, |m| m.adapter_used_mb);
         let (cost, _) = Learned::vram_plan(&self.cfg.layout, lease.run.as_deref().unwrap_or(""), &lease.build.build_id);
+        // (PROTOCOL 13.6: an owner machine keeps `gpu_reserve_mb` - 12 GB unless set - for its trainer)
+        let reserve = self.settings().gpu_reserve();
         Some(Vram {
             luid,
             total_mb: g.vram_mb,
-            budget_mb: crate::rolling::vram_budget(g.vram_mb, others),
+            budget_mb: crate::rolling::vram_budget_kept(g.vram_mb, others, reserve),
             others_mb: others,
+            reserve_mb: reserve,
             cost,
             per_row_max: 0,
             steady_per_row: 0,
@@ -1432,14 +1443,19 @@ impl Engine {
         // (tests of the bench-shaped start, which other GPUs keep: ZEROFARM_TEST_LEGACY_GPU_START, debug builds only)
         let legacy = crate::test_env("ZEROFARM_TEST_LEGACY_GPU_START").is_some();
         let crew = dml || (nvidia_cuda && tune::CUDA_CREW && !legacy);
-        let target = if crew { crate::rolling::dml_target(setup.gpu, setup.hi - setup.lo) } else { crate::rolling::gpu_target(setup.gpu, batch) };
         // (no video memory plan: one worker; `autotune` off without the owner's count: one)
         let set = match (vram.is_some(), fixed) {
             (false, _) => Some(1),
             (true, true) => Some(settings.workers.unwrap_or(1)),
             (true, false) => settings.workers,
         };
-        let max_workers = tune::MAX_WORKERS.min(p.cores.max(1));
+        // (PROTOCOL 13.6: an owner machine's crew up to `tune::MAX_SET_WORKERS`, one per 3 physical cores; friends' up to
+        // `tune::MAX_WORKERS`, one per core, as before)
+        let max_workers = tune::gpu_max_workers(p.cores, settings.owner);
+        // (PROTOCOL 13.6: a crew's "auto" target is `rolling::DML_CONC` for each worker it may have - an owner machine's
+        // crew, or the owner's fixed count above 3; else 3 x 1,152 as before)
+        let crew_n = set.unwrap_or(if settings.owner { max_workers } else { crate::rolling::DML_WORKERS });
+        let target = if crew { crate::rolling::dml_target_for(setup.gpu, setup.hi - setup.lo, crew_n) } else { crate::rolling::gpu_target(setup.gpu, batch) };
         let run_n = matches!(setup.gpu, crate::rolling::Inflight::N(_));
         let vram_plan = vram.map(|v| (v.budget_mb, v.cost));
         let mut space = if crew {
@@ -1447,6 +1463,20 @@ impl Engine {
         } else {
             tune::Space::new_gpu(threads, set, max_workers, target, run_n, Some(mem), vram_plan)
         };
+        // (PROTOCOL 13.6: a fixed layout's `worker_inflight` games in flight, `worker_groups` groups and `worker_threads` search
+        // threads per worker - the owner's pinned bench result; the memory plans cut its games as any start's, and lift them
+        // back when they hold more)
+        if fixed && (settings.worker_inflight.is_some() || settings.worker_groups.is_some() || settings.worker_threads.is_some()) {
+            space.pin(set.unwrap_or(1), settings.worker_inflight, settings.worker_groups, settings.worker_threads);
+        }
+        if settings.owner {
+            log::info!(
+                "lease {}: owner machine: no GPU busy gate, workers at normal priority, a crew of up to {} workers, {} MB of video memory kept for other programs",
+                lease.lease_id,
+                space.workers_max,
+                settings.gpu_reserve()
+            );
+        }
         // (agent 0.3.16: an NVIDIA CUDA crew whose memory holds two workers never tries one - `tune::CUDA_CREW_MIN_WORKERS`)
         if crew && !dml && set.is_none() {
             space.cuda_crew_floor();
@@ -1463,9 +1493,12 @@ impl Engine {
             build: lease.build.build_id.clone(),
             runtime: lease.runtime.as_ref().map(|r| r.build_id.clone()),
             net: tune::net_fingerprint(&plan.job, model_size, variant),
-            hw: match settings.workers {
-                Some(n) => format!("{hw} | workers {n}"),
-                None => hw,
+            // (PROTOCOL 13.6: an owner machine's bounds - up to 8 workers, its video memory reserve - are searched apart)
+            hw: match (settings.workers, settings.owner) {
+                (Some(n), false) => format!("{hw} | workers {n}"),
+                (None, false) => hw,
+                (Some(n), true) => format!("{hw} | workers {n} | owner"),
+                (None, true) => format!("{hw} | owner"),
             },
             os: p.os.clone(),
             // (agent 0.3.12: DirectML's keys searched again from its own start)
@@ -3557,7 +3590,7 @@ impl Run {
         let Some(v) = self.roll.as_ref().and_then(|r| r.vram.as_ref()) else { return true };
         // (the budget of the lease's start, less what other programs took since: their use at the last reading)
         let ours = self.vram_mb + self.mates.iter().map(|m| m.vram_mb).sum::<u64>();
-        let budget = v.budget_mb.min(crate::rolling::vram_budget(v.total_mb, v.adapter_used_mb.saturating_sub(ours)));
+        let budget = v.budget_mb.min(crate::rolling::vram_budget_kept(v.total_mb, v.adapter_used_mb.saturating_sub(ours), v.reserve_mb));
         self.vram_reserved(with_main) + n * v.cost.plan_mb(l.batch()) <= budget
     }
 
@@ -4784,7 +4817,7 @@ impl Run {
             Some(v) => {
                 let ours = self.vram_mb + self.mates.iter().map(|m| m.vram_mb).sum::<u64>();
                 let drain_vram: u64 = self.mates.iter().filter(|m| m.finishing).map(|m| m.vram_mb).sum();
-                let budget = v.budget_mb.min(crate::rolling::vram_budget(v.total_mb, v.adapter_used_mb.saturating_sub(ours)));
+                let budget = v.budget_mb.min(crate::rolling::vram_budget_kept(v.total_mb, v.adapter_used_mb.saturating_sub(ours), v.reserve_mb));
                 self.vram_reserved(true).saturating_sub(drain_vram) + v.cost.plan_mb(l.batch()) <= budget
             }
         };
