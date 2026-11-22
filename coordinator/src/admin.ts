@@ -39,6 +39,8 @@ import {
   type CampaignAlternate,
   DRIVER_RE,
   GPU_MODES,
+  JOB_CLASSES,
+  type JobClass,
   MAX_ALTERNATES,
   type HwRouting,
   MAX_EVAL_GAMES_PER_THREAD,
@@ -313,6 +315,7 @@ function selfplayOf(v: unknown): book.SelfplayCfg | null {
     job: jobOf(o.job, "selfplay.job"),
     ...shareOf(o.share, "selfplay.share"),
     ...rollingOf(o.rolling),
+    ...classOf(o, "selfplay."),
   };
 }
 
@@ -369,7 +372,19 @@ export function evalOf(v: unknown): book.EvalCfg | null {
     needs: needsOf(o.needs, "eval.needs"),
     job,
     ...shareOf(o.share, "eval.share"),
+    ...classOf(o, "eval."),
   };
+}
+
+// Rev 25 (PROTOCOL 16.1): a run job's class - "backfill": standing work with no deadline, after every run's games and
+// the fuzz behind its pace, given back when a job ranked above it wants the machine (16.3). Absent or null: a run's job
+// as before (the key is then left out of the stored config). Refused with a `share`: a backfill job takes no share of
+// the runs' leases.
+export function classOf(o: Record<string, any>, prefix: string): { class?: JobClass } {
+  if (o.class === undefined || o.class === null) return {};
+  const k = oneOf(o.class, `${prefix}class`, JOB_CLASSES);
+  if (o.share !== undefined && o.share !== null) throw bad(`${prefix}class "${k}" and ${prefix}share: a backfill job takes no share of the runs' leases`);
+  return { class: k };
 }
 
 // Rev 13 (PROTOCOL 5.3): a background job's (an analysis campaign's eval batch or self-play) share of the runs' active

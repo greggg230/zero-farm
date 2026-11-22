@@ -7,7 +7,8 @@ A change to anything here is a protocol change: bump the version it belongs to a
 bottom.
 
 Versions: HTTP API `v1` (path prefix), agent↔worker protocol `aw/1`, network files `zero-onnx/1`,
-manifests `manifest/1`. Current revision: v1 rev 24 (section 15, the priority lane: waiting eval work takes machines from
+manifests `manifest/1`. Current revision: v1 rev 25 (section 16, the backfill tier: run jobs of class `backfill` below the
+runs' games, ranked per resource and given back to any job above them; rev 24: section 15, the priority lane: waiting eval work takes machines from
 fuzz and rolling self-play, canary machines first; rev 23: section 12.2, a batch's CPU capacity counts only PCs of a platform its
 run has a build for; rev 22: section 9.8, AMD GPUs with DirectML only and the owner's GPU vendors off; rev 21: section 10.4, the in-flight limit of rolling leases; rev 20: section 14, model variants per generation; rev 19: section 13, layout tuning and
 several workers per lease; rev 18: section 12, hardware routing; rev 17: section 11, platforms: macOS on Apple silicon).
@@ -211,7 +212,10 @@ past leases; its hardware class's average before it has one; 16 games / 10 eval 
 seeds before either), unless the run sets `games_per_lease` / the campaign sets `chunk` (rev 18: an `auto` eval
 lease on the CPU gets at least 2 games per thread, section 12.3). Rev 18: after fuzz, tier 3, a PC's self-play that it
 would play on its CPU while the run has a GPU version (section 12.1). Rev 24: waiting eval work also takes busy machines
-- a fuzz lease's or a rolling self-play lease's - at their next beat or extension (section 15). Every
+- a fuzz lease's or a rolling self-play lease's - at their next beat or extension (section 15). Rev 25: a run job with
+`class` `"backfill"` ranks per resource - on the machine's best route (its GPU; any job on a Mac) after tier 1 and before
+fuzz without a `share`, on a Windows PC's CPU after that fuzz and before tier 3 - is offered only where the priority
+lane applies, and gives its machine back to any job above it (section 16). Every
 lease covers one contiguous id range.
 
 ```json
@@ -248,7 +252,8 @@ reaches new leases); eval leases never switch. `cancel`: stop now, discard (sent
 paused, or the run dropped that job kind; the lease is closed, so later calls get 410).
 `give_back`: finish uploading finished games, then `done` with `given_back: true` (also sent, as a
 backstop, once a lease has reported `paused` for longer than `slack_s`; rev 24: to a fuzz lease whose machine an eval
-batch waits for, section 15.3). A beat for an expired or
+batch waits for, section 15.3; rev 25: to a classic backfill lease when a job above it waits, and to a fuzz lease when
+backfill above it does, sections 16.3, 16.4). A beat for an expired or
 cancelled lease → 410 `gone`; a lease id that isn't this machine's → 404 `not_found`. A lease
 that misses 3 beats expires and its unfinished ids go back to the pool.
 
@@ -413,7 +418,7 @@ tools also send an Access service token (`CF-Access-Client-Id`, `CF-Access-Clien
 | `POST /v1/admin/build` | `{"build_id"}` after its manifest, signature and files are uploaded; the coordinator checks presence + sizes + hashes, and the signature and its trusted comment (`build_id=`, `kind=`) when the Worker var `RELEASE_PUBKEYS` is set → `{"ok": true, "build_id", "kind", "version", "size", "sig_verified"}`; failures → 400 with `"problems": [...]` |
 | `POST /v1/admin/agent/release` | `{"version", "build_id", "channel": "canary" \| "stable", "min_agent", "github_url": "<url>" \| null}`: `build_id` must be a registered agent build of that version, `min_agent` ≤ `version`. `github_url` (rev 4): the installer asset of the release's GitHub Release, where `GET /download` redirects; create the GitHub Release first. Rev 6: exactly `https://github.com/<GITHUB_REPO>/releases/download/agent-v<version>/ZeroFarmSetup.exe` (the var defaults to `greggg230/zero-farm`), else 400. `setup` (rev 3) → 400 → `{"ok": true, "channel", "version", "build_id", "min_agent", "github_url"}` |
 | `PUT /v1/admin/definition` | rev 6, section 7: `{"kind": "run" \| "campaign", "id", "version", "key", "sha256"}` after `definition.json` and `.minisig` are uploaded to `key` = `defs/<kind>/<id>/<version>/definition.json` → `{"ok": true, "kind", "id", "version", "key", "sha256", "unchanged", "current": true}`; failures → 400 with `"problems"`, a version not above the current one (or the same with other bytes) → 409 |
-| `PUT /v1/admin/run/{run}` | `{"game", "build_id", "runtime", "priority": 1.0, "min_agent": "0.2.8" \| null, "alternates": [{"build_id", "runtime", "when": {"vendor", "min_driver"?}, "model"?}] \| null (rev 11, section 9.4; `model`: rev 20, section 14.3), "selfplay": {"quota": 600, "slack": 0.1, "max_stale": 1, "games_per_lease": "auto", "gpu_games_per_lease": 24 | "auto" (rev 11, optional, section 9.4), "gpu": "any" \| "preferred" \| "required", "providers": ["dml", "cpu"] \| null, "needs": {"threads", "ram_mb"}, "job": {...}, "share": 0.25 \| null (rev 13, section 5.3), "rolling": {...} \| null (rev 15, section 10.1)} \| null, "eval": {"batch": "it81", "games": 110, "checkpoints": [81, 70], "games_per_lease": "auto", "gpu", "providers", "needs", "job": {"settings", "seats", "paired"}, "share" (rev 13)} \| null, "state": "active" \| "paused"}` → `{"ok": true, "created"}`. `build_id` must be a registered worker build, `runtime` a runtime build. A new eval `batch` reserves `games` fresh game ids (the old batch's unissued ones are dropped); its rules and checks are in section 5.2 (rev 5: `checkpoints` replaces `gen`, which is now refused). Pausing a run, or dropping its `selfplay`/`eval`, cancels those leases at their next beat. Rev 9: `min_agent` (semver, optional; absent or null: none) - the run's leases (self-play and eval) go only to agents at or above it (section 3's update rule); a PUT is the whole configuration, so a PUT without it removes the limit; leases already issued run on (migration 0007) |
+| `PUT /v1/admin/run/{run}` | `{"game", "build_id", "runtime", "priority": 1.0, "min_agent": "0.2.8" \| null, "alternates": [{"build_id", "runtime", "when": {"vendor", "min_driver"?}, "model"?}] \| null (rev 11, section 9.4; `model`: rev 20, section 14.3), "selfplay": {"quota": 600, "slack": 0.1, "max_stale": 1, "games_per_lease": "auto", "gpu_games_per_lease": 24 | "auto" (rev 11, optional, section 9.4), "gpu": "any" \| "preferred" \| "required", "providers": ["dml", "cpu"] \| null, "needs": {"threads", "ram_mb"}, "job": {...}, "share": 0.25 \| null (rev 13, section 5.3), "rolling": {...} \| null (rev 15, section 10.1), "class": "backfill" \| null (rev 25, section 16.1; never with `share`)} \| null, "eval": {"batch": "it81", "games": 110, "checkpoints": [81, 70], "games_per_lease": "auto", "gpu", "providers", "needs", "job": {"settings", "seats", "paired"}, "share" (rev 13), "class" (rev 25)} \| null, "state": "active" \| "paused"}` → `{"ok": true, "created"}`. `build_id` must be a registered worker build, `runtime` a runtime build. A new eval `batch` reserves `games` fresh game ids (the old batch's unissued ones are dropped); its rules and checks are in section 5.2 (rev 5: `checkpoints` replaces `gen`, which is now refused). Pausing a run, or dropping its `selfplay`/`eval`, cancels those leases at their next beat. Rev 9: `min_agent` (semver, optional; absent or null: none) - the run's leases (self-play and eval) go only to agents at or above it (section 3's update rule); a PUT is the whole configuration, so a PUT without it removes the limit; leases already issued run on (migration 0007) |
 | `GET /v1/admin/run/{run}` | config (rev 9: with `min_agent`) + state: `current_gen`, `next_gid`, `pool`, `selfplay_state` (`cap`, `accepted`, `leased`, `pending`, `in_flight`, `headroom`), `checkpoints` (registered gens, rev 5), `eval_state` (the current batch's progress, section 5.2) and `eval_batches` (every batch of the run, newest first, same fields); rev 6 `definition` (as in stats; `GET /v1/admin/campaign/{id}` too) |
 | `PUT /v1/admin/run/{run}/checkpoint/{gen}` | `{"model", "sha256", "reference", "reference_sha256"}` (files under `ckpt/<run>/`, uploaded first); makes `gen` current for self-play and resets that generation's quota counter → `{"ok": true, "unchanged", "current"}`. Rev 5: a `gen` older than the current one is registered without becoming current (`"current": false`: an eval opponent or a head-to-head label); the same `gen` with other files → 409. Rev 6: a gen the current definition already signs must be exactly those files (else 400); self-play with a definition plays the new current gen once a definition signs it. Rev 20: optional `"variants": {"<name>": {"model", "sha256"}}`, which a registered gen may add to (section 14.2; the answer adds `variants`) |
 | `GET /v1/admin/run/{run}/results?after={cursor}&limit=500` | → `{"results": [{"id", "key", "lease_id", "seq", "machine_id", "kind", "gen", "games", "ids", "dup_ids", "sha256", "size", "t"}], "cursor"}`. `ids`/`games`: the game ids credited to this chunk; `dup_ids`: ids in it that an earlier chunk was credited with (skip those games). Eval chunks (rev 5) also carry `batch`, `held` and `also`, and their `games` counts `also` too (section 5.2). `limit` ≤ 1000 |
@@ -1352,7 +1357,7 @@ A rolling lease is a self-play lease (section 3) plus
   lists the lease's worker build (the run was re-pinned: its results would be refused and it can't switch
   generations; the agent asks for a fresh lease with the current builds).
 - `{"games": total, "finish": true, "reason": "yield"}` (rev 24, section 15.4): an eval batch waits for this machine, before
-  or after `until`; the agent finishes as for the other reasons (it reads `finish`, and only logs `reason`).
+  or after `until` (rev 25, section 16.3: for a backfill self-play, any job ranked above it); the agent finishes as for the other reasons (it reads `finish`, and only logs `reason`).
 - **Renewal.** Past `until`, the coordinator renews the lease (`until` += `max_s`, and the answer releases ids as
   usual) unless something else is waiting for this machine, in the order section 3 picks work: a diagnostics request
   for it; an eval batch of an active run with unissued ids; a fuzz campaign with a `share` that is below it (5.4);
@@ -2369,7 +2374,7 @@ highest first:
 | 2 | a run's self-play (tier 1); a fuzz campaign within its `share` (5.4) | nobody (a rolling lease's renewal, 10.4, gives way to higher work at `until`, as before) | level 1 (rolling self-play; fuzz) |
 | 3 | fuzz, the backfill (tier 2) | nobody | level 1 |
 | 4 | CPU self-play of a run with a GPU version (tier 3) | nobody | level 1 (rolling, within the share) |
-| 5 | reserved: a backfill tier for standing low-priority work while no live run needs a platform (an experiment queue) | nobody | every level above (see below) |
+| 5 | backfill (rev 25, section 16): ranked per resource - between levels 2 and 3 on the machine's best route (tier 1.9), between 3 and 4 on a Windows PC's CPU (tier 2.5) | fuzz without a `share` that ranks below it, at its next beat (16.4) | every job of a strictly higher tier, never other backfill (16.3) |
 
 Classic self-play leases (about 7.5 minutes of work), eval leases and diagnostics leases are never preempted; self-play
 and fuzz never preempt anything. **The slot for a backfill tier**: its jobs would rank below tier 3 (a tier 4), get a
@@ -2377,6 +2382,8 @@ free machine only when nothing above has work for it, and be taken back by *any*
 alone - the decision of 15.3 with "the first candidate that would be granted before the lease's own job is an eval
 batch" widened to "is any job" (a self-play with headroom, fuzz, eval), answered by `give_back` at a beat (any lease
 kind) or `finish` at a rolling extension, and marked `pending` `yield:<scope>` as here. Nothing in rev 24 depends on it.
+Rev 25 fills the slot (section 16), per resource rather than below tier 3: backfill on a machine's best route ranks
+above fuzz past its pace and takes that fuzz's machines; backfill on a Windows PC's CPU ranks below it.
 
 ### 15.2 Idle machines ask again sooner
 
@@ -2398,7 +2405,7 @@ machine's order as section 3 would for a new lease request now - from the caps, 
 agent version of its last `/v1/lease`, every job kind, nothing cached, its own lease not counted - and walks it from the
 top to the lease's own campaign: a self-play without headroom is skipped (it would not be granted); the first job that
 would be granted must be an eval batch with unissued ids (anything else - a self-play with headroom, another campaign's
-fuzz - ends the check: the lane covers eval only); and the batch must still come first with its machines on their way
+fuzz - ends the check: the lane covers eval only; rev 25: or a backfill job that sorts before the campaign, 16.4); and the batch must still come first with its machines on their way
 counted as its leases, and be able to use one more machine (15.4). Then the beat answers `give_back` and the lease is
 marked `pending` = `yield:<the batch's scope>` (`yield:run:<run>`); its later beats answer `give_back` too (a lost
 answer is repeated). Not when the lease will be done within 120 s at its own pace (seeds done per running second so far,
@@ -2469,7 +2476,109 @@ Checked against agents 0.3.10 (the macOS stable of before 2026-11-21), 0.3.13 an
 `give_back` → `stop`, `on_extend` `finish` → `roll_finish`, `finish()` for the fuzz final result), `engine.rs` (a new
 `/v1/lease` right after any lease ends; `wait_s` honoured up to `max_wait`).
 
+## 16. The backfill tier (rev 25; coordinator only, no migration, no agent change)
+
+**Why.** In the week to 2026-11-21 the always-on GPU PCs fuzzed about 177 hours with no run iterating, their GPUs idle,
+while fuzz was far past the steward's daily pace (one build: ~384k seeds in a day against a 50k quota). Work with a
+real consumer but no deadline - a yardstick for a checkpoint that has none, a judging top-up - had nowhere to go but the
+desktop. The backfill tier is its place: below every run's games and the fuzz behind its pace, above the fuzz past its
+pace on a machine's best route, and given back as soon as anything above it wants the machine.
+
+### 16.1 The class
+
+`PUT /v1/admin/run/{run}` (section 4): `selfplay.class` and `eval.class` take `"backfill"`; absent or null is a run's
+job as before (the key is then left out of the stored config; `GET` shows it when set). Any other value → 400; together
+with `share` → 400 (a backfill job takes no share of the runs' leases). Among backfill jobs the run's `priority` decides
+as usual (priority × fit ÷ (1 + active leases)). `class` is not part of a batch's identity. Campaigns have no class: a
+fuzz campaign with a `share` is fuzz behind its pace, one without is fuzz past it (5.4).
+
+### 16.2 Where backfill ranks: per resource
+
+Backfill is placed by what it would use on the machine asking, not as one tier. Highest first:
+
+1. waiting eval work (tier 1: a run's evaluation; an analysis campaign's batch within its `share`, 5.3)
+2. a run's self-play within its share (tier 1)
+3. fuzz behind its daily pace: a campaign with a `share` (tier 1, 5.4)
+4. **backfill on the machine's best route** (tier 1.9): a job it would play on its GPU - a GPU lease (section 3: an
+   alternate for its GPU vendor, or the default with a GPU provider verified with that pack, 9.4), for self-play also
+   `caps.gpu_games` not 0 for the run - or any backfill job on a Mac (macOS has no GPU route, 11.5: the Mac's CPU is
+   its best and only one)
+5. fuzz past its pace: a campaign without a `share` (tier 2; a GPU-preferring job on a PC that isn't GPU-eligible for
+   it, section 8, sits here too)
+6. **backfill on a Windows PC's CPU** (tier 2.5)
+7. CPU self-play of a run with a GPU version (tier 3, 12.1)
+
+4 above 5: past its pace fuzz adds little, and a GPU PC on it leaves its GPU idle. 6 below 5: CPU-only PCs are good at
+fuzz and slow at match play. Fuzz behind its pace (3) stays above every backfill: that is the depth the owner set. A
+backfill batch is never deferred (12.2 defers only tier-1 batches).
+
+### 16.3 A backfill lease gives its machine back
+
+A backfill lease is an eval or self-play lease whose run's job, as stored now, has `class` `"backfill"`. Once it has
+run 60 s (no churn on a lease just granted), the coordinator decides as in 15.3 - the machine's order as section 3
+would work it out for a new lease request now, from what the machine last asked with, its own lease not counted - and
+the first job that would be granted may be **any job of a strictly higher tier**:
+- an eval batch with unissued ids, as in 15.4 (its machines on their way counted as its leases; at most its unissued
+  games over this machine's lease size for it; no share limit: a background batch past its share is still tier 1);
+- a self-play with headroom (a self-play without is skipped), likewise at most its headroom over this machine's lease
+  size for it;
+- a fuzz campaign (behind its pace on any route; past it, for backfill on a Windows CPU).
+
+Never another backfill job, whatever its priority or route: backfill jobs don't take machines from each other. Then:
+- **classic lease** (an eval lease, or a self-play lease that isn't rolling): its beat (`running`, nothing pending,
+  nothing paused) answers `give_back` and the lease is marked `pending` `yield:<scope>` (the job's scope:
+  `run:<run>` or `campaign:<campaign>`); its later beats answer `give_back` too. The agent uploads its finished games
+  and sends `done` with `given_back: true`; the rest of its ids go back to the pool. Games in play are lost, bounded
+  by the lease size;
+- **rolling self-play lease**: at every extension, before or after `until`, the answer is `{"finish": true, "reason":
+  "yield"}` and the lease is marked as above; later extensions answer `finish` with `state`, as in 15.4.
+
+This holds whatever `priority_lane` says now and on every channel: the lease was granted under the lane (16.5) and none
+runs without its yield rule. When the lease's own job is no longer offered (a batch whose every id is issued, the lane
+turned off since), it counts at tier 1.9 (so a Windows CPU's backfill lease then gives way to tier-1 work only). The
+renewal of a rolling lease (10.4, past `until`) is unchanged: a backfill self-play may hand its machine to a backfill
+job of a higher priority there.
+
+### 16.4 Fuzz past its pace gives way to backfill
+
+15.3's decision for a fuzz lease (the lane applies, the lease not within 120 s of its end, nothing paused) also stops at
+a backfill job: when the first job that would be granted is backfill that sorts before the lease's own campaign, the
+beat answers `give_back` and the lease is marked `yield:<its scope>`, with the limits of 16.3 (machines on their way;
+unissued games or headroom over this machine's lease size). Only backfill on the machine's best route (tier 1.9)
+sorts before fuzz without a `share` (tier 2): a Windows CPU PC keeps its fuzz, and fuzz with a `share` (tier 1) never
+gives way to backfill. A self-play with headroom ahead still ends the check (self-play takes busy machines from
+nobody, 15.1). Backfill takes busy machines from fuzz only: a rolling CPU self-play of tier 3 runs to its renewal.
+
+### 16.5 Gating, the idle poll and rev 18's bookkeeping
+
+- **Gating.** Backfill jobs are offered only where the priority lane applies (15.6): `"off"` none anywhere,
+  `"canary"` only to canary machines, `"all"` to every machine.
+- **The idle poll** (15.2): a backfill batch never makes `no_work` say 60 s (neither with unissued ids nor with leases
+  out). Backfill always exists, and 300 s is soon enough for it.
+- **Rev 18** (12.2): a backfill self-play on a PC's GPU doesn't set the PC's `gpu_play`: its own eval batches aren't
+  deferred behind it (they rank above it), and the PC counts as CPU eval capacity for other PCs' deferral (its
+  backfill lease gives way to the batch).
+
+### 16.6 Wire and agents
+
+No new endpoint, migration or agent field: `class` is a new key of a stored run job; `give_back` (section 3) and
+`finish` with `"yield"` (15.7) are existing answers every agent version handles. `leases.pending` `yield:<scope>` may now
+name a self-play's or a fuzz campaign's scope (internal; machines on their way to a run count for both its jobs).
+Backfill jobs are submitted by the desktop tools (a campaign submitted with the backfill class puts `eval.class` and no
+`share` on its run's eval job).
+
 ## Changes
+- v1 rev 25 (2026-11-21; coordinator only, every agent version; no migration): **the backfill tier** (section 16). A run's
+  `selfplay` or `eval` may carry `class` `"backfill"` (refused with `share`): standing work with no deadline. It ranks per
+  resource: on the machine's best route (a GPU lease; any job on a Mac) after every tier-1 job, the fuzz with a `share`
+  included, and before fuzz without one; on a Windows PC's CPU after that fuzz and before the CPU self-play of a run with
+  a GPU version. A backfill lease that has run 60 s gives its machine back to any job of a strictly higher tier, never
+  to other backfill (`give_back` at a classic lease's beat, `finish` with `"yield"` at a rolling lease's extension,
+  `pending` `yield:<scope>`), whatever the lane's setting now; a fuzz lease without a `share` gives way to backfill on its
+  machine's best route (15.3's decision). Offered only where `priority_lane` applies (`"off"`: none; `"canary"`: canary
+  machines); a backfill batch never makes `no_work` 60 s; a backfill self-play doesn't set `gpu_play` (12.2). Why: the
+  always-on GPU PCs fuzzed ~177 h in a week past the fuzz's pace with their GPUs idle, while measurements with a consumer
+  ran on the desktop.
 - v1 rev 24 (2026-11-21; coordinator only, every agent version; no migration; owner setting `priority_lane`, default
   `"canary"`): **the priority lane** (section 15). While a run's eval batch with unissued ids comes first for a machine,
   a fuzz lease's next beat answers `give_back` (not within 120 s of its end) and a rolling self-play lease's next

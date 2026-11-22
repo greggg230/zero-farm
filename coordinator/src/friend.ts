@@ -49,6 +49,10 @@ import {
   laneApplies,
   sortsBefore,
   yieldTarget,
+  BACKFILL_TIER,
+  type JobClass,
+  YIELD_MIN_S,
+  backfillTier,
 } from "./routing";
 import { presenceOf } from "./presence";
 import { TUNING_FEATURE, cleanTuning, hintFor, storedTuning, type Hint } from "./tuning";
@@ -266,7 +270,10 @@ interface Candidate {
   run?: string;
   campaign?: string;
   priority: number;
-  tier: number; // 1: a run's games; 2: backfill (fuzz, or a GPU-preferring job on a PC that isn't GPU-eligible); 3 (rev 18): CPU self-play of a run with a GPU version
+  // 1: a run's games; 2: backfill (fuzz, or a GPU-preferring job on a PC that isn't GPU-eligible); 3 (rev 18): CPU self-play
+  // of a run with a GPU version; rev 25 (PROTOCOL 16.2): a backfill-class job, BACKFILL_TIER (1.9) on the machine's best
+  // route, BACKFILL_CPU_TIER (2.5) on a Windows PC's CPU
+  tier: number;
   fit: number;
   gpu_play?: boolean; // rev 18: self-play this PC plays on its GPU (a GPU lease whose GPU pays here)
   unissued?: number; // rev 18: an eval batch's unissued games
@@ -286,6 +293,7 @@ interface Candidate {
   model?: string; // rev 20 (PROTOCOL 14.3): the model variant the chosen alternate names (book.ts decides per gen)
   gpu_lease: boolean; // an alternate, or a machine GPU-eligible for the job: `auto` leases get GPU_LEASE_MIN
   share?: number; // rev 13: a background job's share of the runs' active leases (PROTOCOL 5.3)
+  klass?: JobClass; // rev 25 (PROTOCOL 16.1): the run job's class ("backfill"; absent: a run's job)
 }
 
 // Lease sizing: about TARGET_S seconds of this machine's measured rate (ids per running second),
@@ -445,7 +453,8 @@ export async function lease(c: Ctx): Promise<Response> {
   }
   // Rev 24 (PROTOCOL 15.2): eval work this machine could play is about to need it (ids may come back to a batch it was
   // offered, or a batch whose leases are still out, or a run being set up): it asks again sooner.
-  const soon = o.hw.priority_lane !== "off" && (o.soon || o.usable.some((cd) => cd.kind === "eval"));
+  // (rev 25, PROTOCOL 16.5: a backfill batch doesn't count)
+  const soon = o.hw.priority_lane !== "off" && (o.soon || o.usable.some((cd) => cd.kind === "eval" && !cd.klass));
   return withDiag({ wait_s: soon ? LANE_WAIT_S : WAIT_S, reason: "no_work" });
 }
 
@@ -763,7 +772,9 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
       const routing = sp ? storedRouting(sp.gpu, sp.providers) : null;
       const v = routing ? choiceFor(r, "selfplay", routing) : null;
       const at = routing && v ? place("selfplay", routing, v.eligible, caps.gpu) : null;
-      if (sp && routing && v && at && needsOk(sp.needs) && diskOk([v.build_id, v.runtime])) {
+      // Rev 25 (PROTOCOL 16.5): a backfill self-play only where the lane applies (none runs without its yield rule)
+      const spBackfill = sp?.class === "backfill";
+      if (sp && routing && v && at && needsOk(sp.needs) && diskOk([v.build_id, v.runtime]) && (!spBackfill || lane)) {
         // rev 20: a lease of an alternate naming a variant brings that file (agents from 0.3.5 list it as run/gen/name)
         const ckptKey = v.model && variantAware ? `${r.run}/${r.current_gen}/${v.model}` : `${r.run}/${r.current_gen}`;
         const ckptBonus = cachedCkpts.has(ckptKey) || cachedCkpts.has(`${r.run}/${r.current_gen}`) ? 1.1 : 1;
@@ -776,7 +787,8 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
           kind: "selfplay",
           run: r.run,
           priority: r.priority,
-          tier: cpuBackfill ? CPU_SELFPLAY_TIER : at.tier,
+          // rev 25 (PROTOCOL 16.2): a backfill self-play by its route here (its GPU, or a Mac: 1.9; a Windows CPU: 2.5)
+          tier: spBackfill ? backfillTier(gpuPlay, platform) : cpuBackfill ? CPU_SELFPLAY_TIER : at.tier,
           gpu_play: gpuPlay,
           fit: at.fit * (cachedBuilds.has(v.build_id) ? 1.2 : 1) * ckptBonus,
           configured: sp.games_per_lease,
@@ -789,6 +801,7 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
           ...(v.model ? { model: v.model } : {}),
           gpu_lease: altAware && v.gpuLease,
           ...(typeof sp.share === "number" ? { share: sp.share } : {}),
+          ...(spBackfill ? { klass: "backfill" as const } : {}),
         });
       }
     }
@@ -801,7 +814,9 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
       // Rev 24 (PROTOCOL 15.2): a batch with no unissued id whose leases are still out (ids may come back) is a candidate
       // only to say this machine could play it (`soon`: never offered, never asks for an update).
       const soon = hw.priority_lane !== "off" && unissued === 0 && (active.get(`${scope}|eval`) ?? 0) > 0;
-      if (ev && routing && v && at && Array.isArray(ev.checkpoints) && (unissued > 0 || soon) && needsOk(ev.needs)) {
+      // Rev 25 (PROTOCOL 16.5): a backfill batch only where the lane applies
+      const evBackfill = ev?.class === "backfill";
+      if (ev && routing && v && at && Array.isArray(ev.checkpoints) && (unissued > 0 || soon) && needsOk(ev.needs) && (!evBackfill || lane)) {
         // Rev 5: the lease brings every network the seats name; uncached ones count against the disk. Rev 20: a gen's
         // variant instead (its own entry and size) when the alternate names one and the gen has it registered.
         const vname = v.model && variantAware ? v.model : null;
@@ -827,7 +842,8 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
             kind: "eval",
             run: r.run,
             priority: r.priority,
-            tier: at.tier,
+            // rev 25 (PROTOCOL 16.2): a backfill batch by its route here (a GPU lease, or a Mac: 1.9; a Windows CPU: 2.5)
+            tier: evBackfill ? backfillTier(altAware && v.gpuLease, platform) : at.tier,
             fit: at.fit * (cachedBuilds.has(v.build_id) ? 1.2 : 1) * ckptBonus,
             // (a batch that requires a GPU has no CPU PCs to wait for: never deferred)
             ...(routing.gpu === "required" ? {} : { unissued }),
@@ -843,6 +859,7 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
             ...(v.model ? { model: v.model } : {}),
             gpu_lease: altAware && v.gpuLease,
             ...(typeof ev.share === "number" ? { share: ev.share } : {}),
+            ...(evBackfill ? { klass: "backfill" as const } : {}),
           });
         }
       }
@@ -909,8 +926,9 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
     return !worker || worker.aw === null || worker.aw === aw;
   });
   // Rev 24 (15.2): `soon` batches only say that eval work is about to need this machine; they are never offered.
+  // (rev 25, PROTOCOL 16.5: a backfill batch never says so - backfill always exists, and 300 s is soon enough for it)
   const usable = passed.filter((cd) => !cd.soon);
-  const soon = setupSoon || passed.length > usable.length;
+  const soon = setupSoon || passed.some((cd) => cd.soon && !cd.klass);
 
   const rate = new Map<string, number>((ratesR.results as any[]).map((x) => [`${x.scope}|${x.kind}`, x.rate]));
   const classRate = new Map<string, number>((classR.results as any[]).map((x) => [`${x.scope}|${x.kind}`, x.rate]));
@@ -920,7 +938,8 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
 
   // Rev 18 (PROTOCOL 12): a PC that plays some run's self-play on its GPU records it (the CPU PCs' eval capacity reads
   // it), and takes an eval batch after that self-play unless the CPU PCs online couldn't finish it within the horizon.
-  const gpuPlay = usable.some((cd) => cd.kind === "selfplay" && cd.gpu_play);
+  // (rev 25, PROTOCOL 16.5: not a backfill self-play - the PC's eval batches rank above it, and it gives its machine back)
+  const gpuPlay = usable.some((cd) => cd.kind === "selfplay" && cd.gpu_play && !cd.klass);
   if (m.gpu_play !== (gpuPlay ? 1 : 0)) {
     await db.prepare(`UPDATE machines SET gpu_play = ? WHERE machine_id = ?`).bind(gpuPlay ? 1 : 0, m.machine_id).run();
     m.gpu_play = gpuPlay ? 1 : 0;
@@ -1026,8 +1045,16 @@ export async function beat(c: Ctx, leaseId: string): Promise<Response> {
   const stats = cleanStats(b.stats);
   // Rev 15 (PROTOCOL 10.6): a rolling lease's newest generation in play (ignored for a classic lease).
   const gen = int(b.gen, "gen", { optional: true, min: 0, max: 999_999_999 }) ?? null;
-  // Rev 24 (PROTOCOL 15.3): a fuzz lease gives its machine back to an eval batch that waits for it.
-  const yieldTo = l.kind === "fuzz" && l.state === "active" && l.pending === null && state === "running" ? await fuzzYield(c, m, l, progress) : null;
+  // Rev 24 (PROTOCOL 15.3): a fuzz lease gives its machine back to an eval batch that waits for it (rev 25, 16.4: or to
+  // backfill on the machine's best route). Rev 25 (16.3): a classic backfill lease that has run YIELD_MIN_S, to any job
+  // ranked above it.
+  let yieldTo: string | null = null;
+  if (l.state === "active" && l.pending === null && state === "running") {
+    if (l.kind === "fuzz") yieldTo = await fuzzYield(c, m, l, progress);
+    else if (!book.isRolling(l) && c.now - l.issued_at >= YIELD_MIN_S && (await backfillLease(c.env.DB, l))) {
+      yieldTo = await laneTarget(c, m, l, await hwSetting(c.env.DB), true);
+    }
+  }
   const ans = unwrap(
     await bookFor(c.env, l.scope).beat({ now: c.now, machine_id: m.machine_id, lease_id: leaseId, scope: l.scope, state, progress, stats, gen, yield_to: yieldTo }),
   );
@@ -1053,10 +1080,13 @@ export async function extend(c: Ctx, leaseId: string): Promise<Response> {
   const due = l.state === "active" && !paused && (l.until === null || c.now >= l.until);
   // Rev 24 (PROTOCOL 15.4): an eval batch that waits for this machine ends the lease at any extension, not only past
   // `until` (the renewal's rule, below, is unchanged).
+  // Rev 25 (16.3): a backfill self-play's lease, once it has run YIELD_MIN_S, ends when any job ranked above it waits.
   let yieldTo: string | null = null;
   if (l.state === "active" && !paused && l.pending === null) {
     const hw = await hwSetting(c.env.DB);
-    if (laneApplies(hw, m.channel)) yieldTo = await laneTarget(c, m, l, hw);
+    if (await backfillLease(c.env.DB, l)) {
+      if (c.now - l.issued_at >= YIELD_MIN_S) yieldTo = await laneTarget(c, m, l, hw, true);
+    } else if (laneApplies(hw, m.channel)) yieldTo = await laneTarget(c, m, l, hw);
   }
   const waiting = due && !yieldTo ? await otherWorkWaits(c, m, l) : null;
   const ans = unwrap(
@@ -1118,34 +1148,52 @@ async function fuzzYield(c: Ctx, m: MachineRow, l: book.LeaseRow, progress: Reco
 // its leases (its share, 5.3; a deferred batch, 12.2, never does for a GPU self-play lease); and for a rolling lease
 // every background job's leases and machines on their way, with this one, stay within the batch's share of the runs'
 // active leases (several analysis campaigns together take no more of a live run than one would).
-export async function laneTarget(c: Ctx, m: MachineRow, l: book.LeaseRow, hw: HwRouting): Promise<string | null> {
+// Rev 25 (PROTOCOL 16.3, 16.4): the same walk decides for backfill. `backfill`: `l` is a backfill lease (classic or
+// rolling; the caller checks YIELD_MIN_S) - the first candidate that would be granted may be any job of a strictly
+// higher tier (an eval batch as above but with no share limit, a self-play with headroom, a fuzz campaign), never
+// another backfill job; it applies whatever the lane's setting now (the lease was granted under the lane). A fuzz lease
+// also gives way to a backfill job that sorts before it (on the machine's best route, before fuzz without a share).
+// A self-play target can use as many machines as its headroom over this machine's lease size.
+export async function laneTarget(c: Ctx, m: MachineRow, l: book.LeaseRow, hw: HwRouting, backfill = false): Promise<string | null> {
   const db = c.env.DB;
-  if (!laneApplies(hw, m.channel) || m.paused) return null;
+  if ((!backfill && !laneApplies(hw, m.channel)) || m.paused) return null;
   const waiting = await waitingBatches(db);
-  if (!waiting.size) return null;
   const transit = await inTransit(db, c.now);
-  // (cheap first: every waiting batch already has a machine on its way per smallest eval lease of its unissued games)
-  if (![...waiting].some(([s, n]) => (transit.get(s) ?? 0) + 1 <= batchMachines(n, SIZING.eval.min))) return null;
+  if (!backfill) {
+    // (cheap first: every waiting batch already has a machine on its way per smallest eval lease of its unissued games,
+    // and - for a fuzz lease - no active run has a backfill job)
+    const room = [...waiting].some(([s, n]) => (transit.get(s) ?? 0) + 1 <= batchMachines(n, SIZING.eval.min));
+    if (!room && !(l.kind === "fuzz" && (await backfillOffered(db)))) return null;
+  }
   const ask = storedAsk(c, m);
   const o = await offer(c, m, ask, parseJson<Profile | null>(m.profile, null));
   if (o.farmPaused) return null;
-  const rolling = l.kind === "selfplay";
-  const runsAfter = o.activeRuns - (rolling ? 1 : 0); // the runs' active leases once this lease has closed
+  const rolling = l.kind === "selfplay" && book.isRolling(l);
+  const runsAfter = o.activeRuns - (l.kind === "selfplay" || l.kind === "eval" ? 1 : 0); // the runs' active leases once this lease has closed
   const own = o.usable.find((cd) => cd.scope === l.scope && cd.kind === l.kind);
-  // the lease's own job as the machine would see it after closing it (its own lease no longer counted)
+  // the lease's own job as the machine would see it after closing it (its own lease no longer counted); not offered (a
+  // backfill batch with every id issued, the lane turned off): a backfill lease at its best route's tier
   const ownActive = own ? Math.max(0, (o.active.get(`${own.scope}|${own.kind}`) ?? 0) - 1) : 0;
   const ownKey: SortKey = own
     ? { tier: own.tier, rank: jobRank(own.kind, own.share, ownActive, runsAfter), score: (own.priority * own.fit) / (1 + ownActive) }
-    : { tier: rolling ? 1 : 2, rank: kindRank(l.kind), score: 0 };
+    : { tier: backfill ? BACKFILL_TIER : l.kind === "selfplay" ? 1 : 2, rank: kindRank(l.kind), score: 0 };
   for (const cd of o.usable) {
     if (cd === own || !sortsBefore({ tier: cd.tier, rank: o.rank(cd), score: o.score(cd) }, ownKey)) return null;
+    // 16.4: backfill takes a busy machine only from fuzz (not from other backfill: no churn between backfill jobs; not
+    // from a rolling self-play below it, tier 3: left to its renewal); 16.3: a backfill lease gives way only to a
+    // strictly higher tier
+    if (cd.klass ? l.kind !== "fuzz" : backfill && cd.tier >= ownKey.tier) return null;
     if (cd.kind === "selfplay") {
-      // another run's self-play first: granted only with headroom (then the lane has nothing to do here)
+      // a self-play first: granted only with headroom (else the next candidate); the lane alone covers eval only
       const r = cd.run ? await book.getRun(db, cd.run) : null;
       const sp = r ? parseJson<book.SelfplayCfg | null>(r.selfplay, null) : null;
-      if (!r || !sp || (await book.selfplayState(db, r, sp)).headroom < 1) continue;
-      return null;
+      const headroom = r && sp ? (await book.selfplayState(db, r, sp)).headroom : 0;
+      if (headroom < 1) continue;
+      if (!backfill && !cd.klass) return null;
+      if ((transit.get(cd.scope) ?? 0) + 1 > batchMachines(headroom, await wantFor(db, o, cd, ask.caps, ask.gpuGames))) return null;
+      return cd.scope;
     }
+    if (cd.kind === "fuzz") return backfill ? cd.scope : null; // (a campaign's seeds never run out)
     if (cd.kind !== "eval") return null;
     const unissued = waiting.get(cd.scope) ?? 0;
     if (unissued < 1) continue;
@@ -1154,13 +1202,30 @@ export async function laneTarget(c: Ctx, m: MachineRow, l: book.LeaseRow, hw: Hw
     let rank = jobRank("eval", cd.share, (o.active.get(`${cd.scope}|eval`) ?? 0) + t, runsAfter);
     if (cd.deferred) rank = Math.max(rank, DEFERRED_EVAL_RANK);
     if (!sortsBefore({ tier: cd.tier, rank, score: o.score(cd) }, ownKey)) return null;
-    if (rolling && cd.share !== undefined) {
+    if (rolling && !backfill && cd.share !== undefined) {
       const bg = [...o.bgScopes].reduce((s, x) => s + (o.active.get(`${x}|selfplay`) ?? 0) + (o.active.get(`${x}|eval`) ?? 0) + (transit.get(x) ?? 0), 0);
       if (bg + 1 > cd.share * o.activeRuns + 1e-9) return null;
     }
     return cd.scope;
   }
   return null;
+}
+
+// Rev 25 (PROTOCOL 16.3): a backfill lease - an eval or self-play lease whose run's job (as stored now) has `class`
+// "backfill".
+async function backfillLease(db: D1Database, l: book.LeaseRow): Promise<boolean> {
+  if ((l.kind !== "selfplay" && l.kind !== "eval") || !l.run) return false;
+  const r = await book.getRun(db, l.run);
+  const cfg = r ? parseJson<{ class?: unknown } | null>(l.kind === "selfplay" ? r.selfplay : r.eval, null) : null;
+  return cfg?.class === "backfill";
+}
+
+// Rev 25 (16.4): some active run has a backfill job (a fuzz lease may have one to give way to).
+async function backfillOffered(db: D1Database): Promise<boolean> {
+  const row = await db
+    .prepare(`SELECT 1 AS x FROM runs WHERE state = 'active' AND (json_extract(selfplay, '$.class') = 'backfill' OR json_extract(eval, '$.class') = 'backfill') LIMIT 1`)
+    .first<{ x: number }>();
+  return !!row;
 }
 
 // Rev 15 (PROTOCOL 10.4): what else waits for this machine, in the order PROTOCOL 3 picks work (offer(), with the caps

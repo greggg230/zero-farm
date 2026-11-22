@@ -379,10 +379,29 @@ export const sortsBefore = (a: SortKey, b: SortKey): boolean =>
 // The most machines an eval batch can use now (15.3, 15.4): its unissued games over one machine's lease size.
 export const batchMachines = (unissued: number, leaseSize: number): number => Math.ceil(unissued / Math.max(1, leaseSize));
 
+// ---------- rev 25 (PROTOCOL 16): the backfill tier ----------
+
+// A run's `selfplay` or `eval` may carry `class: "backfill"`: standing work that has a consumer but no deadline (a
+// yardstick for a checkpoint that has none, a judging top-up). It is offered only while the priority lane is on for the
+// machine (laneApplies), takes no share, and gives its machine back to any job ranked above it (16.3).
+export const JOB_CLASSES = ["backfill"] as const;
+export type JobClass = (typeof JOB_CLASSES)[number];
+// Where a backfill job ranks, per resource (16.2): on the machine's best route - a job it would play on its GPU, or any
+// job on a Mac (macOS has no GPU route, 11.5: the Mac's CPU is its best and only one) - after every tier-1 job (a fuzz
+// campaign with a `share`, behind its daily pace, included) and before fuzz without a share (past its pace); on a
+// Windows PC's CPU after that fuzz (CPU-only PCs are good at fuzz and slow at match play) and before the CPU self-play of
+// a run with a GPU version (CPU_SELFPLAY_TIER).
+export const BACKFILL_TIER = 1.9;
+export const BACKFILL_CPU_TIER = 2.5;
+export const backfillTier = (gpuLease: boolean, platform: string): number => (gpuLease || platform === "macos-arm64" ? BACKFILL_TIER : BACKFILL_CPU_TIER);
+// A backfill lease is asked to give its machine back only once it has run this long (no churn on a lease just granted).
+export const YIELD_MIN_S = 60;
+
 // A deferred eval batch (a PC that plays self-play on its GPU, the batch not behind) ranks after that self-play
 // (rank 1) and before a background job past its share (rank 2), still in tier 1 (before fuzz).
 export const DEFERRED_EVAL_RANK = 1.5;
-// Self-play a PC would play on its CPU while the run has a GPU version that other PCs play: after fuzz (tier 2).
+// Self-play a PC would play on its CPU while the run has a GPU version that other PCs play: after fuzz (tier 2) and
+// (rev 25) after backfill on a Windows PC's CPU (BACKFILL_CPU_TIER).
 export const CPU_SELFPLAY_TIER = 3;
 
 // The memory a CPU eval lease's games take (PROTOCOL 10.6's CPU plan: 600 MB + 45 MB per game in flight).

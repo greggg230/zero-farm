@@ -35,7 +35,7 @@ import {
 } from "./definitions";
 import { intersect, normalize, parseRanges, subtract, total, type Range } from "./ranges";
 import { storedPlatform } from "./platform";
-import { type Alternate, type CampaignAlternate, type GpuMode, type Provider, YIELD_PREFIX, requiresRuntimeOf, yieldTarget } from "./routing";
+import { type Alternate, type CampaignAlternate, type GpuMode, type JobClass, type Provider, YIELD_PREFIX, requiresRuntimeOf, yieldTarget } from "./routing";
 import {
   HttpError,
   type Json,
@@ -75,6 +75,7 @@ export interface SelfplayCfg {
   job: Record<string, Json>;
   share?: number; // rev 13 (PROTOCOL 5.3): a background self-play (an analysis campaign's), as EvalCfg's
   rolling?: RollingCfg; // rev 15 (PROTOCOL 10.1): rolling leases for agents that take them (absent: classic only)
+  class?: JobClass; // rev 25 (PROTOCOL 16.1): "backfill" - standing work below the runs' games; it gives way to them (absent: a run's job)
 }
 
 // Rev 15 (PROTOCOL 10.1): a run's rolling self-play leases.
@@ -115,6 +116,7 @@ export interface EvalCfg {
   // while its share of the runs' active leases is below this; otherwise after them. Absent: the eval rule of rev 7
   // (evaluation before self-play).
   share?: number;
+  class?: JobClass; // rev 25 (PROTOCOL 16.1): "backfill", as SelfplayCfg's (never with a share)
 }
 
 export const isPaired = (ev: EvalCfg) => ev.job.paired === true;
@@ -195,7 +197,8 @@ export interface LeaseRow {
   lease: string;
   state: "active" | "done" | "given_back" | "expired" | "cancelled";
   // Rev 24 (PROTOCOL 15.3, 15.4): "yield:<scope>" - the lease gives its machine to that eval batch (a fuzz lease's beats
-  // answer give_back, a rolling lease's extensions finish).
+  // answer give_back, a rolling lease's extensions finish). Rev 25 (16.3, 16.4): or to that scope's job ranked above a
+  // backfill lease or a fuzz lease (a classic lease's beats answer give_back).
   pending: "cancel" | "give_back" | `yield:${string}` | null;
   beat_s: number;
   slack_s: number;
@@ -943,7 +946,8 @@ export interface BeatReq {
   stats: Json | undefined;
   gen?: number | null; // rev 15: a rolling lease's newest generation in play (ignored for classic leases)
   // Rev 24 (PROTOCOL 15.3): a fuzz lease whose machine an eval batch waits for: that batch's scope (friend.ts decides;
-  // null or absent: none). Honoured only for an active fuzz lease with nothing pending.
+  // null or absent: none). Honoured only for an active classic lease (rev 25, 16.3: a backfill eval or self-play lease
+  // too; a rolling lease yields at its extension) with nothing pending.
   yield_to?: string | null;
 }
 
@@ -985,12 +989,13 @@ export async function beat(env: Env, r: BeatReq): Promise<BeatAnswer> {
   let pending: LeaseRow["pending"] = l.pending;
   if (l.pending === "cancel") action = "cancel";
   else if (l.pending === "give_back") action = "give_back";
-  // rev 24 (PROTOCOL 15.3): a fuzz lease on its way to an eval batch keeps answering give_back (a lost answer is repeated)
-  else if (yieldTarget(l.pending) !== null && l.kind === "fuzz") action = "give_back";
+  // rev 24 (PROTOCOL 15.3): a fuzz lease on its way to an eval batch keeps answering give_back (a lost answer is repeated);
+  // rev 25 (16.3): so does a classic backfill lease on its way (a rolling lease's beats go on: its extensions finish)
+  else if (yieldTarget(l.pending) !== null && !rolling) action = "give_back";
   else if (pausedSince !== null && r.now - pausedSince > l.slack_s) {
     action = "give_back"; // the agent should have
     pending = "give_back";
-  } else if (r.yield_to && l.kind === "fuzz" && l.pending === null && !paused) {
+  } else if (r.yield_to && !rolling && l.pending === null && !paused) {
     action = "give_back";
     pending = `${YIELD_PREFIX}${r.yield_to}`;
   }
@@ -1076,7 +1081,8 @@ export interface ExtendReq {
   // null: nothing, so the lease is renewed). Not looked at before `until`.
   waiting: string | null;
   // Rev 24 (PROTOCOL 15.4): the eval batch (its scope) this machine gives way to now, before or after `until` (friend.ts
-  // decides; null or absent: none). The lease is marked on its way there and finishes.
+  // decides; null or absent: none). The lease is marked on its way there and finishes. Rev 25 (16.3): for a backfill
+  // lease, the scope of any job ranked above it.
   yield_to?: string | null;
 }
 
