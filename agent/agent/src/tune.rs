@@ -76,6 +76,13 @@ pub const CUDA_CREW: bool = true;
 /// 1,796-2,048 games in flight played 14.5-17.0k leaves/s, every crew of two or three 20-28k -, and the tuner's trial of
 /// one worker cost a handoff that quit ~1,200 games in flight (the crew's memory) and ~9 minutes at its rate.
 pub const CUDA_CREW_MIN_WORKERS: u32 = 2;
+/// agent 0.3.16: a CUDA crew (`CUDA_CREW`) plays its start for the whole lease, with no in-lease trials (the memory plan
+/// still re-plans it, as a fixed layout's). Each GPU trial is a handoff: the old crew's games in flight (1,000-1,600 on
+/// the 4070 Ti PC) are quit after `drain_tail` because the next crew needs their memory, the new crew refills under the
+/// coordinator's in-flight limit (rev 21), and a trial short of ids is put off and handed over to again - on a test run
+/// with no quota (2026-11-22, 0.3.15's tuner) six trials in 47 minutes quit 6,783 games against ~12,500 finished and the
+/// lease averaged ~16k leaves/s where its layouts measured 21-22k.
+pub const CUDA_CREW_NO_TRIALS: bool = true;
 /// agent 0.3.16: CUDA crews' keys (`CUDA_CREW`) searched again from their new start.
 pub const CUDA_CREW_TUNER_VERSION: u32 = 5;
 /// Worker processes a lease's job may run (searched and set) at most; a hint or a report may say up to `MAX_WORKERS_JSON`.

@@ -1131,7 +1131,7 @@ impl Engine {
                 "lease {id}: GPU layout {}{} ({})",
                 t.current.describe_on(true),
                 if m { ", measured" } else { "" },
-                if t.fixed { "fixed: autotune off".to_string() } else { t.entry.describe() }
+                if t.fixed { "fixed: autotune off, or a CUDA crew's start".to_string() } else { t.entry.describe() }
             );
             measure0 = m;
             tuning = Some(t);
@@ -1504,7 +1504,8 @@ impl Engine {
             revert_due: false,
             no_trial_before: Instant::now(),
             defaults: tune::defaults(tune::Platform::current(), &hw0),
-            fixed,
+            // (agent 0.3.16: a CUDA crew runs its start without in-lease trials - `tune::CUDA_CREW_NO_TRIALS`)
+            fixed: fixed || (crew && !dml && tune::CUDA_CREW_NO_TRIALS),
             crew_cap: tune::MAX_WORKERS_JSON,
             probe_members: Vec::new(),
             hold_mark: None,
