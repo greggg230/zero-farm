@@ -46,11 +46,13 @@ import {
   evalBehind,
   evalCpuFloor,
   hwRoutingOf,
+  freshApplies,
   laneApplies,
   sortsBefore,
   yieldTarget,
 } from "./routing";
 import { presenceOf } from "./presence";
+import { runFresh } from "./fresh";
 import { TUNING_FEATURE, cleanTuning, hintFor, storedTuning, type Hint } from "./tuning";
 import { cleanStats, telemetry } from "./telemetry";
 import {
@@ -417,6 +419,8 @@ export async function lease(c: Ctx): Promise<Response> {
 
   // Rev 15 (PROTOCOL 10.2): this agent takes rolling self-play leases (a run with `selfplay.rolling` then gives one).
   const rolling = o.defAware && features.has("rolling") && cmpSemver(agent, cfg.rollingAgent) >= 0;
+  // Rev 26 (PROTOCOL 18): and is sent the run's freshness budget with it
+  const fresh = rolling && freshFor(cfg.freshAgent, agent, o.hw, m);
   // --- then runs' games by priority and fit, then backfill; share by active leases (offer's order) ---
   for (const cd of o.usable) {
     const want = await wantFor(db, o, cd, caps, gpuGames);
@@ -434,6 +438,7 @@ export async function lease(c: Ctx): Promise<Response> {
         // rev 20 (PROTOCOL 14.3): this agent takes model variants
         ...(cmpSemver(agent, cfg.variantAgent) >= 0 ? { variants: true } : {}),
         ...(rolling && cd.kind === "selfplay" ? { rolling: true } : {}),
+        ...(fresh && cd.kind === "selfplay" ? { fresh: true } : {}),
       }),
     );
     // Rev 7: the job's provider allowlist rides along (a routing hint, not part of the signed job). Rev 19: so does
@@ -1035,7 +1040,10 @@ export async function beat(c: Ctx, leaseId: string): Promise<Response> {
     telemetry(c.env.TELEMETRY).write({ machine_id: m.machine_id, class: m.class, lease_id: leaseId, kind: l.kind, scope: l.scope, event: "beat", stats });
   }
   const uploadDiag = await takeUploadDiag(c.env.DB, m, c.now);
-  return json(uploadDiag ? { ...ans, upload_diag: uploadDiag } : ans);
+  // Rev 26 (PROTOCOL 18.2): a rolling self-play lease's answer keeps its freshness budget current
+  const fresh = l.kind === "selfplay" && book.isRolling(l) && l.state === "active" ? await leaseFresh(c, m, l.run) : undefined;
+  const out = fresh === undefined ? ans : { ...ans, fresh_s: fresh };
+  return json(uploadDiag ? { ...out, upload_diag: uploadDiag } : out);
 }
 
 // Rev 15 (PROTOCOL 10.4): POST /v1/lease/{id}/extend `{"games": k}` releases k more ids of a rolling lease (fewer at
@@ -1062,7 +1070,30 @@ export async function extend(c: Ctx, leaseId: string): Promise<Response> {
   const ans = unwrap(
     await bookFor(c.env, l.scope).extend({ now: c.now, machine_id: m.machine_id, lease_id: leaseId, scope: l.scope, games, paused, waiting, yield_to: yieldTo }),
   );
-  return json(ans);
+  // Rev 26 (PROTOCOL 18.2): with the run's freshness budget as it is now
+  const fresh = l.state === "active" ? await leaseFresh(c, m, l.run) : undefined;
+  return json(fresh === undefined ? ans : { ...ans, fresh_s: fresh });
+}
+
+// ---------- rev 26 (PROTOCOL 18): the freshness budget ----------
+
+// The machine is sent its rolling leases' freshness budget: an agent from FRESH_AGENT on a machine the owner's
+// `fresh_cap` names (18.4).
+function freshFor(freshAgent: string, agent: string | null, hw: HwRouting, m: MachineRow): boolean {
+  return !!agent && isSemver(agent) && cmpSemver(agent, freshAgent) >= 0 && freshApplies(hw, m.channel);
+}
+
+// A rolling self-play lease's freshness budget for the beat and extension answers: undefined when the machine isn't sent
+// one (the answer keeps exactly its keys of before); else the run's budget now (null: none - not active, not rolling, or
+// too little history).
+async function leaseFresh(c: Ctx, m: MachineRow, run: string | null): Promise<number | null | undefined> {
+  const agent = m.agent_version;
+  // (the agent's version first: no read for an older agent)
+  if (!run || !agent || !isSemver(agent) || cmpSemver(agent, config(c.env).freshAgent) < 0) return undefined;
+  if (!freshFor(config(c.env).freshAgent, agent, await hwSetting(c.env.DB), m)) return undefined;
+  const r = await book.getRun(c.env.DB, run);
+  const sp = r && r.state === "active" ? parseJson<book.SelfplayCfg | null>(r.selfplay, null) : null;
+  return runFresh(c.env.DB, run, sp, c.now);
 }
 
 // ---------- rev 24 (PROTOCOL 15): the priority lane ----------

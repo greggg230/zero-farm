@@ -321,8 +321,13 @@ export interface HwRouting {
   eval_games_per_thread: number;
   priority_lane: PriorityLane; // rev 24
   eval_stall_s: number; // rev 24
+  fresh_cap: FreshCap; // rev 26
 }
-export const HW_ROUTING_DEFAULT: HwRouting = { on: true, eval_horizon_s: 1800, eval_games_per_thread: 2, priority_lane: "canary", eval_stall_s: 180 };
+// Rev 26 (PROTOCOL 18.4): `fresh_cap` - which machines' rolling self-play leases are sent the run's freshness budget
+// (`fresh_s`): "off" none (as before rev 26), "canary" the canary channel's, "all" every machine's (agents from FRESH_AGENT).
+export const FRESH_CAPS = ["off", "canary", "all"] as const;
+export type FreshCap = (typeof FRESH_CAPS)[number];
+export const HW_ROUTING_DEFAULT: HwRouting = { on: true, eval_horizon_s: 1800, eval_games_per_thread: 2, priority_lane: "canary", eval_stall_s: 180, fresh_cap: "canary" };
 export const MAX_EVAL_HORIZON_S = 7 * 86400;
 export const MAX_EVAL_GAMES_PER_THREAD = 16;
 export const MAX_EVAL_STALL_S = 86400;
@@ -343,6 +348,7 @@ export function hwRoutingOf(text: string | null | undefined): HwRouting {
     eval_games_per_thread: n(o.eval_games_per_thread, MAX_EVAL_GAMES_PER_THREAD, HW_ROUTING_DEFAULT.eval_games_per_thread),
     priority_lane: (PRIORITY_LANES as readonly unknown[]).includes(o.priority_lane) ? (o.priority_lane as PriorityLane) : HW_ROUTING_DEFAULT.priority_lane,
     eval_stall_s: n(o.eval_stall_s, MAX_EVAL_STALL_S, HW_ROUTING_DEFAULT.eval_stall_s),
+    fresh_cap: (FRESH_CAPS as readonly unknown[]).includes(o.fresh_cap) ? (o.fresh_cap as FreshCap) : HW_ROUTING_DEFAULT.fresh_cap,
   };
 }
 
@@ -351,6 +357,11 @@ export function hwRoutingOf(text: string | null | undefined): HwRouting {
 // The lane's preemption (15.3, 15.4) and its reading of eval capacity (15.5) apply to a machine of this channel.
 export function laneApplies(hw: HwRouting, channel: string): boolean {
   return hw.priority_lane === "all" || (hw.priority_lane === "canary" && channel === "canary");
+}
+
+// Rev 26 (PROTOCOL 18.4): a machine of this channel is sent its rolling leases' freshness budget.
+export function freshApplies(hw: HwRouting, channel: string): boolean {
+  return hw.fresh_cap === "all" || (hw.fresh_cap === "canary" && channel === "canary");
 }
 
 // A `no_work` answer while eval work is about to need the machine (15.2): ask again after this many seconds (300

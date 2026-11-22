@@ -7,8 +7,9 @@ A change to anything here is a protocol change: bump the version it belongs to a
 bottom.
 
 Versions: HTTP API `v1` (path prefix), agent↔worker protocol `aw/1`, network files `zero-onnx/1`,
-manifests `manifest/1`. Current revision: v1 rev 24 (section 15, the priority lane: waiting eval work takes machines from
-fuzz and rolling self-play, canary machines first; rev 23: section 12.2, a batch's CPU capacity counts only PCs of a platform its
+manifests `manifest/1`. Current revision: v1 rev 26 (section 18, the freshness budget: a rolling lease's games in flight
+capped so its games last no longer than the run's staleness window allows; rev 24: section 15, the priority lane: waiting
+eval work takes machines from fuzz and rolling self-play, canary machines first; rev 23: section 12.2, a batch's CPU capacity counts only PCs of a platform its
 run has a build for; rev 22: section 9.8, AMD GPUs with DirectML only and the owner's GPU vendors off; rev 21: section 10.4, the in-flight limit of rolling leases; rev 20: section 14, model variants per generation; rev 19: section 13, layout tuning and
 several workers per lease; rev 18: section 12, hardware routing; rev 17: section 11, platforms: macOS on Apple silicon).
 
@@ -1333,6 +1334,7 @@ A rolling lease is a self-play lease (section 3) plus
   the rest of the block belongs to the lease but to no game yet.
 - `until`: the lease runs to at least this time (`issued_at + max_s`, moved on by a renewal, 10.4).
 - `inflight`: the run's setting for a CPU and a GPU job; the agent picks one by its own CPU-or-GPU choice (9.6).
+- `fresh_s` (rev 26, section 18; optional): the run's freshness budget, the seconds a game may last; absent: none.
 
 ### 10.4 `POST /v1/lease/{lease_id}/extend`
 
@@ -1351,6 +1353,8 @@ A rolling lease is a self-play lease (section 3) plus
   leases are also cancelled at their next beat, section 4), or (2026-11-19) the run's current definition no longer
   lists the lease's worker build (the run was re-pinned: its results would be refused and it can't switch
   generations; the agent asks for a fresh lease with the current builds).
+- Rev 26 (section 18.2): every answer here also carries `fresh_s` (the run's budget now, or null) for an agent that is
+  sent the budget; to every other agent the answers keep exactly their keys of before.
 - `{"games": total, "finish": true, "reason": "yield"}` (rev 24, section 15.4): an eval batch waits for this machine, before
   or after `until`; the agent finishes as for the other reasons (it reads `finish`, and only logs `reason`).
 - **Renewal.** Past `until`, the coordinator renews the lease (`until` += `max_s`, and the answer releases ids as
@@ -2519,7 +2523,99 @@ iteration's games, so its `accept` total (4) can exceed the ids it was credited,
 the run's `check-config`; an older build refuses the setting, and the pool refuses the run at its start (zero-core
 docs/az.md 70), never plays it without branches.
 
+## 18. The freshness budget (rev 26; coordinator: no migration, Worker var `FRESH_AGENT`, owner setting `fresh_cap`; agent 0.3.17)
+
+**Why.** The trainer keeps a farm row only while the network that searched it is at most `max_stale` generations behind
+its newest (zero-core's pool counts the lag from the newest generation, so a row survives about `max_stale` + 1
+generation periods after its network was registered; rolling chunks are never refused for staleness, 10.7). A game's
+first row is its oldest: it waits the whole game, then up to `flush_s` in the worker, and its network reached the agent up
+to a beat after it was registered. The agent's tuner (13) maximises leaves per second by raising the games in flight, and
+a game lasts about (games in flight) / (games finished per second) (Little's law), so past some number of games in flight
+every extra game only makes rows the trainer drops. Measured on legacy-meta3-r1 (max_stale 4, a generation every ~1.5-2
+minutes; the pool's per-machine counters, 100 iterations, 2026-11-22): 24.7 % of the farm's rows dropped - a laptop GPU
+72 %, a Mac 25 %, the CUDA desktops 12-14 %; their implied game latencies were 2 to 25+ minutes against a window of about
+8-10. Rows that will be dropped are worth nothing, so the coordinator tells each rolling lease how long a game may last,
+from the run's own pace, and the agent keeps its games in flight within what its own completion rate allows.
+
+### 18.1 The budget (coordinator, per run)
+
+Worked out per run, never per machine, from the run's checkpoint registrations (the `checkpoints` table's `t`):
+
+- `period` = the median of the gaps between the run's last 9 registrations by generation (8 gaps; only positive gaps -
+  an older generation registered late, an eval opponent, is left out), with the open gap (now - the newest registration)
+  counted as one more once it is longer than that median (the trainer slowed down: its window is wider now). Fewer than
+  4 gaps: no budget (a new run, or a run without that much history).
+- `fresh_s` = floor(0.75 x (`max_stale` + 1) x `period` - `flush_s` - 60), at least 120 and at most 86,400. 0.75: games
+  vary in length around the mean the agent caps; `flush_s`: the run's rolling setting (10.1), the longest a finished game
+  waits in the worker; 60: a new generation reaches the agent with its next beat.
+- legacy-meta3-r1 (max_stale 4, `flush_s` 120): 157 s at a generation every 90 s, 292 s at 126 s.
+- No budget for a run that is not active or has no `selfplay.rolling`. Constants: coordinator `src/fresh.ts`.
+
+### 18.2 On the wire
+
+- A rolling lease (10.3) carries `rolling.fresh_s` (integer seconds) when the run has a budget; absent: none.
+- A rolling self-play lease's beat answers and every 200 answer of its extensions (10.4) carry `fresh_s`: the run's
+  budget now, or `null` (none any more - the run was paused, or lost its rolling setting or its history).
+- Only to agents at or above `FRESH_AGENT` (Worker var, default `0.3.17`) on machines the owner's `fresh_cap` names
+  (18.4). To every other agent the lease and the answers keep exactly their keys of before.
+- The agent reads a positive integer as the budget and anything else in an answer (`null`, 0, a string) as none; a key
+  absent from an answer leaves the budget as it was.
+- Lease Stats (beats, `done`) of a capped lease add `fresh_cap`: the games in flight the agent caps the job at (kept in
+  D1 with the lease's Stats). Admin: `GET /v1/admin/run/{run}` adds `fresh_s` (the run's budget now, whoever is sent it;
+  null: none).
+
+### 18.3 The agent (0.3.17)
+
+- **The cap.** A rolling lease's job with a tuned layout (13.1: every GPU job, a CPU job whose worker counts) caps its
+  games in flight in all - every worker's, 13.5 - at `max(floor, rate x fresh_s)`:
+  - `rate`: the lease's own completed games per running second (every worker's `fin`s; paused, starved and slept time
+    left out) over the last 300 s of running time, or a longer window up to 1,800 s until it holds 16 finished games (a
+    CPU laptop's 32 games in flight at ~20 minutes a game finish ~8 in 5 minutes); measured only from once a whole
+    turnover of the layout finished (as many games as it keeps in flight): a fresh worker starts every game at once, so its
+    first game length finishes few games and would read as a slow rate. No rate yet: no cap yet (13.1's start).
+  - `floor`: 128 games in flight on a GPU (two batches of 64 rows), 16 on the CPU (two groups of the Windows tuner's
+    smallest batch); and a capped crew runs fewer workers rather than workers of fewer than 64 (GPU) / 8 (CPU) games each,
+    never fewer than its bounds' least (a CUDA crew's two, 13.1; the owner's fixed `workers`). Low enough to bind on a
+    fast CUDA crew: 3 x 1,152 at ~5.6 games a second comes down to ~880 at a 157 s budget.
+  - Each worker gets its share of the cap; a GPU worker's groups are the rule's for its games (two once each keeps 256
+    rows), a CPU worker keeps its groups where its batches allow (as where the memory plan cuts its games, 10.6).
+- **Re-evaluated** at every tick as the budget and the rate change, with hysteresis: a new cap replaces the running one
+  only when it differs from it by more than 15 %; after a change that moves the layout wanted, the next decision waits for
+  a turnover of that layout. A budget that goes (`null`) removes the cap.
+- **Within the tuner.** The cap bounds the tuner's space (13.1): no layout over it is planned, tried or handed over to,
+  and no trial starts while it holds the incumbent back (every candidate would be cut to it). A running layout over the
+  cap is handed over to the capped one by 13.2's handoff (one drain at a time, at most 6 an hour, never while the lease is
+  short of ids; the old workers finish their games in flight, a drain past `drain_tail` ends its last ones as in 13.2) - a
+  fixed layout's too (`autotune` off, CUDA crews), which is otherwise handed over only to more games (10.6). When the cap
+  rises or goes, the layout wanted grows back the same way.
+- **Never remembered.** The cap is the lease's (its run's pace, its own rate): tuning entries (13.3) are bound to and
+  compare their layouts in the space without it, so a capped layout's measurements are its own and the next lease starts
+  from the remembered layout, capped again once it has measured its own rate. Reports (13.4) carry the uncapped incumbent.
+- **Log:** one line per decision - `freshness: games may last S s and the lease finishes R games/s: at most N games in
+  flight - capping the job at <layout> (M games in flight without the cap)` (or `not binding`), and one when the budget
+  goes.
+- **No budget** (a coordinator before rev 26, a machine the owner's setting leaves out, a run with too little history): no
+  cap, exactly as before. A rolling job without a tuned layout is never capped.
+
+### 18.4 The owner's setting (canary first)
+
+`fresh_cap` in the hardware-routing setting (12, `POST /v1/admin/routing`; `scripts/admin.ts routing '{"fresh_cap":
+"all"}'`): `"off"` - no budget sent to anyone (exactly as before rev 26); `"canary"` (default) - machines of the canary channel
+only; `"all"` - every machine. Agents before `FRESH_AGENT` are never sent it. The yardstick for widening it is the pool's
+per-machine stale counters (zero-core `farm_pool` `by_machine`, its docs/az.md 54.8): each machine's share of its rows
+dropped as stale, before and after.
+
 ## Changes
+- v1 rev 26, agent 0.3.17 (2026-11-22; coordinator: no migration, Worker var `FRESH_AGENT` default 0.3.17, owner setting
+  `fresh_cap` default `"canary"`): **the freshness budget** (section 18). A rolling lease carries `rolling.fresh_s` - from
+  the run's pace, floor(0.75 x (`max_stale` + 1) x the median gap of its last 9 checkpoint registrations - `flush_s` -
+  60), at least 120 s; none with fewer than 4 gaps - and its beat and extension answers keep it current (`null`: none);
+  only agents from `FRESH_AGENT` on machines `fresh_cap` names get it, every other answer is unchanged. The agent caps the
+  job's games in flight in all at max(128 GPU / 16 CPU, its measured completed-games rate x `fresh_s`), with 15 %
+  hysteresis, fewer workers rather than workers under 64 / 8 games each, no trials while the cap holds the incumbent back,
+  the running layout handed down by the usual handoff (fixed layouts and CUDA crews too); never remembered in the tuning
+  entries; Stats `fresh_cap`. Why: legacy-meta3-r1's trainer dropped 24.7 % of farm rows as stale (a laptop GPU 72 %, a
+  Mac 25 %, CUDA desktops 12-14 %), because games in flight raised for leaves/s made games outlast the window.
 - No rev (2026-11-22; no wire change, no migration, no agent change; zero-core `feat/neartie-branches`): **branch games
   in self-play records** (16): a worker build of a run with `selfplay_branch` writes `"records": 2` files holding each
   branch game under its game's id, in its game's file; the coordinator credits ids as before (a game and its branch

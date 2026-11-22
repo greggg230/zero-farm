@@ -2,6 +2,7 @@
 // release tool, scripts/admin.ts and the /admin dashboard.
 
 import { presenceOf } from "./presence";
+import { runFresh } from "./fresh";
 import { storedTuning, tuningClasses } from "./tuning";
 import { accessEnabled } from "./access";
 import * as book from "./book";
@@ -46,6 +47,7 @@ import {
   MAX_EVAL_STALL_S,
   MAX_EVICT,
   MAX_VENDORS_OFF,
+  FRESH_CAPS,
   PRIORITY_LANES,
   type Routing,
   VENDOR_PROVIDERS,
@@ -583,6 +585,8 @@ export async function getRunRoute(c: Ctx, run: string): Promise<Response> {
     eval_batches: batches,
     pool: await book.poolSize(c.env.DB, scope),
     rolling_leases: await rollingLeases(c.env.DB, scope),
+    // Rev 26 (PROTOCOL 18): the run's freshness budget now (seconds a game may last; null: none), whoever is sent it
+    fresh_s: r.state === "active" ? await runFresh(c.env.DB, r.run, parseJson<book.SelfplayCfg | null>(r.selfplay, null), c.now) : null,
     definition: await definitionStatus(c, "run", r.run, r, null),
     alternates,
     // Rev 17 (PROTOCOL 11.4): the platforms that can get its jobs.
@@ -1041,7 +1045,7 @@ export async function getVendorsOff(c: Ctx): Promise<Response> {
 export async function routing(c: Ctx): Promise<Response> {
   await authAdmin(c);
   const b = await readJson(c.req);
-  const fields = ["on", "eval_horizon_s", "eval_games_per_thread", "priority_lane", "eval_stall_s"];
+  const fields = ["on", "eval_horizon_s", "eval_games_per_thread", "priority_lane", "eval_stall_s", "fresh_cap"];
   for (const k of Object.keys(b)) if (!fields.includes(k)) throw bad(`${k}: unknown field`);
   const cur = hwRoutingOf((await c.env.DB.prepare(`SELECT value FROM settings WHERE key = 'hw_routing'`).first<{ value: string }>())?.value ?? null);
   const next: HwRouting = {
@@ -1051,6 +1055,8 @@ export async function routing(c: Ctx): Promise<Response> {
     // rev 24 (PROTOCOL 15.6): the priority lane's canary gate, and its stall rule (15.5)
     priority_lane: oneOf(b.priority_lane, "priority_lane", PRIORITY_LANES, { optional: true }) ?? cur.priority_lane,
     eval_stall_s: int(b.eval_stall_s, "eval_stall_s", { optional: true, min: 0, max: MAX_EVAL_STALL_S }) ?? cur.eval_stall_s,
+    // rev 26 (PROTOCOL 18.4): which machines get the freshness budget
+    fresh_cap: oneOf(b.fresh_cap, "fresh_cap", FRESH_CAPS, { optional: true }) ?? cur.fresh_cap,
   };
   await c.env.DB.prepare(`INSERT OR REPLACE INTO settings (key, value) VALUES ('hw_routing', ?)`).bind(JSON.stringify(next)).run();
   return json({ ok: true, ...next });
@@ -1412,6 +1418,8 @@ export async function stats(c: Ctx): Promise<Response> {
       platform_agent: cfg.platformAgent,
       // rev 22 (PROTOCOL 9.8)
       amd_dml_agent: cfg.amdDmlAgent,
+      // rev 26 (PROTOCOL 18)
+      fresh_agent: cfg.freshAgent,
       data_keys: cfg.dataPubkeys.length,
       max_active_leases: cfg.maxActiveLeases,
       max_lease_chunks: cfg.maxLeaseChunks,
