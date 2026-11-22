@@ -126,6 +126,9 @@ struct Roll {
     /// agent 0.3.4 (PROTOCOL 13.5): a GPU job's video memory plan and readings (None on the CPU, or when the adapter's
     /// size isn't known: then one worker).
     vram: Option<Vram>,
+    /// agent 0.3.17 (PROTOCOL 18): the run's freshness budget (seconds a game may last), from the lease and kept current
+    /// by beat and extension answers; None: no freshness cap (`fresh.rs`).
+    fresh_s: Option<u64>,
 }
 
 /// agent 0.3.4 (PROTOCOL 10.6, 13.5): a GPU job's video memory: the adapter, what its workers are planned within, the
@@ -1255,6 +1258,7 @@ impl Engine {
                 restart: None,
                 gpu_batch,
                 vram,
+                fresh_s: lease.rolling.as_ref().and_then(|r| r.fresh_s),
             }),
             // (a GPU job's inference threads are the worker's own: not in its job line)
             infer: layout0.filter(|_| !gpu_choice).map(|l| (l.infer_workers, l.infer_threads)),
@@ -1281,7 +1285,10 @@ impl Engine {
             stats_vram: 0,
             finish_sent: None,
             tail_quit: false,
+            fresh: crate::fresh::Gauge::default(),
         };
+        // (agent 0.3.17: the freshness cap's rate is measured from once a turnover of the first layout finished)
+        run.fresh = crate::fresh::Gauge::new(run.tuning.as_ref().map_or(0, |t| t.current.total_conc()), self.cfg.timings.fresh_window.as_secs_f64());
         run.show_tuning(self);
         run.go(self)
     }
@@ -1673,6 +1680,8 @@ struct Run {
     /// were ended (`tail_tick`).
     finish_sent: Option<Instant>,
     tail_quit: bool,
+    /// agent 0.3.17 (PROTOCOL 18.3): the lease's completed-games rate for the freshness cap.
+    fresh: crate::fresh::Gauge,
 }
 
 impl Run {
@@ -1706,6 +1715,10 @@ impl Run {
             let inflight = self.conc.map(|c| c + crew.iter().map(|m| m.layout.conc).sum::<u64>() + draining);
             s.insert("inflight".into(), json!(inflight));
             s.insert("released".into(), json!(r.released));
+            // (agent 0.3.17, PROTOCOL 18.3: the freshness cap on the job's games in flight, while there is one)
+            if let Some(c) = self.tuning.as_ref().and_then(|t| t.space.fresh) {
+                s.insert("fresh_cap".into(), json!(c));
+            }
             if !crew.is_empty() || self.tuning.as_ref().is_some_and(|t| t.current.workers > 1) {
                 s.insert("workers".into(), json!(1 + crew.len()));
             }
@@ -2012,6 +2025,7 @@ impl Run {
         self.mem_check(eng);
         self.vram_check(eng);
         self.calibrate(eng);
+        self.fresh_tick(eng, must_pause);
         self.mates_tick(eng, &t, must_pause);
         self.tune_tick(eng, &t, must_pause);
         self.crew_tick(eng, &t, must_pause);
@@ -2484,6 +2498,10 @@ impl Run {
             }
         };
         r.backoff.reset();
+        // agent 0.3.17 (PROTOCOL 18.2): the run's freshness budget as it is now (absent: unchanged)
+        if let Some(f) = a.fresh_s {
+            r.fresh_s = f;
+        }
         if r.finishing {
             return;
         }
@@ -3043,6 +3061,12 @@ impl Run {
 
     fn on_beat(&mut self, eng: &mut Engine, r: Result<BeatResp, CallError>) {
         self.beat_inflight = false;
+        // agent 0.3.17 (PROTOCOL 18.2): a rolling lease's freshness budget as it is now (absent: unchanged)
+        if let (Ok(resp), Some(roll)) = (r.as_ref(), self.roll.as_mut()) {
+            if let Some(f) = resp.fresh_s {
+                roll.fresh_s = f;
+            }
+        }
         match r {
             Ok(resp) => match resp.action.as_str() {
                 "continue" => {
@@ -3708,7 +3732,9 @@ impl Run {
             return;
         }
         let wanted = tu.entry.wanted(&tu.space);
-        let next = if !fixed && strict && !uncalibrated && !tu.revert_due && Instant::now() >= tu.no_trial_before { tu.entry.plan(&tu.space) } else { None };
+        // (agent 0.3.17: no trial while the freshness cap holds the incumbent back - every candidate would be cut to the cap)
+        let capped = tu.space.capped(&tu.entry.incumbent);
+        let next = if !fixed && strict && !uncalibrated && !tu.revert_due && !capped && Instant::now() >= tu.no_trial_before { tu.entry.plan(&tu.space) } else { None };
         // (agent 0.3.13: a trial put off for want of game ids runs on until it is measured afresh - no handoff back to the
         // incumbent meanwhile, which would end games for nothing)
         if next.is_none() && tu.postponed == Some(tu.current) {
@@ -3716,7 +3742,8 @@ impl Run {
         }
         let (target, measure) = match next {
             Some(l) => (l, true),
-            None if tu.current != wanted && (!fixed || wanted.conc > tu.current.conc) => (wanted, strict && !fixed),
+            // (agent 0.3.17: a fixed layout too when the freshness cap holds it back - handed over to the capped one)
+            None if tu.current != wanted && (!fixed || wanted.conc > tu.current.conc || tu.space.capped(&tu.current)) => (wanted, strict && !fixed),
             None => return,
         };
         // (never to the layout the main worker runs, unless to measure it: a measurement needs a fresh worker)
@@ -4321,10 +4348,12 @@ impl Run {
         // lease measured a one-worker candidate first and stayed with one worker of 1,024, its crew never measured)
         if t.gpu {
             let (nvidia, batch) = t.gpu_start;
-            let s = t.space.gpu_start(nvidia, batch);
+            // (agent 0.3.17: the start without the freshness cap - the entry remembers it; the cap cuts it where it runs)
+            let free = t.space.uncapped();
+            let s = free.gpu_start(nvidia, batch);
             let fresh = t.entry.incumbent == t.entry.start && t.entry.state == tune::State::Searching && t.entry.trials == 0;
-            let held_back = old.workers_max < t.space.workers_max && t.entry.wanted(&t.space).workers < s.workers;
-            if (fresh || held_back) && s != t.entry.wanted(&t.space) {
+            let held_back = old.workers_max < t.space.workers_max && t.entry.wanted(&free).workers < s.workers;
+            if (fresh || held_back) && s != t.entry.wanted(&free) {
                 t.entry.start = s;
                 t.entry.incumbent = s;
                 if held_back {
@@ -4338,6 +4367,58 @@ impl Run {
         log::info!("lease {id}: {line}");
         eng.worker_log.write_line(&format!("tuning [{id}]: {line}"));
         self.save_tuning(eng);
+        self.show_tuning(eng);
+    }
+
+    /// agent 0.3.17 (PROTOCOL 18.3): the freshness cap. With the run's budget `fresh_s` and the lease's measured
+    /// completed-games rate (`fresh::Gauge`), the job's games in flight in all are capped at `fresh::raw_cap` (rate x
+    /// `fresh_s`, at least `fresh::floor`) - the tuner's space (`tune::Space::fresh`: no layout over it is planned, tried
+    /// or handed over to; trials wait while it holds the incumbent back), a running layout over it handed over to the
+    /// capped one by the usual handoff (`tune_tick`: one drain at a time, its games in flight finished) - and kept within
+    /// `fresh::HYSTERESIS`; after a change that moves the layout wanted, the next decision waits for a turnover of it. No
+    /// budget (any more): no cap, as before. One log line per change.
+    fn fresh_tick(&mut self, eng: &Engine, must_pause: bool) {
+        let running = matches!(self.state, WState::Running) && self.job_sent && !must_pause && self.stall_since.is_none();
+        self.fresh.tick(Instant::now(), running, self.games_done);
+        let id = self.lease.lease_id.clone();
+        let gpu = self.gpu_lease();
+        let Some(fresh_s) = self.roll.as_ref().filter(|r| r.active && !r.finishing).map(|r| r.fresh_s) else { return };
+        let rate = self.fresh.rate();
+        let games_done = self.games_done;
+        let Some(t) = self.tuning.as_mut() else { return };
+        let line = match (fresh_s, rate) {
+            (None, _) => {
+                if t.space.fresh.take().is_none() {
+                    return;
+                }
+                format!("freshness: the run sets no game-latency budget any more: no cap on the games in flight (the layout wanted: {})", t.entry.wanted(&t.space).describe_on(gpu))
+            }
+            (Some(_), None) => return,
+            (Some(f), Some(rate)) => {
+                let raw = crate::fresh::raw_cap(rate, f, crate::fresh::floor(t.gpu));
+                let cap = crate::fresh::next_cap(t.space.fresh, raw);
+                if t.space.fresh == Some(cap) {
+                    return;
+                }
+                let before = t.entry.wanted(&t.space);
+                let was = t.space.fresh.map_or(String::new(), |c| format!(" (was {})", tune::thousands(c)));
+                t.space.fresh = Some(cap);
+                let wanted = t.entry.wanted(&t.space);
+                let free = t.entry.wanted(&t.space.uncapped());
+                if wanted != before {
+                    // (the next decision measures the new layout: a turnover of it first)
+                    self.fresh.settle(games_done, wanted.total_conc());
+                }
+                let what = if wanted.total_conc() < free.total_conc() {
+                    format!("capping the job at {} ({} games in flight without the cap)", wanted.describe_on(gpu), tune::thousands(free.total_conc()))
+                } else {
+                    format!("not binding (the layout wanted plays {} in all)", tune::thousands(wanted.total_conc()))
+                };
+                format!("freshness: games may last {f} s and the lease finishes {rate:.2} games/s: at most {} games in flight{was} - {what}", tune::thousands(cap))
+            }
+        };
+        log::info!("lease {id}: {line}");
+        eng.worker_log.write_line(&format!("tuning [{id}]: {line}"));
         self.show_tuning(eng);
     }
 

@@ -7,6 +7,7 @@ pub mod availability;
 pub mod cache;
 pub mod engine;
 pub mod enroll;
+pub mod fresh;
 #[cfg(target_os = "macos")]
 pub mod headless;
 #[cfg(windows)]
@@ -121,6 +122,9 @@ pub struct Timings {
     /// agent 0.3.6: a worker finishing its games whose memory the next worker waits for ends its last games after this
     /// long (`lease.rs` `tail_tick`).
     pub drain_tail: Duration,
+    /// agent 0.3.17 (PROTOCOL 18.3): the freshness cap's rate is measured over this much running time at least
+    /// (`fresh::Gauge`: up to 6 times as long until it holds `fresh::RATE_MIN_GAMES` finished games).
+    pub fresh_window: Duration,
 }
 
 impl Default for Timings {
@@ -156,6 +160,7 @@ impl Default for Timings {
             tune_handoff_window: Duration::from_secs(3600),
             early_calibration: Duration::from_secs(90),
             drain_tail: Duration::from_secs(120),
+            fresh_window: Duration::from_secs(crate::fresh::RATE_WINDOW_S as u64),
         }
     }
 }

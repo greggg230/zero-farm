@@ -422,6 +422,12 @@ pub struct Space {
     /// each worker's share of an "auto" target is at most `rolling::DML_CONC` (`target_conc`).
     #[serde(default)]
     pub dml: bool,
+    /// agent 0.3.17 (PROTOCOL 18.3): the freshness cap - the job's games in flight in all at most this (`fresh.rs`: the
+    /// lease's completed-games rate x the run's `fresh_s`, at least `fresh::floor`); a capped crew runs fewer workers
+    /// rather than workers of fewer than `fresh::MIN_PER_WORKER_*` games each. None: no cap. Never remembered: the
+    /// entry's layouts are compared and stored without it (`uncapped`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fresh: Option<u64>,
 }
 
 /// agent 0.3.4: a GPU crew's share of the target games in flight is rounded up to a multiple of this (1,024 for three
@@ -462,6 +468,7 @@ impl Space {
             vram: None,
             target: 0,
             dml: false,
+            fresh: None,
         };
         s.bound_workers(workers, d.max_workers);
         s
@@ -490,6 +497,7 @@ impl Space {
             vram,
             target,
             dml: false,
+            fresh: None,
         };
         s.bound_workers(workers, max_workers);
         s
@@ -664,6 +672,53 @@ impl Space {
     /// before sessions), each worker's games in flight within its part of the job's bounds and the memory plan, the
     /// batches within bounds where the games in flight allow.
     pub fn fit(&self, l: Layout) -> Layout {
+        let u = self.fit_within(l, None);
+        let Some(cap) = self.fresh.map(|c| c.max(1)).filter(|&c| u.total_conc() > c) else { return u };
+        // agent 0.3.17 (PROTOCOL 18.3): over the freshness cap - fewer workers where each would keep fewer than its
+        // minimum (never below the bounds' least), each worker's share of the cap; a GPU worker's groups are the rule's for
+        // its games (two once each keeps `rolling::GPU_SPLIT_MIN_ROWS` rows), a CPU worker keeps its groups where the
+        // batches allow (as where the memory plan cuts its games, agent 0.3.3)
+        let per_min = if self.gpu { crate::fresh::MIN_PER_WORKER_GPU } else { crate::fresh::MIN_PER_WORKER_CPU };
+        let w = ((cap / per_min).clamp(1, MAX_WORKERS_JSON as u64) as u32).clamp(self.workers_min.max(1), u.workers.max(self.workers_min).max(1));
+        let conc = (cap / w as u64).max(1);
+        let mut n = if w == u.workers { u } else { self.rescale(&u, w) };
+        n.groups = if self.gpu { crate::rolling::gpu_groups(conc, GPU_BATCH_MAX) } else { u.groups };
+        n.conc = conc;
+        self.fit_within(n, Some(conc))
+    }
+
+    /// This space without the freshness cap: where the entry's layouts are compared and what it remembers.
+    pub fn uncapped(&self) -> Space {
+        Space { fresh: None, ..*self }
+    }
+
+    /// agent 0.3.17: the freshness cap holds `l` back (it runs fewer games in flight than without the cap).
+    pub fn capped(&self, l: &Layout) -> bool {
+        self.fresh.is_some() && self.fit(*l).total_conc() < self.uncapped().fit(*l).total_conc()
+    }
+
+    /// `l` with `w` workers: each kind of thread keeps its share of its budget for the new count (as the search's worker
+    /// move, `neighbour`).
+    fn rescale(&self, l: &Layout, w: u32) -> Layout {
+        let scale = |v: u32, infer: bool| {
+            let (a, b) = if infer { (self.infer_cap(w), self.infer_cap(l.workers)) } else { (self.search_cap(w), self.search_cap(l.workers)) };
+            ((v as f64 * a as f64 / b.max(1) as f64).round() as u32).max(1)
+        };
+        let mut n = Layout { workers: w, threads: scale(l.threads, false), ..*l };
+        let infer = scale(l.infer_total(), true);
+        if self.sessions {
+            n.infer_workers = ((infer as f64 / l.infer_threads.max(1) as f64).round() as u32).max(1);
+        } else {
+            n.infer_threads = infer;
+        }
+        if self.gpu {
+            n.infer_threads = n.threads;
+        }
+        n
+    }
+
+    /// `fit` within the bounds, each worker's games in flight at most `ceiling` (the freshness cap's share).
+    fn fit_within(&self, l: Layout, ceiling: Option<u64>) -> Layout {
         let workers = l.workers.clamp(self.workers_min.max(1), self.workers_max.max(self.workers_min).max(1));
         let (max_search, max_infer) = (self.search_cap(workers), self.infer_cap(workers));
         let n = workers as u64;
@@ -671,6 +726,9 @@ impl Space {
         let mut conc = l.conc.clamp(cmin.min(cmax), cmax);
         if let Some(room) = self.mem_room(workers) {
             conc = conc.min(room);
+        }
+        if let Some(c) = ceiling {
+            conc = conc.min(c.max(1));
         }
         let threads = l.threads.clamp(1, max_search);
         let mut l = Layout {
@@ -950,13 +1008,15 @@ impl Entry {
 
     /// The bounds the entry's layouts are compared in from now on (the lease's space).
     pub fn bind(&mut self, s: &Space) {
-        self.space = Some(*s);
+        // (agent 0.3.17: never the freshness cap - a lease's, from its run's pace and its own rate)
+        self.space = Some(s.uncapped());
     }
 
-    /// `l` as it runs in `s` (else in the bound space; as it is without one).
+    /// `l` as it runs in `s` (else in the bound space; as it is without one). Agent 0.3.17: without the freshness cap -
+    /// measurements belong to the layouts as they ran, the cap is the lease's (a capped layout's numbers are its own).
     fn fitted(&self, l: &Layout, s: Option<&Space>) -> Layout {
         match s.or(self.space.as_ref()) {
-            Some(s) => s.fit(*l),
+            Some(s) => s.uncapped().fit(*l),
             None => *l,
         }
     }
@@ -1080,6 +1140,8 @@ impl Entry {
     /// `Learned::steady`): the incumbent and the start, where the old bounds held their games in flight back (at the
     /// most a worker could run there), get the most the new bounds hold; a tuner's choice of fewer games stays.
     pub fn lift_conc(&mut self, old: &Space, new: &Space) {
+        // (agent 0.3.17: without the freshness cap - it isn't the memory plan's, and the entry never remembers it)
+        let (old, new) = (&old.uncapped(), &new.uncapped());
         for l in [&mut self.incumbent, &mut self.start] {
             let f = old.fit(*l);
             if f.conc >= old.top_conc(f.workers) {
@@ -1537,7 +1599,7 @@ mod tests {
 
     /// The M4 Max's space: search and inference threads at most 16, sessions, 1,152-2,304 games in flight, 192-384 rows.
     fn space() -> Space {
-        Space { max_search: 16, max_infer: 16, sessions: true, conc_min: 1152, conc_max: 2304, batch_min: 192, batch_max: 384, workers_min: 1, workers_max: 1, mem: None, gpu: false, vram: None, target: 0, dml: false }
+        Space { max_search: 16, max_infer: 16, sessions: true, conc_min: 1152, conc_max: 2304, batch_min: 192, batch_max: 384, workers_min: 1, workers_max: 1, mem: None, gpu: false, vram: None, target: 0, dml: false, fresh: None }
     }
 
     fn lay(threads: u32, w: u32, t: u32, groups: u64, conc: u64) -> Layout {
@@ -2204,6 +2266,77 @@ mod tests {
         // 0.3.15's start on the same plans, for the record
         let old = |c| Space::new_gpu(6, None, 3, crate::rolling::gpu_target(crate::rolling::Inflight::Auto, 1024), false, Some((13_470, crate::rolling::MemCost { base_mb: 1_992, per_game_mb: c })), Some((9_831, crate::rolling::GPU_VRAM))).gpu_start(true, 1024);
         assert_eq!((old(2), old(3)), (glay(3, 2, 2, 704), glay(3, 2, 2, 608)));
+    }
+
+    /// agent 0.3.17 (PROTOCOL 18.3): the freshness cap bounds every layout the space makes valid - the job's games in
+    /// flight in all at most the cap, each worker its share, fewer workers rather than workers below their minimum (never
+    /// below the bounds' least: a CUDA crew's floor, the owner's fixed count); a GPU worker's groups are the rule's for its
+    /// games. No cap, or a cap above the layout: the layout as before.
+    #[test]
+    fn the_freshness_cap_bounds_a_gpu_crew() {
+        let mut s = dml_space(24_000, 2_059, 3, VRAM_12G, 6, None);
+        let crew = s.gpu_start(true, 1024);
+        assert_eq!(crew, glay(3, 2, 2, 1152));
+        assert!(!s.capped(&crew));
+        // a CUDA crew at ~5.6 games/s and legacy-meta3-r1's 157 s: 879 games in flight - three workers of 293 in one batch
+        s.fresh = Some(879);
+        let c = s.fit(crew);
+        assert_eq!(c, glay(3, 2, 1, 293));
+        assert!(c.total_conc() <= 879 && s.capped(&crew) && !s.capped(&c));
+        assert_eq!(s.fit(c), c, "a capped layout is valid as it is");
+        assert_eq!(s.uncapped().fit(crew), crew);
+        // 1,600 in all: 533 each, two groups (each keeps 256 rows or more)
+        s.fresh = Some(1600);
+        assert_eq!(s.fit(crew), glay(3, 2, 2, 533));
+        // the floor: 128 in all - two workers of 64 (their threads rescaled to the share of two), not three of 42
+        s.fresh = Some(crate::fresh::FLOOR_GPU);
+        assert_eq!(s.fit(crew), glay(2, 3, 1, 64));
+        // a cap above the layout: nothing changes
+        s.fresh = Some(4000);
+        assert_eq!(s.fit(crew), crew);
+        // the bounds' least worker count stays: a CUDA crew's floor of two, the owner's fixed three
+        let mut floor2 = dml_space(24_000, 2_059, 3, VRAM_12G, 6, None);
+        floor2.cuda_crew_floor();
+        floor2.fresh = Some(64);
+        assert_eq!(floor2.fit(crew), glay(2, 3, 1, 32));
+        let mut owner3 = dml_space(24_000, 2_059, 3, VRAM_12G, 6, Some(3));
+        owner3.fresh = Some(crate::fresh::FLOOR_GPU);
+        assert_eq!(owner3.fit(crew), glay(3, 2, 1, 42));
+        // the tuner's moves stay under it: no neighbour plays more games in flight than the cap
+        s.fresh = Some(900);
+        let c = s.fit(crew);
+        for cd in COORDS {
+            for up in [true, false] {
+                if let Some(n) = neighbour(&c, cd, up, &s) {
+                    assert!(n.total_conc() <= 900, "{cd:?} {up}: {n:?}");
+                }
+            }
+        }
+    }
+
+    /// agent 0.3.17: a CPU job's cap keeps its groups where the batches allow; the entry never remembers the cap (its
+    /// bound space, its measurements compared without it), and a remembered incumbent is capped where it runs.
+    #[test]
+    fn the_freshness_cap_bounds_a_cpu_job_and_is_never_remembered() {
+        let d = defaults(Platform::Windows, &Hw { cores: 8, logical: 16, perf: 8, eff: 0, ram_mb: 32_768 });
+        let mut s = Space::new(&d, None, None, 16, 32, None);
+        let l = s.fit(d.layout_for(1, 32, 4));
+        assert_eq!((l.workers, l.conc, l.groups), (1, 32, 4));
+        s.fresh = Some(20);
+        let c = s.fit(l);
+        assert_eq!((c.workers, c.conc, c.groups), (1, 20, 2), "two groups of 10 rows (at least 8)");
+        s.fresh = Some(4);
+        assert_eq!(s.fit(l).conc, 4, "the space takes the cap as given; the agent never sets one under fresh::FLOOR_CPU");
+        // the entry: bound without the cap, measurements of the uncapped layout stay its own, wanted is capped
+        s.fresh = Some(20);
+        let mut e = Entry::new(key(), "r", l, false, 0);
+        e.bind(&s);
+        assert_eq!(e.space.unwrap().fresh, None);
+        e.record(l, 1000.0, None, None, &s, 1);
+        assert_eq!(e.mean(&l), Some(1000.0));
+        assert_eq!(e.mean(&c), None, "the capped layout has no measurement of its own");
+        assert_eq!(e.wanted(&s), c);
+        assert!(serde_json::to_string(&e).unwrap().find("fresh").is_none());
     }
 
     #[test]

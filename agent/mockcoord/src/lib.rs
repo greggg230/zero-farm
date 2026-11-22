@@ -153,6 +153,9 @@ pub struct State {
     pub extend_answers: Vec<(String, Value)>,
     /// When each lease was granted (its rate, for the in-flight limit's buffer).
     pub granted: HashMap<String, std::time::Instant>,
+    /// rev 26 (PROTOCOL 18.2): per lease, the `fresh_s` its beat and extension answers carry (a number or null; absent:
+    /// none, the answers of before - see [`MockCoord::set_fresh`]).
+    pub fresh: HashMap<String, Value>,
 }
 
 pub struct MockCoord {
@@ -342,6 +345,12 @@ impl MockCoord {
     /// `{"status": 410}` is that error.
     pub fn script_extend(&self, lease_id: &str, answer: Value) {
         self.with(|s| s.extend_script.entry(lease_id.to_string()).or_default().push_back(answer));
+    }
+
+    /// rev 26 (PROTOCOL 18.2): from now on every 200 beat and extension answer of `lease_id` carries `fresh_s` = `v` (a
+    /// number, or null: no budget any more).
+    pub fn set_fresh(&self, lease_id: &str, v: Value) {
+        self.with(|s| s.fresh.insert(lease_id.to_string(), v));
     }
 
     /// rev 15: the run's current generation: a rolling lease's beats with an older `gen` answer with this checkpoint
@@ -693,6 +702,9 @@ fn handle(mut req: Request, st: &Arc<Mutex<State>>) {
                     if ans.get("checkpoint").is_none() {
                         ans["checkpoint"] = Value::Null;
                     }
+                    if let Some(f) = s.fresh.get(&id) {
+                        ans["fresh_s"] = f.clone();
+                    }
                     if ans["action"] == "cancel" {
                         s.leases.get_mut(&id).unwrap().cancelled = true;
                     }
@@ -751,6 +763,10 @@ fn handle(mut req: Request, st: &Arc<Mutex<State>>) {
                         done!(err(req, code as u16, "scripted", "scripted extension failure"))
                     } else {
                         s.leases.get_mut(&id).unwrap().lease["job"]["games"] = json!(total);
+                        let mut ans = ans;
+                        if let Some(f) = s.fresh.get(&id) {
+                            ans["fresh_s"] = f.clone();
+                        }
                         s.extend_answers.push((id.clone(), ans.clone()));
                         done!(reply(req, 200, ans))
                     }
