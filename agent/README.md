@@ -53,7 +53,16 @@ workers, jobs and updates the owner signed.
 
 ```
 cargo test --workspace --all-features -- --test-threads=2
+node ../tools/agent-tests.mjs            # the same tests, four test binaries at once
 ```
+
+`tools/agent-tests.mjs` builds the same binaries with the same command (`--no-run`) and runs them itself, `--jobs` at
+a time (default 4), longest first, each still with `--test-threads=2`. Most of the suite's time is integration tests
+that start real processes and wait on them, one binary after another: 633 s with cargo alone against 174 s four at
+once on the development PC (2026-11-22, 388 tests, both passing; the longest binary, `gpu`, is 147 s of it). It passes
+only when every binary exits 0 with its own `test result: ok.` line, prints a failed binary's whole output, and ends
+with `agent tests: PASSED - ...` or `FAILED - ...`. Tests keep to their own temporary directories, which is what lets
+binaries share the machine; keep a new test that way. Checked on Windows; not yet run on macOS.
 
 Run it on the whole workspace in debug: the integration tests start the real `ZeroFarm.exe`,
 `farm-agent.exe`, `fakeworker.exe` and `fakeagent.exe` from the target dir, and those are built

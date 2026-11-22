@@ -247,6 +247,7 @@ Tools with the C++ workload and a Windows SDK):
 cd agent
 cargo build --release -p farm-agent -p zerofarm-launcher
 cargo test --workspace --all-features -- --test-threads=2
+node ../tools/agent-tests.mjs       # the same tests, several test binaries at once (agent/README.md)
 ```
 
 A build from source trusts exactly the official release and data keys, so it runs only workers,
