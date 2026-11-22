@@ -122,8 +122,8 @@ pub struct Timings {
     /// agent 0.3.6: a worker finishing its games whose memory the next worker waits for ends its last games after this
     /// long (`lease.rs` `tail_tick`).
     pub drain_tail: Duration,
-    /// agent 0.3.17 (PROTOCOL 18.3): the freshness cap's rate is measured over this much running time at least
-    /// (`fresh::Gauge`: up to 6 times as long until it holds `fresh::RATE_MIN_GAMES` finished games).
+    /// agent 0.3.17 (PROTOCOL 18.3): the freshness cap's leaves/s is measured over this much running time (agent 0.3.18:
+    /// `fresh::Gauge` of the lease's leaves while it plays new games).
     pub fresh_window: Duration,
 }
 

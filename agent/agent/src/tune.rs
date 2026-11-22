@@ -451,7 +451,7 @@ pub struct Space {
     #[serde(default, skip_serializing_if = "is_zero")]
     pub fixed_groups: u64,
     /// agent 0.3.17 (PROTOCOL 18.3): the freshness cap - the job's games in flight in all at most this (`fresh.rs`: the
-    /// lease's completed-games rate x the run's `fresh_s`, at least `fresh::floor`); a capped crew runs fewer workers
+    /// run's `fresh_s` x the lease's leaves/s / the p75 game's leaves, agent 0.3.18; at least `fresh::floor`); a capped crew runs fewer workers
     /// rather than workers of fewer than `fresh::MIN_PER_WORKER_*` games each. None: no cap. Never remembered: the
     /// entry's layouts are compared and stored without it (`uncapped`).
     #[serde(default, skip_serializing_if = "Option::is_none")]

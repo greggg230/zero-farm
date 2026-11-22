@@ -328,6 +328,14 @@ const RUNWAY_INFLIGHTS: u64 = 2;
 
 /// agent 0.3.7: a GPU job's trials wait for its memory plan to be measured at most this long from the lease's start:
 /// then they run on the plan as it is.
+/// agent 0.3.18 (PROTOCOL 18.3): the key a lease's freshness measurements are remembered under: run, worker build,
+/// runtime pack and the job's provider (as the memory plan's keys, with the runtime and provider: the leaves/s is the
+/// hardware's with that runtime and provider; the leaves per game the run's).
+fn fresh_key(lease: &Lease, choice: &crate::probe::Choice) -> String {
+    let provider = if choice.providers != ["cpu"] { choice.providers.first().map(String::as_str).unwrap_or("gpu") } else { "cpu" };
+    crate::fresh::Learned::key(lease.run.as_deref().unwrap_or(""), &lease.build.build_id, lease.runtime.as_ref().map(|r| r.build_id.as_str()), provider)
+}
+
 const GPU_TRIAL_WAIT: Duration = Duration::from_secs(15 * 60);
 
 /// agent 0.3.13: a beat brought forward because a worker started or ended (`beat_soon`) goes out at most this soon after
@@ -1293,12 +1301,44 @@ impl Engine {
             stats_vram: 0,
             finish_sent: None,
             tail_quit: false,
-            fresh: crate::fresh::Gauge::default(),
+            fresh: crate::fresh::Meter::new(self.cfg.timings.fresh_window.as_secs_f64()),
+            fresh_key: None,
+            fresh_lpg: None,
         };
-        // (agent 0.3.17: the freshness cap's rate is measured from once a turnover of the first layout finished)
-        run.fresh = crate::fresh::Gauge::new(run.tuning.as_ref().map_or(0, |t| t.current.total_conc()), self.cfg.timings.fresh_window.as_secs_f64());
+        // (agent 0.3.18: a lease with a budget measures and remembers under its key)
+        if lease.rolling.as_ref().and_then(|r| r.fresh_s).is_some() && run.tuning.is_some() {
+            let key = fresh_key(lease, &choice);
+            run.fresh_lpg = crate::fresh::Learned::get(&self.cfg.layout, &key).and_then(|e| e.lpg());
+            run.fresh_key = Some(key);
+        }
         run.show_tuning(self);
         run.go(self)
+    }
+
+    /// agent 0.3.18 (PROTOCOL 18.3): the freshness cap a lease starts with: under the lease's budget, its key's remembered
+    /// leaves per game and leaves/s (`fresh::Entry::start_cap`), when both are known - so a short lease starts AT the
+    /// capped layout instead of handing its start down (a handoff ends games). None: no cap until the lease measures one.
+    fn start_cap(&self, lease: &Lease, choice: &crate::probe::Choice, space: &tune::Space, entry: &tune::Entry) -> Option<u64> {
+        let f = lease.rolling.as_ref().and_then(|r| r.fresh_s)?;
+        let e = crate::fresh::Learned::get(&self.cfg.layout, &fresh_key(lease, choice))?;
+        let cap = e.start_cap(f, crate::fresh::floor(space.gpu))?;
+        let capped = tune::Space { fresh: Some(cap), ..*space };
+        let (wanted, free) = (entry.wanted(&capped), entry.wanted(space));
+        let line = format!(
+            "freshness: games may last {f} s; remembered: {} leaves/s at {} games in flight, a game takes {} leaves (p75): starting at most {} games in flight - {}",
+            tune::thousands(e.leaves_s.unwrap_or(0.0) as u64),
+            tune::thousands(e.inflight.unwrap_or(0)),
+            tune::thousands(e.lpg().unwrap_or(0.0) as u64),
+            tune::thousands(cap),
+            if wanted.total_conc() < free.total_conc() {
+                format!("{} ({} without the cap)", wanted.describe_on(space.gpu), tune::thousands(free.total_conc()))
+            } else {
+                "not binding".to_string()
+            }
+        );
+        log::info!("lease {}: {line}", lease.lease_id);
+        self.worker_log.write_line(&format!("tuning [{}]: {line}", lease.lease_id));
+        Some(cap)
     }
 
     /// rev 19 (PROTOCOL 13): a rolling CPU job's tuning: its key (worker build, runtime pack, network, hardware, OS,
@@ -1361,7 +1401,10 @@ impl Engine {
         if !fixed && entry.maybe_check(now) {
             log::info!("lease {}: the weekly check of the tuned layout is due", lease.lease_id);
         }
-        let next = if self.tune_ok && !fixed { entry.plan(&space) } else { None };
+        // (agent 0.3.18: a key with a remembered freshness cap starts at it - no trial while it holds the incumbent back)
+        let mut space = space;
+        space.fresh = self.start_cap(lease, choice, &space, &entry);
+        let next = if self.tune_ok && !fixed && !space.capped(&entry.incumbent) { entry.plan(&space) } else { None };
         let current = next.unwrap_or_else(|| entry.wanted(&space));
         let t = Tuning {
             space,
@@ -1528,7 +1571,9 @@ impl Engine {
         if !fixed && entry.maybe_check(now) {
             log::info!("lease {}: the weekly check of the tuned GPU layout is due", lease.lease_id);
         }
-        let next = if self.tune_ok && !fixed { entry.plan(&space) } else { None };
+        // (agent 0.3.18: a key with a remembered freshness cap starts at it - no trial while it holds the incumbent back)
+        space.fresh = self.start_cap(lease, choice, &space, &entry);
+        let next = if self.tune_ok && !fixed && !space.capped(&entry.incumbent) { entry.plan(&space) } else { None };
         let current = next.unwrap_or_else(|| entry.wanted(&space));
         let hw0 = tune::Hw { cores: p.cores, logical: p.threads, perf: p.perf_cores, eff: p.eff_cores, ram_mb: p.ram_mb };
         let t = Tuning {
@@ -1713,8 +1758,12 @@ struct Run {
     /// were ended (`tail_tick`).
     finish_sent: Option<Instant>,
     tail_quit: bool,
-    /// agent 0.3.17 (PROTOCOL 18.3): the lease's completed-games rate for the freshness cap.
-    fresh: crate::fresh::Gauge,
+    /// agent 0.3.18 (PROTOCOL 18.3): the freshness cap's measurements - the workers' first waves and the lease's leaves/s
+    /// (`fresh::Meter`) -, the key they are remembered under (None: the lease has no budget, nothing is learned) and the
+    /// leaves per game planned with (`fresh::Entry::lpg`).
+    fresh: crate::fresh::Meter,
+    fresh_key: Option<String>,
+    fresh_lpg: Option<f64>,
 }
 
 impl Run {
@@ -2935,6 +2984,11 @@ impl Run {
                 let n = |k: &str| s.get(k).and_then(Value::as_u64);
                 let (leaves, games, started) = (n("leaves"), n("games"), n("games_started"));
                 self.main_watch().status(leaves, games, started);
+                // (agent 0.3.18: the freshness cap's first wave and leaves)
+                if let (Some(l), Some(g), Some(st)) = (leaves, games, started) {
+                    let (pid, conc) = (self.worker.pid, self.main_layout().conc);
+                    self.fresh_status(eng, pid, conc, l, g, st);
+                }
                 // (agent 0.3.4: a worker that reports its video memory)
                 self.stats_vram = s.get("vram_mb").and_then(Value::as_u64).unwrap_or(0);
                 // (agent 0.3.6: a GPU job's worker's base reading - sessions built, games started, none finished)
@@ -4089,8 +4143,13 @@ impl Run {
                 // (agent 0.3.15: its progress watched)
                 m.watch.status(n("leaves"), n("games"), n("games_started"));
                 m.stats_vram = n("vram_mb").unwrap_or(0);
-                if m.active() {
+                let (pid, conc, active) = (m.worker.pid, m.layout.conc, m.active());
+                if active {
                     self.probe_sample(eng);
+                }
+                // (agent 0.3.18: the freshness cap's first wave and leaves - a drainer's too: its first wave finishes)
+                if let (Some(l), Some(g), Some(st)) = (n("leaves"), n("games"), n("games_started")) {
+                    self.fresh_status(eng, pid, conc, l, g, st);
                 }
             }
             "selftest" => {
@@ -4403,32 +4462,65 @@ impl Run {
         self.show_tuning(eng);
     }
 
-    /// agent 0.3.17 (PROTOCOL 18.3): the freshness cap. With the run's budget `fresh_s` and the lease's measured
-    /// completed-games rate (`fresh::Gauge`), the job's games in flight in all are capped at `fresh::raw_cap` (rate x
-    /// `fresh_s`, at least `fresh::floor`) - the tuner's space (`tune::Space::fresh`: no layout over it is planned, tried
-    /// or handed over to; trials wait while it holds the incumbent back), a running layout over it handed over to the
+    /// agent 0.3.18 (PROTOCOL 18.3): a worker's status for the freshness cap: the lease's leaves, and the worker's first
+    /// wave (`fresh::Wave`) - once `fresh::QUANTILE` of it finished, a leaves-per-game sample, remembered under the
+    /// lease's key and planned with (the median of the key's samples).
+    fn fresh_status(&mut self, eng: &Engine, pid: u32, conc: u64, leaves: u64, games: u64, started: u64) {
+        let Some(key) = self.fresh_key.clone() else { return };
+        let Some(x) = self.fresh.status(pid, conc, leaves, games, started) else { return };
+        let e = crate::fresh::Learned::sample(&eng.cfg.layout, &key, x);
+        self.fresh_lpg = e.lpg();
+        let id = self.lease.lease_id.clone();
+        let line = format!(
+            "freshness: worker pid {pid}'s first wave of {} games: its p75 game took {} leaves (planning with {}, the median of {} first waves)",
+            tune::thousands(conc),
+            tune::thousands(x as u64),
+            tune::thousands(self.fresh_lpg.unwrap_or(x) as u64),
+            e.lpg.len()
+        );
+        log::info!("lease {id}: {line}");
+        eng.worker_log.write_line(&format!("tuning [{id}]: {line}"));
+    }
+
+    /// agent 0.3.17, estimator 0.3.18 (PROTOCOL 18.3): the freshness cap. With the run's budget `fresh_s`, the lease's
+    /// leaves/s over the last `Timings::fresh_window` of running time while it plays new games and the key's leaves per
+    /// game (`fresh.rs`), the job's games in flight in all are capped at `fresh::latency_cap` (`fresh_s` x leaves/s /
+    /// leaves per game, at least `fresh::floor`) - the tuner's space (`tune::Space::fresh`: no layout over it is planned,
+    /// tried or handed over to; trials wait while it holds the incumbent back), a running layout over it handed over to the
     /// capped one by the usual handoff (`tune_tick`: one drain at a time, its games in flight finished) - and kept within
-    /// `fresh::HYSTERESIS`; after a change that moves the layout wanted, the next decision waits for a turnover of it. No
-    /// budget (any more): no cap, as before. One log line per change.
+    /// `fresh::HYSTERESIS`; after a change that moves the layout wanted, the next decision waits for a new leaves/s window.
+    /// The leaves/s is remembered for the next lease's start (`tuning_for`: it starts at the capped layout). No budget (any
+    /// more): no cap, as before. One log line per change.
     fn fresh_tick(&mut self, eng: &Engine, must_pause: bool) {
-        let running = matches!(self.state, WState::Running) && self.job_sent && !must_pause && self.stall_since.is_none();
-        self.fresh.tick(Instant::now(), running, self.games_done);
+        let finishing = self.roll.as_ref().is_none_or(|r| r.finishing);
+        let handing = self.tuning.as_ref().is_some_and(|t| t.handoff.is_some());
+        let running = matches!(self.state, WState::Running) && self.job_sent && !must_pause && self.stall_since.is_none() && !finishing && !handing;
+        let leaves = self.fresh.leaves;
+        self.fresh.gauge.tick(Instant::now(), running, leaves);
         let id = self.lease.lease_id.clone();
         let gpu = self.gpu_lease();
         let Some(fresh_s) = self.roll.as_ref().filter(|r| r.active && !r.finishing).map(|r| r.fresh_s) else { return };
-        let rate = self.fresh.rate();
-        let games_done = self.games_done;
+        let rate = self.fresh.gauge.rate();
+        // (the leaves/s, remembered with the games in flight it was measured at, for the next lease's start)
+        if let (Some(r), Some(key), Some(t)) = (rate, self.fresh_key.clone(), self.tuning.as_ref()) {
+            if fresh_s.is_some() && self.fresh.save_due() {
+                crate::fresh::Learned::rate(&eng.cfg.layout, &key, r, t.current.total_conc());
+            }
+        }
+        let lpg = self.fresh_lpg;
         let Some(t) = self.tuning.as_mut() else { return };
-        let line = match (fresh_s, rate) {
-            (None, _) => {
+        let line = match (fresh_s, rate, lpg) {
+            (None, ..) => {
                 if t.space.fresh.take().is_none() {
                     return;
                 }
                 format!("freshness: the run sets no game-latency budget any more: no cap on the games in flight (the layout wanted: {})", t.entry.wanted(&t.space).describe_on(gpu))
             }
-            (Some(_), None) => return,
-            (Some(f), Some(rate)) => {
-                let raw = crate::fresh::raw_cap(rate, f, crate::fresh::floor(t.gpu));
+            // (no new decision while the running layout is still over the cap - its handoff down pending or under way: the
+            // leaves/s of the layout wanted is measured once it runs)
+            (Some(_), Some(_), Some(_)) if t.handoff.is_some() || t.space.capped(&t.current) => return,
+            (Some(f), Some(rate), Some(lpg)) => {
+                let raw = crate::fresh::latency_cap(rate, lpg, f, crate::fresh::floor(t.gpu));
                 let cap = crate::fresh::next_cap(t.space.fresh, raw);
                 if t.space.fresh == Some(cap) {
                     return;
@@ -4439,16 +4531,22 @@ impl Run {
                 let wanted = t.entry.wanted(&t.space);
                 let free = t.entry.wanted(&t.space.uncapped());
                 if wanted != before {
-                    // (the next decision measures the new layout: a turnover of it first)
-                    self.fresh.settle(games_done, wanted.total_conc());
+                    // (the next decision measures the new layout's leaves/s afresh)
+                    self.fresh.gauge.reset();
                 }
                 let what = if wanted.total_conc() < free.total_conc() {
                     format!("capping the job at {} ({} games in flight without the cap)", wanted.describe_on(gpu), tune::thousands(free.total_conc()))
                 } else {
                     format!("not binding (the layout wanted plays {} in all)", tune::thousands(wanted.total_conc()))
                 };
-                format!("freshness: games may last {f} s and the lease finishes {rate:.2} games/s: at most {} games in flight{was} - {what}", tune::thousands(cap))
+                format!(
+                    "freshness: games may last {f} s; the lease plays {} leaves/s and a game takes {} leaves (p75): at most {} games in flight{was} - {what}",
+                    tune::thousands(rate as u64),
+                    tune::thousands(lpg as u64),
+                    tune::thousands(cap)
+                )
             }
+            _ => return,
         };
         log::info!("lease {id}: {line}");
         eng.worker_log.write_line(&format!("tuning [{id}]: {line}"));
