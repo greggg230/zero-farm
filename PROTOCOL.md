@@ -1961,6 +1961,24 @@ before rev 19, eval, fuzz and classic jobs are unchanged; GPU jobs are tuned fro
     their incumbents never a crew - are searched again from this start; other GPU jobs keep 3.
   - **Measured choice** (9.6): a DirectML candidate is rated at the batch of this start, not at the bench's target as the
     memory plan cuts it.
+- **CUDA crews** (agents from 0.3.16; no wire change). An NVIDIA GPU's CUDA job (provider `cuda`, the chosen GPU's vendor
+  `nvidia`) takes DirectML's target and start above (3 x 1,152 games in flight in two groups, each worker down to 768
+  where the memory plans hold less, then a worker fewer) instead of the most workers sharing two of the bench's full
+  batches. The farm's CUDA worker is bound by ONNX Runtime's host side (~1,200 kernels launched one by one a call, ~20 ms
+  of a CPU thread at any batch size), so bigger batches per worker pay until its evaluator thread is busy all the time.
+  The 4070 Ti PC (2026-11-22, the e9ff0e24 CUDA worker, the fp16 variant, 5-minute windows, leaves/s; the trainer's
+  path 32.9k): 3 x 384 in one group 20.0k, 3 x 704 in two 23.5k, 3 x 912 26.4k, 3 x 1,150 28.1k, 2 x 1,244 25.2k,
+  2 x 1,866 24.9k, 1 x 2,048 17.0k; with its memory plan (13.4 GB limit, 1,992 MB a worker) 0.3.15 started 3 x 704,
+  3 x 608 or 3 x 384, 0.3.16 starts 3 x 912 at 2 MB a game and 2 x 1,152 at 3 MB.
+  - **At least two workers** where the memory plans hold two of 768 (one worker's evaluator thread caps it: 14.5-17.0k on
+    that PC).
+  - **No in-lease trials:** the crew plays its start for the whole lease, as a fixed layout (re-planned by the memory plan
+    only, 10.6; nothing remembered). Each GPU trial is a handoff whose new crew needs the old crew's memory, so the old
+    crew's games in flight are quit after `drain_tail` (13.2), and the in-flight limit (10.4) then holds back the new
+    crew's ids, putting the trial off and handing over to it again: on a test run with no quota, 0.3.15's tuner made six
+    trials in 47 minutes, quit 6,783 games against ~12,500 finished and averaged ~16k leaves/s where its layouts measured
+    21-22k; 0.3.16 played 336 games a minute on the same run against 0.3.15's 244 (+38 %).
+  - **Tuning key:** CUDA crews' keys carry tuner version 5 (13.3).
 - **The owner's settings** `autotune` (default on; Windows `machine.json`, macOS `ZeroFarm set autotune on|off`) and
   `workers` (`auto` (default) | 1 | 2 | 3, 13.5). `autotune` off: the fixed rules of before (one worker, `threads` = the
   CPU threads, no `infer_*` fields, 10.6's games in flight) - unless `workers` is 2 or 3: then that many workers with
@@ -2470,6 +2488,11 @@ Checked against agents 0.3.10 (the macOS stable of before 2026-11-21), 0.3.13 an
 `/v1/lease` right after any lease ends; `wait_s` honoured up to `max_wait`).
 
 ## Changes
+- v1 rev 24, agent 0.3.16 (2026-11-22; no wire change): **CUDA crews** (13.1): an NVIDIA GPU's CUDA job starts from
+  DirectML's crew rule (3 x 1,152 games in flight in two groups; fewer games each, then fewer workers; at least two
+  workers where two fit) and runs no in-lease trials (tuner key version 5). Why: on a 4070 Ti PC 0.3.15's start (3 x 704
+  / 3 x 608 / 3 x 384) played 20-23.5k leaves/s against 25-26.4k for the crew rule's, and its trials' handoffs quit
+  6,783 games in 47 minutes on a test run with no quota (336 games a minute with 0.3.16 against 244).
 - v1 rev 24 (2026-11-21; coordinator only, every agent version; no migration; owner setting `priority_lane`, default
   `"canary"`): **the priority lane** (section 15). While a run's eval batch with unissued ids comes first for a machine,
   a fuzz lease's next beat answers `give_back` (not within 120 s of its end) and a rolling self-play lease's next

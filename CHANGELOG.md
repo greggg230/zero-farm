@@ -4,6 +4,15 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's: `agent-macos-v<version>`).
 
+## Unreleased (0.3.16)
+
+- **More games at once on NVIDIA graphics cards, and no more costly layout trials there.** On a computer with an NVIDIA
+  card, Zero Farm now starts the card's job programs the way it already starts them on DirectML cards: up to three
+  programs of about 1,150 games each, fewer games each where memory is short, and only then fewer programs - never a
+  single program when two fit. It also stops trying other layouts during a job on these cards: each trial had to stop
+  the running programs' unfinished games (more than a thousand at a time) to free their memory for the next ones. On a
+  4-core PC with an RTX 4070 Ti this played 38 % more games per minute in a test (336 against 244).
+
 ## Unreleased (0.3.15)
 
 - **A job program that stops playing is started again.** After a pause, a job program has to set its graphics card up
