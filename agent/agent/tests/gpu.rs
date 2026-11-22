@@ -72,6 +72,10 @@ struct Gpus {
 /// The harness of an NVIDIA PC (a GPU of `vram_mb`, GPU work allowed): `workers` per job, `autotune`; the fake worker
 /// never counted as starved by the test machine's load.
 fn harness(vram_mb: u64, workers: Option<u32>, autotune: bool) -> (H, Gpus) {
+    // (these tests cover the bench-shaped GPU start and its tuner, which agents from 0.3.16 keep for GPUs other than an
+    // NVIDIA GPU's CUDA job - that one's crew rule is tests/cuda_crew.rs; the switch is process-wide, every test here
+    // wants it)
+    std::env::set_var("ZEROFARM_TEST_LEGACY_GPU_START", "1");
     let mut h = H::new();
     h.version = "0.3.4".into();
     h.signals.real_starvation = false;

@@ -1429,7 +1429,9 @@ impl Engine {
         // 1,152 games in flight in two groups, fewer games each where the memory plan holds less, then fewer workers -
         // not two of the bench's full batches shared by the most workers)
         let nvidia_cuda = provider == "cuda" && choice.gpu.get("vendor").and_then(Value::as_str).is_some_and(|v| v.eq_ignore_ascii_case("nvidia"));
-        let crew = dml || (nvidia_cuda && tune::CUDA_CREW);
+        // (tests of the bench-shaped start, which other GPUs keep: ZEROFARM_TEST_LEGACY_GPU_START, debug builds only)
+        let legacy = crate::test_env("ZEROFARM_TEST_LEGACY_GPU_START").is_some();
+        let crew = dml || (nvidia_cuda && tune::CUDA_CREW && !legacy);
         let target = if crew { crate::rolling::dml_target(setup.gpu, setup.hi - setup.lo) } else { crate::rolling::gpu_target(setup.gpu, batch) };
         // (no video memory plan: one worker; `autotune` off without the owner's count: one)
         let set = match (vram.is_some(), fixed) {
