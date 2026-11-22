@@ -1,8 +1,10 @@
-//! Agent 0.3.17 (PROTOCOL 18.3): the freshness cap - a rolling lease whose coordinator sends the run's `fresh_s` caps the
-//! job's games in flight at about the lease's completed-games rate x `fresh_s` (Little's law), handing a running layout
-//! over the cap down to the capped one by the usual handoff; a coordinator without the field: exactly as before. With the
-//! real engine, the fakeworker (a CUDA crew, which the farm's measurements showed losing 12-14 % of its rows to staleness)
-//! and the mock coordinator.
+//! Agent 0.3.17 / 0.3.18 (PROTOCOL 18.3): the freshness cap - a rolling lease whose coordinator sends the run's `fresh_s`
+//! caps the job's games in flight at `fresh_s` x its leaves/s / the p75 game's leaves (a worker's first wave), handing a
+//! running layout over the cap down to the capped one by the usual handoff, and a later lease of the same run, build,
+//! runtime and provider starts at the remembered cap (agent 0.3.18: also when every lease ends before a steady state, as
+//! a run's ~9-minute leases with ~7-minute drains do); a coordinator without the field: exactly as before. With the real
+//! engine, the fakeworker (a CUDA crew, which the farm's measurements showed losing 12-14 % of its rows to staleness) and
+//! the mock coordinator.
 // GPU work: Windows only (no GPU jobs on macOS)
 #![cfg(windows)]
 
@@ -140,7 +142,7 @@ fn fresh_log(h: &H) -> String {
 /// The cap of the last "freshness: ... at most N games in flight" line.
 fn last_cap(h: &H) -> Option<u64> {
     let log = h.agent_log();
-    let l = log.lines().filter(|l| l.contains("tuning [") && l.contains("freshness:") && l.contains("at most ")).last()?;
+    let l = log.lines().filter(|l| l.contains("tuning [") && l.contains("freshness:") && l.contains("at most ")).next_back()?;
     let rest = &l[l.find("at most ")? + 8..];
     rest.split_whitespace().next()?.replace(',', "").parse().ok()
 }
@@ -197,6 +199,70 @@ fn crate_floor() -> u64 {
     farm_agent::fresh::FLOOR_GPU
 }
 
+/// The short-lease pattern (agent 0.3.18): the canary's leases of 2026-11-22 ran ~9 minutes, then the coordinator
+/// answered `finish` (a renewal or the priority lane) and the crew drained its games for ~7 minutes - 0.3.17's estimator
+/// (completed games over 300 s after a whole turnover) never measured once. Here three leases in a row are each told
+/// `finish` before their workers' first waves reach their p75 game (~6 s): the drain finishes the first waves, so lease 1
+/// learns the run's leaves per game and its leaves/s (no cap binds in it), and leases 2 and 3 start AT the capped layout -
+/// their very first job lines within the cap, no handoff down.
+#[test]
+fn short_leases_learn_the_cap_and_the_next_leases_start_at_it() {
+    let (h, g) = harness(12_282, None, true);
+    seed_memory(&h, &g, 3);
+    let mut h = h;
+    let mut template = gpu_lease(&h, &g, "l_S1", &fake(40, json!([1.0, 1.0, 1.0])), json!(600), 3_000_000);
+    template["rolling"]["fresh_s"] = json!(5);
+    h.start();
+    let mut caps = Vec::new();
+    for n in 1..=3u64 {
+        let id = format!("l_S{n}");
+        let mut l = template.clone();
+        l["lease_id"] = json!(id);
+        l["job"]["gid_base"] = json!((n - 1) * 1_000_000);
+        l["rolling"]["block"] = json!([(n - 1) * 1_000_000, n * 1_000_000]);
+        let n0 = job_lines(&h).len();
+        h.push(l);
+        let crew = |h: &H| h.agent_log().lines().filter(|x| x.contains(&format!("crew [{id}]")) && x.contains("joins the crew")).count() + 1;
+        assert!(wait(|| job_lines(&h).len() > n0 && crew(&h) >= 2), "{}", fresh_log(&h));
+        if n >= 2 {
+            // it starts at the remembered cap: every job line of the lease within it
+            let lines: Vec<String> = h.agent_log().lines().filter(|x| x.contains(&format!("tuning [{id}]: freshness:")) && x.contains("starting at most")).map(String::from).collect();
+            assert_eq!(lines.len(), 1, "lease {n} starts capped: {}", fresh_log(&h));
+            let cap = last_cap(&h).unwrap();
+            assert!((crate_floor()..600).contains(&cap), "cap {cap}: {}", fresh_log(&h));
+            caps.push(cap);
+        }
+        // ~3 s of play (the first waves' p75 comes at ~6 s), then `finish` and the drain
+        std::thread::sleep(Duration::from_secs(3));
+        h.mock.script_extend(&id, json!({"finish": true, "reason": "max_s"}));
+        let done = h.wait_done(&id);
+        let (credited, again) = credits(&h, &id);
+        assert_eq!(again, 0, "{done}");
+        assert_eq!(credited + unfinished_n(&done), done["stats"]["released"].as_u64().unwrap(), "{done}");
+        if let Some(&cap) = caps.last().filter(|_| n >= 2) {
+            // (every worker of the lease within its share of the cap, the lease's Stats saying so, and no handoff down)
+            let workers = crew(&h) as u64;
+            for j in &job_lines(&h)[n0..] {
+                assert!(j["conc"].as_u64().unwrap() * workers <= cap, "lease {n}: {j} over the cap of {cap}: {}", fresh_log(&h));
+            }
+            assert_eq!(done["stats"]["fresh_cap"].as_u64(), Some(cap), "{done}");
+            assert!(!h.agent_log().contains(&format!("tuning [{id}]: handing the job over to")), "no handoff: {}", fresh_log(&h));
+        } else {
+            assert!(!h.agent_log().contains("tuning [l_S1]: freshness: games may last"), "no cap in lease 1: {}", fresh_log(&h));
+            assert!(done["stats"].get("fresh_cap").is_none(), "{done}");
+        }
+    }
+    // lease 1 learned from its drain (first-wave samples, the leaves/s), and the caps agree lease to lease
+    assert!(h.agent_log().contains("tuning [l_S1]: freshness: worker pid") && h.agent_log().contains("its p75 game took"), "{}", fresh_log(&h));
+    let learned: Value = serde_json::from_slice(&std::fs::read(h.layout.state().join("rolling_fresh.json")).unwrap()).unwrap();
+    let entry = learned.as_object().unwrap().values().next().cloned().unwrap();
+    assert!(entry["lpg"].as_array().is_some_and(|a| a.len() >= 3) && entry["leaves_s"].as_f64().is_some(), "{learned}");
+    assert!(caps[1] as f64 >= caps[0] as f64 * 0.7 && caps[1] as f64 <= caps[0] as f64 * 1.3, "{caps:?}");
+    h.stop();
+    assert!(h.crashes().is_empty(), "{:?}
+{}", h.crashes(), h.agent_log());
+}
+
 /// A coordinator that sends no budget (before rev 26, or a machine its owner's setting leaves out): no cap however long
 /// the games last - the crew plays its start on, nothing about freshness in the log.
 #[test]
@@ -213,6 +279,7 @@ fn without_a_budget_nothing_is_capped() {
         std::thread::sleep(Duration::from_millis(500));
     }
     assert!(!h.agent_log().contains("freshness"), "{}", fresh_log(&h));
+    assert!(!h.layout.state().join("rolling_fresh.json").exists(), "nothing learned without a budget");
     // (the memory plan's handoffs are 0.3.16's; nothing is cut below the run's 600 shared by the crew)
     for j in &job_lines(&h) {
         assert!(j["conc"].as_u64().unwrap() >= 192, "{j}");

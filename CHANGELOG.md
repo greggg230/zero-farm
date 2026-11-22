@@ -4,6 +4,14 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's: `agent-macos-v<version>`).
 
+## Unreleased (0.3.18)
+
+- **The limit on games at once now works on short jobs too.** 0.3.17 needed a job to run long and steadily before it
+  could work out how many games finish in time, and on runs whose jobs last about ten minutes it never got there. Zero
+  Farm now learns how much searching a game of the run takes from the first games of each job - also while a job winds
+  down - remembers it for that run, and starts the next job with the right number of games at once instead of starting
+  full and cutting back (cutting back throws away unfinished games).
+
 ## Unreleased (0.3.17)
 
 - **Fewer games at once where too many would arrive too late to count.** The training program only keeps a game's
