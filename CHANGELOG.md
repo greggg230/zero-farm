@@ -4,6 +4,18 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's: `agent-macos-v<version>`).
 
+## Unreleased
+
+- **An "owner machine" setting, for the farm owner's own computer only.** The owner's desktop trains its networks and
+  can now also play all of their practice games through Zero Farm, on the same graphics card. `owner on` makes Zero Farm
+  work there whenever it isn't paused - also while the owner uses the computer or a fullscreen app runs -, share the
+  graphics card with the training program instead of stepping aside for it (the temperature limit stays), run its job
+  programs at normal priority, run up to 8 of them at once on a big card, and keep 12 GB of the card's memory free for
+  the training program (`gpu_reserve_mb` changes that). A fixed layout can be set too: how many job programs, how many
+  games each, in one or two groups, and how many search threads each. On Windows these are set with `farm-agent set`
+  while Zero Farm is not running. Nothing changes on friends' computers: the setting is off unless set, and their own
+  settings keep their limits (except that a fixed number of job programs may now be up to 8).
+
 ## Unreleased (0.3.16)
 
 - **More games at once on NVIDIA graphics cards, and no more costly layout trials there.** On a computer with an NVIDIA

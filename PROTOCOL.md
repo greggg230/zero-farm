@@ -993,7 +993,8 @@ released) whenever the GPU rules block GPU work, and gets below-normal priority 
 Engine(*)\Utilization Percentage`, per process: what Task Manager shows): per engine the sum over every
 process except the agent and its workers (agents from 0.3.4: every worker of a lease's crew, 13.5 - before, only the
 main one), per adapter its busiest engine; the gate is the busiest
-adapter (more than 10 % for 30 s blocks GPU work; 30 s quiet clears it). It replaces NVML as the gate for
+adapter (more than 10 % for 30 s blocks GPU work; 30 s quiet clears it; not on an owner machine, 13.6, whose trainer
+shares the GPU). It replaces NVML as the gate for
 GPU work; NVML only gives the NVIDIA driver version and a cross-check of the adapter count. Temperature:
 `D3DKMTQueryAdapterInfo(KMTQAITYPE_ADAPTERPERFDATA)` per adapter LUID (DESIGN 8.5, decided); a GPU whose
 driver reports none (0, or the query fails) has no temperature rule.
@@ -1980,7 +1981,8 @@ before rev 19, eval, fuzz and classic jobs are unchanged; GPU jobs are tuned fro
     21-22k; 0.3.16 played 336 games a minute on the same run against 0.3.15's 244 (+38 %).
   - **Tuning key:** CUDA crews' keys carry tuner version 5 (13.3).
 - **The owner's settings** `autotune` (default on; Windows `machine.json`, macOS `ZeroFarm set autotune on|off`) and
-  `workers` (`auto` (default) | 1 | 2 | 3, 13.5). `autotune` off: the fixed rules of before (one worker, `threads` = the
+  `workers` (`auto` (default) | 1 | 2 | 3, 13.5; up to 8 with the owner machine's agent, 13.6, which also pins a GPU job's
+  games in flight, groups and search threads per worker). `autotune` off: the fixed rules of before (one worker, `threads` = the
   CPU threads, no `infer_*` fields, 10.6's games in flight) - unless `workers` is 2 or 3: then that many workers with
   the platform's start for them, fixed (no trials, nothing remembered; handed over only when the memory plan comes to
   hold more games in flight, 10.6, agents from 0.3.3).
@@ -2225,6 +2227,62 @@ extra lease: the coordinator sees one lease, its released ids, its extensions an
 - **Cost.** A member's closed range lasts one to a few game lengths of its own (about 1-3 h on the M4 Max at the start's
   layout), then it finishes its games beside its successor. A worker op handing a running worker a new range would let
   every member run as long as the lease (an aw/1 change); not needed for the measured gain.
+
+### 13.6 Owner machine (no rev: no wire change, no migration; agent only, unreleased)
+
+**Why.** The farm owner's own desktop (many cores, plenty of RAM, one big NVIDIA GPU) should play all of its runs'
+self-play through the farm instead of the trainer's local self-play, while the trainer keeps training on the same GPU.
+Every rule above assumes a friend's PC, where Zero Farm gives way to the owner of the PC: the GPU busy gate (section 8)
+yields the workers whenever another program uses the GPU over 10 % for 30 s - the trainer trains ~25 s of every ~95 s,
+so the crew would be yielded every iteration, and a lease asked for while the trainer trains says `caps.gpu` false -;
+idle-only work and fullscreen apps stop it while the owner uses the PC; a quarter of RAM is kept free while the PC is
+in use (a crew planned while it was idle is stopped when the owner comes back); workers run at idle / below-normal
+priority; a GPU crew has at most 3 workers (the 4070 Ti PC's 4 cores) and its video memory plan leaves nothing for a
+program whose use comes and goes (the trainer between its steps). One setting turns all of that around for this one
+machine; friends' defaults don't change.
+
+- **The switch.** `owner` (default off; Windows `machine.json` - `farm-agent set owner on` while Zero Farm is not running
+  -, macOS `ZeroFarm set owner on`; written only when on). It implies, for this machine only:
+  - **Work whenever not paused**: `work_when` "always" and fullscreen apps ignored, whatever the stored settings say
+    (`owner off` brings them back). Pause, hours, power (`on_battery`) and low memory still stop work.
+  - **No GPU busy gate**: other programs' GPU use never blocks GPU work (the trainer shares the GPU). The temperature
+    rule stays (83 °C / 78 °C), and "Use the GPU" off and no adapter still mean no GPU work.
+  - **The idle memory floor always**: an eighth of RAM (at least 4 GB) is kept free whether the PC is in use or not
+    (10.6 / agent 0.3.6's floor while idle), so the owner coming back to the keyboard doesn't stop a crew; free memory
+    below it still blocks work and gives back a paused lease.
+  - **A job memory cap of three quarters of the RAM** unless `max_ram_mb` is set (friends: half).
+  - **Normal priority**: workers run at NORMAL_PRIORITY_CLASS without EcoQoS (macOS: nice 0), CPU and GPU jobs alike -
+    the priority of the trainer's own self-play. Provider probes stay at below-normal priority.
+  - **A bigger GPU crew**: the crew rule (13.1 **DirectML**, **CUDA crews**) chooses up to 8 workers, at most one per 3
+    physical cores (a 24-core PC: 8; a 4-core one: 3, as a friend's), each with 1,152 games in flight in two groups
+    where the memory plans hold it - the "auto" target is 1,152 for each worker the crew may have (8 x 1,152 = 9,216),
+    at most the lease's block -, fewer games each down to 768 where they hold less, then a worker fewer. One worker
+    never runs more than 4,096 games; a crew's total may (at most 8 x 4,096). The search threads are shared as before
+    (1.5 per physical core, at most the logical processors: 32 there, 4 each for 8 workers).
+  - **Video memory kept for the trainer**: `gpu_reserve_mb` (below), 12,288 MB unless set.
+  - Trials (13.2) stay as strict as anyone's (idle, no fullscreen, quiet): with the trainer's load they would rarely
+    run, which is one more reason to pin the layout (below). CUDA crews run no trials anyway.
+- **`gpu_reserve_mb`** (any machine; `None`: 12,288 on an owner machine, else 0 - friends' plan as before): a GPU job's
+  workers are planned within 85 % of the adapter's dedicated memory less the **more** of this and what other programs
+  hold at the reading (10.6 **Video memory**: the lease's start, and every reading while it runs). Set it to the most
+  the trainer and the desktop hold at once: with the trainer resident the reading is already near it, between its
+  steps the reserve keeps its room. The 95 % rule (a worker gives way when the adapter's memory in use reaches 95 %)
+  still applies. On a 32 GB GPU (32,607 MB) with 12,288 kept: 15,427 MB for the crew (8 workers' batches of 452 rows at the
+  default 1 GB + 2 MB a row, until the run's own cost is measured).
+- **A fixed GPU layout** (any machine, `autotune` off; all optional): `workers` (1 to 8 - before, 1 to 3 -, the crew's
+  size), `worker_inflight` (1 to 4,096 games in flight per worker; default: the crew rule's share), `worker_groups` (1
+  or 2 per worker; default: the rule's - two once each holds 256 rows) and `worker_threads` (search threads per worker;
+  default: the job's shared search threads / `workers`). The lease runs exactly that layout with no trials and nothing
+  remembered, as `autotune` off with `workers` always did (13.1): the memory plan and the video memory plan cut each
+  worker's games in flight where they hold less (a calibration lifts them back, 10.6), never the workers' count except
+  where a worker's base doesn't fit (then fewer workers, each with its `worker_threads`); a batch over the video memory
+  plan's rows is split in two groups first. The owner's games in flight win over a run's number (`gpu_inflight`) on
+  this machine. The fixed layout is the GPU job's only: a CPU job keeps 13.1's rules (`workers` up to 8 there too).
+- **Wire.** None: the coordinator sees one rolling lease, its extensions and chunks, as for any crew (13.5). A crew of
+  6 x 1,152 asks for about 2 x 6,912 ids an extension; Stats `inflight` / `workers` say what it holds (the in-flight
+  limit, 10.4, follows them). A run whose generation quota (`quota` x (1 + `slack`)) is not well above the crew's games
+  in flight is throttled by its own quota (`wait_s` `quota`): many games in flight also make each game span more
+  generations (the run's `max_stale`).
 
 ## 14. Model variants per generation (rev 20; coordinator migration 0016, agents from 0.3.5)
 
@@ -2520,6 +2578,10 @@ the run's `check-config`; an older build refuses the setting, and the pool refus
 docs/az.md 70), never plays it without branches.
 
 ## Changes
+- No rev (2026-11-22; no wire change, no migration; agent only, unreleased): **owner machine** (13.6): the owner's setting
+  `owner` (work whenever not paused, no GPU busy gate, the idle memory floor, normal priority, a GPU crew of up to 8
+  workers, 12 GB of video memory kept), `gpu_reserve_mb`, and a fixed GPU layout (`workers` up to 8, `worker_inflight`,
+  `worker_groups`, `worker_threads`); Windows `farm-agent set` / `settings`. Friends' defaults unchanged.
 - No rev (2026-11-22; no wire change, no migration, no agent change; zero-core `feat/neartie-branches`): **branch games
   in self-play records** (16): a worker build of a run with `selfplay_branch` writes `"records": 2` files holding each
   branch game under its game's id, in its game's file; the coordinator credits ids as before (a game and its branch
