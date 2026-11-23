@@ -7,7 +7,8 @@ A change to anything here is a protocol change: bump the version it belongs to a
 bottom.
 
 Versions: HTTP API `v1` (path prefix), agent↔worker protocol `aw/1`, network files `zero-onnx/1`,
-manifests `manifest/1`. Current revision: v1 rev 29 (section 21, the ids a rolling lease gave up: counted as done with
+manifests `manifest/1`. Current revision: v1 rev 30 (section 22, single games: the trainer's ack says how many single
+games each result's credited ids held; rev 29: section 21, the ids a rolling lease gave up: counted as done with
 every result and left out of the run's quota; rev 28: section 20, fresher rows from fast machines: new generations with
 extension answers and a per-machine poll, drains that keep switching, the owner's per-machine freshness budget, rolling
 result limits per hour; rev 27: section 19, opt-in runtimes per machine: the torch runtime pack and
@@ -424,7 +425,7 @@ tools also send an Access service token (`CF-Access-Client-Id`, `CF-Access-Clien
 | `PUT /v1/admin/run/{run}/checkpoint/{gen}` | `{"model", "sha256", "reference", "reference_sha256"}` (files under `ckpt/<run>/`, uploaded first); makes `gen` current for self-play and resets that generation's quota counter → `{"ok": true, "unchanged", "current"}`. Rev 5: a `gen` older than the current one is registered without becoming current (`"current": false`: an eval opponent or a head-to-head label); the same `gen` with other files → 409. Rev 6: a gen the current definition already signs must be exactly those files (else 400); self-play with a definition plays the new current gen once a definition signs it. Rev 20: optional `"variants": {"<name>": {"model", "sha256"}}`, which a registered gen may add to (section 14.2; the answer adds `variants`) |
 | `GET /v1/admin/run/{run}/results?after={cursor}&limit=500` | → `{"results": [{"id", "key", "lease_id", "seq", "machine_id", "kind", "gen", "games", "ids", "dup_ids", "sha256", "size", "t"}], "cursor"}`. `ids`/`games`: the game ids credited to this chunk; `dup_ids`: ids in it that an earlier chunk was credited with (skip those games). Eval chunks (rev 5) also carry `batch`, `held` and `also`, and their `games` counts `also` too (section 5.2). `limit` ≤ 1000 |
 | `POST /v1/admin/run/{run}/accept` | `{"gen", "games": n}`: the trainer's total of games accepted for `gen` (a total, not an increment; include games held over for the next generation). Self-play stops when accepted + in flight (unclaimed ids in active self-play leases + credited self-play games not yet acked) reaches `quota × (1 + slack)`. Call it before `ack` |
-| `POST /v1/admin/run/{run}/ack` | `{"cursor"}`: results up to it are ingested (R2 objects deleted after 7 days) → `{"ok": true, "acked"}` |
+| `POST /v1/admin/run/{run}/ack` | `{"cursor", "single_games"?: [[result id, n], ...]}`: results up to it are ingested (R2 objects deleted after 7 days) → `{"ok": true, "acked"}`. Rev 30 (section 22): `single_games` - the single games in the ids each result credited, stored per result; the answer then carries `single_games: {"stored", "ignored"}` |
 | `PUT /v1/admin/campaign/{id}` | `{"build_id", "mode", "env": {"FUZZ_POOL": "delver", ...}, "seed_base": 10000000, "chunk": "auto" \| n, "priority": 0.2, "state", "needs": {"threads", "ram_mb"} \| null, "gpu": "any" (default) \| "preferred" \| "required", "providers": [...] \| null, "min_agent": "0.2.8" \| null, "share": 0.5 \| null}` → `{"ok": true, "created", "cursor"}`. The seed cursor never rewinds: a lower `seed_base` is ignored, a higher one moves it up. Rev 7: `gpu` and `providers` (section 8; migration 0006). Rev 9: `min_agent` as for runs (migration 0007). Rev 14: `share` (0 < x <= 1, or null/absent: the backfill; section 5.4; migration 0010); a PUT is the whole configuration, so one without `share` removes it |
 | `GET /v1/admin/campaign/{id}` · `GET …/results?after=` · `POST …/ack` | config (rev 14: with `share`) + `cursor`, `seeds_done`, `seeds_leased`, `active_leases`, `pool`, `failures`, `sites`; results and ack as for runs (`ids` are seeds) |
 | `GET /v1/admin/campaign/{id}/failures?after=&limit=` | → `{"failures": [{"id", "seed", "mode", "site", "panic", "repro", "output_tail", "build_id", "engine_commit", "machine_id", "lease_id", "first_of_site", "t"}], "cursor"}` (section 5.1; one row per (seed, site)) |
@@ -437,7 +438,7 @@ tools also send an Access service token (`CF-Access-Client-Id`, `CF-Access-Clien
 | `POST /v1/admin/diag` | `{"machine_id" \| "class", "kind": "sweep" \| "profile" \| "stability" \| "logs", "params"}` → `{"requests": [{"id", "machine_id"}]}`. `class` = a hardware class as the stats show it (`"<cpu> / <gpu or 'no gpu'>"`). `logs` goes out as `upload_diag`; the others become `diag` leases (`params.build_id` or `params.run` picks the build) |
 | `GET /v1/admin/diag?machine_id=` | requests, uploads and diag-lease results with their R2 keys |
 | `GET /v1/admin/stats` | aggregates for the dashboard (`/admin`); per machine also `idle_h_day`, `on_h_day`, `starved_s_24h`, `blocked` (rev 5: `[{"build_id", "until", "os_error", "message", "agent_version", "t"}]`); per run `eval` (the current batch's progress, rev 5); `eval_batches` (the 20 newest batches of all runs, with `run`); `releases` (latest per channel, `github_url`), `diag_uploads` (recent, `user`). Rev 6: `auth` (`{"via": "token" \| "access", "email"?, "common_name"?}`), `limits`, per run and campaign `definition` (current version, gens, jobs, builds and `problems`: why a job can't be leased), per machine `refused_24h`, `blocks` (every active block), `contributors` (farm PCs and external sources, below), `totals` (`farm`, `own`, `all`: self-play/eval games and fuzz seeds over 1 h and 24 h), `by_scope` |
-| `POST /v1/admin/external` | rev 6: a reporter's numbers for the owner's machines that don't run the agent (the desktop playing locally, machines over SSH, rented boxes): `{"reporter": "<id>", "t": <unix>, "sources": [{"id", "name", "kind": "local" \| "ssh" \| "vast" \| "other", "hardware"?, "working_on": ["run:<run>", "campaign:<id>", ...], "selfplay_games": {"1h", "24h"}, "eval_games": {"1h", "24h"}, "fuzz_seeds": {"1h", "24h"}, "busy_h_24h": x \| null}]}` (at most 64 sources, 64 KB) → `{"ok": true, "reporter", "sources": n}`. Each POST replaces all sources of its reporter; a source whose last report is over 30 min old shows offline; rows are deleted 7 days after it. Admin page only (`contributors` in stats), never on a public page |
+| `POST /v1/admin/external` | rev 6: a reporter's numbers for the owner's machines that don't run the agent (the desktop playing locally, machines over SSH, rented boxes): `{"reporter": "<id>", "t": <unix>, "sources": [{"id", "name", "kind": "local" \| "ssh" \| "vast" \| "other", "hardware"?, "working_on": ["run:<run>", "campaign:<id>", ...], "selfplay_games": {"1h", "24h"}, "eval_games": {"1h", "24h"}, "fuzz_seeds": {"1h", "24h"}, "busy_h_24h": x \| null, "single_games"?: {"1h", "24h"}, "uncounted"?: {"1h", "24h"} (rev 30, section 22.3)}]}` (at most 64 sources, 64 KB) → `{"ok": true, "reporter", "sources": n}`. Each POST replaces all sources of its reporter; a source whose last report is over 30 min old shows offline; rows are deleted 7 days after it. Admin page only (`contributors` in stats), never on a public page |
 
 ## 5. Jobs (`lease.job`) and the agent↔worker protocol (`aw/1`)
 
@@ -3039,7 +3040,57 @@ failed on the missing partial file - `setup failed: network: ... cannot find the
 could not be installed. Nothing changes on the wire. (`farm-release` makes no compressed copy of a file of 64 KiB or
 less, 9.3; a manifest that names one for an empty file is unpacked to an empty file.)
 
+## 22. Single games (rev 30; coordinator migration 0019, no agent or worker change)
+
+**Why.** `results.games` is the number of ids a result credited, and an id is whatever the job plays under it: one game
+in a best-of-one job, one whole match (two or three games) in a best-of-three job. The coordinator does not know a
+job's format, so every number built on `games` - a machine's games per hour, lifetime totals - added games and matches
+together. Throughput is reported in single games.
+
+**Who counts.** The trainer: it reads every result it acknowledges - a self-play record is replayed game by game, an
+eval row is read - so it knows exactly how many single games the credited ids held. No worker or agent reports
+anything new, so no release is needed, and results of every worker build are counted alike.
+
+**22.1 The ack.** `POST /v1/admin/run/{run}/ack` (and a campaign's) takes an optional `single_games`: a list of at
+most 1,000 `[result id, n]` pairs - `n` = the single games in the ids that result credited (its `games` ids: for an
+eval result its own `ids`, the held ids it completed are counted with it). For each pair the coordinator stores `n`
+in `results.single_games` when the result is a self-play or eval result of the acked scope, its id is at or below the
+`cursor`, `games <= n <= 64 x games` (an id holds at least one game) and no other count is stored for it. A pair that
+fails any of these is **left out, never an error** (a trainer's ingestion must not stall on a count): the answer
+gains `"single_games": {"stored", "ignored"}` (only when the ack carried the key; a pair repeating the stored count
+is `stored`). A malformed list is a 400. Without the key the request and the answer are exactly those of before.
+
+A trainer sends a count only when it is exact: it found every credited id in the result and knows the games of each
+(a contest played as chained episodes lists them in its record; a game the trainer's game package declares as one game
+an id counts one). Otherwise it sends no pair for that result, and `single_games` stays NULL: **not counted** - never
+an estimate. NULL is also every result before rev 30, a result acked by a trainer that does not count, a result whose
+record was refused, an untraced eval row of a chained contest (the row does not say how many games its match took),
+and a fuzz result (its ids are seeds).
+
+**22.2 Reading it.** `GET .../results` lists `single_games` (a number or null) with every result. A reader that
+reports games sums `single_games` over the results that have one and reports the `games` of the others apart, as
+ids whose single games are not known - it never adds the two.
+
+**22.3 The owner's own machines.** A source of `POST /v1/admin/external` may carry `single_games` and `uncounted`
+(each `{"1h", "24h"}`): of the source's self-play + eval ids in the window, the single games of the ids whose count
+its runs recorded, and the ids without a recorded count. Stored in `external_sources.single_1h`, `single_24h`,
+`uncounted_1h`, `uncounted_24h`; absent (a reporter before rev 30): NULL, and all of the source's ids are uncounted.
+`selfplay_games` and `eval_games` keep their meaning (ids).
+
+**Order of deployment.** The migration and the coordinator first (a coordinator before rev 30 ignores the ack's and
+the report's new keys, so a newer trainer may run against it; nothing is stored until it is deployed). No agent,
+worker, definition or lease changes.
+
+**Tests.** `test/single_games.test.ts`: counts stored with an ack and listed; an ack without them as before; pairs
+left out (fewer games than ids, beyond the cursor, another scope, another count than the stored one, a fuzz result);
+the list's shape; the external report's keys.
+
 ## Changes
+- v1 rev 30 (2026-11-23; coordinator migration 0019 `results.single_games`, `external_sources.single_*` /
+  `uncounted_*`; no agent or worker change; unreleased): **single games** (section 22). `POST .../ack` takes an optional
+  `single_games` list - the trainer's exact count of the single games in each result's credited ids -, `GET .../results`
+  lists it, `POST /v1/admin/external` takes `single_games` and `uncounted` per source. Without the new keys every
+  request and answer is as before.
 - v1 rev 29, agent 0.3.21 (2026-11-23; coordinator only, no migration; unreleased): **the ids a rolling lease gave up**
   (section 21). Beats' Stats `given_up` (agents from 0.3.21): the coordinator counts finished = credited + given up for
   the in-flight limit (finished games make room with every result, not once a beat), the buffer's rate counts finished

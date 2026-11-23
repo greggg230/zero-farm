@@ -26,7 +26,7 @@ export interface LeaseBookApi {
   putCampaign(cfg: book.CampaignCfg, now: number): Promise<Outcome<{ ok: true; created: boolean; cursor: number }>>;
   publishCheckpoint(req: book.CheckpointReq): Promise<Outcome<{ ok: true; unchanged: boolean; current: boolean; variants?: string[] }>>;
   accept(run: string, gen: number, games: number, now: number): Promise<Outcome<book.SelfplayState | null>>;
-  ack(scope: string, cursor: number, now: number): Promise<Outcome<{ ok: true; acked: number }>>;
+  ack(scope: string, cursor: number, now: number, single?: [number, number][]): Promise<Outcome<book.AckAnswer>>;
   selfplayState(run: string): Promise<Outcome<book.SelfplayState | null>>;
   putDefinition(row: DefinitionRow): Promise<Outcome<book.DefinitionAnswer>>;
 }
@@ -82,8 +82,8 @@ export class LeaseBook extends DurableObject<Env> implements LeaseBookApi {
   accept(run: string, gen: number, games: number, now: number) {
     return this.serial(() => book.accept(this.env, run, gen, games, now));
   }
-  ack(scope: string, cursor: number, now: number) {
-    return this.serial(() => book.ack(this.env, scope, cursor, now));
+  ack(scope: string, cursor: number, now: number, single?: [number, number][]) {
+    return this.serial(() => book.ack(this.env, scope, cursor, now, single));
   }
   // Rev 6: definitions change what a scope's grants may issue, so they go through its LeaseBook.
   putDefinition(row: DefinitionRow) {

@@ -1936,11 +1936,49 @@ export async function accept(env: Env, run: string, gen: number, games: number, 
   return sp ? selfplayState(db, r, sp) : null;
 }
 
-export async function ack(env: Env, scope: string, cursor: number, now: number): Promise<{ ok: true; acked: number }> {
-  const res = await env.DB.prepare(`UPDATE results SET acked_at = ? WHERE scope = ? AND id <= ? AND acked_at IS NULL`)
+// Rev 30 (PROTOCOL 22): at most this many single games in one credited id (a best-of-three match holds at most 3; a
+// count beyond it is a trainer bug and is not stored).
+export const MAX_SINGLE_PER_ID = 64;
+export const MAX_SINGLE_ENTRIES = 1000;
+
+export interface AckAnswer {
+  ok: true;
+  acked: number;
+  // Rev 30: only when the ack carried `single_games`: entries stored (or already stored with the same count) and
+  // entries left out (no such self-play / eval result of the scope at or below the cursor, a count outside
+  // [games, games x MAX_SINGLE_PER_ID], or another count than the one already stored).
+  single_games?: { stored: number; ignored: number };
+}
+
+// `single`: rev 30 (PROTOCOL 22), [[result id, n], ...] - the single games in the ids each result credited. An entry
+// that cannot be stored never fails the ack (the trainer's ingestion must not stall on it): it is counted `ignored`.
+export async function ack(env: Env, scope: string, cursor: number, now: number, single?: [number, number][]): Promise<AckAnswer> {
+  const db = env.DB;
+  let counts: { stored: number; ignored: number } | undefined;
+  if (single) {
+    counts = { stored: 0, ignored: 0 };
+    for (let i = 0; i < single.length; i += 50) {
+      const part = single.slice(i, i + 50);
+      const out = await db.batch(
+        part.map(([id, n]) =>
+          db
+            .prepare(
+              `UPDATE results SET single_games = ?1 WHERE id = ?2 AND scope = ?3 AND id <= ?4 AND kind IN ('selfplay', 'eval')
+                 AND ?1 >= games AND ?1 <= games * ${MAX_SINGLE_PER_ID} AND (single_games IS NULL OR single_games = ?1)`,
+            )
+            .bind(n, id, scope, cursor),
+        ),
+      );
+      for (const o of out) {
+        if (o.meta.changes) counts.stored += 1;
+        else counts.ignored += 1;
+      }
+    }
+  }
+  const res = await db.prepare(`UPDATE results SET acked_at = ? WHERE scope = ? AND id <= ? AND acked_at IS NULL`)
     .bind(now, scope, cursor)
     .run();
-  return { ok: true, acked: res.meta.changes ?? 0 };
+  return { ok: true, acked: res.meta.changes ?? 0, ...(counts ? { single_games: counts } : {}) };
 }
 
 // ---------- definitions (rev 6) ----------

@@ -31,6 +31,10 @@ export interface ExternalSource {
   eval: Window;
   fuzz: Window;
   busy_h_24h: number | null;
+  // Rev 30 (PROTOCOL 22): of the source's self-play + eval ids, the single games of the ids whose count its runs
+  // recorded and the ids without one; null: the reporter did not say (all of its ids are uncounted).
+  single: Window | null;
+  uncounted: Window | null;
 }
 
 export interface ExternalReport {
@@ -80,6 +84,8 @@ export function parseReport(b: Record<string, any>): ExternalReport {
       eval: window(s.eval_games, `${n}.eval_games`),
       fuzz: window(s.fuzz_seeds, `${n}.fuzz_seeds`),
       busy_h_24h: num(s.busy_h_24h, `${n}.busy_h_24h`, { optional: true, min: 0, max: 24 }) ?? null,
+      single: s.single_games === undefined || s.single_games === null ? null : window(s.single_games, `${n}.single_games`),
+      uncounted: s.uncounted === undefined || s.uncounted === null ? null : window(s.uncounted, `${n}.uncounted`),
     };
   });
   return { reporter, t, sources };
@@ -93,7 +99,8 @@ export async function storeReport(db: D1Database, r: ExternalReport, now: number
       db
         .prepare(
           `INSERT INTO external_sources (reporter, id, name, kind, hardware, working_on, selfplay_1h, selfplay_24h, eval_1h, eval_24h,
-             fuzz_1h, fuzz_24h, busy_h_24h, t, seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+             fuzz_1h, fuzz_24h, busy_h_24h, t, seen_at, single_1h, single_24h, uncounted_1h, uncounted_24h)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .bind(
           r.reporter,
@@ -111,6 +118,10 @@ export async function storeReport(db: D1Database, r: ExternalReport, now: number
           s.busy_h_24h,
           r.t,
           now,
+          s.single?.h1 ?? null,
+          s.single?.h24 ?? null,
+          s.uncounted?.h1 ?? null,
+          s.uncounted?.h24 ?? null,
         ),
     ),
   ];

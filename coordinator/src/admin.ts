@@ -839,6 +839,8 @@ async function listResults(c: Ctx, scope: string): Promise<Response> {
       kind: r.kind,
       gen: r.gen,
       games: r.games,
+      // Rev 30 (PROTOCOL 22): the single games in the credited ids, once a trainer's ack said so; else null.
+      single_games: r.single_games ?? null,
       ids: JSON.parse(r.ids),
       dup_ids: JSON.parse(r.dup_ids),
       sha256: r.sha256,
@@ -884,7 +886,18 @@ export async function acceptRoute(c: Ctx, run: string): Promise<Response> {
 async function ackScope(c: Ctx, scope: string): Promise<Response> {
   const b = await readJson(c.req);
   const cursor = int(b.cursor, "cursor", { min: 0 });
-  return json(unwrap(await bookFor(c.env, scope).ack(scope, cursor, c.now)));
+  // Rev 30 (PROTOCOL 22): the single games in the ids each result credited, as the trainer counted them: optional.
+  let single: [number, number][] | undefined;
+  if (b.single_games !== undefined && b.single_games !== null) {
+    if (!Array.isArray(b.single_games) || b.single_games.length > book.MAX_SINGLE_ENTRIES) {
+      throw bad(`single_games must be a list of at most ${book.MAX_SINGLE_ENTRIES} [result id, single games] pairs`);
+    }
+    single = b.single_games.map((e: unknown, i: number): [number, number] => {
+      if (!Array.isArray(e) || e.length !== 2) throw bad(`single_games[${i}] must be [result id, single games]`);
+      return [int(e[0], `single_games[${i}][0]`, { min: 1 }), int(e[1], `single_games[${i}][1]`, { min: 0, max: 1e9 })];
+    });
+  }
+  return json(unwrap(await bookFor(c.env, scope).ack(scope, cursor, c.now, single)));
 }
 
 export async function runAck(c: Ctx, run: string): Promise<Response> {
