@@ -1046,6 +1046,9 @@ export async function updateMachine(c: Ctx, id: string): Promise<Response> {
   if (optSet !== undefined && (optAdd || optRemove)) throw bad("opt_in replaces the list: not with opt_in_add or opt_in_remove");
   // Rev 28 (PROTOCOL 20): the owner's freshness settings for this machine (replaced whole; null or {}: none)
   const fresh = b.fresh === undefined ? undefined : machineFreshIn(b.fresh);
+  // Rev 28 (PROTOCOL 20.7): the owner's disk cap for this machine in MB (null: none - the friend's own setting applies);
+  // only with the friend's consent: it replaces the cap they set on their PC while it is set
+  const diskCap = b.disk_cap_mb === undefined ? undefined : b.disk_cap_mb === null ? null : int(b.disk_cap_mb, "disk_cap_mb", { min: DISK_CAP_MIN_MB, max: DISK_CAP_MAX_MB });
   const r = await c.env.DB.prepare(
     `UPDATE machines SET channel = COALESCE(?, channel), paused = COALESCE(?, paused), name = COALESCE(?, name) WHERE machine_id = ?`,
   )
@@ -1065,10 +1068,17 @@ export async function updateMachine(c: Ctx, id: string): Promise<Response> {
   if (fresh !== undefined) {
     await c.env.DB.prepare(`UPDATE machines SET fresh = ? WHERE machine_id = ?`).bind(Object.keys(fresh).length ? JSON.stringify(fresh) : null, id).run();
   }
+  if (diskCap !== undefined) {
+    await c.env.DB.prepare(`UPDATE machines SET disk_cap_mb = ? WHERE machine_id = ?`).bind(diskCap, id).run();
+  }
   // Rev 5: lifts the builds this machine reported as blocked by Windows (/v1/crash kind blocked).
   const unblocked = unblock ? ((await c.env.DB.prepare(`DELETE FROM blocks WHERE machine_id = ?`).bind(id).run()).meta.changes ?? 0) : 0;
-  return json({ ok: true, ...(unblock ? { unblocked } : {}), ...(optIn !== undefined ? { opt_in: optIn } : {}), ...(fresh !== undefined ? { fresh } : {}) });
+  return json({ ok: true, ...(unblock ? { unblocked } : {}), ...(optIn !== undefined ? { opt_in: optIn } : {}), ...(fresh !== undefined ? { fresh } : {}), ...(diskCap !== undefined ? { disk_cap_mb: diskCap } : {}) });
 }
+
+// Rev 28 (PROTOCOL 20.7): the owner's disk cap per machine, as the agent's own `disk_cap_mb` takes it (1 GB to 16 TB).
+export const DISK_CAP_MIN_MB = 1024;
+export const DISK_CAP_MAX_MB = 1 << 24;
 
 // Rev 28 (PROTOCOL 20): a machine's `fresh` as put: `{"poll_s": 2..300, "share": 0.1..4}`, each optional (null or {}: none).
 function machineFreshIn(v: unknown): MachineFresh {
@@ -1250,7 +1260,7 @@ export async function stats(c: Ctx): Promise<Response> {
   const cfg = config(c.env);
   const [machinesR, leasesR, crashesR, thrR, runsR, campsR, recentCrashR, fuzzR, classR, pausedR, failCountR, releasesR, diagR, blocksR, batchesR, perMachineR, perScopeR, externalR] = await db.batch<any>([
     db.prepare(
-      `SELECT machine_id, name, class, channel, platform, agent_version, created_at, last_seen, revoked_at, paused, caps, presence, presence_t, tuning, tuning_t, opt_in, fresh,
+      `SELECT machine_id, name, class, channel, platform, agent_version, created_at, last_seen, revoked_at, paused, caps, presence, presence_t, tuning, tuning_t, opt_in, fresh, disk_cap_mb,
          json_extract(profile, '$.idle_h_day') AS idle_h_day, json_extract(profile, '$.on_h_day') AS on_h_day,
          json_extract(profile, '$.providers') AS providers, json_extract(profile, '$.gpus') AS gpus
        FROM machines ORDER BY created_at`,
@@ -1352,6 +1362,8 @@ export async function stats(c: Ctx): Promise<Response> {
       opt_in: [...machineOptIns(m.opt_in)],
       // Rev 28 (PROTOCOL 20): the owner's freshness settings for it ({}: none).
       fresh: machineFreshOf(m.fresh),
+      // Rev 28 (PROTOCOL 20.7): the owner's disk cap for it (MB; null: none, the agent's own setting applies).
+      disk_cap_mb: m.disk_cap_mb ?? null,
       // Rev 16: why an online agent isn't working (POST /v1/presence), while fresh.
       presence: presenceOf(m, c.now),
       // Rev 19 (PROTOCOL 13): the CPU layouts its agent tuned (its last report) and when it sent them.
@@ -1530,6 +1542,7 @@ export async function stats(c: Ctx): Promise<Response> {
       torch_agent: cfg.torchAgent,
       // rev 28 (PROTOCOL 20)
       poll_agent: cfg.pollAgent,
+      disk_cap_agent: cfg.diskCapAgent,
       data_keys: cfg.dataPubkeys.length,
       max_active_leases: cfg.maxActiveLeases,
       max_lease_chunks: cfg.maxLeaseChunks,

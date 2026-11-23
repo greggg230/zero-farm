@@ -19,6 +19,9 @@ use zerofarm_common::rotlog::RotatingFile;
 
 /// Past this many bytes of unsent results, ask only for fuzz/diag work (DESIGN 3.5).
 pub const MAX_PENDING_RESULTS: u64 = 200 << 20;
+/// rev 28 (PROTOCOL 20.7): after the owner's disk cap changed in a "no work" answer, ask again within this many seconds
+/// (the ask's caps.disk_mb was the old cap's).
+pub const OWNER_CAP_RETRY_S: u64 = 5;
 
 /// Quit and wake-up signals between the tray/main thread and the engine thread.
 #[derive(Default)]
@@ -184,8 +187,27 @@ impl Engine {
         })
     }
 
+    /// The settings the agent works by (rev 28, PROTOCOL 20.7: with the farm owner's disk cap in place of the friend's
+    /// while it is set - `Machine::settings_now`).
     pub fn settings(&self) -> Settings {
-        self.machine.lock().unwrap().settings.clone()
+        self.machine.lock().unwrap().settings_now()
+    }
+
+    /// rev 28 (PROTOCOL 20.7): a lease answer's `owner_disk_cap_mb` (None: cleared), kept in `machine.json`. -> whether it
+    /// changed.
+    pub(crate) fn apply_owner_disk_cap(&mut self, mb: Option<u64>) -> bool {
+        let mut m = self.machine.lock().unwrap();
+        if !m.set_owner_disk_cap(mb) {
+            return false;
+        }
+        match mb {
+            Some(n) => log::info!("the farm owner set this PC's disk cap to {n} MB (its own setting, {} MB, applies again when the owner clears it)", m.settings.disk_cap_mb),
+            None => log::info!("the farm owner cleared this PC's disk cap: its own setting, {} MB, applies again", m.settings.disk_cap_mb),
+        }
+        if let Err(e) = m.save(&self.cfg.layout) {
+            log::warn!("could not save machine.json: {e}");
+        }
+        true
     }
 
     pub fn quitting(&self) -> bool {
@@ -534,12 +556,16 @@ impl Engine {
         if let Some(what) = &resp.upload_diag {
             crate::logging::upload_diag(&self.client, &self.cfg.layout, what);
         }
+        // rev 28 (PROTOCOL 20.7): the owner's disk cap (absent: an older coordinator, unchanged). This ask's caps.disk_mb
+        // came from the cap of before, so a changed cap with "no work" asks again soon with the new one.
+        let cap_changed = resp.owner_disk_cap_mb.is_some_and(|mb| self.apply_owner_disk_cap(mb));
         if let Some(l) = resp.lease {
             Ok(Answer::Lease(Box::new(l)))
         } else if let Some(u) = resp.update {
             Ok(Answer::Update(u.min_agent))
         } else {
-            Ok(Answer::Wait(resp.wait_s.unwrap_or(60), resp.reason.unwrap_or_default()))
+            let (wait, reason) = (resp.wait_s.unwrap_or(60), resp.reason.unwrap_or_default());
+            Ok(Answer::Wait(if cap_changed && reason == "no_work" { wait.min(OWNER_CAP_RETRY_S) } else { wait }, reason))
         }
     }
 

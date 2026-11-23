@@ -202,7 +202,8 @@ Response, exactly one of:
   release keeps the stable channel's agents on everything else).
 
 Any of the three may also carry `"upload_diag": ["logs"]` (as a beat answer can): a machine with no
-lease hears about a diagnostics request on its next `/v1/lease`.
+lease hears about a diagnostics request on its next `/v1/lease`. Rev 28 (section 20.7): to agents from `DISK_CAP_AGENT`
+(0.3.20), `wait_s` and `lease` answers always carry `"owner_disk_cap_mb": n | null`, the owner's disk cap for the machine.
 
 How the coordinator picks (DESIGN 5.1): diagnostics asked for this machine first; then runs'
 evaluation (unissued games) and self-play (short of quota), by run priority × fit ÷ (1 + that job's
@@ -427,7 +428,7 @@ tools also send an Access service token (`CF-Access-Client-Id`, `CF-Access-Clien
 | `GET /v1/admin/campaign/{id}` · `GET …/results?after=` · `POST …/ack` | config (rev 14: with `share`) + `cursor`, `seeds_done`, `seeds_leased`, `active_leases`, `pool`, `failures`, `sites`; results and ack as for runs (`ids` are seeds) |
 | `GET /v1/admin/campaign/{id}/failures?after=&limit=` | → `{"failures": [{"id", "seed", "mode", "site", "panic", "repro", "output_tail", "build_id", "engine_commit", "machine_id", "lease_id", "first_of_site", "t"}], "cursor"}` (section 5.1; one row per (seed, site)) |
 | `GET /v1/admin/machines` · `POST /v1/admin/machine/{id}/revoke` | revoking cancels the machine's active leases at once (their ids go back to the pool) → `{"ok": true, "cancelled"}` |
-| `POST /v1/admin/machine/{id}` | `{"name"?, "channel"?, "paused"?, "unblock"?, "opt_in"?, "opt_in_add"?, "opt_in_remove"?}`; a paused machine gets `wait_s` / `paused_by_admin`; `"unblock": true` (rev 5) lifts the machine's build blocks (`/v1/crash` kind `blocked`) and answers `{"ok": true, "unblocked": n}`; rev 27 (19.2): the machine's opt-in runtimes, answered as `"opt_in": [...]` |
+| `POST /v1/admin/machine/{id}` | `{"name"?, "channel"?, "paused"?, "unblock"?, "opt_in"?, "opt_in_add"?, "opt_in_remove"?}`; a paused machine gets `wait_s` / `paused_by_admin`; `"unblock": true` (rev 5) lifts the machine's build blocks (`/v1/crash` kind `blocked`) and answers `{"ok": true, "unblocked": n}`; rev 27 (19.2): the machine's opt-in runtimes, answered as `"opt_in": [...]`; rev 28: `"fresh"` (20.4) and `"disk_cap_mb"` (20.7, the owner's disk cap, MB or null) |
 | `POST /v1/admin/pause` | `{"paused": true \| false}`: farm-wide, no new leases while paused |
 | `POST /v1/admin/routing` | rev 18: `{"on": bool, "eval_horizon_s": 0..604800, "eval_games_per_thread": 0..16}`, rev 24: `"priority_lane": "off" \| "canary" \| "all"`, `"eval_stall_s": 0..86400`; any of them; the others keep their values → `{"ok": true, "on", "eval_horizon_s", "eval_games_per_thread", "priority_lane", "eval_stall_s"}`. `GET /v1/admin/routing` → the same fields and `"stored"` (false: never set, the defaults). Sections 12, 15.6 |
 | `POST /v1/admin/evict` | rev 12: `{"builds": ["<build_id>", ...]}` (at most 64; `[]` clears it) replaces the evict list → `{"ok": true, "builds"}` (deduplicated). `GET /v1/admin/evict` → `{"builds"}`. It rides on every `GET /v1/agent/latest` (section 3) |
@@ -2840,7 +2841,7 @@ shim (it is a file of the worker build like any other, signed with it).
    `npm run admin -- machine <id> opt-in torch` for each of the two machines (`machines` shows their ids).
 4. To stop: `opt-out torch` (from the next lease), or take the alternate off the run.
 
-## 20. Fresher rows from fast machines (rev 28; coordinator migration 0018, Worker var `POLL_AGENT`; agents from 0.3.20)
+## 20. Fresher rows from fast machines (rev 28; coordinator migration 0018, Worker vars `POLL_AGENT`, `DISK_CAP_AGENT`; agents from 0.3.20)
 
 **Why.** The owner's bar for moving the training desktop's self-play onto the farm (2026-11-22): at least 95 % of its
 local games an hour, rows no staler than local ones, iterations no slower. Local self-play's rows lag ~0.5 generations:
@@ -2945,6 +2946,38 @@ costs; everything is additive, and agents before 0.3.20 see exactly the answers 
    enough for the desktop's in-flight (zero-core `farm_pool`).
 5. To undo: `fresh off` (from the next answer), or `fresh_cap` `"off"` for the budget part.
 
+### 20.7 The owner's disk cap per machine (migration 0018, Worker var `DISK_CAP_AGENT`)
+
+**Why.** A friend's agent caps everything under its install root at its local `disk_cap_mb` - 3,072 MB unless they
+changed it, settable only on their PC (Windows: `farm-agent set` with the agent stopped; the tray doesn't show it). It
+reports what it may still download under that cap as `caps.disk_mb`, and 9.4 rule 5 offers an alternate only when its
+uncached builds' plain sizes fit `caps.disk_mb`. The torch runtime pack alone is 4.33 GB, so on a friend's PC that opted
+into torch (19.2) the torch alternate could never fit, however much free disk the PC had. With the friend's consent the
+owner sets a larger cap for that machine on the coordinator.
+
+- **Coordinator.** `machines.disk_cap_mb` (INTEGER, NULL: none). `POST /v1/admin/machine/{id}` takes `"disk_cap_mb": n |
+  null` (an integer from 1,024 to 16,777,216 MB, as the agent's own setting takes; else 400) and answers
+  `{"ok": true, "disk_cap_mb": n | null}`. Admin CLI: `npm run admin -- machine <id> disk-cap <MB>` / `... disk-cap off`.
+  `GET /v1/admin/machines` and the stats' machines list `disk_cap_mb`; the admin page shows "disk cap: n MB" under the
+  machine's agent version; the stats' `limits` add `disk_cap_agent`. Only with the friend's consent: it replaces the cap
+  they chose.
+- **On the wire.** To an agent from `DISK_CAP_AGENT` (default 0.3.20), every `/v1/lease` answer that is a `lease` or a
+  `wait_s` (`no_work`, `paused_by_admin`, `too_many_leases`) carries `"owner_disk_cap_mb": n | null` - null when the owner
+  set none. The machine-level settings ride on lease answers as `upload_diag` does (section 3); `/v1/agent/latest` would
+  reach the agent only at start and every 6 h. Older agents never get the key. The coordinator's fit is unchanged: it
+  still compares sizes with the `caps.disk_mb` the agent reports, which follows the cap from the agent's next ask.
+- **The agent (0.3.20).** A number (1,024 to 16,777,216; anything else is ignored and the cap stays as it was) becomes the
+  machine's effective disk cap: it **replaces** the friend's own `disk_cap_mb` (not the larger of the two) for every use -
+  `caps.disk_mb`, downloads and eviction, the in-lease update check. The friend's own setting is kept unchanged in
+  `machine.json` beside it (`owner_disk_cap_mb`, written only while set, so it holds across restarts) and applies again
+  as soon as an answer says null (the owner cleared it). An answer without the key (a coordinator before rev 28) changes
+  nothing. When the cap changed in a `no_work` answer, the agent asks again within 5 s (that ask's `caps.disk_mb` came
+  from the cap of before). The tray shows "Disk space for the farm: N GB (set by the farm owner; your own setting, M GB,
+  applies again when the owner clears it)" while it is set; the macOS `ZeroFarm status` and Windows `farm-agent
+  settings` say the same; diagnostics' settings line adds `owner_disk_cap_mb=N`.
+- **Agents before 0.3.20** keep their local cap: the owner's cap reaches a machine once its channel's release is 0.3.20
+  or newer. A locally paused agent asks for no lease, so it hears of the cap when it resumes.
+
 ## Changes
 - v1 rev 28, agent 0.3.20 (2026-11-22; coordinator migration 0018 `machines.fresh`, Worker var `POLL_AGENT` default
   0.3.20; unreleased): **fresher rows from fast machines** (section 20). An extension may say its `gen` and every answer
@@ -2959,7 +2992,12 @@ costs; everything is additive, and agents before 0.3.20 see exactly the answers 
   desktop simulated at 1.5-2.3 generations of lag against local self-play's ~0.5 (a gen reached a lease only with a beat,
   ~30 s; the run's budget never bound there; drains played on a frozen gen); a renewing desktop lease would hit the
   2,000-chunk limit in ~3-5 h; and the second PC's leases were finished at every renewal because its stored disk cap
-  could not hold its own run's CUDA pack.
+  could not hold its own run's CUDA pack. Also (20.7; migration 0018 `machines.disk_cap_mb`, Worker var `DISK_CAP_AGENT`
+  default 0.3.20): **the owner's disk cap per machine** (`POST /v1/admin/machine/{id}` `disk_cap_mb`, CLI `machine <id>
+  disk-cap <MB|off>`), sent as `owner_disk_cap_mb` in every lease and wait answer to agents from `DISK_CAP_AGENT`;
+  agent 0.3.20 uses it in place of the friend's own `disk_cap_mb` while it is set (kept in `machine.json`, shown in the
+  tray), and the friend's setting applies again once the owner clears it. Why: a friend's default 3 GB cap can never
+  hold the 4.33 GB torch pack (9.4 rule 5), and the friend can only change it on their PC.
 - v1 rev 27, agent 0.3.19 (2026-11-22; coordinator migration 0017 `machines.opt_in`, Worker var `TORCH_AGENT` default
   0.3.19; unreleased): **opt-in runtimes per machine - the torch runtime** (section 19). Runtime manifests may carry
   `opt_in` (a name; `farm-release sign --opt-in`, `min_agent` 0.3.19+); the provider `torch-cuda` (only in an opt-in pack,

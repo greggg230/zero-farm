@@ -395,7 +395,10 @@ export async function lease(c: Ctx): Promise<Response> {
   if (o.need && cmpSemver(agent, o.need) < 0) return json({ update: { min_agent: o.need } });
 
   const uploadDiag = await takeUploadDiag(db, m, c.now);
-  const withDiag = (x: Record<string, unknown>) => json(uploadDiag ? { ...x, upload_diag: uploadDiag } : x);
+  // Rev 28 (PROTOCOL 20.7): every answer below tells an agent from DISK_CAP_AGENT the owner's disk cap for this machine
+  // (null: none), which it uses in place of its own setting while it is set - so its next ask's caps.disk_mb follows it
+  const diskCap = cmpSemver(agent, cfg.diskCapAgent) >= 0 ? { owner_disk_cap_mb: m.disk_cap_mb ?? null } : {};
+  const withDiag = (x: Record<string, unknown>) => json(uploadDiag ? { ...x, ...diskCap, upload_diag: uploadDiag } : { ...x, ...diskCap });
 
   if (o.farmPaused || m.paused) return withDiag({ wait_s: WAIT_S, reason: "paused_by_admin" });
   // Review M4: one machine can't hoard work (an agent runs one lease at a time; one more covers a

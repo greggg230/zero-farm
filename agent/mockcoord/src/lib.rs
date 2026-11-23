@@ -106,6 +106,9 @@ pub struct State {
     pub enroll_min_agent: Option<String>,
     /// The next lease answer / beat carries `"upload_diag": ["logs"]`.
     pub upload_diag_next: bool,
+    /// rev 28 (PROTOCOL 20.7): every lease answer (a lease or "no work") carries `"owner_disk_cap_mb": <this>` (a number
+    /// or null; None: no key, a coordinator before rev 28).
+    pub owner_disk_cap: Option<Value>,
     pub diag_requested: bool,
     /// Self-play chunks with `x-gen` below this are stale (410).
     pub stale_below_gen: Option<u64>,
@@ -676,10 +679,12 @@ fn handle(mut req: Request, st: &Arc<Mutex<State>>) {
                 s.granted.insert(id.clone(), std::time::Instant::now());
                 s.leases.insert(id, LeaseState { lease: l.clone(), ..Default::default() });
                 let ans = with_diag(&mut s, json!({"lease": l}));
+                let ans = with_owner_cap(&s, ans);
                 done!(reply(req, 200, ans))
             } else {
                 let w = s.wait_s;
                 let ans = with_diag(&mut s, json!({"wait_s": w, "reason": "no_work"}));
+                let ans = with_owner_cap(&s, ans);
                 done!(reply(req, 200, ans))
             }
         }
@@ -969,6 +974,14 @@ fn is_semver(v: &str) -> bool {
 fn semver_lt(a: &str, b: &str) -> bool {
     let n = |v: &str| -> Vec<u64> { v.split(['-', '+']).next().unwrap_or("").split('.').map(|x| x.parse().unwrap_or(0)).collect() };
     n(a) < n(b)
+}
+
+/// rev 28 (PROTOCOL 20.7): adds the owner's disk cap to a lease answer when the test set one.
+fn with_owner_cap(s: &State, mut ans: Value) -> Value {
+    if let Some(v) = &s.owner_disk_cap {
+        ans["owner_disk_cap_mb"] = v.clone();
+    }
+    ans
 }
 
 /// Adds `upload_diag` to an answer when one is pending.

@@ -12,6 +12,11 @@ version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's:
   hears about new networks with every request for more games too, asks every few seconds where the farm owner turned
   that on for the computer, and switches its last games to a new network while a job winds down. Practice games then
   reach the training with fresher positions, and fewer are thrown away as too old.
+- **The farm owner can raise this computer's disk space limit from the server - only with your consent.** Zero Farm
+  keeps its files under a disk space limit you can set (3 GB unless you changed it). Some of the farm's programs are now
+  bigger than that (the PyTorch program's files are over 4 GB). When you agree, the farm owner can set a different limit
+  for your computer; Zero Farm then uses the owner's limit instead of yours, and the tray menu says so ("set by the farm
+  owner"). Your own setting is kept, and applies again as soon as the owner clears theirs.
 
 ## Unreleased (0.3.19)
 

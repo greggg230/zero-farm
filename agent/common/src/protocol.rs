@@ -336,6 +336,11 @@ pub struct LeaseResp {
     /// rev 2: any lease answer may ask for diagnostics (`["logs"]`).
     #[serde(default)]
     pub upload_diag: Option<Vec<String>>,
+    /// rev 28 (PROTOCOL 20.7): the farm owner's disk cap for this machine in MB, which the agent uses in place of its own
+    /// `disk_cap_mb` while it is set (`fresh_update`: absent - unchanged, an older coordinator; null - none, the
+    /// friend's own setting applies again).
+    #[serde(default, deserialize_with = "fresh_update", skip_serializing_if = "Option::is_none")]
+    pub owner_disk_cap_mb: Option<Option<u64>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
@@ -568,6 +573,11 @@ mod tests {
         assert_eq!(serde_json::from_str::<Rolling>(r#"{"block": [0, 10], "poll_s": 5}"#).unwrap().poll_s, Some(5));
         assert_eq!(serde_json::from_str::<Rolling>(r#"{"block": [0, 10]}"#).unwrap().poll_s, None);
         assert_eq!(serde_json::from_str::<BeatResp>(r#"{"action": "continue", "poll_s": 5}"#).unwrap().poll_s, Some(Some(5)));
+        // rev 28 (PROTOCOL 20.7): the owner's disk cap in lease answers - absent: unchanged; null: none
+        let la = |s: &str| serde_json::from_str::<LeaseResp>(s).unwrap().owner_disk_cap_mb;
+        assert_eq!(la(r#"{"wait_s": 300, "reason": "no_work"}"#), None);
+        assert_eq!(la(r#"{"wait_s": 300, "reason": "no_work", "owner_disk_cap_mb": null}"#), Some(None));
+        assert_eq!(la(r#"{"wait_s": 300, "reason": "paused_by_admin", "owner_disk_cap_mb": 12288}"#), Some(Some(12288)));
         let b = serde_json::to_value(BeatReq { state: "running".into(), progress: Progress::default(), stats: Stats::new(), gen: None }).unwrap();
         assert!(b.get("gen").is_none(), "classic beats are unchanged");
         let c = CrashReq { kind: "blocked".into(), os_error: Some(4551), ..Default::default() };

@@ -26,6 +26,9 @@ CF_ACCESS_CLIENT_ID and CF_ACCESS_CLIENT_SECRET, an Access service token)
   machine <machine_id> fresh '<json>' | off        freshness settings per machine (rev 28, PROTOCOL 20), e.g.
                                                    '{"poll_s":5,"share":0.75}': poll for new generations every
                                                    poll_s s; a freshness budget of share x the run's period
+  machine <machine_id> disk-cap <MB> | off         the owner's disk cap per machine (rev 28, PROTOCOL 20.7), only
+                                                   with the friend's consent: agents from 0.3.20 use it in place of
+                                                   their own disk_cap_mb while it is set; off: theirs again
   revoke <machine_id>
   pause | resume                                   farm-wide: no new leases while paused
 
@@ -229,7 +232,14 @@ async function main(argv: string[]): Promise<void> {
         }
         return print(await api("POST", `/v1/admin/machine/${pos[0]}`, { fresh }));
       }
-      if (pos.length > 1) throw new Fail(`machine: unknown subcommand ${pos[1]} (opt-in, opt-out or fresh)`);
+      // rev 28 (PROTOCOL 20.7): machine <id> disk-cap <MB> | off
+      if (pos[1] === "disk-cap") {
+        need(pos, 3, "machine <machine_id> disk-cap <MB> | off");
+        const mb = pos[2] === "off" ? null : Number(pos[2]);
+        if (mb !== null && !(Number.isSafeInteger(mb) && mb > 0)) throw new Fail(`machine disk-cap: a whole number of MB or off, not ${pos[2]}`);
+        return print(await api("POST", `/v1/admin/machine/${pos[0]}`, { disk_cap_mb: mb }));
+      }
+      if (pos.length > 1) throw new Fail(`machine: unknown subcommand ${pos[1]} (opt-in, opt-out, fresh or disk-cap)`);
       return print(
         await api("POST", `/v1/admin/machine/${pos[0]}`, {
           name: opt.name,
