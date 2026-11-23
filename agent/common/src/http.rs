@@ -269,7 +269,8 @@ impl Client {
 
     /// Downloads `GET /v1/artifact/{key}` into `dest`, resuming a previous partial download
     /// (`dest` + `.part`) with a range request, refusing more than `want.max` bytes, and checking
-    /// size and sha256 before the file appears under its final name.
+    /// size and sha256 before the file appears under its final name. A file whose declared size
+    /// is 0 is not requested: it is created empty and checked like any other.
     pub fn download(&self, key: &str, dest: &Path, want: &Want, stop: &dyn Fn() -> bool) -> Result<(), CallError> {
         check_key(key)?;
         let part = part_path(dest);
@@ -356,6 +357,14 @@ impl Client {
                 f.write_all(&buf[..n]).map_err(|e| CallError::Network(format!("write: {e}")))?;
             }
             f.flush().map_err(|e| CallError::Network(format!("flush: {e}")))?;
+        } else if have == 0 {
+            // An empty file (`size` 0) with no partial download: there is nothing to fetch, but the file must still
+            // exist to be checked and get its name (0.3.21; before, it failed with "cannot find the file").
+            OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&part)
+                .map_err(|e| CallError::Network(format!("open {}: {e}", part.display())))?;
         }
         let (sha, size) = crate::hash::sha256_file(&part).map_err(|e| CallError::Network(e.to_string()))?;
         if let Some(s) = want.size {
@@ -534,6 +543,43 @@ mod tests {
         assert!(check_key("../etc").is_err());
         assert!(check_key("/abs").is_err());
         assert!(check_key("a b").is_err());
+    }
+
+    /// A file declared empty needs no request (nothing listens on the port here): it appears under its name, checked,
+    /// whether or not an empty `.part` was left behind; a wrong sha256 never gets the name.
+    #[test]
+    fn an_empty_file_is_created_and_checked_without_a_request() {
+        const EMPTY: &str = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let d = tempfile::tempdir().unwrap();
+        let c = Client::new("http://127.0.0.1:9", None, "0.0.0").unwrap();
+        let want = |sha: &str| Want { size: Some(0), sha256: Some(sha.to_string()), max: 0 };
+        // no `.part`: created, verified, renamed (also into a directory that does not exist yet)
+        let dest = d.path().join("pkg").join("sub").join("__init__.py");
+        c.download("builds/x/pkg/sub/__init__.py", &dest, &want(EMPTY), &|| false).unwrap();
+        assert_eq!(std::fs::metadata(&dest).unwrap().len(), 0);
+        assert!(!part_path(&dest).exists());
+        // an empty `.part` left by an earlier attempt: the same
+        let dest2 = d.path().join("b.py");
+        std::fs::write(part_path(&dest2), b"").unwrap();
+        c.download("builds/x/b.py", &dest2, &want(EMPTY), &|| false).unwrap();
+        assert_eq!(std::fs::metadata(&dest2).unwrap().len(), 0);
+        assert!(!part_path(&dest2).exists());
+        // a sha256 that is not the empty file's: refused, nothing under the name, no `.part` left
+        let dest3 = d.path().join("c.py");
+        let e = c.download("builds/x/c.py", &dest3, &want(&"0".repeat(64)), &|| false).unwrap_err();
+        assert!(matches!(e, CallError::Integrity(_)), "{e}");
+        assert!(!dest3.exists() && !part_path(&dest3).exists());
+        // no declared size: a request is needed as before (and fails here: nothing listens)
+        let dest4 = d.path().join("d.py");
+        let e = c.download("builds/x/d.py", &dest4, &Want { size: None, sha256: None, max: 10 }, &|| false).unwrap_err();
+        assert!(matches!(e, CallError::Network(_)), "{e}");
+        assert!(!dest4.exists());
+        // a non-empty file that is complete in its `.part` is still only checked and renamed (resume unchanged)
+        let dest5 = d.path().join("e.bin");
+        std::fs::write(part_path(&dest5), b"abc").unwrap();
+        let abc = crate::hash::sha256_file(&part_path(&dest5)).unwrap().0;
+        c.download("builds/x/e.bin", &dest5, &Want { size: Some(3), sha256: Some(abc), max: 3 }, &|| false).unwrap();
+        assert_eq!(std::fs::read(&dest5).unwrap(), b"abc");
     }
 
     #[test]

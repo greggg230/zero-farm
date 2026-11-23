@@ -39,6 +39,12 @@ fn torch_pack(dir: &Path, key: &SigningKey, probe: &Value) -> String {
     std::fs::copy(mockcoord::testkit::bin("fakeworker"), py.join("python.exe")).unwrap();
     std::fs::write(py.join("torch_probe.json"), probe.to_string()).unwrap();
     std::fs::write(py.join("python313._pth"), "python313.zip\n.\nLib\\site-packages\n").unwrap();
+    // empty files, as a real Python has many (`__init__.py`): agents before 0.3.21 could not download one
+    for pkg in ["pkg", "pkg/sub"] {
+        let d = py.join("Lib").join("site-packages").join(pkg);
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("__init__.py"), b"").unwrap();
+    }
     let mut t = template(Kind::Runtime, "torch-2.11.0-cu128-py313");
     t.min_agent = Some(OPT_IN_MIN_AGENT.into());
     t.gpu = Some(GpuNeed { vendor: "nvidia".into(), min_driver: Some("570.65".into()), providers: vec![TORCH_PROVIDER.into()] });
@@ -144,6 +150,11 @@ fn a_torch_job_is_one_worker_process_behind_the_shim_on_the_packs_python() {
     h.push(torch_lease(&h, &t, "l_T1", &fake));
     h.start();
     assert!(wait(|| credits(&h, "l_T1").0 >= 8), "games credited: {}", h.agent_log());
+    // the pack's empty files were installed (0.3.21): present under their names, zero bytes
+    for pkg in ["pkg", "pkg\\sub"] {
+        let init = h.layout.cache_builds().join(&t.pack).join("python\\Lib\\site-packages").join(pkg).join("__init__.py");
+        assert_eq!(std::fs::metadata(&init).map(|m| m.len()).ok(), Some(0), "{}", init.display());
+    }
     // the probe: the pack's python with the probe's flags, before the first job line; recorded as torch-cuda
     let log = h.agent_log();
     let probe_at = log.find("fakeworker: python -I -B -X utf8 script=<code>").unwrap_or_else(|| panic!("the torch probe ran: {log}"));

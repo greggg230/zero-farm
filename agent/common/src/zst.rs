@@ -89,6 +89,24 @@ pub fn pack(src: &Path, dest: &Path, level: i32, threads: u32) -> Result<Packed,
 mod tests {
     use super::*;
 
+    /// An empty file's compressed copy (`farm-release` makes none, but a manifest may name one) unpacks to an empty
+    /// file under its name.
+    #[test]
+    fn an_empty_file_packs_and_unpacks() {
+        let d = tempfile::tempdir().unwrap();
+        let src = d.path().join("__init__.py");
+        std::fs::write(&src, b"").unwrap();
+        let z = d.path().join("__init__.py.zst");
+        let p = pack(&src, &z, 3, 1).unwrap();
+        assert!(p.size > 0, "{p:?}");
+        let (sha, n) = crate::hash::sha256_file(&src).unwrap();
+        assert_eq!(n, 0);
+        let out = d.path().join("out.py");
+        unpack(&z, &out, 0, &sha, &|| false).unwrap();
+        assert_eq!(std::fs::metadata(&out).unwrap().len(), 0);
+        assert!(!d.path().join("out.py.part").exists());
+    }
+
     #[test]
     fn pack_then_unpack_checks_size_and_hash() {
         let d = tempfile::tempdir().unwrap();
