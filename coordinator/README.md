@@ -148,6 +148,7 @@ npm run check     # wrangler types --check, tsc (src + test), tsc (scripts)
 | `fresh.test.ts` | rev 26 freshness budget: the formula (too little history: none; steady gens; outliers - a trainer pause, a burst, a gen registered late; the open gap; floor and cap), the setting `fresh_cap` (default canary, validation), `rolling.fresh_s` in the lease and `fresh_s` in beat and extension answers for an agent from `FRESH_AGENT` on a canary machine, following the run's pace; none for a run with too little history (null in the answers); the answers of before for older agents, stable machines under "canary" and everyone under "off"; per run |
 | `fresh_desktop.test.ts` | rev 28: an extension with `gen` is offered checkpoint + definition (also with `finish`), stores `cur_gen` (never older than the lease's first), the answer of before without `gen`; `POST /v1/lease/{id}/poll` answers the offer and changes nothing, 400 / 404 / 410, its own rate bucket; the machine setting `fresh` (validation, replace, clear, machines / stats, defensive reads); `poll_s` in the lease and every answer for agents from `POLL_AGENT`, null once unset, never for older agents; `share`: min(the run's budget, share x period) on any channel, off under `fresh_cap` "off"; result limits per started hour of a rolling lease |
 | `owner_disk_cap.test.ts` | rev 28 (20.7): the machine setting `disk_cap_mb` (set, shown in machines / stats, kept by other updates, cleared; 1,024..16,777,216 integers only, 404 for an unknown machine); `owner_disk_cap_mb` in no-work, paused and lease answers for agents from `DISK_CAP_AGENT` (null when unset), never for older agents; the fit still follows the reported `caps.disk_mb` |
+| `rolling.test.ts` (rev 29 part) | PROTOCOL 21.1, Stats `given_up`: games credited after a handoff make room at once (no beat needed), given-up ids are out of the run's quota (never more than the uncredited ids; junk counts as 0) and back in the pool when the lease closes, the buffer's rate counts finished games only |
 | `fleet.test.ts` | 10 fake machines × 6 generations against the real Worker, with the real lease cap (2); rev 6: 4 run an agent older than `DEFINITION_AGENT`, the campaign is signed from the start and the run once gen 2 is out (then a new version per gen and batch), every definition lease is checked as an agent would (signature, run, build, runtime, checkpoints, per-lease fields only), legacy agents get legacy self-play leases before the cutover and nothing after; random vanishing (some crash and lose games in progress, one dies for good holding a lease), pauses past the slack, late results, double and conflicting uploads, checkpoint switches, fuzz backfill, and two paired eval batches (gen 2 v 1, then the current gen v 1) whose games finish in random order, so pairs are split across chunks and left half-played by dropouts; a fake trainer fills each generation by cursor and reads the eval batches by `ids` + `also`. Asserts every game id and seed is claimed exactly once or back in the pool, every generation filled by exactly `quota` accepted games, accepted + in flight never over the cap, ≥ 3 machines per generation, the dead machine's games played by others, every eval pair credited exactly once with both games from one lease, eval chunks never refused as stale |
 
 Test notes:
@@ -297,6 +298,14 @@ alternate first (its `providers` allowlist, if any, must name `torch-cuda`); the
 `npm run admin -- machine <id> opt-in torch` for each machine (`npm run admin -- machines` lists ids and `opt_in`),
 `opt-out torch` to stop (from its next lease). `GET /v1/admin/run/{run}` lists the opted-in machines in the alternate's
 `opt_in_notes`; the admin page shows "opt-in: torch" under the machine.
+
+### Deploy notes: rev 29 (the ids a rolling lease gave up)
+
+Worker only (no migration, no var). Beats' Stats `given_up` (agents from 0.3.21, PROTOCOL 21.1) are kept with the
+lease's Stats; the in-flight limit counts finished = credited + given up, and the run's quota (`selfplay_state.leased`)
+leaves given-up ids out. Nothing changes for leases whose beats don't say `given_up` (every agent before 0.3.21). Order:
+the Worker, then agent 0.3.21 (canary first). PROTOCOL 21.2 says how large a run's quota must be for its rolling leases
+to keep their buffers.
 
 ### Deploy notes: rev 28 (fresher rows from fast machines)
 

@@ -41,7 +41,8 @@ pub struct Logged {
 
 /// rev 21 (PROTOCOL 10.4): the coordinator's in-flight limit, modelled on `book.ts` `rollingLimit`: an unscripted
 /// extension asking for `k` ids releases at most what keeps the lease's unfinished ids - released less finished, where
-/// finished = the ids its chunks credited, or its last beat's `progress.games_done` when higher - within
+/// finished = the ids its chunks credited (rev 29, PROTOCOL 21.1: plus its last beat's Stats `given_up`), or its last
+/// beat's `progress.games_done` when higher - within
 /// `(crew ? 2 : 1) x inflight + buffer`: `inflight` = the most of half the ask and the last beat's Stats `concurrency`
 /// and `inflight`; a crew = Stats `workers` > 1 or half the ask above `concurrency`; `buffer` = the most of
 /// `buffer_min`, an eighth of `inflight` and the lease's rate (finished per second since its grant) x `buffer_s`. At the
@@ -191,14 +192,16 @@ fn inflight_room(s: &State, id: &str, released: u64, k: u64, cap: &InflightCap) 
     let beat = s.beats.iter().filter(|(l, _)| l == id).map(|(_, b)| b).next_back();
     let num = |k: &str| beat.and_then(|b| b["stats"][k].as_f64()).filter(|x| x.is_finite() && *x > 0.0).unwrap_or(0.0);
     let done = beat.and_then(|b| b["progress"]["games_done"].as_u64()).unwrap_or(0);
-    let finished = credited.max(done).min(released);
+    // rev 29 (PROTOCOL 21.1): credited ids plus the given-up ones (never more than the uncredited)
+    let given = (num("given_up") as u64).min(released.saturating_sub(credited));
+    let finished = (credited + given).max(done).min(released);
     let unfinished = released - finished;
     let conc = num("concurrency");
     let half = k.div_ceil(2) as f64;
     let inflight = half.max(conc).max(num("inflight"));
     let crew = num("workers") > 1.0 || (conc > 0.0 && half > conc);
     let secs = s.granted.get(id).map_or(1.0, |t| t.elapsed().as_secs_f64().max(1.0));
-    let buffer = (cap.buffer_min as f64).max((inflight / 8.0).ceil()).max((finished as f64 / secs * cap.buffer_s).ceil());
+    let buffer = (cap.buffer_min as f64).max((inflight / 8.0).ceil()).max(((finished - given.min(finished)) as f64 / secs * cap.buffer_s).ceil());
     let limit = (if crew { 2.0 } else { 1.0 }) * inflight + buffer;
     (limit as u64).saturating_sub(unfinished)
 }

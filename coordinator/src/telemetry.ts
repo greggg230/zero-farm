@@ -46,8 +46,8 @@ export const DOUBLES = [
 // Numeric Stats fields kept in D1 (the lease's last Stats) but not sent to AE.
 // batch_rows: rev 11 (PROTOCOL 9.6); inflight, workers: a rolling lease's whole crew (rev 19 agents send them; kept
 // from rev 21 for the extension limit, PROTOCOL 10.4); fresh_cap: rev 26, the games in flight the agent caps the job at
-// by the run's freshness budget (PROTOCOL 18.3)
-export const EXTRA_NUMS = ["paused_ms", "resume_ms_max", "batch_rows", "inflight", "workers", "fresh_cap"] as const;
+// by the run's freshness budget (PROTOCOL 18.3); given_up: rev 29, the released ids a rolling lease gave up (PROTOCOL 21.1)
+export const EXTRA_NUMS = ["paused_ms", "resume_ms_max", "batch_rows", "inflight", "workers", "fresh_cap", "given_up"] as const;
 
 const noop: Telemetry = { write() {} };
 

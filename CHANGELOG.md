@@ -4,6 +4,18 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's: `agent-macos-v<version>`).
 
+## Unreleased (0.3.21)
+
+- **Programs with empty files can be installed.** Zero Farm could not download a file of zero bytes: it skipped the
+  download (nothing to fetch) and then failed with "setup failed: network: The system cannot find the file specified".
+  The PyTorch program has 93 such files, so no computer could install it. An empty file is now created, checked and
+  put in place like every other file.
+- **A big computer keeps its games going after it had to drop some.** When Zero Farm replaces a job program with one
+  that needs the old one's memory, the old program's unfinished games are dropped. The server went on counting those
+  as "being played" until the whole job ended - against the computer's own limit of games (so it got new games only
+  once a minute, in lumps, and played with 10-25 % of its seats empty) and against the run's limit for all computers.
+  Zero Farm now tells the server how many games it dropped. (Takes effect once the server is updated.)
+
 ## Unreleased (0.3.20)
 
 - **New networks reach a running job within seconds, also while it winds down.** A computer used to hear about a new

@@ -947,9 +947,20 @@ fn a_directml_lease_under_the_in_flight_limit_keeps_finishing_games_instead_of_c
     // every next worker played its predecessor's unstarted ids (0.3.12 started each with none after the first handoffs)
     let lines = job_lines(&h);
     assert!(lines.len() >= 2 && lines.iter().skip(1).all(|j| j["games"].as_u64().unwrap_or(0) > 0), "{:?}", lines.iter().map(range_of).collect::<Vec<_>>());
+    // agent 0.3.21 (PROTOCOL 21.1): the beats say how many released ids the lease gave up (each handoff's old worker ended
+    // its last games) - never more than its `games_done` (which counts them with the finished games) or its released ids
+    let given: Vec<(u64, u64, u64)> = h.mock.with(|s| {
+        let n = |v: &Value| v.as_u64().unwrap_or(0);
+        s.beats.iter().filter(|(l, _)| l == "l_SV").map(|(_, b)| (n(&b["stats"]["given_up"]), n(&b["progress"]["games_done"]), n(&b["stats"]["released"]))).collect()
+    });
+    assert!(given.iter().any(|g| g.0 > 0), "a beat says the given-up ids: {given:?}
+{log}");
+    assert!(given.iter().all(|&(g, done, released)| g <= done && done <= released), "{given:?}");
     h.stop();
     let done = h.wait_done("l_SV");
     ids_accounted(&h, "l_SV", &done);
+    // (given-up ids are unfinished ids of the lease's `done`: back to the pool)
+    assert!(given.last().is_some_and(|g| g.0 <= unfinished_n(&done)), "{given:?} {done}");
     assert!(h.crashes().is_empty(), "{:?}", h.crashes());
 }
 

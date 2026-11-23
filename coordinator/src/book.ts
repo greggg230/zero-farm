@@ -412,8 +412,17 @@ export async function selfplayState(db: D1Database, run: RunRow, sp: SelfplayCfg
       .prepare(`SELECT COALESCE(SUM(games), 0) AS n FROM results WHERE scope = ? AND kind = 'selfplay' AND acked_at IS NULL`)
       .bind(scope),
   ]);
+  // Rev 29 (PROTOCOL 21.1): less the ids its rolling leases gave up (their beats' Stats `given_up`): no worker will play
+  // them, and they go back to the pool when the lease closes. (Few leases say any: read apart, only those.)
+  const gave = await db
+    .prepare(
+      `SELECT lo, hi, rel_hi, claimed, stats FROM leases
+       WHERE scope = ? AND kind = 'selfplay' AND state = 'active' AND rel_hi IS NOT NULL AND stats LIKE '%"given_up"%'`,
+    )
+    .bind(scope)
+    .all<GaveRow>();
   const accepted = acc.results[0]?.n ?? 0;
-  const l = leased.results[0]?.n ?? 0;
+  const l = (leased.results[0]?.n ?? 0) - gave.results.reduce((a, g) => a + givenUpIds(g), 0);
   const p = pending.results[0]?.n ?? 0;
   return {
     gen: run.current_gen,
@@ -1120,14 +1129,28 @@ export interface ExtendAnswer {
   definition?: { key: string; sha256: string };
 }
 
+// Rev 29 (PROTOCOL 21.1): the released ids a rolling lease gave up - no worker of it will play them (the games in flight
+// of a worker that ended them or failed, ids left over at a handoff) - as its last beat's Stats `given_up` says (agents
+// from 0.3.21; absent: 0). Never more than its released ids its results did not credit.
+type GaveRow = Pick<LeaseRow, "lo" | "hi" | "rel_hi" | "claimed" | "stats">;
+export function givenUpIds(l: GaveRow): number {
+  const released = (l.rel_hi ?? l.hi ?? 0) - (l.lo ?? 0);
+  const g = parseJson<{ given_up?: unknown } | null>(l.stats, null)?.given_up;
+  const n = typeof g === "number" && Number.isFinite(g) && g > 0 ? Math.floor(g) : 0;
+  return Math.max(0, Math.min(n, released - l.claimed));
+}
+
 // Rev 21 (PROTOCOL 10.4): the games a rolling lease finished as far as the coordinator knows - the ids its results
 // credited, or the agent's own count in its last beat when that is higher - and the released ids not finished (the
-// games in play and the unstarted ids).
+// games in play and the unstarted ids). Rev 29 (PROTOCOL 21.1): the credited ids plus the given-up ones, when that is
+// more: the beat's count is a beat old (60 s), the credited ids a result old (`flush_s`), and a lease that gave ids up
+// was otherwise seen to finish games only with each beat (its beat's count, given-up ids included, stayed above its
+// credited ids for good).
 export function finishedIds(l: LeaseRow): number {
   const released = (l.rel_hi ?? l.hi ?? 0) - (l.lo ?? 0);
   const p = parseJson<{ games_done?: unknown } | null>(l.progress, null);
   const beat = typeof p?.games_done === "number" && Number.isFinite(p.games_done) ? p.games_done : 0;
-  return Math.max(0, Math.min(released, Math.max(l.claimed, beat)));
+  return Math.max(0, Math.min(released, Math.max(l.claimed + givenUpIds(l), beat)));
 }
 
 export function unfinishedIds(l: LeaseRow): number {
@@ -1157,7 +1180,8 @@ export function rollingLimit(l: LeaseRow, asked: number, now: number, knownRate 
   const inflight = Math.max(half, conc, num(s.inflight));
   const crew = num(s.workers) > 1 || (conc > 0 && half > conc);
   const active = Math.max(BEAT_S, now - l.issued_at - l.paused_s);
-  const rate = Math.max(finishedIds(l) / active, Number.isFinite(knownRate) ? knownRate : 0);
+  // (rev 29: the games it finished - given-up ids are no games played)
+  const rate = Math.max((finishedIds(l) - givenUpIds(l)) / active, Number.isFinite(knownRate) ? knownRate : 0);
   const buffer = Math.max(ROLLING_BUFFER_MIN, Math.ceil(inflight / 8), Math.ceil(rate * ROLLING_BUFFER_S));
   return (crew ? 2 : 1) * inflight + buffer;
 }

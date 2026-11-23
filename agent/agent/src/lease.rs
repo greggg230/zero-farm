@@ -1952,6 +1952,12 @@ impl Run {
             let inflight = self.conc.map(|c| c + crew.iter().map(|m| m.layout.conc).sum::<u64>() + draining);
             s.insert("inflight".into(), json!(inflight));
             s.insert("released".into(), json!(r.released));
+            // agent 0.3.21 (PROTOCOL 21.1): the released ids the lease gave up - done with (`ids_held`) but not finished:
+            // the coordinator adds them to the ids its results credited, so it sees games finish with every result (not
+            // only with each beat), and leaves them out of the run's quota. Only when there are any.
+            if let Some(given) = self.ids_held().map(|held| r.released.saturating_sub(held).saturating_sub(self.games_done)).filter(|&g| g > 0) {
+                s.insert("given_up".into(), json!(given));
+            }
             // (agent 0.3.17, PROTOCOL 18.3: the freshness cap on the job's games in flight, while there is one)
             if let Some(c) = self.tuning.as_ref().and_then(|t| t.space.fresh) {
                 s.insert("fresh_cap".into(), json!(c));

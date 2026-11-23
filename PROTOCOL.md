@@ -7,7 +7,8 @@ A change to anything here is a protocol change: bump the version it belongs to a
 bottom.
 
 Versions: HTTP API `v1` (path prefix), agent↔worker protocol `aw/1`, network files `zero-onnx/1`,
-manifests `manifest/1`. Current revision: v1 rev 28 (section 20, fresher rows from fast machines: new generations with
+manifests `manifest/1`. Current revision: v1 rev 29 (section 21, the ids a rolling lease gave up: counted as done with
+every result and left out of the run's quota; rev 28: section 20, fresher rows from fast machines: new generations with
 extension answers and a per-machine poll, drains that keep switching, the owner's per-machine freshness budget, rolling
 result limits per hour; rev 27: section 19, opt-in runtimes per machine: the torch runtime pack and
 worker, offered only to machines the owner opted in; rev 26: section 18, the freshness budget: a rolling lease's games in flight
@@ -1376,7 +1377,8 @@ every answer then carries `checkpoint` / `definition` as a beat answer does). An
   batch full). An extension releases at most what keeps the lease's unfinished ids - released, not finished: its games
   in play and its unstarted ids - within
   `limit = (crew ? 2 : 1) x inflight + buffer`, where
-  - finished = the ids its results credited (`claimed`), or its last beat's `progress.games_done` when higher;
+  - finished = the ids its results credited (`claimed`; rev 29, 21.1: plus the ids it gave up, its last beat's Stats
+    `given_up`), or its last beat's `progress.games_done` when higher;
   - `inflight` = half of the `games` asked (agents ask for about 2 x their whole crew's games in flight), never fewer than
     its last beat's Stats `concurrency` (its main worker's) or `inflight` (its crew's, 13.5);
   - a crew - Stats `workers` > 1, or half the ask above its main worker's `concurrency` - holds twice that: a new
@@ -1403,7 +1405,8 @@ every answer then carries `checkpoint` / `definition` as a beat answer does). An
     member can still play), when that is more than the games finished. Given-up ids still go back to the pool only when
     the lease closes (`done`'s `unfinished`, worked out from the credited ids); the beats just stop counting them as
     held (the buffer's rate, which the coordinator reads from the same count, grows by their share: a few ids; the run's
-    quota still counts them as leased until the lease closes, as before). Agents 0.3.6-0.3.12 counted finished games
+    quota still counts them as leased until the lease closes, as before - rev 29, 21.1: neither any more for a lease
+    whose beats say `given_up`). Agents 0.3.6-0.3.12 counted finished games
     only, so every given-up id stayed unfinished for the limit until the
     lease closed: a DirectML PC's lease of 2026-11-21 (one worker of 457 games in flight, ~5 leaves/s a game, ~800 s
     a game) ended a worker's last games at each of its tuner's handoffs, reached its limit (457 + 58) with 513 given-up
@@ -2978,7 +2981,70 @@ owner sets a larger cap for that machine on the coordinator.
 - **Agents before 0.3.20** keep their local cap: the owner's cap reaches a machine once its channel's release is 0.3.20
   or newer. A locally paused agent asks for no lease, so it hears of the cap when it resumes.
 
+## 21. The ids a rolling lease gave up (rev 29; coordinator only, no migration; agents from 0.3.21)
+
+**Why.** The owner's desktop first played a live run through the farm on 2026-11-23: one torch worker (19) of 1,536
+games in flight, games of ~17,000 leaves (~10 minutes each at that many in flight), `flush_s` 10, the run's quota 5,600
+(cap 6,160) shared with three friends' PCs. Its lease was refused ids again and again (`inflight`, then `quota` for a
+minute or more at a time, then 170-390 ids at once), and its worker played 75-90 % of its games in flight. Two rules
+did it, both about ids a lease **gave up** - released ids no worker of it will play (10.4 **What the agent reports**): a
+handoff there ends the old worker's last games when the next worker needs its memory, 850-1,400 ids each time:
+
+1. *Finished games were seen only with each beat.* The limit's finished count was the more of the credited ids and the
+   last beat's `progress.games_done`, which counts given-up ids with the finished ones. After the first handoff the
+   beat's count stayed ahead of the credited ids for the rest of the lease, so results (every 10 s) no longer moved the
+   count: it moved once a beat (60 s). The lease got its finished games' ids back a minute late, in one lump.
+2. *Given-up ids stayed in the run's quota until the lease closed* (a rolling lease runs for hours: `max_s`). One lease
+   held 2,520 given-up ids against a cap of 6,160 after three handoffs; with that the headroom stayed under the
+   reserve (10.4 **Headroom to the short first**: ids past a lease's batch never take the last quarter of the cap), so
+   no lease got its reporting buffer, and at times the cap was used up and every machine of the run waited.
+
+### 21.1 Stats `given_up`
+
+- **The agent (0.3.21).** A rolling lease's beats carry Stats `given_up`: n - the released ids it is done with (10.4)
+  less the games it finished, as of the beat; absent while 0. (`progress.games_done` is unchanged: finished + given up.)
+  A beat still goes out as soon as a worker starts or ends (10.4), which is when the number changes.
+- **The coordinator** keeps it with the lease's Stats (a finite number > 0, floored; anything else counts as 0; never
+  more than the lease's released ids its results did not credit) and uses it for three things:
+  - **the in-flight limit** (10.4): finished = max(`claimed` + `given_up`, the last beat's `games_done`), at most the
+    released ids. The credited ids move with every result, so a lease that gave ids up gets its finished games' ids back
+    within a `flush_s` and an ask again;
+  - **the buffer's rate** (10.4): the games finished - finished less `given_up` - over the lease's active time (before,
+    given-up ids counted as games played);
+  - **the run's quota** (section 3; `selfplay_state.leased` of `GET /v1/admin/run/{run}`): a rolling lease counts its
+    released ids less the credited and the given-up ones. Given-up ids still go back to the pool only when the lease
+    closes (`done`'s `unfinished`), and are counted again when another lease is released them.
+- **Older agents** send no `given_up`: their leases are counted exactly as before (rules 1 and 2 above hold for them; a
+  DirectML PC's handoffs give up few ids).
+- **Trust.** As a beat's `games_done`: a machine that overstates it holds more ids than its limit allows, within its
+  block and the run's headroom, until its lease closes.
+
+### 21.2 Sizing a run's quota for rolling leases
+
+The quota's cap (`quota` x (1 + `slack`)) holds the generation's accepted games, the games credited and not yet acked,
+and every active lease's unfinished ids. For every rolling lease to keep its games in flight **and** its reporting buffer
+(10.4), three quarters of the cap must cover them: cap x 0.75 >= the sum over the run's machines of (games in flight +
+buffer; twice the games in flight for a crew) + the games the trainer accepts per generation. Below that the leases are
+held at their games in flight by the coordinator's count - a result's delay behind what their workers play - and take
+turns waiting out `quota` answers. The numbers are in `GET /v1/admin/run/{run}` (`selfplay_state`, `rolling_leases`).
+For the run of 2026-11-23: 1,536 + ~400 for the desktop, ~2,300 held by three friends' PCs, 866 games a generation: a
+cap of at least ~6,900 (quota ~6,300 at slack 0.1), with room for one more machine ~7,500.
+
+### 21.3 Empty build files (agent 0.3.21)
+
+A manifest may list files of size 0 (a Python runtime pack has many: `__init__.py`). The agent does not request such a
+file: it creates it empty and checks it like any other (size 0, the sha256 of no bytes) before it gets its name. Agents
+before 0.3.21 skipped the request (a download whose partial file already has the declared size is complete) but then
+failed on the missing partial file - `setup failed: network: ... cannot find the file` - so a build with an empty file
+could not be installed. Nothing changes on the wire. (`farm-release` makes no compressed copy of a file of 64 KiB or
+less, 9.3; a manifest that names one for an empty file is unpacked to an empty file.)
+
 ## Changes
+- v1 rev 29, agent 0.3.21 (2026-11-23; coordinator only, no migration; unreleased): **the ids a rolling lease gave up**
+  (section 21). Beats' Stats `given_up` (agents from 0.3.21): the coordinator counts finished = credited + given up for
+  the in-flight limit (finished games make room with every result, not once a beat), the buffer's rate counts finished
+  games only, and the run's quota no longer counts given-up ids as leased. 21.2: how to size a run's quota for rolling
+  leases. Agent 0.3.21 also installs builds with empty files (21.3). Older agents and their leases: unchanged.
 - v1 rev 28, agent 0.3.20 (2026-11-22; coordinator migration 0018 `machines.fresh`, Worker var `POLL_AGENT` default
   0.3.20; unreleased): **fresher rows from fast machines** (section 20). An extension may say its `gen` and every answer
   then offers a newer generation as a beat does; `POST /v1/lease/{id}/poll` `{"gen"}` asks for one (its own rate bucket,

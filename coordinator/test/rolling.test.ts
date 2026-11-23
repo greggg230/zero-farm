@@ -30,6 +30,7 @@ import {
   sha256,
   upload,
 } from "./helpers";
+import { finishedIds } from "../src/book";
 
 const ROLL = "0.2.13"; // ROLLING_AGENT's default
 const ROLLING = { inflight: 8, gpu_inflight: 64, block: 1000 }; // first release: the larger in-flight count, 64
@@ -443,6 +444,65 @@ describe("rolling leases: the in-flight limit (10.4, rev 21)", () => {
     ok(await beat(m, l.lease_id, "running", { stats: { concurrency: 200 }, progress: { games_done: 0, games_total: 64 } }));
     // half of 16 is 8, but the worker plays 200: at most 200 + 25 unfinished
     expect(ok(await extend(m, l.lease_id, { games: 16 }))).toEqual({ games: 80 });
+  });
+});
+
+describe("rolling leases: given-up ids (21.1, rev 29)", () => {
+  // A worker of 64 games in flight: `given` of its released ids were given up at a handoff (its beat's Stats say so,
+  // and its `games_done` counts them with the games finished then, as agents from 0.3.13 do).
+  const handedOff = (m: Machine, id: string, given: number, finished: number, total: number) =>
+    beat(m, id, "running", { stats: { concurrency: 64, inflight: 64, given_up: given }, progress: { games_done: finished + given, games_total: total } });
+
+  it("finished games count as soon as their results credit them, also after ids were given up (not only with each beat)", async () => {
+    await rollingRun("gave", { quota: 10000 });
+    const m = await enroll("m");
+    const l = await rollingLease(m); // 64 released
+    await aged(l.lease_id, 3600);
+    ok(await beat(m, l.lease_id, "running", { stats: { concurrency: 64 }, progress: { games_done: 0, games_total: 64 } }));
+    expect(ok(await extend(m, l.lease_id, { games: 128 }))).toEqual({ games: 80 }); // 64 + a buffer of 16
+    // a handoff: 10 games credited, the old worker's other 40 given up; the new worker holds 30 of the 80
+    ok(await upload(m, l.lease_id, 0, "rows", { ids: [[0, 10]], gen: 1 }));
+    ok(await handedOff(m, l.lease_id, 40, 10, 80));
+    expect(ok(await extend(m, l.lease_id, { games: 128 }))).toEqual({ games: 130 }); // 50 done with: room for 50
+    expect(ok(await extend(m, l.lease_id, { games: 128 }))).toEqual({ games: 130, wait_s: 20, reason: "inflight" });
+    // 20 more games credited, no beat since: before rev 29 the beat's count (50) hid them until the next beat
+    ok(await upload(m, l.lease_id, 1, "rows", { ids: [[50, 70]], gen: 1 }));
+    expect(ok(await extend(m, l.lease_id, { games: 128 }))).toEqual({ games: 150 });
+    expect(finishedIds(await row(l.lease_id))).toBe(70);
+  });
+
+  it("given-up ids do not count against the generation's quota; the pool gets them back when the lease closes", async () => {
+    await rollingRun("gq", { quota: 100, slack: 0 }); // cap 100
+    const m = await enroll("m");
+    const l = await rollingLease(m); // 64 released
+    await aged(l.lease_id, 3600);
+    expect((await state("gq")).selfplay_state).toMatchObject({ leased: 64, headroom: 36 });
+    ok(await upload(m, l.lease_id, 0, "rows", { ids: [[0, 4]], gen: 1 }));
+    ok(await handedOff(m, l.lease_id, 40, 4, 64));
+    // 64 released: 4 credited (pending), 40 given up, 20 held
+    expect((await state("gq")).selfplay_state).toMatchObject({ leased: 20, pending: 4, headroom: 76 });
+    // the lease is 44 below its batch: it takes those, and what the reserve (25) leaves of the headroom past it - 51;
+    // never more given up than its uncredited ids
+    expect(ok(await extend(m, l.lease_id, { games: 128 }))).toEqual({ games: 115 });
+    await env.DB.prepare(`UPDATE leases SET stats = json_object('concurrency', 64, 'given_up', 999999) WHERE lease_id = ?`).bind(l.lease_id).run();
+    expect((await state("gq")).selfplay_state).toMatchObject({ leased: 0, pending: 4, headroom: 96 });
+    for (const bad of ["many", -5, null, 1e400]) {
+      await env.DB.prepare(`UPDATE leases SET stats = ? WHERE lease_id = ?`).bind(JSON.stringify({ concurrency: 64, given_up: bad }), l.lease_id).run();
+      expect((await state("gq")).selfplay_state, String(bad)).toMatchObject({ leased: 111, headroom: -15 });
+    }
+    // closing: every uncredited id, given up or not, is back in the pool
+    ok(await finish(m, l.lease_id, [0], { unfinished: { gids: [[4, 115]] } }));
+    expect((await state("gq")).selfplay_state).toMatchObject({ leased: 0, pending: 4, headroom: 96 });
+  });
+
+  it("the buffer's rate is the games finished, not the ids given up", async () => {
+    await rollingRun("gr", { quota: 10000 });
+    const m = await enroll("m");
+    const l = await rollingLease(m); // 64 released
+    await aged(l.lease_id, 120);
+    ok(await handedOff(m, l.lease_id, 64, 0, 64)); // all 64 given up in 120 s, none finished
+    // 64 in flight + the floor buffer of 16 (not 64 more for "64 games in 120 s"), all 64 given-up ids replaced
+    expect(ok(await extend(m, l.lease_id, { games: 128 }))).toEqual({ games: 144 });
   });
 });
 
