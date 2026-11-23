@@ -4,7 +4,7 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's: `agent-macos-v<version>`).
 
-## Unreleased
+## Unreleased (0.3.19)
 
 - **An "owner machine" setting, for the farm owner's own computer only.** The owner's desktop trains its networks and
   can now also play all of their practice games through Zero Farm, on the same graphics card. `owner on` makes Zero Farm
