@@ -4,6 +4,15 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's: `agent-macos-v<version>`).
 
+## Unreleased (0.3.20)
+
+- **New networks reach a running job within seconds, also while it winds down.** A computer used to hear about a new
+  network only with its once-a-minute check-in, and a job that was winding down (finishing its last games before
+  ending) kept playing the old network until it ended - on one computer 8-9 minutes, every ten minutes. Zero Farm now
+  hears about new networks with every request for more games too, asks every few seconds where the farm owner turned
+  that on for the computer, and switches its last games to a new network while a job winds down. Practice games then
+  reach the training with fresher positions, and fewer are thrown away as too old.
+
 ## Unreleased
 
 - **An "owner machine" setting, for the farm owner's own computer only.** The owner's desktop trains its networks and
