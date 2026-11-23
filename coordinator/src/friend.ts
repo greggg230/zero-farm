@@ -52,6 +52,13 @@ import {
   laneApplies,
   sortsBefore,
   yieldTarget,
+  ASK_BUILDS_MAX,
+  LANE_MAX_DRAIN_S,
+  drainEstimate,
+  laneMissed,
+  laneSettled,
+  laneStateOf,
+  laneStateText,
 } from "./routing";
 import { presenceOf } from "./presence";
 import { machineFreshOf, runFresh } from "./fresh";
@@ -385,6 +392,13 @@ export async function lease(c: Ctx): Promise<Response> {
   // (otherWorkWaits) sees the same GPU self-play this request does (an agent may send gpu false, gpu_allowed true).
   const capsJson = JSON.stringify({ ...caps, gpu_allowed: gpuAllowed, ...(gpuGames.size ? { gpu_games: Object.fromEntries(gpuGames) } : {}) });
   if (capsJson !== m.caps) await db.prepare(`UPDATE machines SET caps = ? WHERE machine_id = ?`).bind(capsJson, m.machine_id).run();
+  // Rev 29 (PROTOCOL 15.8): and the kinds and cached builds it offers, so the lane (15.3, 15.4) and the renewal decide
+  // with the candidates this request sees (before rev 29 they assumed every kind and nothing cached: a PC whose free disk
+  // was below its CUDA pack had no GPU self-play in the lane's eyes, so a batch the grant defers looked like its next
+  // job, and the lane finished its self-play for nothing, lease after lease). An ask that offers no kind at all says
+  // nothing about the work the machine takes: the stored one stays.
+  const askJson = JSON.stringify({ kinds: [...kinds].sort(), builds: [...cachedBuilds].sort().slice(0, ASK_BUILDS_MAX) });
+  if (kinds.size && askJson !== m.ask) await db.prepare(`UPDATE machines SET ask = ? WHERE machine_id = ?`).bind(askJson, m.machine_id).run();
   if (tuning && tuning.length) {
     const t = JSON.stringify(tuning);
     if (t !== m.tuning) await db.prepare(`UPDATE machines SET tuning = ?, tuning_t = ? WHERE machine_id = ?`).bind(t, c.now, m.machine_id).run();
@@ -454,14 +468,44 @@ export async function lease(c: Ctx): Promise<Response> {
     // Rev 7: the job's provider allowlist rides along (a routing hint, not part of the signed job). Rev 19: so does
     // the best layout this hardware class reported for a rolling self-play lease's build and runtime.
     if (l) {
+      await laneSettle(c, m, cd.kind === "eval");
       const hint = (l as any).rolling && features.has(TUNING_FEATURE) ? await tuningHint(db, m, l as any) : null;
       return withDiag({ lease: { ...l, providers: cd.providers, ...(hint ? { tuning_hint: hint } : {}) } });
     }
   }
+  await laneSettle(c, m, false);
   // Rev 24 (PROTOCOL 15.2): eval work this machine could play is about to need it (ids may come back to a batch it was
   // offered, or a batch whose leases are still out, or a run being set up): it asks again sooner.
   const soon = o.hw.priority_lane !== "off" && (o.soon || o.usable.some((cd) => cd.kind === "eval"));
   return withDiag({ wait_s: soon ? LANE_WAIT_S : WAIT_S, reason: "no_work" });
+}
+
+// Rev 29 (PROTOCOL 15.8): the first lease request after a lane yield settles it - once the lease that gave way has closed
+// (an agent asks while it still finishes a lease only to fill a second slot). Given eval work, the yield did its job;
+// given anything else, or nothing, the batch is a miss for this machine (laneTarget skips it for LANE_MISS_S).
+async function laneSettle(c: Ctx, m: MachineRow, gotEval: boolean): Promise<void> {
+  const st = laneStateOf(m.lane);
+  if (!st.yield) return;
+  const db = c.env.DB;
+  const draining = await db
+    .prepare(`SELECT 1 FROM leases WHERE machine_id = ? AND state = 'active' AND expires_at >= ? AND pending LIKE 'yield:%' LIMIT 1`)
+    .bind(m.machine_id, c.now)
+    .first();
+  if (draining) return;
+  const text = laneStateText(laneSettled(st, gotEval, c.now), c.now);
+  await db.prepare(`UPDATE machines SET lane = ? WHERE machine_id = ?`).bind(text, m.machine_id).run();
+  m.lane = text;
+}
+
+// Rev 29 (PROTOCOL 15.8): the lease of machine `m` now gives way to the eval batch of `scope` (the book marked it
+// `yield:<scope>`): remembered with the batch, for the next lease request to settle.
+async function laneMarkYield(c: Ctx, m: MachineRow, scope: string): Promise<void> {
+  const db = c.env.DB;
+  const r = scope.startsWith("run:") ? await book.getRun(db, scope.slice(4)) : null;
+  const st = laneStateOf(m.lane);
+  const text = laneStateText({ ...st, yield: { scope, batch: r?.eval_batch ?? null, t: c.now } }, c.now);
+  await db.prepare(`UPDATE machines SET lane = ? WHERE machine_id = ?`).bind(text, m.machine_id).run();
+  m.lane = text;
 }
 
 // The ids a lease of candidate `cd` asks for on this machine (PROTOCOL 3: about TARGET_S of its measured rate; rev 11's
@@ -574,7 +618,15 @@ async function batchStalled(db: D1Database, run: string, batch: string, stallS: 
   return !!row && row.created_at <= now - stallS && !row.working && !row.taken;
 }
 
-async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | null): Promise<Offer> {
+// Rev 29 (PROTOCOL 15.8): the lane's view of a machine's order: its own lease `closing` (not counted: the order once it has
+// closed) and the machines on their way to each batch (`transit`, scope -> leases marked `yield:<scope>`) counted as the
+// batch's leases. A lease request passes none: the order is section 3's.
+interface OfferView {
+  closing?: Pick<book.LeaseRow, "scope" | "kind">;
+  transit?: Map<string, number>;
+}
+
+async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | null, view: OfferView = {}): Promise<Offer> {
   const db = c.env.DB;
   const { caps, gpuAllowed, cachedBuilds, cachedCkpts, kinds, agent, aw } = a;
   const cfg = config(c.env);
@@ -775,6 +827,11 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
     );
   };
   const active = new Map<string, number>((activeR.results as any[]).map((x) => [`${x.scope}|${x.kind}`, x.n]));
+  // Rev 29 (PROTOCOL 15.8): the lane's view - the order once the machine's own lease has closed (not counted)
+  if (view.closing) {
+    const k = `${view.closing.scope}|${view.closing.kind}`;
+    active.set(k, Math.max(0, (active.get(k) ?? 0) - 1));
+  }
   // Rev 24 (PROTOCOL 15): the lane applies to this machine; background jobs' scopes (a run job with a `share`, 5.3).
   const lane = laneApplies(hw, m.channel);
   const bgScopes = new Set<string>();
@@ -944,9 +1001,13 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
 
   const rate = new Map<string, number>((ratesR.results as any[]).map((x) => [`${x.scope}|${x.kind}`, x.rate]));
   const classRate = new Map<string, number>((classR.results as any[]).map((x) => [`${x.scope}|${x.kind}`, x.rate]));
-  const score = (cd: Candidate) => (cd.priority * cd.fit) / (1 + (active.get(`${cd.scope}|${cd.kind}`) ?? 0));
   // Rev 13: the runs' active leases (self-play and eval), for a background batch's share.
-  const activeRuns = (activeR.results as any[]).filter((x) => x.kind === "selfplay" || x.kind === "eval").reduce((t, x) => t + x.n, 0);
+  const activeRuns = [...active].filter(([k]) => k.endsWith("|selfplay") || k.endsWith("|eval")).reduce((t, [, n]) => t + n, 0);
+  // Rev 29 (PROTOCOL 15.8): in the lane's view, the machines on their way to a batch count as its leases (their own
+  // self-play leases are still active, so the runs' total above already has them).
+  const counted = new Map(active);
+  for (const [scope, n] of view.transit ?? []) counted.set(`${scope}|eval`, (counted.get(`${scope}|eval`) ?? 0) + n);
+  const score = (cd: Candidate) => (cd.priority * cd.fit) / (1 + (counted.get(`${cd.scope}|${cd.kind}`) ?? 0));
 
   // Rev 18 (PROTOCOL 12): a PC that plays some run's self-play on its GPU records it (the CPU PCs' eval capacity reads
   // it), and takes an eval batch after that self-play unless the CPU PCs online couldn't finish it within the horizon.
@@ -970,7 +1031,7 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
 
   // A deferred batch (rev 18) ranks after the self-play, and never before where its share (rev 13) puts it.
   const rank = (cd: Candidate) => {
-    const r = jobRank(cd.kind, cd.share, active.get(`${cd.scope}|${cd.kind}`) ?? 0, activeRuns);
+    const r = jobRank(cd.kind, cd.share, counted.get(`${cd.scope}|${cd.kind}`) ?? 0, activeRuns);
     return cd.deferred ? Math.max(r, DEFERRED_EVAL_RANK) : r;
   };
   // Within a tier, evaluation before self-play (rev 7; a background batch only within its share, rev 13; a GPU self-play
@@ -989,7 +1050,7 @@ async function offer(c: Ctx, m: MachineRow, a: Ask, machineProfile: Profile | nu
     classRate,
     hw,
     soon,
-    active,
+    active: counted,
     activeRuns,
     bgScopes,
   };
@@ -1061,6 +1122,7 @@ export async function beat(c: Ctx, leaseId: string): Promise<Response> {
   const ans = unwrap(
     await bookFor(c.env, l.scope).beat({ now: c.now, machine_id: m.machine_id, lease_id: leaseId, scope: l.scope, state, progress, stats, gen, yield_to: yieldTo }),
   );
+  if (yieldTo && ans.action === "give_back") await laneMarkYield(c, m, yieldTo); // rev 29 (15.8)
   if (stats) {
     telemetry(c.env.TELEMETRY).write({ machine_id: m.machine_id, class: m.class, lease_id: leaseId, kind: l.kind, scope: l.scope, event: "beat", stats });
   }
@@ -1100,6 +1162,7 @@ export async function extend(c: Ctx, leaseId: string): Promise<Response> {
   const ans = unwrap(
     await bookFor(c.env, l.scope).extend({ now: c.now, machine_id: m.machine_id, lease_id: leaseId, scope: l.scope, games, paused, waiting, yield_to: yieldTo, gen }),
   );
+  if (yieldTo && ans.finish && ans.reason === "yield") await laneMarkYield(c, m, yieldTo); // rev 29 (15.8)
   // Rev 26 (PROTOCOL 18.2): with the run's freshness budget as it is now (rev 28, 20.2: and the poll interval)
   const fresh = l.state === "active" ? await leaseFresh(c, m, l.run) : undefined;
   const poll = l.state === "active" ? leasePoll(c, m) : undefined;
@@ -1211,13 +1274,17 @@ async function fuzzYield(c: Ctx, m: MachineRow, l: book.LeaseRow, progress: Reco
 }
 
 // Rev 24 (PROTOCOL 15.3, 15.4): the eval batch (its scope) that machine `m`'s lease `l` - a fuzz lease, or a rolling
-// self-play lease - gives way to now, or null. In the machine's order (offer(), from what it last asked with, its own
-// lease not counted): the first candidate that would be granted before the lease's own job must be an eval batch with
-// unissued ids; the batch can use one more machine (its machines on their way plus this one at most its unissued games
-// over this machine's lease size); it still sorts before the lease's own job with the machines on their way counted as
-// its leases (its share, 5.3; a deferred batch, 12.2, never does for a GPU self-play lease); and for a rolling lease
-// every background job's leases and machines on their way, with this one, stay within the batch's share of the runs'
-// active leases (several analysis campaigns together take no more of a live run than one would).
+// self-play lease - gives way to now, or null. In the machine's order as its next lease request would see it (offer()
+// with what it last asked with - rev 29: its kinds and cached builds too - its own lease not counted and the machines on
+// their way counted as their batch's leases): the first candidate that would be granted before the lease's own job must
+// be an eval batch with unissued ids; the batch can use one more machine (its machines on their way plus this one at
+// most its unissued games over this machine's lease size); it sorts before the lease's own job (its share, 5.3; a
+// deferred batch, 12.2, never does for a GPU self-play lease); and for a rolling lease every background job's leases and
+// machines on their way, with this one, stay within the batch's share of the runs' active leases (several analysis
+// campaigns together take no more of a live run than one would).
+// Rev 29 (PROTOCOL 15.8): a batch this machine gave way to recently and then was not given is skipped (LANE_MISS_S); and
+// a rolling lease gives way only when it can finish its games in flight within LANE_MAX_DRAIN_S and before the other
+// PCs that could play the batch would have played all of it.
 export async function laneTarget(c: Ctx, m: MachineRow, l: book.LeaseRow, hw: HwRouting): Promise<string | null> {
   const db = c.env.DB;
   if (!laneApplies(hw, m.channel) || m.paused) return null;
@@ -1227,16 +1294,12 @@ export async function laneTarget(c: Ctx, m: MachineRow, l: book.LeaseRow, hw: Hw
   // (cheap first: every waiting batch already has a machine on its way per smallest eval lease of its unissued games)
   if (![...waiting].some(([s, n]) => (transit.get(s) ?? 0) + 1 <= batchMachines(n, SIZING.eval.min))) return null;
   const ask = storedAsk(c, m, l);
-  const o = await offer(c, m, ask, parseJson<Profile | null>(m.profile, null));
+  const o = await offer(c, m, ask, parseJson<Profile | null>(m.profile, null), { closing: l, transit });
   if (o.farmPaused) return null;
   const rolling = l.kind === "selfplay";
-  const runsAfter = o.activeRuns - (rolling ? 1 : 0); // the runs' active leases once this lease has closed
+  const lane = laneStateOf(m.lane);
   const own = o.usable.find((cd) => cd.scope === l.scope && cd.kind === l.kind);
-  // the lease's own job as the machine would see it after closing it (its own lease no longer counted)
-  const ownActive = own ? Math.max(0, (o.active.get(`${own.scope}|${own.kind}`) ?? 0) - 1) : 0;
-  const ownKey: SortKey = own
-    ? { tier: own.tier, rank: jobRank(own.kind, own.share, ownActive, runsAfter), score: (own.priority * own.fit) / (1 + ownActive) }
-    : { tier: rolling ? 1 : 2, rank: kindRank(l.kind), score: 0 };
+  const ownKey: SortKey = own ? { tier: own.tier, rank: o.rank(own), score: o.score(own) } : { tier: rolling ? 1 : 2, rank: kindRank(l.kind), score: 0 };
   for (const cd of o.usable) {
     if (cd === own || !sortsBefore({ tier: cd.tier, rank: o.rank(cd), score: o.score(cd) }, ownKey)) return null;
     if (cd.kind === "selfplay") {
@@ -1249,23 +1312,43 @@ export async function laneTarget(c: Ctx, m: MachineRow, l: book.LeaseRow, hw: Hw
     if (cd.kind !== "eval") return null;
     const unissued = waiting.get(cd.scope) ?? 0;
     if (unissued < 1) continue;
+    if (laneMissed(lane, cd.scope, cd.batch, c.now)) continue; // rev 29: the grant didn't follow the last yield to it
     const t = transit.get(cd.scope) ?? 0;
     if (t + 1 > batchMachines(unissued, await wantFor(db, o, cd, ask.caps, ask.gpuGames))) return null;
-    let rank = jobRank("eval", cd.share, (o.active.get(`${cd.scope}|eval`) ?? 0) + t, runsAfter);
-    if (cd.deferred) rank = Math.max(rank, DEFERRED_EVAL_RANK);
-    if (!sortsBefore({ tier: cd.tier, rank, score: o.score(cd) }, ownKey)) return null;
     if (rolling && cd.share !== undefined) {
-      const bg = [...o.bgScopes].reduce((s, x) => s + (o.active.get(`${x}|selfplay`) ?? 0) + (o.active.get(`${x}|eval`) ?? 0) + (transit.get(x) ?? 0), 0);
-      if (bg + 1 > cd.share * o.activeRuns + 1e-9) return null;
+      // (o.active counts the machines on their way as their batch's leases; o.activeRuns no longer counts this lease)
+      const bg = [...o.bgScopes].reduce((s, x) => s + (o.active.get(`${x}|selfplay`) ?? 0) + (o.active.get(`${x}|eval`) ?? 0), 0);
+      if (bg + 1 > cd.share * (o.activeRuns + 1) + 1e-9) return null;
     }
+    if (rolling && !(await drainFits(c, m, l, hw, cd, unissued))) return null;
     return cd.scope;
   }
   return null;
 }
 
+// Rev 29 (PROTOCOL 15.8): rolling lease `l` can give way to eval batch `cd` (`unissued` games): its drain (drainEstimate,
+// with the machine's measured rate for the run) is unknown, or at most LANE_MAX_DRAIN_S and shorter than the time the
+// other PCs that could play the batch on the CPU (cpuEvalRate, as the deferral counts them) would take for all of it -
+// unless the batch is stalled (15.5: those PCs are not taking it).
+async function drainFits(c: Ctx, m: MachineRow, l: book.LeaseRow, hw: HwRouting, cd: Candidate, unissued: number): Promise<boolean> {
+  const db = c.env.DB;
+  const known = await db
+    .prepare(`SELECT rate FROM rates WHERE machine_id = ? AND kind = 'selfplay' AND scope = ?`)
+    .bind(m.machine_id, l.scope)
+    .first<{ rate: number }>();
+  const running = Math.max(0, c.now - l.issued_at - l.paused_s);
+  const drain = drainEstimate(book.batchOf(l), book.unfinishedIds(l), book.finishedIds(l), running, known?.rate ?? 0);
+  if (drain === null) return true;
+  if (drain > LANE_MAX_DRAIN_S) return false;
+  const cpu = await cpuEvalRate(db, cd.scope, m.machine_id, c.now, cd.platforms ?? [storedPlatform(m.platform)], hw.priority_lane);
+  if (cpu <= 0 || unissued / cpu >= drain) return true;
+  return hw.eval_stall_s > 0 && !!cd.run && !!cd.batch && (await batchStalled(db, cd.run, cd.batch, hw.eval_stall_s, c.now));
+}
+
 // Rev 15 (PROTOCOL 10.4): what else waits for this machine, in the order PROTOCOL 3 picks work (offer(), with the caps
-// and profile the coordinator last stored for it, every job kind and nothing cached): a diagnostics request it would
-// get as a lease; a job that ranks before the rolling lease's own self-play by tier and rank (an eval batch with
+// and profile the coordinator last stored for it - rev 29: and the kinds and cached builds it last offered, storedAsk):
+// a diagnostics request it would get as a lease; a job that ranks before the rolling lease's own self-play by tier and
+// rank (an eval batch with
 // unissued ids, a fuzz campaign or a background job within its share); or, at the same rank, another run's
 // self-play with a higher priority. A self-play counts only with headroom. Null: nothing waits.
 export async function otherWorkWaits(c: Ctx, m: MachineRow, l: book.LeaseRow): Promise<string | null> {
@@ -1307,12 +1390,15 @@ export async function otherWorkWaits(c: Ctx, m: MachineRow, l: book.LeaseRow): P
 }
 
 // What a machine last asked with (POST /v1/lease), as the coordinator stored it - its caps, `gpu_allowed` and
-// `gpu_games` (rev 18), its agent version - with every job kind: the ask of a rolling lease's renewal (rev 15,
-// otherWorkWaits) and of the priority lane's decisions (rev 24, laneTarget). Cached: rev 28 (PROTOCOL 20.5) the running
-// lease's own worker build and runtime pack - they are on the machine's disk, and the stored `disk_mb` is the free space
-// with them there - and nothing else (before rev 28 nothing at all: on a PC with little free disk the lease's own run
-// didn't fit its disk cap, so another run's self-play "waited" and the lease was finished at every renewal, only for
-// the next lease request - which says what is cached - to get the same run again).
+// `gpu_games` (rev 18), its agent version, and (rev 29, PROTOCOL 15.8) its job kinds and cached builds: the ask of a
+// rolling lease's renewal (rev 15, otherWorkWaits) and of the priority lane's decisions (rev 24, laneTarget), so they
+// see the candidates the machine's next lease request will. Cached: also rev 28's (PROTOCOL 20.5) running lease's own
+// worker build and runtime pack - they are on the machine's disk, and the stored `disk_mb` is the free space with them
+// there (before rev 28 nothing at all: on a PC with little free disk the lease's own run didn't fit its disk cap, so
+// another run's self-play "waited" and the lease was finished at every renewal, only for the next lease request - which
+// says what is cached - to get the same run again; before rev 29 its other cached builds were missing the same way, and
+// every kind was assumed). No checkpoint counts as cached (an eval batch's networks count against the disk: the lane
+// may miss a batch the grant would give, never the reverse).
 function storedAsk(c: Ctx, m: MachineRow, l?: Pick<book.LeaseRow, "build_id" | "lease">): Ask {
   const stored = parseJson<(Partial<Caps> & { gpu_allowed?: unknown; gpu_games?: unknown }) | null>(m.caps, null) ?? {};
   const caps: Caps = {
@@ -1331,8 +1417,13 @@ function storedAsk(c: Ctx, m: MachineRow, l?: Pick<book.LeaseRow, "build_id" | "
   const awHeader = c.req.headers.get("x-farm-aw") ?? "1";
   const aw = /^\d{1,4}$/.test(awHeader) ? Number(awHeader) : 1;
   const own = l ? [l.build_id, parseJson<{ runtime?: { build_id?: string } | null }>(l.lease, {}).runtime?.build_id] : [];
-  const cachedBuilds = new Set(own.filter((x): x is string => typeof x === "string" && x.length > 0));
-  return { caps, gpuAllowed, gpuGames, cachedBuilds, cachedCkpts: new Set(), kinds: new Set(KINDS), agent, aw };
+  // Rev 29 (PROTOCOL 15.8): and the kinds and cached builds its last /v1/lease offered (stored before rev 29: every kind,
+  // nothing cached)
+  const asked = parseJson<{ kinds?: unknown; builds?: unknown } | null>(m.ask ?? null, null) ?? {};
+  const strs = (x: unknown) => (Array.isArray(x) ? x.filter((v): v is string => typeof v === "string" && v.length > 0) : []);
+  const cachedBuilds = new Set([...own.filter((x): x is string => typeof x === "string" && x.length > 0), ...strs(asked.builds)]);
+  const kinds = Array.isArray(asked.kinds) ? new Set(strs(asked.kinds).filter((k) => (KINDS as readonly string[]).includes(k))) : new Set<string>(KINDS);
+  return { caps, gpuAllowed, gpuGames, cachedBuilds, cachedCkpts: new Set(), kinds, agent, aw };
 }
 
 export async function result(c: Ctx, leaseId: string, seqStr: string): Promise<Response> {

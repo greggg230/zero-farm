@@ -1006,6 +1006,8 @@ export async function machines(c: Ctx): Promise<Response> {
       paused: !!m.paused,
       opt_in: [...machineOptIns(m.opt_in)], // rev 27 (PROTOCOL 19)
       fresh: machineFreshOf(m.fresh), // rev 28 (PROTOCOL 20)
+      ask: parseJson(m.ask, null), // rev 29 (PROTOCOL 15.8): its last ask's kinds and cached builds
+      lane: parseJson(m.lane, null), // rev 29 (PROTOCOL 15.8): its last lane yield and recent misses
     })),
   });
 }

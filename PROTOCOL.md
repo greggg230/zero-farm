@@ -7,7 +7,9 @@ A change to anything here is a protocol change: bump the version it belongs to a
 bottom.
 
 Versions: HTTP API `v1` (path prefix), agent↔worker protocol `aw/1`, network files `zero-onnx/1`,
-manifests `manifest/1`. Current revision: v1 rev 28 (section 20, fresher rows from fast machines: new generations with
+manifests `manifest/1`. Current revision: v1 rev 29 (section 15.8, the priority lane yields a lease only for a batch the
+machine's next lease request would get: the machine's real ask replayed, a yield the grant didn't follow not repeated, no
+yield whose drain outlasts the batch; rev 28: section 20, fresher rows from fast machines: new generations with
 extension answers and a per-machine poll, drains that keep switching, the owner's per-machine freshness budget, rolling
 result limits per hour; rev 27: section 19, opt-in runtimes per machine: the torch runtime pack and
 worker, offered only to machines the owner opted in; rev 26: section 18, the freshness budget: a rolling lease's games in flight
@@ -2558,6 +2560,46 @@ Checked against agents 0.3.10 (the macOS stable of before 2026-11-21), 0.3.13 an
 `give_back` → `stop`, `on_extend` `finish` → `roll_finish`, `finish()` for the fuzz final result), `engine.rs` (a new
 `/v1/lease` right after any lease ends; `wait_s` honoured up to `max_wait`).
 
+### 15.8 Only for a batch the machine would get (rev 29; coordinator migration 0019, no agent change)
+
+**Why.** On 2026-11-23 (rev 27) a canary PC with a CUDA GPU and 627 MB of free disk under its cap played rolling
+self-play on its GPU while short analysis campaigns came and went (a 100-200-game batch every ~12 minutes, each played
+in ~5 minutes by two Macs that left their fuzz for it). The lane worked out its order from a reconstructed ask that
+listed nothing cached: its 1.58 GB CUDA pack didn't fit the disk, so it had no GPU self-play in the lane's eyes, nothing
+deferred the batch (12.2) and the batch came first. Its leases finished their games in flight (1.5-10 minutes) and it
+asked for a lease - listing its cache - and the grant saw its GPU self-play, deferred the batch (the Macs could play it)
+and gave it self-play again: 7 yields in 45 minutes, about 28 minutes of drains for nothing. Rev 28 counted the lease's
+own build and pack as cached (which ended this case); the decision still used an ask the machine never made (every
+kind, no other cached build), and nothing noticed when the grant didn't follow a yield.
+
+**The ask.** Each `/v1/lease` that offers at least one kind stores its kinds and cached builds (at most
+`ASK_BUILDS_MAX` = 200) with the machine (`machines.ask`). The lane (15.3, 15.4) and the renewal (10.4) replay them with
+the stored caps, `gpu_allowed`, `gpu_games` and the lease's own build and pack (rev 28): they see the candidates the next
+lease request will. Still not replayed: cached checkpoints (an eval batch's networks count against the disk, so the lane
+may miss a batch the grant would give, never the reverse). The lane's order is offer()'s - section 3's - with the lease
+not counted and the machines on their way counted as their batch's leases (in `active` and the score; the runs' total
+without the lease); the lease's own job sorts where offer() puts it, so the lane and the grant rank with one function.
+
+**A yield the grant doesn't follow.** A yield (15.3 `give_back`, 15.4 `finish` with `yield`) is remembered with the
+machine (`machines.lane`: the batch's scope and id, the time). The machine's next lease request, once the yielding
+lease has closed (a request for a second slot while it finishes settles nothing), settles it: granted eval work, the
+yield did its job; granted anything else or nothing, the batch is a **miss** for that machine, and the lane doesn't send
+it to that batch (same scope and batch id) again for `LANE_MISS_S` = 1800 s. A yield not settled within
+`LANE_YIELD_TTL_S` = 3600 s is dropped. Other machines are unaffected, and so is the run's next batch.
+
+**The drain.** A rolling lease gives way only if its drain is short: its games in flight (its last beat's `inflight`, else
+`concurrency`, never more than its released ids not finished; before its first beat those ids) over its rate (finished
+games per running second so far, or the machine's measured self-play rate for the run, the higher), times
+`LANE_DRAIN_TAIL` = 1.5 (the longest game in flight; Little's law gives the average one), must be at most
+`LANE_MAX_DRAIN_S` = 600 s and less than the time the CPU PCs that would play the batch (12.2's capacity, read as 15.5
+says) need for all its unissued games - unless the batch is stalled (15.5). Without a rate the drain is not known and
+doesn't stop the yield (the miss rule still applies). Fuzz leases are not affected (a give-back loses only the seeds in
+play).
+
+**Wire and agents.** No new field or endpoint for agents; the answers are 15.3's and 15.4's. Migration 0019 adds
+`machines.ask` and `machines.lane` (nullable; NULL reads as rev 28's ask and no yield or miss); `GET /v1/admin/machines`
+shows both (`ask` {kinds, builds}, `lane` {yield, miss}).
+
 ## 16. Branch games in self-play records (`records/2`; no wire change, no migration, no agent change)
 
 **Why.** A run may branch its self-play games (zero-core `selfplay_branch`, its docs/az.md 24 and 72): a share of the
@@ -2979,6 +3021,13 @@ owner sets a larger cap for that machine on the coordinator.
   or newer. A locally paused agent asks for no lease, so it hears of the cap when it resumes.
 
 ## Changes
+- v1 rev 29 (2026-11-23; coordinator migration 0019 `machines.ask`, `machines.lane`; no agent change; unreleased): the
+  priority lane yields a lease **only for a batch the machine would get** (section 15.8). The lane and the renewal
+  replay the machine's last ask (its kinds and cached builds, not only its caps); a yield the grant didn't follow is a
+  miss and the lane doesn't send that machine to that batch again for 30 minutes; a rolling lease gives way only when it
+  can finish its games in flight within 10 minutes and before the CPU PCs would have played the whole batch. Why: on
+  2026-11-23 a canary GPU PC with little free disk yielded its GPU self-play 7 times in 45 minutes for campaign batches
+  the grant then deferred, ~28 minutes of drains for nothing (rev 27's lane saw no cached CUDA pack, so no GPU self-play).
 - v1 rev 28, agent 0.3.20 (2026-11-22; coordinator migration 0018 `machines.fresh`, Worker var `POLL_AGENT` default
   0.3.20; unreleased): **fresher rows from fast machines** (section 20). An extension may say its `gen` and every answer
   then offers a newer generation as a beat does; `POST /v1/lease/{id}/poll` `{"gen"}` asks for one (its own rate bucket,

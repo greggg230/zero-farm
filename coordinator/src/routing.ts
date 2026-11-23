@@ -409,6 +409,80 @@ export const LANE_SOON_S = 600;
 // A fuzz lease that will be done within this many seconds at its own pace so far is not given back (15.3).
 export const FUZZ_TAIL_S = 120;
 
+// Rev 29 (PROTOCOL 15.8): a machine that gave way to an eval batch and was then given something else is not sent to that
+// batch again for this long (the lane learns from a decision the grant didn't follow).
+export const LANE_MISS_S = 1800;
+// A yield not settled by a lease request within this long says nothing more (the machine went away).
+export const LANE_YIELD_TTL_S = 3600;
+// A rolling lease finishes every game in flight before its machine moves on: no lane yield when that would take longer
+// than this (a CUDA PC drains in 2-8 minutes, a DirectML PC 11-36, a Mac 5-25 - 2026-11-21/22).
+export const LANE_MAX_DRAIN_S = 600;
+// A game in flight at the finish has run part of its course: the longest of them lasts about this many average games.
+export const LANE_DRAIN_TAIL = 1.5;
+// The most cached builds of an ask the coordinator keeps (an agent lists up to 1,000; it caches a few dozen).
+export const ASK_BUILDS_MAX = 200;
+
+// Rev 29 (PROTOCOL 15.8): how long a rolling lease would take to finish its games in flight, or null (not known). Its
+// games in flight (its last beat's, never more than its released ids not finished; before any beat, those ids) over its
+// rate (finished games per running second so far, or the machine's measured rate for the run, the higher): Little's
+// law gives the average game's length, and the longest game in flight lasts LANE_DRAIN_TAIL of that.
+export function drainEstimate(inflight: number, unfinished: number, finished: number, runningS: number, knownRate: number): number | null {
+  const games = inflight > 0 ? Math.min(inflight, unfinished) : unfinished;
+  const rate = Math.max(runningS > 0 ? finished / runningS : 0, Number.isFinite(knownRate) ? knownRate : 0);
+  if (games <= 0) return 0;
+  if (!(rate > 0)) return null;
+  return (LANE_DRAIN_TAIL * games) / rate;
+}
+
+// Rev 29 (PROTOCOL 15.8): `machines.lane` - the batch a machine's last lease gave way to, and the batches it gave way to
+// and then was not given.
+export interface LaneMark {
+  scope: string;
+  batch: string | null;
+  t: number;
+}
+export interface LaneState {
+  yield: LaneMark | null;
+  miss: Record<string, { batch: string | null; t: number }>;
+}
+export function laneStateOf(text: string | null | undefined): LaneState {
+  let v: any = null;
+  try {
+    v = text ? JSON.parse(text) : null;
+  } catch {
+    v = null;
+  }
+  const o = v && typeof v === "object" && !Array.isArray(v) ? v : {};
+  const mark = (x: any): LaneMark | null =>
+    x && typeof x === "object" && typeof x.scope === "string" && typeof x.t === "number" ? { scope: x.scope, batch: typeof x.batch === "string" ? x.batch : null, t: x.t } : null;
+  const miss: LaneState["miss"] = {};
+  if (o.miss && typeof o.miss === "object" && !Array.isArray(o.miss)) {
+    for (const [scope, x] of Object.entries(o.miss as Record<string, any>)) {
+      if (x && typeof x === "object" && typeof x.t === "number") miss[scope] = { batch: typeof x.batch === "string" ? x.batch : null, t: x.t };
+    }
+  }
+  return { yield: mark(o.yield), miss };
+}
+// The stored text (null: nothing to keep); misses older than LANE_MISS_S are dropped.
+export function laneStateText(s: LaneState, now: number): string | null {
+  const miss = Object.fromEntries(Object.entries(s.miss).filter(([, x]) => now - x.t < LANE_MISS_S));
+  if (!s.yield && !Object.keys(miss).length) return null;
+  return JSON.stringify({ ...(s.yield ? { yield: s.yield } : {}), ...(Object.keys(miss).length ? { miss } : {}) });
+}
+// A lease request settles the machine's yield: given eval work (`gotEval`), the yield did its job; given anything else (or
+// nothing), the batch is a miss for this machine. A yield older than LANE_YIELD_TTL_S is dropped without a verdict.
+export function laneSettled(s: LaneState, gotEval: boolean, now: number): LaneState {
+  const y = s.yield;
+  if (!y) return s;
+  if (gotEval || now - y.t > LANE_YIELD_TTL_S) return { ...s, yield: null };
+  return { yield: null, miss: { ...s.miss, [y.scope]: { batch: y.batch, t: now } } };
+}
+// The lane doesn't send this machine to batch `batch` of `scope`: it gave way to it and wasn't given it, recently.
+export function laneMissed(s: LaneState, scope: string, batch: string | null | undefined, now: number): boolean {
+  const x = s.miss[scope];
+  return !!x && x.batch === (batch ?? null) && now - x.t < LANE_MISS_S;
+}
+
 // `leases.pending` of a lease on its way to an eval batch (15.3, 15.4): "yield:" + the batch's scope ("run:<run>").
 export const YIELD_PREFIX = "yield:";
 export const yieldTarget = (pending: string | null | undefined): string | null =>

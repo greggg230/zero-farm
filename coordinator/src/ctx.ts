@@ -89,6 +89,8 @@ export interface MachineRow {
   opt_in?: string | null; // rev 27 (PROTOCOL 19, migration 0017): JSON list of the opt-in runtimes the owner allowed here
   fresh?: string | null; // rev 28 (PROTOCOL 20, migration 0018): the owner's freshness settings here (JSON {poll_s, share})
   disk_cap_mb?: number | null; // rev 28 (PROTOCOL 20.7, migration 0018): the owner's disk cap here (MB), in place of the agent's own
+  ask?: string | null; // rev 29 (PROTOCOL 15.8, migration 0019): its last /v1/lease's kinds and cached builds (JSON {kinds, builds})
+  lane?: string | null; // rev 29 (PROTOCOL 15.8, migration 0019): the batch its last lease yielded to, and recent misses (JSON)
 }
 
 function bearer(req: Request): string | null {
