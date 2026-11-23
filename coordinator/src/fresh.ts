@@ -54,14 +54,64 @@ export function freshBudget(ts: number[], maxStale: number, flushS: number, now:
   return Math.min(FRESH_MAX_S, Math.max(FRESH_MIN_S, s));
 }
 
-// The budget of a run's rolling self-play now (null: not rolling, or too little history).
-export async function runFresh(db: D1Database, run: string, sp: Pick<SelfplayCfg, "max_stale"> & { rolling?: RollingCfg } | null, now: number): Promise<number | null> {
+// The budget of a run's rolling self-play now (null: not rolling, or too little history). Rev 28 (PROTOCOL 20.3): with a
+// machine's `share`, that machine's budget - the less of the run's and `shareBudget`.
+export async function runFresh(
+  db: D1Database,
+  run: string,
+  sp: Pick<SelfplayCfg, "max_stale"> & { rolling?: RollingCfg } | null,
+  now: number,
+  share?: number | null,
+): Promise<number | null> {
   if (!sp || !sp.rolling) return null;
   const { results } = await db.prepare(`SELECT t FROM checkpoints WHERE run = ? ORDER BY gen DESC LIMIT ?`).bind(run, FRESH_GENS).all<{ t: number }>();
-  return freshBudget(
-    results.map((r) => r.t),
-    sp.max_stale ?? 1,
-    sp.rolling.flush_s,
-    now,
-  );
+  const ts = results.map((r) => r.t);
+  const budget = freshBudget(ts, sp.max_stale ?? 1, sp.rolling.flush_s, now);
+  if (budget === null || !share) return budget;
+  const own = shareBudget(ts, share, now);
+  return own === null ? budget : Math.min(budget, own);
+}
+
+// ---------- rev 28 (PROTOCOL 20): the owner's freshness settings per machine ----------
+//
+// The run's budget above keeps a farm PC's rows inside the trainer's staleness window: a drop-avoidance cap. A machine
+// that replaces the trainer's local self-play - the owner's own desktop - must deliver rows as fresh as local ones,
+// which play about one generation period per game. The owner gives such a machine (`machines.fresh`, migration 0018):
+//   share  - its budget is at most floor(share x the run's generation period) seconds (at least FRESH_SHARE_MIN_S): the
+//            agent's cap (18.3) then keeps its p75 game within that share of a generation;
+//   poll_s - its rolling leases poll for a new generation every poll_s seconds (POST /v1/lease/{id}/poll) instead of
+//            waiting for a beat (every 60 s).
+
+export const FRESH_SHARE_MIN = 0.1;
+export const FRESH_SHARE_MAX = 4;
+export const FRESH_SHARE_MIN_S = 30; // never a machine budget under 30 s (a GPU's batches would starve)
+export const POLL_MIN_S = 2; // the poll bucket allows one every 2 s (ratelimit.ts)
+export const POLL_MAX_S = 300;
+
+export interface MachineFresh {
+  poll_s?: number;
+  share?: number;
+}
+
+// A machine's stored `fresh` (JSON) -> its settings; anything malformed counts as unset.
+export function machineFreshOf(text: string | null | undefined): MachineFresh {
+  let v: any = null;
+  try {
+    v = text ? JSON.parse(text) : null;
+  } catch {
+    v = null;
+  }
+  const o = v && typeof v === "object" && !Array.isArray(v) ? v : {};
+  const out: MachineFresh = {};
+  if (Number.isInteger(o.poll_s) && o.poll_s >= POLL_MIN_S && o.poll_s <= POLL_MAX_S) out.poll_s = o.poll_s;
+  if (typeof o.share === "number" && Number.isFinite(o.share) && o.share >= FRESH_SHARE_MIN && o.share <= FRESH_SHARE_MAX) out.share = o.share;
+  return out;
+}
+
+// A machine's own budget: `share` of the run's generation period (registration times newest gen first); null with too
+// little history.
+export function shareBudget(ts: number[], share: number, now: number): number | null {
+  const period = genPeriod(ts, now);
+  if (period === null) return null;
+  return Math.min(FRESH_MAX_S, Math.max(FRESH_SHARE_MIN_S, Math.floor(share * period)));
 }

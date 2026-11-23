@@ -87,6 +87,7 @@ export interface MachineRow {
   tuning?: string | null; // rev 19 (migration 0015): its agent's last `tuning` report (JSON)
   tuning_t?: number | null;
   opt_in?: string | null; // rev 27 (PROTOCOL 19, migration 0017): JSON list of the opt-in runtimes the owner allowed here
+  fresh?: string | null; // rev 28 (PROTOCOL 20, migration 0018): the owner's freshness settings here (JSON {poll_s, share})
 }
 
 function bearer(req: Request): string | null {

@@ -1,7 +1,7 @@
 // zero-farm coordinator: hands out work to invited friends' idle PCs for zero-core training runs.
 // The wire contract is ../PROTOCOL.md; why it works this way is ../DESIGN.md (sections 5-7).
 //
-//   friends (machine token):  /v1/enroll /v1/lease /v1/lease/:id/{beat,extend,result/:seq,done}
+//   friends (machine token):  /v1/enroll /v1/lease /v1/lease/:id/{beat,extend,poll,result/:seq,done}
 //                             /v1/artifact/:key /v1/agent/latest /v1/crash /v1/diag/:name
 //   desktop (admin token or a Cloudflare Access login):  /v1/admin/...
 //   dashboard:                /admin (static; reads /v1/admin/stats)
@@ -33,6 +33,7 @@ const routes: [string, RegExp, Handler][] = [
   ["POST", /^\/v1\/lease$/, friend.lease],
   ["POST", new RegExp(`^/v1/lease/${SEG}/beat$`), friend.beat],
   ["POST", new RegExp(`^/v1/lease/${SEG}/extend$`), friend.extend], // rev 15: rolling leases
+  ["POST", new RegExp(`^/v1/lease/${SEG}/poll$`), friend.poll], // rev 28: a rolling lease's generation poll
   ["PUT", new RegExp(`^/v1/lease/${SEG}/result/${SEG}$`), friend.result],
   ["POST", new RegExp(`^/v1/lease/${SEG}/done$`), friend.done],
   ["GET", /^\/v1\/artifact\/(.+)$/, friend.artifact],

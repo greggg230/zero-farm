@@ -233,7 +233,9 @@ function render(s) {
     ["agent", (m) => esc(m.agent_version) + ' <span class="muted">' + esc(m.channel) + "</span>" +
       (s.limits && m.agent_version && cmpVer(m.agent_version, s.limits.definition_agent) < 0 ? ' <span class="warn" title="older than the first agent that verifies definitions">legacy</span>' : "") +
       // Rev 27 (PROTOCOL 19): the opt-in runtimes the owner allowed on it.
-      (Array.isArray(m.opt_in) && m.opt_in.length ? '<br><span class="muted" title="opt-in runtimes (PROTOCOL 19)">opt-in: ' + esc(m.opt_in.join(", ")) + "</span>" : "")],
+      (Array.isArray(m.opt_in) && m.opt_in.length ? '<br><span class="muted" title="opt-in runtimes (PROTOCOL 19)">opt-in: ' + esc(m.opt_in.join(", ")) + "</span>" : "") +
+      // Rev 28 (PROTOCOL 20): the owner's freshness settings for it.
+      (m.fresh && (m.fresh.poll_s || m.fresh.share) ? '<br><span class="muted" title="freshness settings (PROTOCOL 20)">fresh: ' + esc([m.fresh.poll_s ? "poll " + m.fresh.poll_s + " s" : "", m.fresh.share ? "share " + m.fresh.share : ""].filter(Boolean).join(", ")) + "</span>" : "")],
     ["last seen", (m) => (m.revoked ? '<span class="bad">revoked</span>' : ago(m.last_seen, now)) + (m.paused ? ' <span class="warn">paused</span>' : "")],
     ["working on", (m) => esc(m.working_on || "")],
     ["caps", (m) => (m.caps ? m.caps.threads + " thr, " + Math.round(m.caps.ram_mb / 1024) + " GB" + (m.caps.gpu ? ", gpu" : "") : "") +

@@ -2,7 +2,7 @@
 // release tool, scripts/admin.ts and the /admin dashboard.
 
 import { presenceOf } from "./presence";
-import { runFresh } from "./fresh";
+import { FRESH_SHARE_MAX, FRESH_SHARE_MIN, POLL_MAX_S, POLL_MIN_S, type MachineFresh, machineFreshOf, runFresh } from "./fresh";
 import { storedTuning, tuningClasses } from "./tuning";
 import { accessEnabled } from "./access";
 import * as book from "./book";
@@ -1005,6 +1005,7 @@ export async function machines(c: Ctx): Promise<Response> {
       caps: parseJson(m.caps, null),
       paused: !!m.paused,
       opt_in: [...machineOptIns(m.opt_in)], // rev 27 (PROTOCOL 19)
+      fresh: machineFreshOf(m.fresh), // rev 28 (PROTOCOL 20)
     })),
   });
 }
@@ -1043,6 +1044,8 @@ export async function updateMachine(c: Ctx, id: string): Promise<Response> {
   const optAdd = str(b.opt_in_add, "opt_in_add", { optional: true, re: OPT_IN_RE });
   const optRemove = str(b.opt_in_remove, "opt_in_remove", { optional: true, re: OPT_IN_RE });
   if (optSet !== undefined && (optAdd || optRemove)) throw bad("opt_in replaces the list: not with opt_in_add or opt_in_remove");
+  // Rev 28 (PROTOCOL 20): the owner's freshness settings for this machine (replaced whole; null or {}: none)
+  const fresh = b.fresh === undefined ? undefined : machineFreshIn(b.fresh);
   const r = await c.env.DB.prepare(
     `UPDATE machines SET channel = COALESCE(?, channel), paused = COALESCE(?, paused), name = COALESCE(?, name) WHERE machine_id = ?`,
   )
@@ -1059,9 +1062,25 @@ export async function updateMachine(c: Ctx, id: string): Promise<Response> {
     optIn = [...cur].sort();
     await c.env.DB.prepare(`UPDATE machines SET opt_in = ? WHERE machine_id = ?`).bind(optIn.length ? JSON.stringify(optIn) : null, id).run();
   }
+  if (fresh !== undefined) {
+    await c.env.DB.prepare(`UPDATE machines SET fresh = ? WHERE machine_id = ?`).bind(Object.keys(fresh).length ? JSON.stringify(fresh) : null, id).run();
+  }
   // Rev 5: lifts the builds this machine reported as blocked by Windows (/v1/crash kind blocked).
   const unblocked = unblock ? ((await c.env.DB.prepare(`DELETE FROM blocks WHERE machine_id = ?`).bind(id).run()).meta.changes ?? 0) : 0;
-  return json({ ok: true, ...(unblock ? { unblocked } : {}), ...(optIn !== undefined ? { opt_in: optIn } : {}) });
+  return json({ ok: true, ...(unblock ? { unblocked } : {}), ...(optIn !== undefined ? { opt_in: optIn } : {}), ...(fresh !== undefined ? { fresh } : {}) });
+}
+
+// Rev 28 (PROTOCOL 20): a machine's `fresh` as put: `{"poll_s": 2..300, "share": 0.1..4}`, each optional (null or {}: none).
+function machineFreshIn(v: unknown): MachineFresh {
+  if (v === null) return {};
+  const o = obj(v, "fresh");
+  for (const k of Object.keys(o)) if (k !== "poll_s" && k !== "share") throw bad(`fresh.${k}: unknown field (poll_s, share)`);
+  const out: MachineFresh = {};
+  const pollS = int(o.poll_s, "fresh.poll_s", { optional: true, min: POLL_MIN_S, max: POLL_MAX_S });
+  const share = num(o.share, "fresh.share", { optional: true, min: FRESH_SHARE_MIN, max: FRESH_SHARE_MAX });
+  if (pollS !== undefined) out.poll_s = pollS;
+  if (share !== undefined) out.share = share;
+  return out;
 }
 
 // Rev 27 (PROTOCOL 19): a machine's `opt_in` list as put: opt-in names, at most MAX_OPT_IN, no repeats ([] or null: none).
@@ -1231,7 +1250,7 @@ export async function stats(c: Ctx): Promise<Response> {
   const cfg = config(c.env);
   const [machinesR, leasesR, crashesR, thrR, runsR, campsR, recentCrashR, fuzzR, classR, pausedR, failCountR, releasesR, diagR, blocksR, batchesR, perMachineR, perScopeR, externalR] = await db.batch<any>([
     db.prepare(
-      `SELECT machine_id, name, class, channel, platform, agent_version, created_at, last_seen, revoked_at, paused, caps, presence, presence_t, tuning, tuning_t, opt_in,
+      `SELECT machine_id, name, class, channel, platform, agent_version, created_at, last_seen, revoked_at, paused, caps, presence, presence_t, tuning, tuning_t, opt_in, fresh,
          json_extract(profile, '$.idle_h_day') AS idle_h_day, json_extract(profile, '$.on_h_day') AS on_h_day,
          json_extract(profile, '$.providers') AS providers, json_extract(profile, '$.gpus') AS gpus
        FROM machines ORDER BY created_at`,
@@ -1331,6 +1350,8 @@ export async function stats(c: Ctx): Promise<Response> {
       paused: !!m.paused,
       // Rev 27 (PROTOCOL 19): the opt-in runtimes the owner allowed on it.
       opt_in: [...machineOptIns(m.opt_in)],
+      // Rev 28 (PROTOCOL 20): the owner's freshness settings for it ({}: none).
+      fresh: machineFreshOf(m.fresh),
       // Rev 16: why an online agent isn't working (POST /v1/presence), while fresh.
       presence: presenceOf(m, c.now),
       // Rev 19 (PROTOCOL 13): the CPU layouts its agent tuned (its last report) and when it sent them.
@@ -1507,6 +1528,8 @@ export async function stats(c: Ctx): Promise<Response> {
       fresh_agent: cfg.freshAgent,
       // rev 27 (PROTOCOL 19)
       torch_agent: cfg.torchAgent,
+      // rev 28 (PROTOCOL 20)
+      poll_agent: cfg.pollAgent,
       data_keys: cfg.dataPubkeys.length,
       max_active_leases: cfg.maxActiveLeases,
       max_lease_chunks: cfg.maxLeaseChunks,

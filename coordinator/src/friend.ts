@@ -54,7 +54,7 @@ import {
   yieldTarget,
 } from "./routing";
 import { presenceOf } from "./presence";
-import { runFresh } from "./fresh";
+import { machineFreshOf, runFresh } from "./fresh";
 import { TUNING_FEATURE, cleanTuning, hintFor, storedTuning, type Hint } from "./tuning";
 import { cleanStats, telemetry } from "./telemetry";
 import {
@@ -71,6 +71,7 @@ import {
   clamp,
   cmpSemver,
   conflict,
+  gone,
   int,
   isSemver,
   json,
@@ -421,8 +422,11 @@ export async function lease(c: Ctx): Promise<Response> {
 
   // Rev 15 (PROTOCOL 10.2): this agent takes rolling self-play leases (a run with `selfplay.rolling` then gives one).
   const rolling = o.defAware && features.has("rolling") && cmpSemver(agent, cfg.rollingAgent) >= 0;
-  // Rev 26 (PROTOCOL 18): and is sent the run's freshness budget with it
+  // Rev 26 (PROTOCOL 18): and is sent the run's freshness budget with it (rev 28, PROTOCOL 20.3: this machine's own, with
+  // the owner's `share`) and, rev 28 (20.2), the owner's `poll_s` for this machine
   const fresh = rolling && freshFor(cfg.freshAgent, agent, o.hw, m);
+  const mf = machineFreshOf(m.fresh);
+  const pollS = rolling && cmpSemver(agent, cfg.pollAgent) >= 0 ? mf.poll_s : undefined;
   // --- then runs' games by priority and fit, then backfill; share by active leases (offer's order) ---
   for (const cd of o.usable) {
     const want = await wantFor(db, o, cd, caps, gpuGames);
@@ -440,7 +444,8 @@ export async function lease(c: Ctx): Promise<Response> {
         // rev 20 (PROTOCOL 14.3): this agent takes model variants
         ...(cmpSemver(agent, cfg.variantAgent) >= 0 ? { variants: true } : {}),
         ...(rolling && cd.kind === "selfplay" ? { rolling: true } : {}),
-        ...(fresh && cd.kind === "selfplay" ? { fresh: true } : {}),
+        ...(fresh && cd.kind === "selfplay" ? { fresh: true, ...(mf.share ? { fresh_share: mf.share } : {}) } : {}),
+        ...(pollS && cd.kind === "selfplay" ? { poll_s: pollS } : {}),
       }),
     );
     // Rev 7: the job's provider allowlist rides along (a routing hint, not part of the signed job). Rev 19: so does
@@ -1057,9 +1062,12 @@ export async function beat(c: Ctx, leaseId: string): Promise<Response> {
     telemetry(c.env.TELEMETRY).write({ machine_id: m.machine_id, class: m.class, lease_id: leaseId, kind: l.kind, scope: l.scope, event: "beat", stats });
   }
   const uploadDiag = await takeUploadDiag(c.env.DB, m, c.now);
-  // Rev 26 (PROTOCOL 18.2): a rolling self-play lease's answer keeps its freshness budget current
-  const fresh = l.kind === "selfplay" && book.isRolling(l) && l.state === "active" ? await leaseFresh(c, m, l.run) : undefined;
-  const out = fresh === undefined ? ans : { ...ans, fresh_s: fresh };
+  // Rev 26 (PROTOCOL 18.2): a rolling self-play lease's answer keeps its freshness budget current (rev 28, 20.2: and its
+  // poll interval)
+  const live = l.kind === "selfplay" && book.isRolling(l) && l.state === "active";
+  const fresh = live ? await leaseFresh(c, m, l.run) : undefined;
+  const poll = live ? leasePoll(c, m) : undefined;
+  const out = { ...ans, ...(fresh === undefined ? {} : { fresh_s: fresh }), ...(poll === undefined ? {} : { poll_s: poll }) };
   return json(uploadDiag ? { ...out, upload_diag: uploadDiag } : out);
 }
 
@@ -1072,6 +1080,8 @@ export async function extend(c: Ctx, leaseId: string): Promise<Response> {
   const l = await ownLeaseRow(c, m, leaseId);
   const b = await readJson(c.req, 64 * 1024);
   const games = int(b.games, "games", { min: 1, max: book.MAX_LEASE_IDS });
+  // Rev 28 (PROTOCOL 20.1): the newest generation the lease's workers play (agents from 0.3.20): the answer offers newer
+  const gen = int(b.gen, "gen", { optional: true, min: 0, max: 999_999_999 }) ?? null;
   if (l.kind !== "selfplay" || !book.isRolling(l)) throw bad("only a rolling self-play lease is extended (PROTOCOL 10.4)");
   const farm = await c.env.DB.prepare(`SELECT value FROM settings WHERE key = 'paused'`).first<{ value: string }>();
   const paused = !!m.paused || farm?.value === "1";
@@ -1085,19 +1095,57 @@ export async function extend(c: Ctx, leaseId: string): Promise<Response> {
   }
   const waiting = due && !yieldTo ? await otherWorkWaits(c, m, l) : null;
   const ans = unwrap(
-    await bookFor(c.env, l.scope).extend({ now: c.now, machine_id: m.machine_id, lease_id: leaseId, scope: l.scope, games, paused, waiting, yield_to: yieldTo }),
+    await bookFor(c.env, l.scope).extend({ now: c.now, machine_id: m.machine_id, lease_id: leaseId, scope: l.scope, games, paused, waiting, yield_to: yieldTo, gen }),
   );
-  // Rev 26 (PROTOCOL 18.2): with the run's freshness budget as it is now
+  // Rev 26 (PROTOCOL 18.2): with the run's freshness budget as it is now (rev 28, 20.2: and the poll interval)
   const fresh = l.state === "active" ? await leaseFresh(c, m, l.run) : undefined;
-  return json(fresh === undefined ? ans : { ...ans, fresh_s: fresh });
+  const poll = l.state === "active" ? leasePoll(c, m) : undefined;
+  return json({ ...ans, ...(fresh === undefined ? {} : { fresh_s: fresh }), ...(poll === undefined ? {} : { poll_s: poll }) });
+}
+
+// Rev 28 (PROTOCOL 20.2): POST /v1/lease/{id}/poll `{"gen": g}` - has the run a newer generation for this rolling lease
+// than `g`, the newest its workers play? The answer is a beat's offer (`checkpoint`, with `definition` when there is one)
+// plus the lease's `fresh_s` and `poll_s` as a beat answer has them. It changes nothing: no id is released, no renewal or
+// yield is decided, `cur_gen` is not stored (beats and extensions do that), and it doesn't go through the scope's
+// LeaseBook (it reads only). Its own bucket (`poll`, one per 2 s), so a poll every few seconds leaves the beat bucket
+// to beats and extensions.
+export async function poll(c: Ctx, leaseId: string): Promise<Response> {
+  const m = await authMachine(c);
+  await take(c, m.machine_id, "poll", "poll");
+  const l = await ownLeaseRow(c, m, leaseId);
+  const b = await readJson(c.req, 4 * 1024);
+  const gen = int(b.gen, "gen", { min: 0, max: 999_999_999 });
+  if (l.kind !== "selfplay" || !book.isRolling(l)) throw bad("only a rolling self-play lease is polled (PROTOCOL 20.2)");
+  if (l.state === "expired") throw gone("lease expired");
+  if (l.state === "cancelled") throw gone("lease was cancelled");
+  if (l.state !== "active") throw gone("lease is closed");
+  const offer = await book.rollingOffer(c.env.DB, l, gen);
+  const fresh = await leaseFresh(c, m, l.run);
+  const pollS = leasePoll(c, m);
+  return json({
+    checkpoint: offer?.checkpoint ?? null,
+    ...(offer ? { definition: offer.definition } : {}),
+    ...(fresh === undefined ? {} : { fresh_s: fresh }),
+    ...(pollS === undefined ? {} : { poll_s: pollS }),
+  });
+}
+
+// Rev 28 (PROTOCOL 20.2): a rolling lease's poll interval for the answers: undefined for an agent before POLL_AGENT (the
+// answer keeps exactly its keys of before), else the owner's `poll_s` for this machine or null (none: stop polling).
+function leasePoll(c: Ctx, m: MachineRow): number | null | undefined {
+  const agent = m.agent_version;
+  if (!agent || !isSemver(agent) || cmpSemver(agent, config(c.env).pollAgent) < 0) return undefined;
+  return machineFreshOf(m.fresh).poll_s ?? null;
 }
 
 // ---------- rev 26 (PROTOCOL 18): the freshness budget ----------
 
 // The machine is sent its rolling leases' freshness budget: an agent from FRESH_AGENT on a machine the owner's
-// `fresh_cap` names (18.4).
+// `fresh_cap` names (18.4). Rev 28 (PROTOCOL 20.3): or on a machine the owner gave a `share` - unless `fresh_cap` is
+// "off", the kill switch for every budget.
 function freshFor(freshAgent: string, agent: string | null, hw: HwRouting, m: MachineRow): boolean {
-  return !!agent && isSemver(agent) && cmpSemver(agent, freshAgent) >= 0 && freshApplies(hw, m.channel);
+  if (!agent || !isSemver(agent) || cmpSemver(agent, freshAgent) < 0) return false;
+  return freshApplies(hw, m.channel) || (hw.fresh_cap !== "off" && machineFreshOf(m.fresh).share !== undefined);
 }
 
 // A rolling self-play lease's freshness budget for the beat and extension answers: undefined for an agent before
@@ -1111,7 +1159,7 @@ async function leaseFresh(c: Ctx, m: MachineRow, run: string | null): Promise<nu
   if (!freshFor(config(c.env).freshAgent, agent, await hwSetting(c.env.DB), m)) return null;
   const r = await book.getRun(c.env.DB, run);
   const sp = r && r.state === "active" ? parseJson<book.SelfplayCfg | null>(r.selfplay, null) : null;
-  return runFresh(c.env.DB, run, sp, c.now);
+  return runFresh(c.env.DB, run, sp, c.now, machineFreshOf(m.fresh).share);
 }
 
 // ---------- rev 24 (PROTOCOL 15): the priority lane ----------
@@ -1175,7 +1223,7 @@ export async function laneTarget(c: Ctx, m: MachineRow, l: book.LeaseRow, hw: Hw
   const transit = await inTransit(db, c.now);
   // (cheap first: every waiting batch already has a machine on its way per smallest eval lease of its unissued games)
   if (![...waiting].some(([s, n]) => (transit.get(s) ?? 0) + 1 <= batchMachines(n, SIZING.eval.min))) return null;
-  const ask = storedAsk(c, m);
+  const ask = storedAsk(c, m, l);
   const o = await offer(c, m, ask, parseJson<Profile | null>(m.profile, null));
   if (o.farmPaused) return null;
   const rolling = l.kind === "selfplay";
@@ -1219,7 +1267,7 @@ export async function laneTarget(c: Ctx, m: MachineRow, l: book.LeaseRow, hw: Hw
 // self-play with a higher priority. A self-play counts only with headroom. Null: nothing waits.
 export async function otherWorkWaits(c: Ctx, m: MachineRow, l: book.LeaseRow): Promise<string | null> {
   const db = c.env.DB;
-  const o = await offer(c, m, storedAsk(c, m), parseJson<Profile | null>(m.profile, null));
+  const o = await offer(c, m, storedAsk(c, m, l), parseJson<Profile | null>(m.profile, null));
   if (!o.defAware && o.diag.length) return "diag";
   const own = o.usable.find((cd) => cd.scope === l.scope && cd.kind === "selfplay");
   const ownRun = await book.getRun(db, l.run!);
@@ -1256,9 +1304,13 @@ export async function otherWorkWaits(c: Ctx, m: MachineRow, l: book.LeaseRow): P
 }
 
 // What a machine last asked with (POST /v1/lease), as the coordinator stored it - its caps, `gpu_allowed` and
-// `gpu_games` (rev 18), its agent version - with every job kind and nothing cached: the ask of a rolling lease's renewal
-// (rev 15, otherWorkWaits) and of the priority lane's decisions (rev 24, laneTarget).
-function storedAsk(c: Ctx, m: MachineRow): Ask {
+// `gpu_games` (rev 18), its agent version - with every job kind: the ask of a rolling lease's renewal (rev 15,
+// otherWorkWaits) and of the priority lane's decisions (rev 24, laneTarget). Cached: rev 28 (PROTOCOL 20.5) the running
+// lease's own worker build and runtime pack - they are on the machine's disk, and the stored `disk_mb` is the free space
+// with them there - and nothing else (before rev 28 nothing at all: on a PC with little free disk the lease's own run
+// didn't fit its disk cap, so another run's self-play "waited" and the lease was finished at every renewal, only for
+// the next lease request - which says what is cached - to get the same run again).
+function storedAsk(c: Ctx, m: MachineRow, l?: Pick<book.LeaseRow, "build_id" | "lease">): Ask {
   const stored = parseJson<(Partial<Caps> & { gpu_allowed?: unknown; gpu_games?: unknown }) | null>(m.caps, null) ?? {};
   const caps: Caps = {
     threads: typeof stored.threads === "number" ? stored.threads : 1,
@@ -1275,7 +1327,9 @@ function storedAsk(c: Ctx, m: MachineRow): Ask {
   const agent = m.agent_version && isSemver(m.agent_version) ? m.agent_version : "0.0.0";
   const awHeader = c.req.headers.get("x-farm-aw") ?? "1";
   const aw = /^\d{1,4}$/.test(awHeader) ? Number(awHeader) : 1;
-  return { caps, gpuAllowed, gpuGames, cachedBuilds: new Set(), cachedCkpts: new Set(), kinds: new Set(KINDS), agent, aw };
+  const own = l ? [l.build_id, parseJson<{ runtime?: { build_id?: string } | null }>(l.lease, {}).runtime?.build_id] : [];
+  const cachedBuilds = new Set(own.filter((x): x is string => typeof x === "string" && x.length > 0));
+  return { caps, gpuAllowed, gpuGames, cachedBuilds, cachedCkpts: new Set(), kinds: new Set(KINDS), agent, aw };
 }
 
 export async function result(c: Ctx, leaseId: string, seqStr: string): Promise<Response> {
