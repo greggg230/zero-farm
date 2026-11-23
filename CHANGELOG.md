@@ -13,7 +13,7 @@ version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's:
   that on for the computer, and switches its last games to a new network while a job winds down. Practice games then
   reach the training with fresher positions, and fewer are thrown away as too old.
 
-## Unreleased
+## Unreleased (0.3.19)
 
 - **An "owner machine" setting, for the farm owner's own computer only.** The owner's desktop trains its networks and
   can now also play all of their practice games through Zero Farm, on the same graphics card. `owner on` makes Zero Farm
