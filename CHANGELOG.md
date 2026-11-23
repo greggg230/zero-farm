@@ -4,6 +4,20 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's: `agent-macos-v<version>`).
 
+## Unreleased (0.3.20)
+
+- **New networks reach a running job within seconds, also while it winds down.** A computer used to hear about a new
+  network only with its once-a-minute check-in, and a job that was winding down (finishing its last games before
+  ending) kept playing the old network until it ended - on one computer 8-9 minutes, every ten minutes. Zero Farm now
+  hears about new networks with every request for more games too, asks every few seconds where the farm owner turned
+  that on for the computer, and switches its last games to a new network while a job winds down. Practice games then
+  reach the training with fresher positions, and fewer are thrown away as too old.
+- **The farm owner can raise this computer's disk space limit from the server - only with your consent.** Zero Farm
+  keeps its files under a disk space limit you can set (3 GB unless you changed it). Some of the farm's programs are now
+  bigger than that (the PyTorch program's files are over 4 GB). When you agree, the farm owner can set a different limit
+  for your computer; Zero Farm then uses the owner's limit instead of yours, and the tray menu says so ("set by the farm
+  owner"). Your own setting is kept, and applies again as soon as the owner clears theirs.
+
 ## Unreleased (0.3.19)
 
 - **An "owner machine" setting, for the farm owner's own computer only.** The owner's desktop trains its networks and

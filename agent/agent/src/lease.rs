@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 use zerofarm_common::definition::Definition;
 use zerofarm_common::http::{Backoff, CallError};
 use zerofarm_common::manifest::{check_rel_path, Kind, VerifiedBuild};
-use zerofarm_common::protocol::{BeatReq, BeatResp, CheckpointRef, CrashReq, DefinitionRef, DoneReq, ExtendReq, ExtendResp, Lease, Progress, Stats};
+use zerofarm_common::protocol::{BeatReq, BeatResp, CheckpointRef, CrashReq, DefinitionRef, DoneReq, ExtendReq, ExtendResp, Lease, PollReq, PollResp, Progress, Stats};
 use zerofarm_common::manifest::GpuNeed;
 use std::collections::BTreeMap;
 
@@ -57,6 +57,8 @@ enum Ev {
     Ckpt(Result<(CheckpointRef, CkptFiles), (CheckpointRef, String)>),
     /// rev 15 (PROTOCOL 10.4): the answer to a rolling lease's extension.
     Extend(Result<ExtendResp, CallError>),
+    /// rev 28 (PROTOCOL 20.2): the answer to a rolling lease's generation poll.
+    Poll(Result<PollResp, CallError>),
     /// rev 15 (PROTOCOL 10.6): a rolling lease's new definition, verified (or why not), with the checkpoint it came with.
     Def(Box<Result<(DefinitionRef, Definition, CheckpointRef), Recheck>>),
     /// rev 15 (PROTOCOL 10.6): a rolling lease's update check: the agent version now ready, the evict list (rev 22: and
@@ -72,7 +74,8 @@ struct Roll {
     /// The worker's `hello` lists `rolling`: it gets the rolling job and `extend`s. Else the lease runs as a classic
     /// one (done after its released ids).
     active: bool,
-    /// `finish` was sent: no more ids, generations or update checks.
+    /// `finish` was sent: no more ids or update checks. (Agent 0.3.20: new generations still - a drain plays its last games
+    /// on the newest network, PROTOCOL 20.1; before, a finishing lease ignored them and drained on a frozen one.)
     finishing: bool,
     /// The worker said `low`: ask for more ids when allowed.
     want_more: bool,
@@ -129,6 +132,16 @@ struct Roll {
     /// agent 0.3.17 (PROTOCOL 18): the run's freshness budget (seconds a game may last), from the lease and kept current
     /// by beat and extension answers; None: no freshness cap (`fresh.rs`).
     fresh_s: Option<u64>,
+    /// agent 0.3.20 (PROTOCOL 20.2): poll for a new generation every this many seconds (the lease's `rolling.poll_s`, kept
+    /// current by beat, extension and poll answers); None: no polling.
+    poll_s: Option<u64>,
+    poll_inflight: bool,
+    /// No poll before this.
+    next_poll: Instant,
+    /// agent 0.3.20: the definition being checked (`recheck_definition`), and the last one that failed its check or changed
+    /// the template - not checked again (generations keep coming while the lease finishes because of it).
+    def_checking: Option<DefinitionRef>,
+    def_skip: Option<DefinitionRef>,
 }
 
 /// agent 0.3.4 (PROTOCOL 10.6, 13.5): a GPU job's video memory: the adapter, what its workers are planned within, the
@@ -1391,6 +1404,11 @@ impl Engine {
                 gpu_batch,
                 vram,
                 fresh_s: lease.rolling.as_ref().and_then(|r| r.fresh_s),
+                poll_s: lease.rolling.as_ref().and_then(|r| r.poll_s),
+                poll_inflight: false,
+                next_poll: Instant::now(),
+                def_checking: None,
+                def_skip: None,
             }),
             // (a GPU job's inference threads are the worker's own: not in its job line)
             infer: layout0.filter(|_| !gpu_choice).map(|l| (l.infer_workers, l.infer_threads)),
@@ -2605,10 +2623,15 @@ impl Run {
 
     /// rev 15 (PROTOCOL 10.4, 10.6), each tick of a rolling lease: more ids when the worker is low (at most once per
     /// `extend_every`, not before a `wait_s` or a backoff), the update check every `update_check` (a rolling lease
-    /// would otherwise never let the agent update), and `finish` once a newer agent is ready.
+    /// would otherwise never let the agent update), and `finish` once a newer agent is ready. Agent 0.3.20 (PROTOCOL
+    /// 20.2): a generation poll every `poll_s` while the lease plays or finishes its games.
     fn roll_tick(&mut self, eng: &mut Engine) {
         let stopping = matches!(self.state, WState::Stopping(_)) || self.after.is_some();
-        if stopping || !self.roll.as_ref().is_some_and(|r| r.active && !r.finishing) {
+        if stopping || !self.roll.as_ref().is_some_and(|r| r.active) {
+            return;
+        }
+        self.poll_tick(eng);
+        if self.roll.as_ref().is_some_and(|r| r.finishing) {
             return;
         }
         if let Some(v) = eng.pending_update.clone() {
@@ -2617,12 +2640,14 @@ impl Run {
         }
         // about 2 x the games in flight (PROTOCOL 10.4; rev 19, 13.5: the whole crew's)
         let ask = 2 * self.crew_conc().max(1);
+        let gen_now = self.prep.ckpt.as_ref().map(|(c, _)| c.gen);
         let Some(r) = self.roll.as_mut() else { return };
         let now = Instant::now();
         if r.want_more && !r.extend_inflight && now >= r.next_extend {
             r.extend_inflight = true;
             r.next_extend = now + eng.cfg.timings.extend_every;
-            let body = ExtendReq { games: ask };
+            // agent 0.3.20 (PROTOCOL 20.1): with the newest generation the workers play, so the answer offers a newer one
+            let body = ExtendReq { games: ask, gen: gen_now };
             log::info!("lease {}: the worker is low on game ids ({} released); asking for {} more", self.lease.lease_id, r.released, body.games);
             let (client, tx, id) = (eng.client.clone(), self.tx.clone(), self.lease.lease_id.clone());
             std::thread::spawn(move || {
@@ -2653,6 +2678,101 @@ impl Run {
             std::thread::spawn(move || {
                 let _ = tx.send(Ev::Update(check.run()));
             });
+        }
+    }
+
+    /// agent 0.3.20 (PROTOCOL 20.2): a rolling lease with a `poll_s` asks every `poll_s` seconds whether the run has a newer
+    /// generation than the one its workers play (`POST /v1/lease/{id}/poll`) - while it plays and while it finishes its
+    /// games, as long as a worker still plays (the main one, or a crew member or drainer that hasn't ended). Not while a
+    /// network is being fetched or a definition checked (their answers come first). Its own rate bucket at the
+    /// coordinator (one per 2 s), so beats and extensions keep theirs.
+    fn poll_tick(&mut self, eng: &Engine) {
+        let playing = (self.job_sent && self.end_ev.is_none() && !self.eof) || self.mates.iter().any(|m| m.job_sent && m.end_ev.is_none());
+        let gen = self.prep.ckpt.as_ref().map(|(c, _)| c.gen);
+        let busy = self.ckpt_inflight;
+        let Some(r) = self.roll.as_mut() else { return };
+        let (Some(every), Some(gen)) = (r.poll_s, gen) else { return };
+        let now = Instant::now();
+        if !playing || busy || r.poll_inflight || r.def_inflight || now < r.next_poll {
+            return;
+        }
+        r.poll_inflight = true;
+        r.next_poll = now + Duration::from_secs(every.clamp(crate::rolling::POLL_S.0, crate::rolling::POLL_S.1));
+        let (client, tx, id) = (eng.client.clone(), self.tx.clone(), self.lease.lease_id.clone());
+        std::thread::spawn(move || {
+            let r = client.post_json::<_, PollResp>(&format!("/v1/lease/{id}/poll"), &PollReq { gen });
+            let _ = tx.send(Ev::Poll(r));
+        });
+    }
+
+    /// agent 0.3.20 (PROTOCOL 20.2): the answer to a poll - a newer generation (handled as a beat's), the budget and the
+    /// poll interval as now. A lost lease (410) stops as an extension's would; 429 and network errors wait for the next poll;
+    /// any other refusal stops polling for the rest of the lease.
+    fn on_poll(&mut self, eng: &mut Engine, res: Result<PollResp, CallError>) {
+        let id = self.lease.lease_id.clone();
+        let Some(r) = self.roll.as_mut() else { return };
+        r.poll_inflight = false;
+        let a = match res {
+            Ok(a) => a,
+            Err(e) if e.status() == Some(410) => {
+                log::info!("lease {id}: the coordinator no longer has it ({e})");
+                self.stop(After::Expire);
+                return;
+            }
+            Err(e) if e.is_revoked() => {
+                self.after = Some(After::Revoked);
+                self.kill("machine revoked");
+                return;
+            }
+            Err(e) => {
+                // (429 or a network error: the next poll, after any retry-after. Any other 4xx - a 404 too: a coordinator
+                // without the poll answers so, and a lease it lost shows up in the beats and extensions - stops polling
+                // for the rest of the lease; generations still come with beats and extensions.)
+                if !e.is_retryable() {
+                    log::warn!("lease {id}: generation poll refused ({e}); not polling any more in this lease");
+                    r.poll_s = None;
+                } else if let CallError::Http { retry_after: Some(s), .. } = &e {
+                    r.next_poll = r.next_poll.max(Instant::now() + Duration::from_secs((*s).min(300)));
+                }
+                return;
+            }
+        };
+        if let Some(f) = a.fresh_s {
+            r.fresh_s = f;
+        }
+        if let Some(p) = a.poll_s {
+            r.poll_s = p;
+        }
+        self.offered(eng, a.checkpoint, a.definition);
+    }
+
+    /// A newer generation offered by a beat, an extension (agent 0.3.20) or a poll (0.3.20): fetched and switched to once
+    /// (repeats ignored). A rolling lease's comes with the run's current definition, verified off this thread before the
+    /// network is fetched (PROTOCOL 10.6); agent 0.3.20 also while the lease finishes its games (PROTOCOL 20.1), except a
+    /// definition that already failed its check or changed the template in this lease.
+    fn offered(&mut self, eng: &mut Engine, checkpoint: Option<CheckpointRef>, definition: Option<DefinitionRef>) {
+        // (self-play only: eval networks never change during a lease)
+        let Some(c) = checkpoint.filter(|_| self.lease.kind == "selfplay") else { return };
+        let current = self.prep.ckpt.as_ref().map(|(c, _)| c.gen);
+        let failed = self.ckpt_failed.iter().any(|(g, h)| *g == c.gen && *h == c.sha256);
+        if current.is_some_and(|g| c.gen <= g) || self.ckpt_inflight || failed {
+            return;
+        }
+        match self.roll.as_ref().map(|r| (r.active, r.def_inflight, &r.def, &r.def_skip)) {
+            // rev 15 (PROTOCOL 10.6): a rolling lease's new generation comes with the run's current definition: verified
+            // (off this thread) before the checkpoint is fetched; one that failed or changed the template: not again
+            Some((true, false, cur, skip)) if definition.as_ref().is_some_and(|d| d != cur) => {
+                if skip.is_some() && skip.as_ref() == definition.as_ref() {
+                    return;
+                }
+                self.recheck_definition(eng, definition.expect("checked"), c)
+            }
+            // a definition being checked: repeats are ignored
+            Some((true, true, ..)) => {}
+            // a rolling lease before its worker said hello: nothing is switched yet
+            Some((false, ..)) if !self.hello_seen => {}
+            // classic, an old worker, or a gen the lease's own definition signs
+            _ => self.fetch_checkpoint(eng, c),
         }
     }
 
@@ -2721,7 +2841,16 @@ impl Run {
         if let Some(f) = a.fresh_s {
             r.fresh_s = f;
         }
-        if r.finishing {
+        // agent 0.3.20 (PROTOCOL 20.2): and the poll interval
+        if let Some(p) = a.poll_s {
+            r.poll_s = p;
+        }
+        let finishing = r.finishing;
+        // agent 0.3.20 (PROTOCOL 20.1): a newer generation offered with the answer, as with a beat's
+        let (ck, def) = (a.checkpoint.clone(), a.definition.clone());
+        self.offered(eng, ck, def);
+        let Some(r) = self.roll.as_mut() else { return };
+        if finishing {
             return;
         }
         let block = r.setup.hi - r.setup.lo;
@@ -2850,9 +2979,7 @@ impl Run {
             Ev::Ckpt(r) => {
                 self.ckpt_inflight = false;
                 let rolling = self.roll.as_ref().is_some_and(|r| r.active);
-                if self.roll.as_ref().is_some_and(|r| r.finishing) {
-                    return;
-                }
+                // (agent 0.3.20, PROTOCOL 20.1: a finishing lease switches too - its last games play on the newest network)
                 match r {
                     Ok((c, f)) => {
                         log::info!("lease {}: switching to checkpoint {}", self.id(), c.gen);
@@ -2866,8 +2993,9 @@ impl Run {
                             self.send(op.clone());
                         }
                         // rev 19 (PROTOCOL 13.5): a crew switches together (a member without its job yet gets it in its
-                        // job line; one finishing its games keeps the network it has)
-                        for m in self.mates.iter_mut().filter(|m| m.active() && m.job_sent) {
+                        // job line). Agent 0.3.20 (PROTOCOL 20.1): so do workers finishing their games - a handoff's
+                        // drainers, a finishing lease's crew - until they end (0.3.19: they kept the network they had)
+                        for m in self.mates.iter_mut().filter(|m| m.job_sent && m.end_ev.is_none()) {
                             if let Err(e) = m.worker.send(&op) {
                                 log::warn!("lease {}: write to worker pid {} failed: {e}", self.lease.lease_id, m.worker.pid);
                             }
@@ -2885,6 +3013,7 @@ impl Run {
                 }
             }
             Ev::Extend(r) => self.on_extend(eng, r),
+            Ev::Poll(r) => self.on_poll(eng, r),
             Ev::Def(r) => self.on_definition(eng, *r),
             Ev::Update(r) => {
                 if let Some(x) = self.roll.as_mut() {
@@ -2920,8 +3049,11 @@ impl Run {
         let id = self.lease.lease_id.clone();
         let Some(roll) = self.roll.as_mut() else { return };
         roll.def_inflight = false;
-        if roll.finishing {
-            return;
+        // (agent 0.3.20: also while the lease finishes its games, PROTOCOL 20.1; a definition that fails or changes the
+        // template is not checked again in this lease)
+        let checked = roll.def_checking.take();
+        if matches!(r, Err(Recheck::TemplateChanged(_)) | Err(Recheck::Refused(_))) {
+            roll.def_skip = checked;
         }
         match r {
             Ok((dref, d, c)) => {
@@ -3285,36 +3417,21 @@ impl Run {
 
     fn on_beat(&mut self, eng: &mut Engine, r: Result<BeatResp, CallError>) {
         self.beat_inflight = false;
-        // agent 0.3.17 (PROTOCOL 18.2): a rolling lease's freshness budget as it is now (absent: unchanged)
+        // agent 0.3.17 (PROTOCOL 18.2): a rolling lease's freshness budget as it is now (absent: unchanged); agent 0.3.20
+        // (PROTOCOL 20.2): and its poll interval
         if let (Ok(resp), Some(roll)) = (r.as_ref(), self.roll.as_mut()) {
             if let Some(f) = resp.fresh_s {
                 roll.fresh_s = f;
+            }
+            if let Some(p) = resp.poll_s {
+                roll.poll_s = p;
             }
         }
         match r {
             Ok(resp) => match resp.action.as_str() {
                 "continue" => {
                     // rev 2: a newer checkpoint is repeated in every beat; act on it once
-                    // (self-play only: eval networks never change during a lease).
-                    if let Some(c) = resp.checkpoint.filter(|_| self.lease.kind == "selfplay") {
-                        let current = self.prep.ckpt.as_ref().map(|(c, _)| c.gen);
-                        let failed = self.ckpt_failed.iter().any(|(g, h)| *g == c.gen && *h == c.sha256);
-                        if current.is_none_or(|g| c.gen > g) && !self.ckpt_inflight && !failed {
-                            match self.roll.as_ref().map(|r| (r.active, r.finishing || r.def_inflight, &r.def)) {
-                                // rev 15 (PROTOCOL 10.6): a rolling lease's new generation comes with the run's current
-                                // definition: verified (off this thread) before the checkpoint is fetched
-                                Some((true, false, cur)) if resp.definition.as_ref().is_some_and(|d| d != cur) => {
-                                    self.recheck_definition(eng, resp.definition.clone().expect("checked"), c)
-                                }
-                                // finishing, or a definition being checked: repeats are ignored
-                                Some((true, true, _)) => {}
-                                // a rolling lease before its worker said hello: nothing is switched yet
-                                Some((false, _, _)) if !self.hello_seen => {}
-                                // classic, an old worker, or a gen the lease's own definition signs
-                                _ => self.fetch_checkpoint(eng, c),
-                            }
-                        }
-                    }
+                    self.offered(eng, resp.checkpoint.clone(), resp.definition.clone());
                     if let Some(what) = resp.upload_diag {
                         crate::logging::upload_diag(&eng.client, &eng.cfg.layout, &what);
                     }
@@ -3347,6 +3464,7 @@ impl Run {
         let Some(current) = self.plan.def.clone() else { return };
         let Some(r) = self.roll.as_mut() else { return };
         r.def_inflight = true;
+        r.def_checking = Some(dref.clone());
         log::info!("lease {}: generation {} comes with definition {}; checking it", self.lease.lease_id, c.gen, dref.key);
         let (fetch, lease, tx) = (eng.fetch(), self.lease.clone(), self.tx.clone());
         std::thread::spawn(move || {

@@ -589,6 +589,11 @@ export interface GrantReq {
   // Rev 26 (PROTOCOL 18): the agent is sent the run's freshness budget (FRESH_AGENT or newer, a machine the owner's
   // `fresh_cap` names): a rolling lease carries `fresh_s` when the run has one.
   fresh?: boolean;
+  // Rev 28 (PROTOCOL 20.3): the owner's `share` for this machine: its budget is at most that share of the run's period.
+  fresh_share?: number;
+  // Rev 28 (PROTOCOL 20.2): the agent polls for new generations (POLL_AGENT or newer) and the owner set this machine's
+  // `poll_s`: a rolling lease carries it.
+  poll_s?: number;
 }
 
 // Rev 15 (PROTOCOL 10.3): what a rolling lease adds.
@@ -599,6 +604,7 @@ export interface RollingLease {
   max_s: number;
   flush_s: number;
   fresh_s?: number; // rev 26 (PROTOCOL 18): the run's freshness budget (seconds a game may last); absent: none
+  poll_s?: number; // rev 28 (PROTOCOL 20.2): poll for a new generation every poll_s seconds; absent: no polling
 }
 
 export interface Lease {
@@ -760,7 +766,8 @@ async function grantRunGames(env: Env, req: GrantReq): Promise<Lease | null> {
       relHiAt = range[0] + Math.min(st.headroom, range[1] - range[0], Math.max(cnt(r.inflight), cnt(r.gpu_inflight)));
       stmts.push(db.prepare(`UPDATE runs SET next_gid = ? WHERE run = ? AND next_gid = ?`).bind(range[1], run.run, run.next_gid));
       // Rev 26 (PROTOCOL 18): the run's freshness budget, for an agent that is sent it
-      const fresh = req.fresh ? await runFresh(db, run.run, sp, req.now) : null;
+      // (rev 28, PROTOCOL 20.3: this machine's own, with the owner's share)
+      const fresh = req.fresh ? await runFresh(db, run.run, sp, req.now, req.fresh_share) : null;
       rolling = {
         block: [range[0], range[1]],
         inflight: { cpu: r.inflight, gpu: r.gpu_inflight },
@@ -768,6 +775,7 @@ async function grantRunGames(env: Env, req: GrantReq): Promise<Lease | null> {
         max_s: r.max_s,
         flush_s: r.flush_s,
         ...(fresh !== null ? { fresh_s: fresh } : {}),
+        ...(req.poll_s ? { poll_s: req.poll_s } : {}),
       };
     } else {
       const took = await poolTake(db, scope, pool, n);
@@ -1037,18 +1045,8 @@ export async function beat(env: Env, r: BeatReq): Promise<BeatAnswer> {
   // Rev 20 (PROTOCOL 14.3): the lease's model variant, while the run's alternate of its build and runtime still names it.
   const variant = l.run && l.variant ? await leaseVariant(db, l) : null;
   if (rolling && l.run) {
-    // Rev 15 (PROTOCOL 10.6): a rolling lease switches in place to the run's current gen once the *current*
-    // definition signs it; the answer names that definition, which the agent verifies before it switches.
-    const run = await getRun(db, l.run);
-    const have = curGen ?? l.gen;
-    if (run && run.current_gen !== null && (have === null || run.current_gen > have)) {
-      const c = await getCheckpoint(db, l.run, run.current_gen);
-      const def = c ? await currentDef(db, "run", l.run) : null;
-      if (c && def && !checkpointProblem(def, ckptFacts(c))) {
-        return { action, expires_at: r.now + EXPIRE_BEATS * l.beat_s, checkpoint: checkpointFor(c, def, variant), definition: defRef(def) };
-      }
-    }
-    return { action, expires_at: r.now + EXPIRE_BEATS * l.beat_s, checkpoint: null };
+    const offer = await rollingOffer(db, l, curGen ?? l.gen, variant);
+    return { action, expires_at: r.now + EXPIRE_BEATS * l.beat_s, checkpoint: offer?.checkpoint ?? null, ...(offer ? { definition: offer.definition } : {}) };
   }
   if (l.kind === "selfplay" && l.run) {
     const run = await getRun(db, l.run);
@@ -1059,6 +1057,26 @@ export async function beat(env: Env, r: BeatReq): Promise<BeatAnswer> {
     }
   }
   return { action, expires_at: r.now + EXPIRE_BEATS * l.beat_s, checkpoint };
+}
+
+// Rev 15 (PROTOCOL 10.6): a rolling lease switches in place to the run's current gen once the *current* definition signs
+// it; the offer names that definition, which the agent verifies before it switches. `have`: the newest gen the lease
+// plays (null: none known). Null: nothing newer to offer. Rev 28 (PROTOCOL 20.1, 20.2): beats, extensions that say their
+// `gen`, and polls make the same offer. `variant`: the lease's model variant (leaseVariant), when already read.
+export async function rollingOffer(
+  db: D1Database,
+  l: LeaseRow,
+  have: number | null,
+  variant?: string | null,
+): Promise<{ checkpoint: CheckpointRef; definition: { key: string; sha256: string } } | null> {
+  if (!l.run) return null;
+  const run = await getRun(db, l.run);
+  if (!run || run.current_gen === null || (have !== null && run.current_gen <= have)) return null;
+  const c = await getCheckpoint(db, l.run, run.current_gen);
+  const def = c ? await currentDef(db, "run", l.run) : null;
+  if (!c || !def || checkpointProblem(def, ckptFacts(c))) return null;
+  const v = variant !== undefined ? variant : l.variant ? await leaseVariant(db, l) : null;
+  return { checkpoint: checkpointFor(c, def, v), definition: defRef(def) };
 }
 
 // Rev 20 (PROTOCOL 14.3): the model variant a lease's generation switches carry: the one it was granted for, as long as
@@ -1086,6 +1104,10 @@ export interface ExtendReq {
   // Rev 24 (PROTOCOL 15.4): the eval batch (its scope) this machine gives way to now, before or after `until` (friend.ts
   // decides; null or absent: none). The lease is marked on its way there and finishes.
   yield_to?: string | null;
+  // Rev 28 (PROTOCOL 20.1): the newest generation the lease's workers play, as the agent says (agents from 0.3.20);
+  // stored as `cur_gen` like a beat's, and every answer then offers a newer generation as a beat answer does. Null or
+  // absent: no offer (the answer keeps exactly its keys of before).
+  gen?: number | null;
 }
 
 export interface ExtendAnswer {
@@ -1093,6 +1115,9 @@ export interface ExtendAnswer {
   wait_s?: number;
   finish?: true;
   reason?: "quota" | "inflight" | "max_s" | "block" | "state" | "yield"; // inflight: rev 21; yield: rev 24
+  // Rev 28 (PROTOCOL 20.1): to an extension that said its `gen`: a newer generation, as in a beat answer.
+  checkpoint?: CheckpointRef | null;
+  definition?: { key: string; sha256: string };
 }
 
 // Rev 21 (PROTOCOL 10.4): the games a rolling lease finished as far as the coordinator knows - the ids its results
@@ -1147,6 +1172,19 @@ export async function extend(env: Env, r: ExtendReq): Promise<ExtendAnswer> {
   if (l.state === "expired") throw gone("lease expired");
   if (l.state === "cancelled") throw gone("lease was cancelled");
   if (l.state !== "active") throw gone("lease is closed");
+  // Rev 28 (PROTOCOL 20.1): an extension that says its `gen` - stored as a beat's (never older than the lease's first) -
+  // has every answer offer a newer generation, so a rolling lease switches within an extension of a new one.
+  if (typeof r.gen !== "number") return extendLease(env, r, l);
+  const gen = l.gen === null || r.gen >= l.gen ? r.gen : (l.cur_gen ?? l.gen);
+  if (gen !== l.cur_gen) await db.prepare(`UPDATE leases SET cur_gen = ? WHERE lease_id = ?`).bind(gen, l.lease_id).run();
+  const ans = await extendLease(env, r, { ...l, cur_gen: gen });
+  const offer = await rollingOffer(db, l, gen);
+  return { ...ans, checkpoint: offer?.checkpoint ?? null, ...(offer ? { definition: offer.definition } : {}) };
+}
+
+async function extendLease(env: Env, r: ExtendReq, l: LeaseRow): Promise<ExtendAnswer> {
+  const db = env.DB;
+  if (l.lo === null || l.hi === null) throw bad("only a rolling self-play lease is extended (PROTOCOL 10.4)");
   const lo = l.lo;
   const hi = l.hi;
   const rel = l.rel_hi!;
@@ -1232,8 +1270,20 @@ export interface ResultLimits {
   late_s: number;
 }
 
+// Rev 28 (PROTOCOL 20.4): a rolling lease runs for hours (renewed every `max_s`), so its limits are per hour of its life:
+// `chunks` and `bytes` for each started ROLLING_LIMIT_S since it was issued. A renewing lease of the owner's desktop
+// (~26 games/s, records every ~10 s) writes ~360-720 chunks an hour; before rev 28 it reached 2,000 in ~3-5 hours, and
+// every chunk after that was refused (413) and its games lost.
+export const ROLLING_LIMIT_S = 3600;
+export function resultLimitsFor(l: Pick<LeaseRow, "rel_hi" | "issued_at" | "closed_at">, lim: ResultLimits, now: number): ResultLimits {
+  if (l.rel_hi === null) return lim;
+  const hours = Math.max(1, Math.ceil(((l.closed_at ?? now) - l.issued_at) / ROLLING_LIMIT_S));
+  return { ...lim, chunks: lim.chunks * hours, bytes: lim.bytes * hours };
+}
+
 // Throws when one more chunk of `size` bytes would break the lease's limits.
-export async function checkResultLimits(db: D1Database, l: LeaseRow, size: number, lim: ResultLimits, now: number): Promise<void> {
+export async function checkResultLimits(db: D1Database, l: LeaseRow, size: number, limits: ResultLimits, now: number): Promise<void> {
+  const lim = resultLimitsFor(l, limits, now);
   if (l.state !== "active" && l.closed_at !== null && now - l.closed_at > lim.late_s) {
     throw gone(`lease closed ${now - l.closed_at} s ago: results are taken until ${lim.late_s} s after a lease ends`);
   }
@@ -1242,7 +1292,7 @@ export async function checkResultLimits(db: D1Database, l: LeaseRow, size: numbe
     .bind(l.lease_id)
     .first<{ n: number; bytes: number }>();
   if ((r?.n ?? 0) >= lim.chunks) {
-    throw new HttpError(413, "too_large", `this lease already has ${lim.chunks} result chunks, the most a lease may have`, { limit: "chunks" });
+    throw new HttpError(413, "too_large", `this lease already has ${lim.chunks} result chunks, the most a lease may have${l.rel_hi !== null ? " by now (a rolling lease: per started hour)" : ""}`, { limit: "chunks" });
   }
   if ((r?.bytes ?? 0) + size > lim.bytes) {
     throw new HttpError(413, "too_large", `this lease's results would exceed ${lim.bytes} bytes`, { limit: "bytes" });

@@ -309,6 +309,36 @@ describe("rolling self-play and hardware routing (rev 18)", () => {
   it("a deferred batch ends it at renewal once the generation is full", async () => {
     expect(await gpuRolling("full", 1)).toMatchObject({ finish: true, reason: "max_s" });
   });
+
+  // Rev 28 (PROTOCOL 20.5): the renewal's ask counts the lease's own worker build and runtime pack as cached. Before, a PC
+  // whose free disk (with the pack on it) was less than the pack's size couldn't fit its own run's GPU version in the
+  // renewal's eyes: the deferred batch "waited" and the lease was finished at every renewal (the second PC, 2026-11-22:
+  // every ~10 minutes), only for its next lease request - which lists its cache - to get the same self-play again.
+  it("the renewal counts the lease's own build and runtime as on the PC's disk", async () => {
+    const s = await gpuRun("small", { rolling: ROLLING, eval: EVAL(400) });
+    await env.DB.prepare(`UPDATE builds SET size = ? WHERE build_id = ?`).bind(3000 * 2 ** 20, s.cuda).run(); // > disk_mb 2500
+    const cpu = await enroll("cpu", { profile: CPU_ONLY });
+    await online(cpu);
+    await setRate(cpu, "run:small", 1); // the batch is not behind
+    const nv = await enroll("nv");
+    const b = ok(
+      await call("POST", "/v1/lease", {
+        token: nv.token,
+        agent: "0.2.13",
+        body: {
+          profile_digest: "ab".repeat(32),
+          profile: null,
+          caps: { threads: 6, ram_mb: 12000, gpu: true, gpu_allowed: true, disk_mb: 2500 },
+          cached: { builds: [s.alt, s.cuda], ckpts: [] },
+          kinds: ["fuzz", "eval", "selfplay", "diag"],
+          features: ["rolling"],
+        },
+      }),
+    );
+    expect([b.lease?.kind, b.lease?.build?.build_id]).toEqual(["selfplay", s.alt]);
+    await due(b.lease.lease_id);
+    expect(ok(await extend(nv, b.lease.lease_id, 8)).finish).toBeUndefined();
+  });
 });
 
 describe("GET/POST /v1/admin/routing (rev 18)", () => {

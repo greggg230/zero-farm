@@ -238,6 +238,8 @@ pub const MAX_INFLIGHT: u64 = 4096;
 pub const MAX_CREW_INFLIGHT: u64 = MAX_INFLIGHT * crate::tune::MAX_SET_WORKERS as u64;
 /// `flush_s` is kept within these bounds (PROTOCOL 10.1).
 pub const FLUSH_S: (u64, u64) = (10, 3600);
+/// agent 0.3.20 (PROTOCOL 20.2): a lease's `poll_s` is kept within these (the coordinator's poll bucket allows one per 2 s).
+pub const POLL_S: (u64, u64) = (2, 300);
 
 impl Inflight {
     /// `n` (1 to 4,096) or `"auto"`; anything else is taken as `"auto"` (the agent's own choice, never more than

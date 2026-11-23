@@ -237,7 +237,10 @@ impl Tray {
     /// The tray menu (built only: showing it pumps messages, so that happens after the borrow).
     fn build_menu(&self) -> HMENU {
         let st = self.status.lock().unwrap().clone();
-        let s = self.machine.lock().unwrap().settings.clone();
+        let (s, owner_cap) = {
+            let m = self.machine.lock().unwrap();
+            (m.settings.clone(), m.owner_disk_cap_mb.map(|_| m.describe_disk_cap()))
+        };
         let now = zerofarm_common::now_unix();
         unsafe {
             let m = CreatePopupMenu();
@@ -280,6 +283,13 @@ impl Tray {
             // (PROTOCOL 13.6: an owner machine works whenever it is not paused, whatever "When to work" says)
             if s.owner {
                 add(MF_STRING | MF_GRAYED, 5, "Owner machine: works whenever not paused, normal priority");
+            }
+            // rev 28 (PROTOCOL 20.7): the farm owner's disk cap, which replaces the friend's own while set (a menu item
+            // doesn't wrap)
+            if let Some(t) = &owner_cap {
+                for line in crate::status::wrap_menu(&format!("Disk space for the farm: {t}"), 100, 3) {
+                    add(MF_STRING | MF_GRAYED, 5, &line);
+                }
             }
             let mode = CreatePopupMenu();
             let idle = wide("Only when I'm away (idle)");

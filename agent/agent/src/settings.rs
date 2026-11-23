@@ -294,6 +294,15 @@ impl Settings {
     }
 }
 
+/// `12288` MB -> "12 GB (12288 MB)"; under a GB or not a whole GB, MB only.
+fn gb_text(mb: u64) -> String {
+    if mb >= 1024 && mb % 1024 == 0 {
+        format!("{} GB ({mb} MB)", mb / 1024)
+    } else {
+        format!("{mb} MB")
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 pub struct GamesToday {
     pub day: String,
@@ -317,7 +326,15 @@ pub struct Machine {
     /// Keychain would prompt after every self-update, whose code identity changes). Never set on Windows.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
+    /// rev 28 (PROTOCOL 20.7): the farm owner's disk cap for this machine (MB), from the coordinator's lease answers - set
+    /// only with the friend's consent. While it is set it replaces `settings.disk_cap_mb` (`Machine::settings_now`); the
+    /// friend's own setting is kept and applies again once the owner clears it. Written only when set.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_disk_cap_mb: Option<u64>,
 }
+
+/// rev 28 (PROTOCOL 20.7): the owner's disk caps the agent takes (as `disk_cap_mb` itself: 1 GB to 16 TB).
+pub const OWNER_DISK_CAP_MB: std::ops::RangeInclusive<u64> = 1024..=(1 << 24);
 
 impl Default for Machine {
     fn default() -> Self {
@@ -331,11 +348,44 @@ impl Default for Machine {
             first_work_toast_shown: false,
             games_today: GamesToday::default(),
             token: None,
+            owner_disk_cap_mb: None,
         }
     }
 }
 
 impl Machine {
+    /// The settings the agent works by: the friend's, with the farm owner's disk cap in place of theirs while the owner
+    /// has set one (rev 28, PROTOCOL 20.7).
+    pub fn settings_now(&self) -> Settings {
+        let mut s = self.settings.clone();
+        if let Some(mb) = self.owner_disk_cap_mb {
+            s.disk_cap_mb = mb;
+        }
+        s
+    }
+
+    /// rev 28 (PROTOCOL 20.7): a lease answer's `owner_disk_cap_mb` (None: cleared). A value outside `OWNER_DISK_CAP_MB` is
+    /// ignored (the cap stays as it was). -> whether it changed.
+    pub fn set_owner_disk_cap(&mut self, mb: Option<u64>) -> bool {
+        if mb.is_some_and(|n| !OWNER_DISK_CAP_MB.contains(&n)) || mb == self.owner_disk_cap_mb {
+            return false;
+        }
+        self.owner_disk_cap_mb = mb;
+        true
+    }
+
+    /// How the disk cap reads for the friend: theirs, or the owner's with theirs kept.
+    pub fn describe_disk_cap(&self) -> String {
+        match self.owner_disk_cap_mb {
+            Some(mb) => format!(
+                "{} (set by the farm owner; your own setting, {}, applies again when the owner clears it)",
+                gb_text(mb),
+                gb_text(self.settings.disk_cap_mb)
+            ),
+            None => gb_text(self.settings.disk_cap_mb),
+        }
+    }
+
     /// Loads `state\machine.json`; a missing file gives defaults, a corrupt one is set aside as
     /// `machine.json.bad` (and defaults are used) so a bad write can't brick the agent.
     pub fn load(layout: &Layout) -> Machine {
@@ -462,6 +512,31 @@ pub fn pause_until_tomorrow(now: i64) -> Pause {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_owners_disk_cap_replaces_the_friends_while_set_and_theirs_returns_when_cleared() {
+        // rev 28 (PROTOCOL 20.7)
+        let mut m = Machine::default();
+        m.settings.disk_cap_mb = 3072;
+        assert_eq!(m.settings_now().disk_cap_mb, 3072);
+        assert!(m.set_owner_disk_cap(Some(12288)));
+        assert!(!m.set_owner_disk_cap(Some(12288)), "the same value is no change");
+        assert_eq!((m.settings_now().disk_cap_mb, m.settings.disk_cap_mb), (12288, 3072), "the friend's own setting is kept");
+        assert!(m.settings_now().disk_cap_mb == 12288 && m.settings_now().mode == m.settings.mode, "nothing else changes");
+        assert_eq!(m.describe_disk_cap(), "12 GB (12288 MB) (set by the farm owner; your own setting, 3 GB (3072 MB), applies again when the owner clears it)");
+        // out of range: ignored, the cap stays
+        assert!(!m.set_owner_disk_cap(Some(100)));
+        assert!(!m.set_owner_disk_cap(Some(1 << 30)));
+        assert_eq!(m.owner_disk_cap_mb, Some(12288));
+        // kept in machine.json, and only while set
+        let j = serde_json::to_value(&m).unwrap();
+        assert_eq!(j["owner_disk_cap_mb"], 12288);
+        assert_eq!(serde_json::from_value::<Machine>(j).unwrap().owner_disk_cap_mb, Some(12288));
+        assert!(m.set_owner_disk_cap(None));
+        assert_eq!(m.settings_now().disk_cap_mb, 3072);
+        assert_eq!(m.describe_disk_cap(), "3 GB (3072 MB)");
+        assert!(serde_json::to_value(&m).unwrap().get("owner_disk_cap_mb").is_none());
+    }
 
     #[test]
     fn hours_wrap() {

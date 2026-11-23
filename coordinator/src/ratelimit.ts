@@ -24,6 +24,7 @@ export const LIMITS = {
   enroll: { interval: 60, burst: 10 }, // per client IP: a few typos are fine, guessing is not
   diag_user: { interval: 3600, burst: 1 }, // the friend's "Send diagnostics": once an hour
   presence: { interval: 60, burst: 5 }, // rev 16: every ~5 min, and when the reason changes
+  poll: { interval: 2, burst: 10 }, // rev 28 (PROTOCOL 20.2): a rolling lease's generation poll, at most every `poll_s` (2 s or more)
 } as const satisfies Record<string, Limit>;
 
 export type Bucket = keyof typeof LIMITS;

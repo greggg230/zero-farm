@@ -140,6 +140,8 @@ fn status_json(status: &SharedStatus, machine: &SharedMachine, cores: Cores) -> 
         "threads_text": cores.describe(&m.settings),
         "tuning": st.tuning,
         "settings": m.settings,
+        // rev 28 (PROTOCOL 20.7): the farm owner's disk cap, in place of `settings.disk_cap_mb` while set
+        "owner_disk_cap_mb": m.owner_disk_cap_mb,
     })
 }
 
@@ -330,6 +332,8 @@ pub fn cli_status(layout: &Layout) -> i32 {
         "  memory cap for jobs: {}",
         s.max_ram_mb.map_or_else(|| format!("auto ({} the RAM, {} MB)", if s.owner { "three quarters of" } else { "half" }, s.ram_cap_mb(crate::signals::memory_mb().1)), |n| format!("{n} MB"))
     );
+    // rev 28 (PROTOCOL 20.7): the disk cap - the farm owner's while set, else the Mac's own
+    println!("  disk cap: {}", m.describe_disk_cap());
     if let Some(e) = st.as_ref().and_then(|v| v["last_error"].as_str()) {
         println!("  last error: {e}");
     }

@@ -87,6 +87,8 @@ export interface MachineRow {
   tuning?: string | null; // rev 19 (migration 0015): its agent's last `tuning` report (JSON)
   tuning_t?: number | null;
   opt_in?: string | null; // rev 27 (PROTOCOL 19, migration 0017): JSON list of the opt-in runtimes the owner allowed here
+  fresh?: string | null; // rev 28 (PROTOCOL 20, migration 0018): the owner's freshness settings here (JSON {poll_s, share})
+  disk_cap_mb?: number | null; // rev 28 (PROTOCOL 20.7, migration 0018): the owner's disk cap here (MB), in place of the agent's own
 }
 
 function bearer(req: Request): string | null {

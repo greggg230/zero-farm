@@ -100,7 +100,8 @@ fn extends_on_low_until_the_block_is_used_up() {
     assert_eq!(done["given_back"], false, "{done}");
     assert!(done.get("refused").is_none(), "{done}");
     // 4 released at grant, then 4 more three times, then the block is used up: `finish`
-    assert_eq!(extends(&h, "l_R1"), vec![json!({"games": 4}); 4], "about 2 x the games in flight each time");
+    // (agent 0.3.20, PROTOCOL 20.1: each with the generation its worker plays)
+    assert_eq!(extends(&h, "l_R1"), vec![json!({"games": 4, "gen": 1}); 4], "about 2 x the games in flight each time");
     all_accounted(&h, "l_R1", &done, 16, 2);
     assert!(h.agent_log().contains("rolling job ended (finish)"), "{}", h.agent_log());
     let j = h.job_line();
@@ -562,4 +563,100 @@ fn slow_or_paused_workers_are_not_taken_as_failed() {
     assert!(h.crashes().is_empty(), "{:?}", h.crashes());
     h.stop();
     h.wait_done("l_RS");
+}
+
+// ---------- agent 0.3.20 (PROTOCOL 20): new generations within seconds, and during drains ----------
+
+/// Every beat of `id` answers without a checkpoint (so only extensions and polls can bring one).
+fn beats_offer_nothing(h: &H, id: &str) {
+    for _ in 0..200 {
+        h.mock.script_beat(id, json!({"action": "continue", "checkpoint": null}));
+    }
+}
+
+/// The trainer publishes gen 2 (definition version 2 signs gens 1 and 2, the same template).
+fn publish_gen_2(h: &H, game_ms: u64) {
+    let (_, d1) = network(h, 1);
+    let (c2, d2) = network(h, 2);
+    let dref2 = h.define(&definition(h, 2, json!({"1": d1, "2": d2}), settings(game_ms)));
+    h.mock.set_run_current(RUN, c2, dref2);
+}
+
+#[test]
+fn an_extension_says_its_gen_and_its_answer_brings_the_new_generation() {
+    let mut h = H::new();
+    let g1 = generation_1(&h, 100);
+    let mut l = rolling_lease(&h, "l_RX", &g1, 0, 4, 400, json!(2));
+    l["beat_s"] = json!(600);
+    h.push(l);
+    beats_offer_nothing(&h, "l_RX");
+    h.start();
+    assert!(wait(|| !h.mock.results_for("l_RX").is_empty()));
+    publish_gen_2(&h, 100);
+    assert!(wait(|| extends(&h, "l_RX").iter().any(|b| b["gen"] == 2)), "{}", h.agent_log());
+    assert!(h.agent_log().contains("checkpoint Some(2) self-tested (sha256 given: true)"), "{}", h.agent_log());
+    assert!(h.mock.with(|s| s.extend_answers.iter().any(|(l, a)| l == "l_RX" && a["checkpoint"]["gen"] == 2)));
+    assert!(extends(&h, "l_RX").iter().all(|b| b["gen"].is_u64()), "every extension says its generation");
+    assert!(h.mock.with(|s| s.polls.is_empty()), "no poll_s: no polls");
+    let done = h.wait_done("l_RX");
+    assert_eq!(done["given_back"], false, "{done}");
+    let gens = x_gens(&h, "l_RX");
+    assert!(gens.contains(&2) && gens.windows(2).all(|w| w[0] <= w[1]), "{gens:?}");
+    assert_eq!(h.mock.count("GET", &format!("/v1/artifact/ckpt/{RUN}/2/model.onnx")), 1, "fetched once, whatever the repeats");
+    h.stop();
+}
+
+#[test]
+fn a_lease_with_poll_s_polls_and_switches_without_a_beat_or_an_extension() {
+    let mut h = H::new();
+    let g1 = generation_1(&h, 100);
+    // every id released at grant: no extension for a while
+    let mut l = rolling_lease(&h, "l_RP", &g1, 0, 300, 300, json!(2));
+    l["beat_s"] = json!(600);
+    l["rolling"]["poll_s"] = json!(2);
+    h.push(l);
+    beats_offer_nothing(&h, "l_RP");
+    h.start();
+    assert!(wait(|| !h.mock.results_for("l_RP").is_empty()));
+    assert!(h.mock.with(|s| s.polls.iter().any(|(l, b)| l == "l_RP" && b == &json!({"gen": 1}))), "{}", h.agent_log());
+    publish_gen_2(&h, 100);
+    assert!(wait(|| h.agent_log().contains("checkpoint Some(2) self-tested")), "{}", h.agent_log());
+    assert!(extends(&h, "l_RP").is_empty(), "the poll brought it: {:?}", extends(&h, "l_RP"));
+    assert!(wait(|| h.mock.with(|s| s.polls.iter().any(|(l, b)| l == "l_RP" && b["gen"] == 2))), "it polls with the new generation");
+    // polls come about every poll_s, not faster
+    let n = h.mock.with(|s| s.polls.len());
+    std::thread::sleep(Duration::from_millis(2500));
+    let m = h.mock.with(|s| s.polls.len());
+    assert!((1..=2).contains(&(m - n)), "{n} -> {m} polls in 2.5 s");
+    // the coordinator turns polling off (the next answer says poll_s null): no more polls
+    h.mock.set_poll("l_RP", Value::Null);
+    std::thread::sleep(Duration::from_millis(2500));
+    let k = h.mock.with(|s| s.polls.len());
+    std::thread::sleep(Duration::from_millis(3000));
+    assert_eq!(h.mock.with(|s| s.polls.len()), k, "{}", h.agent_log());
+    h.stop();
+}
+
+#[test]
+fn a_finishing_lease_still_switches_to_a_new_generation() {
+    let mut h = H::new();
+    // long games: the drain after `finish` lasts a few seconds
+    let g1 = generation_1(&h, 4000);
+    let mut l = rolling_lease(&h, "l_RD", &g1, 0, 4, 100, json!(2));
+    l["beat_s"] = json!(600);
+    l["rolling"]["poll_s"] = json!(2);
+    h.push(l);
+    beats_offer_nothing(&h, "l_RD");
+    h.mock.script_extend("l_RD", json!({"finish": true, "reason": "max_s"}));
+    h.start();
+    assert!(wait(|| h.mock.with(|s| s.extend_answers.iter().any(|(l, a)| l == "l_RD" && a["finish"] == true))), "{}", h.agent_log());
+    publish_gen_2(&h, 4000);
+    let done = h.wait_done("l_RD");
+    assert_eq!(done["given_back"], false, "{done}");
+    let log = h.agent_log();
+    let sw = log.find("checkpoint Some(2) self-tested").unwrap_or_else(|| panic!("never switched while draining: {log}"));
+    let end = log.find("rolling job ended (finish)").unwrap();
+    assert!(sw < end, "the switch came during the drain, before the worker ended: {log}");
+    assert!(h.mock.with(|s| s.polls.iter().any(|(l, b)| l == "l_RD" && b["gen"] == 1)), "the drain polled");
+    h.stop();
 }

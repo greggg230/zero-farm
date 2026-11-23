@@ -301,7 +301,9 @@ fn run_windows(
         std::sync::Arc::new(move || {
             let (token, settings) = {
                 let m = machine.lock().unwrap();
-                (m.token(), serde_json::to_string(&m.settings).unwrap_or_default())
+                let s = serde_json::to_string(&m.settings).unwrap_or_default();
+                // rev 28 (PROTOCOL 20.7): the farm owner's disk cap, when set
+                (m.token(), m.owner_disk_cap_mb.map_or(s.clone(), |mb| format!("{s} owner_disk_cap_mb={mb}")))
             };
             let Some(token) = token else { return "This PC isn't part of the farm yet.".to_string() };
             let client = match zerofarm_common::http::Client::new(&coord, Some(token), &version) {
@@ -618,6 +620,10 @@ fn main() {
             let m = Machine::load(&Layout::new(root(&args)));
             for k in farm_agent::settings::Settings::KEYS.iter().filter(|k| !matches!(**k, "mode")) {
                 println!("{}", m.settings.describe_key(k));
+            }
+            // rev 28 (PROTOCOL 20.7): the farm owner's disk cap replaces disk_cap_mb while set
+            if let Some(mb) = m.owner_disk_cap_mb {
+                println!("(disk_cap_mb is {mb} while the farm owner's cap is set: {})", m.describe_disk_cap());
             }
             0
         }

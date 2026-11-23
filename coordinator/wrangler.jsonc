@@ -64,6 +64,12 @@
     // python worker behind zf-pyshim.exe). Opt-in packs and alternates with when.opt_in go only to it and newer, and only
     // to machines whose opt_in list holds the name (npm run admin -- machine <id> opt-in torch).
     "TORCH_AGENT": "0.3.19",
+    // Rev 28 (PROTOCOL 20): the first agent that polls a rolling lease for new generations (POST /v1/lease/{id}/poll); only
+    // it and newer are sent `poll_s` (and only machines whose owner setting `fresh.poll_s` is set).
+    "POLL_AGENT": "0.3.20",
+    // Rev 28 (PROTOCOL 20.7): the first agent that takes the owner's disk cap for its machine (`owner_disk_cap_mb` in every
+    // /v1/lease answer; npm run admin -- machine <id> disk-cap <MB|off>, only with the friend's consent).
+    "DISK_CAP_AGENT": "0.3.20",
     // Installers (agent release github_url) must be this repository's agent-v<version> assets.
     "GITHUB_REPO": "greggg230/zero-farm",
     // Limits (security review M3, M4): active leases per machine; result chunks and bytes per

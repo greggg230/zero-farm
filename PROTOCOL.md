@@ -7,7 +7,9 @@ A change to anything here is a protocol change: bump the version it belongs to a
 bottom.
 
 Versions: HTTP API `v1` (path prefix), agent↔worker protocol `aw/1`, network files `zero-onnx/1`,
-manifests `manifest/1`. Current revision: v1 rev 27 (section 19, opt-in runtimes per machine: the torch runtime pack and
+manifests `manifest/1`. Current revision: v1 rev 28 (section 20, fresher rows from fast machines: new generations with
+extension answers and a per-machine poll, drains that keep switching, the owner's per-machine freshness budget, rolling
+result limits per hour; rev 27: section 19, opt-in runtimes per machine: the torch runtime pack and
 worker, offered only to machines the owner opted in; rev 26: section 18, the freshness budget: a rolling lease's games in flight
 capped so its games last no longer than the run's staleness window allows; rev 24: section 15, the priority lane: waiting
 eval work takes machines from fuzz and rolling self-play, canary machines first; rev 23: section 12.2, a batch's CPU capacity counts only PCs of a platform its
@@ -200,7 +202,8 @@ Response, exactly one of:
   release keeps the stable channel's agents on everything else).
 
 Any of the three may also carry `"upload_diag": ["logs"]` (as a beat answer can): a machine with no
-lease hears about a diagnostics request on its next `/v1/lease`.
+lease hears about a diagnostics request on its next `/v1/lease`. Rev 28 (section 20.7): to agents from `DISK_CAP_AGENT`
+(0.3.20), `wait_s` and `lease` answers always carry `"owner_disk_cap_mb": n | null`, the owner's disk cap for the machine.
 
 How the coordinator picks (DESIGN 5.1): diagnostics asked for this machine first; then runs'
 evaluation (unissued games) and self-play (short of quota), by run priority × fit ÷ (1 + that job's
@@ -425,7 +428,7 @@ tools also send an Access service token (`CF-Access-Client-Id`, `CF-Access-Clien
 | `GET /v1/admin/campaign/{id}` · `GET …/results?after=` · `POST …/ack` | config (rev 14: with `share`) + `cursor`, `seeds_done`, `seeds_leased`, `active_leases`, `pool`, `failures`, `sites`; results and ack as for runs (`ids` are seeds) |
 | `GET /v1/admin/campaign/{id}/failures?after=&limit=` | → `{"failures": [{"id", "seed", "mode", "site", "panic", "repro", "output_tail", "build_id", "engine_commit", "machine_id", "lease_id", "first_of_site", "t"}], "cursor"}` (section 5.1; one row per (seed, site)) |
 | `GET /v1/admin/machines` · `POST /v1/admin/machine/{id}/revoke` | revoking cancels the machine's active leases at once (their ids go back to the pool) → `{"ok": true, "cancelled"}` |
-| `POST /v1/admin/machine/{id}` | `{"name"?, "channel"?, "paused"?, "unblock"?, "opt_in"?, "opt_in_add"?, "opt_in_remove"?}`; a paused machine gets `wait_s` / `paused_by_admin`; `"unblock": true` (rev 5) lifts the machine's build blocks (`/v1/crash` kind `blocked`) and answers `{"ok": true, "unblocked": n}`; rev 27 (19.2): the machine's opt-in runtimes, answered as `"opt_in": [...]` |
+| `POST /v1/admin/machine/{id}` | `{"name"?, "channel"?, "paused"?, "unblock"?, "opt_in"?, "opt_in_add"?, "opt_in_remove"?}`; a paused machine gets `wait_s` / `paused_by_admin`; `"unblock": true` (rev 5) lifts the machine's build blocks (`/v1/crash` kind `blocked`) and answers `{"ok": true, "unblocked": n}`; rev 27 (19.2): the machine's opt-in runtimes, answered as `"opt_in": [...]`; rev 28: `"fresh"` (20.4) and `"disk_cap_mb"` (20.7, the owner's disk cap, MB or null) |
 | `POST /v1/admin/pause` | `{"paused": true \| false}`: farm-wide, no new leases while paused |
 | `POST /v1/admin/routing` | rev 18: `{"on": bool, "eval_horizon_s": 0..604800, "eval_games_per_thread": 0..16}`, rev 24: `"priority_lane": "off" \| "canary" \| "all"`, `"eval_stall_s": 0..86400`; any of them; the others keep their values → `{"ok": true, "on", "eval_horizon_s", "eval_games_per_thread", "priority_lane", "eval_stall_s"}`. `GET /v1/admin/routing` → the same fields and `"stored"` (false: never set, the defaults). Sections 12, 15.6 |
 | `POST /v1/admin/evict` | rev 12: `{"builds": ["<build_id>", ...]}` (at most 64; `[]` clears it) replaces the evict list → `{"ok": true, "builds"}` (deduplicated). `GET /v1/admin/evict` → `{"builds"}`. It rides on every `GET /v1/agent/latest` (section 3) |
@@ -1340,7 +1343,8 @@ A rolling lease is a self-play lease (section 3) plus
 
 ### 10.4 `POST /v1/lease/{lease_id}/extend`
 
-`{"games": k}` (k ≥ 1): release k more ids. Answers (200):
+`{"games": k}` (k ≥ 1): release k more ids (rev 28, 20.1: an optional `"gen"`, the newest generation the workers play;
+every answer then carries `checkpoint` / `definition` as a beat answer does). Answers (200):
 - `{"games": total}`: the lease's ids are now `[lo, lo + total)` (total ≥ the previous; it may be less than asked:
   the run's self-play headroom, or the block's end);
 - `{"games": total, "wait_s": 20, "reason": "quota"}`: nothing released now (no headroom: the generation's quota is
@@ -1471,7 +1475,9 @@ A rolling lease is a self-play lease (section 3) plus
   per lease (`/v1/crash` kind `definition`), a changed template is not. A definition that can't be fetched right now
   is asked again at a later beat; a checkpoint whose files can't be fetched or verified ends the lease with `finish` too
   (it would otherwise play an old network for good). Repeats are ignored. Classic
-  leases are unchanged (they switch only to gens their own definition signs, section 3).
+  leases are unchanged (they switch only to gens their own definition signs, section 3). Rev 28 (section 20): extension
+  answers (to an extension that says its `gen`) and polls make the same offer, and a lease that finishes keeps switching
+  until its workers end.
 - **Ending.** As any lease: `cancel` → `quit`; `give_back`, a pause or starvation past `slack_s` → give back; the user
   quits → `quit`. Rolling leases also end with `finish` when the coordinator answers `finish` to an extension, when the
   template changes (above), and when the agent has a newer version ready to switch to (section 6) - a rolling lease
@@ -2618,7 +2624,9 @@ Worked out per run, never per machine, from the run's checkpoint registrations (
 - A rolling self-play lease's beat answers and every 200 answer of its extensions (10.4) carry `fresh_s`: the run's
   budget now, or `null` (none any more - the run was paused, or lost its rolling setting or its history).
 - Only to agents at or above `FRESH_AGENT` (Worker var, default `0.3.17`) on machines the owner's `fresh_cap` names
-  (18.4). To every other agent the lease and the answers keep exactly their keys of before.
+  (18.4). To every other agent the lease and the answers keep exactly their keys of before. Rev 28 (20.3): also on a
+  machine the owner gave a `share`, whatever its channel (not under `fresh_cap` "off"), with that machine's own budget;
+  poll answers (20.2) carry `fresh_s` too.
 - The agent reads a positive integer as the budget and anything else in an answer (`null`, 0, a string) as none; a key
   absent from an answer leaves the budget as it was.
 - Lease Stats (beats, `done`) of a capped lease add `fresh_cap`: the games in flight the agent caps the job at (kept in
@@ -2833,7 +2841,163 @@ shim (it is a file of the worker build like any other, signed with it).
    `npm run admin -- machine <id> opt-in torch` for each of the two machines (`machines` shows their ids).
 4. To stop: `opt-out torch` (from the next lease), or take the alternate off the run.
 
+## 20. Fresher rows from fast machines (rev 28; coordinator migration 0018, Worker vars `POLL_AGENT`, `DISK_CAP_AGENT`; agents from 0.3.20)
+
+**Why.** The owner's bar for moving the training desktop's self-play onto the farm (2026-11-22): at least 95 % of its
+local games an hour, rows no staler than local ones, iterations no slower. Local self-play's rows lag ~0.5 generations:
+the trainer's own driver switches to each new network the instant it is written, accepts a finished game at once, and
+keeps its game latency (1,536 games in flight / ~26 games/s) under one generation. A farm agent on the same desktop,
+simulated with the farm's pipeline of rev 27, lags 1.5-2.3 generations: a new generation reaches a rolling lease only
+with a beat answer (`BEAT_S` 60: ~30 s on average), records wait up to `flush_s` in the worker, the freshness budget (18)
+never binds on a machine that fast (~370 s, ~9,600 games in flight), a lease that finishes plays its drain on a frozen
+network (the second PC: 8-9 minutes, every ~10-minute lease), and a renewing lease at ~93k games an hour runs into the
+per-lease result limits after a few hours (every chunk after that refused and its games lost). Rev 28 removes those
+costs; everything is additive, and agents before 0.3.20 see exactly the answers of before.
+
+### 20.1 Extensions carry new generations; drains keep switching
+
+- `POST /v1/lease/{lease_id}/extend` takes an optional `"gen"` (integer): the newest generation the lease's workers play
+  (agents from 0.3.20 send it with every extension). It is stored as `cur_gen` exactly as a beat's (10.6; never older than
+  the lease's first gen), and **every 200 answer** of that extension - releases, `wait_s`, `finish` alike - carries
+  `checkpoint` (null when there is nothing newer) and, with a newer one, `definition`: the offer a beat answer makes
+  (10.6: the run's current gen when the current definition signs it; the lease's model variant, 14.3). An extension
+  without `gen` gets the answer of before (no `checkpoint` key). Agents extend every 10-20 s while their workers ask for
+  ids, so a new generation reaches such a lease within an extension rather than a beat.
+- The agent (0.3.20) handles a checkpoint offered by an extension answer exactly as a beat's (10.6: the definition
+  verified first, the network fetched once, repeats ignored).
+- **Drains.** A rolling lease that finishes - the coordinator's `finish` (any reason), a memory or template change, an
+  agent update - keeps taking new generations until its workers have ended: beat, extension and poll offers are acted on,
+  the new network goes to the main worker and to every worker still finishing its games (a finishing lease's crew, a
+  handoff's drainers, 13.2) - each switches its games in flight in place (10.5: native and torch workers both build and
+  self-test the network on a thread while the games go on, also after `finish`). 0.3.13-0.3.19 ignored new generations
+  once the lease was finishing, and a handoff's drainers kept the network they had: a drain of the second PC's lease
+  played 8-9 minutes on a frozen generation, and 82 % of its rows dropped as stale fell in two such drains. A definition
+  that failed its check or changed the template (10.6, which itself finishes the lease) is not checked again in that
+  lease.
+
+### 20.2 The generation poll
+
+- `POST /v1/lease/{lease_id}/poll` `{"gen": g}` (g: the newest generation the lease's workers play). For a rolling
+  self-play lease of this machine: 200 `{"checkpoint": <ref> | null, "definition"?: {...}, "fresh_s"?: ..., "poll_s"?:
+  ...}` - the offer of 10.6 against `g`, and the lease's freshness budget (18.2) and poll interval (below) as a beat answer
+  carries them. It changes nothing: no id released, no renewal or yield decided (10.4, 15.4), `cur_gen` not stored (beats
+  and extensions store it), and it reads without the scope's lock. 400: a classic or non-self-play lease, `gen` missing or
+  not an integer; 404: not this machine's lease; 410: not active. Rate limit: its own bucket `poll` (one per 2 s on
+  average, a burst of 10), so polls leave the beat bucket to beats and extensions.
+- **`poll_s`** (the owner's per-machine setting, 20.4): a rolling lease of an agent at or above `POLL_AGENT` (Worker var,
+  default `0.3.20`) on a machine with `poll_s` set carries `rolling.poll_s`; that agent's beat, extension and poll answers
+  carry `poll_s` - the setting now, or null (unset: stop polling). Agents before `POLL_AGENT` never see it.
+- The agent (0.3.20): with a `poll_s` (2 to 300, kept within that), it polls every `poll_s` seconds while any worker of the
+  lease still plays - also while the lease finishes (20.1) -, not while a network is being fetched or a definition
+  checked, and acts on the answer's offer as on a beat's. 410 stops the lease like an extension's (a lost lease); any
+  other refusal that won't change (a 4xx; a coordinator without the poll answers 404) stops polling for the rest of the
+  lease; 429 and network errors wait for the next poll (and `retry-after`).
+- With `poll_s` 5, a new generation reaches the lease ~2.5 s (+ the ~2-3 s fetch, verification and self-test) after it is
+  registered, instead of ~30 s. The cost: one small request per `poll_s` per lease (a few D1 reads).
+
+### 20.3 The machine's own freshness budget (`share`)
+
+- The run's budget (18.1) is a drop-avoidance cap: a game may last about three quarters of the staleness window. For a
+  machine that replaces the trainer's local self-play the owner wants a game to last a fraction of **one** generation, as
+  local games do. A machine with `share` set (20.4) is sent, for every rolling lease, the budget
+  `min(the run's budget, max(30, floor(share x period)))` seconds, `period` being the run's generation period of 18.1
+  (none while the run has too little history, as 18.1).
+- Who gets it: agents from `FRESH_AGENT` (as 18.2) on a machine with `share` set, whatever its channel - the per-machine
+  setting is the owner's choice -, unless `fresh_cap` is `"off"` (18.4: the kill switch for every budget). The lease's
+  `rolling.fresh_s`, its beat, extension and poll answers carry it; no agent change (18.3 caps the job's games in flight
+  so that its p75 game lasts at most the budget).
+- The owner's desktop (~26 games/s, a generation every ~93 s): `share` 0.75 gives 69 s, and 18.3's cap then holds the job
+  near 69 x 26 / 1.35 ~ 1,300 games in flight (1.35: a gamma(2) game's p75 over its mean) - about one iteration of
+  latency, as local self-play's 1,536 at ~59 s.
+
+### 20.4 The owner's settings per machine (migration 0018)
+
+- `machines.fresh`: a JSON object, NULL: none. `POST /v1/admin/machine/{id}` takes `"fresh": {"poll_s": 2..300, "share":
+  0.1..4} | null` (each key optional; replaces the whole object; null or `{}` clears it; any other key, or a value out of
+  range, 400) and answers `{"ok": true, "fresh": {...}}`. Admin CLI: `npm run admin -- machine <id> fresh
+  '{"poll_s":5,"share":0.75}'` / `... fresh off`.
+- `GET /v1/admin/machines` and the stats' machines list `fresh` (`{}`: none); the admin page shows it under the
+  machine's agent version; the stats' `limits` add `poll_agent`. Takes effect at the machine's next answer (beat,
+  extension or poll) for a running lease.
+
+### 20.5 Result limits per hour of a rolling lease; the renewal sees the lease's own files
+
+- **Limits.** A rolling lease's result limits (`MAX_LEASE_CHUNKS` chunks, `MAX_LEASE_BYTES` bytes; review M3) count per
+  started hour of its life: `limit x ceil((now or its close - issued_at) / 3600)` (at least one hour's). Classic leases
+  keep theirs per lease. Before rev 28 a renewing lease of the owner's desktop (records every ~10 s with `flush_s` 10:
+  360-720 chunks an hour) reached 2,000 chunks in ~3-5 hours, and every chunk after that was refused (413) and its games
+  lost; an agent drops a chunk refused that way.
+- **The renewal's ask** (10.4 **What waits**; also the priority lane's, 15.4) counts the lease's own worker build and
+  runtime pack as cached: they are on the machine's disk, and the stored `caps.disk_mb` is the free space with them
+  there. Before rev 28 nothing counted as cached, so on a PC with little free disk the lease's own GPU version did not
+  fit its disk cap in the renewal's eyes: its self-play fell to the CPU tier (12.1) or out, an eval batch (or another
+  run's GPU self-play) "waited", and the lease was finished at every renewal (`max_s`) - only for the machine's next lease
+  request, which lists its cache, to get the same self-play again. The second PC (a stored disk cap of 670 MB, below its
+  CUDA pack's size) had every lease finished after 10 minutes on 2026-11-22, each followed by a frozen-generation drain.
+
+### 20.6 The owner's desktop: what to set (and deploy order)
+
+1. Coordinator rev 28 (migration 0018 before the Worker; `POLL_AGENT` 0.3.20). Nothing changes for anyone until a
+   machine gets `fresh` (and then only for agents from 0.3.20 for `poll_s`).
+2. Agent 0.3.20 on the desktop (canary first).
+3. `npm run admin -- machine <desktop id> fresh '{"poll_s":5,"share":0.75}'`.
+4. The run's rolling setting: `flush_s` 10 (the coordinator's minimum; a finished game waits at most 10 s in the worker),
+   `max_s` large (e.g. 86,400: fewer renewals, and so fewer drains), and the run's `pool_poll_s` 2 / `pool_quota` large
+   enough for the desktop's in-flight (zero-core `farm_pool`).
+5. To undo: `fresh off` (from the next answer), or `fresh_cap` `"off"` for the budget part.
+
+### 20.7 The owner's disk cap per machine (migration 0018, Worker var `DISK_CAP_AGENT`)
+
+**Why.** A friend's agent caps everything under its install root at its local `disk_cap_mb` - 3,072 MB unless they
+changed it, settable only on their PC (Windows: `farm-agent set` with the agent stopped; the tray doesn't show it). It
+reports what it may still download under that cap as `caps.disk_mb`, and 9.4 rule 5 offers an alternate only when its
+uncached builds' plain sizes fit `caps.disk_mb`. The torch runtime pack alone is 4.33 GB, so on a friend's PC that opted
+into torch (19.2) the torch alternate could never fit, however much free disk the PC had. With the friend's consent the
+owner sets a larger cap for that machine on the coordinator.
+
+- **Coordinator.** `machines.disk_cap_mb` (INTEGER, NULL: none). `POST /v1/admin/machine/{id}` takes `"disk_cap_mb": n |
+  null` (an integer from 1,024 to 16,777,216 MB, as the agent's own setting takes; else 400) and answers
+  `{"ok": true, "disk_cap_mb": n | null}`. Admin CLI: `npm run admin -- machine <id> disk-cap <MB>` / `... disk-cap off`.
+  `GET /v1/admin/machines` and the stats' machines list `disk_cap_mb`; the admin page shows "disk cap: n MB" under the
+  machine's agent version; the stats' `limits` add `disk_cap_agent`. Only with the friend's consent: it replaces the cap
+  they chose.
+- **On the wire.** To an agent from `DISK_CAP_AGENT` (default 0.3.20), every `/v1/lease` answer that is a `lease` or a
+  `wait_s` (`no_work`, `paused_by_admin`, `too_many_leases`) carries `"owner_disk_cap_mb": n | null` - null when the owner
+  set none. The machine-level settings ride on lease answers as `upload_diag` does (section 3); `/v1/agent/latest` would
+  reach the agent only at start and every 6 h. Older agents never get the key. The coordinator's fit is unchanged: it
+  still compares sizes with the `caps.disk_mb` the agent reports, which follows the cap from the agent's next ask.
+- **The agent (0.3.20).** A number (1,024 to 16,777,216; anything else is ignored and the cap stays as it was) becomes the
+  machine's effective disk cap: it **replaces** the friend's own `disk_cap_mb` (not the larger of the two) for every use -
+  `caps.disk_mb`, downloads and eviction, the in-lease update check. The friend's own setting is kept unchanged in
+  `machine.json` beside it (`owner_disk_cap_mb`, written only while set, so it holds across restarts) and applies again
+  as soon as an answer says null (the owner cleared it). An answer without the key (a coordinator before rev 28) changes
+  nothing. When the cap changed in a `no_work` answer, the agent asks again within 5 s (that ask's `caps.disk_mb` came
+  from the cap of before). The tray shows "Disk space for the farm: N GB (set by the farm owner; your own setting, M GB,
+  applies again when the owner clears it)" while it is set; the macOS `ZeroFarm status` and Windows `farm-agent
+  settings` say the same; diagnostics' settings line adds `owner_disk_cap_mb=N`.
+- **Agents before 0.3.20** keep their local cap: the owner's cap reaches a machine once its channel's release is 0.3.20
+  or newer. A locally paused agent asks for no lease, so it hears of the cap when it resumes.
+
 ## Changes
+- v1 rev 28, agent 0.3.20 (2026-11-22; coordinator migration 0018 `machines.fresh`, Worker var `POLL_AGENT` default
+  0.3.20; unreleased): **fresher rows from fast machines** (section 20). An extension may say its `gen` and every answer
+  then offers a newer generation as a beat does; `POST /v1/lease/{id}/poll` `{"gen"}` asks for one (its own rate bucket,
+  one per 2 s; changes nothing); the owner's per-machine setting `fresh` (`POST /v1/admin/machine/{id}`, CLI `machine <id>
+  fresh '{"poll_s":5,"share":0.75}'`): `poll_s` (sent to agents from `POLL_AGENT` in `rolling.poll_s` and every rolling
+  answer) and `share` (the machine's freshness budget: min(the run's, share x the run's generation period, at least 30 s),
+  on any channel unless `fresh_cap` is off); a rolling lease's result limits per started hour of its life; the renewal's
+  and the lane's ask count the lease's own build and runtime pack as cached. Agent 0.3.20: `gen` in extensions, offers in
+  extension and poll answers acted on as a beat's, the poll every `poll_s`, and new generations taken while a lease
+  finishes (the main worker and every worker still finishing its games switch). Why: a farm agent on the training
+  desktop simulated at 1.5-2.3 generations of lag against local self-play's ~0.5 (a gen reached a lease only with a beat,
+  ~30 s; the run's budget never bound there; drains played on a frozen gen); a renewing desktop lease would hit the
+  2,000-chunk limit in ~3-5 h; and the second PC's leases were finished at every renewal because its stored disk cap
+  could not hold its own run's CUDA pack. Also (20.7; migration 0018 `machines.disk_cap_mb`, Worker var `DISK_CAP_AGENT`
+  default 0.3.20): **the owner's disk cap per machine** (`POST /v1/admin/machine/{id}` `disk_cap_mb`, CLI `machine <id>
+  disk-cap <MB|off>`), sent as `owner_disk_cap_mb` in every lease and wait answer to agents from `DISK_CAP_AGENT`;
+  agent 0.3.20 uses it in place of the friend's own `disk_cap_mb` while it is set (kept in `machine.json`, shown in the
+  tray), and the friend's setting applies again once the owner clears it. Why: a friend's default 3 GB cap can never
+  hold the 4.33 GB torch pack (9.4 rule 5), and the friend can only change it on their PC.
 - v1 rev 27, agent 0.3.19 (2026-11-22; coordinator migration 0017 `machines.opt_in`, Worker var `TORCH_AGENT` default
   0.3.19; unreleased): **opt-in runtimes per machine - the torch runtime** (section 19). Runtime manifests may carry
   `opt_in` (a name; `farm-release sign --opt-in`, `min_agent` 0.3.19+); the provider `torch-cuda` (only in an opt-in pack,
