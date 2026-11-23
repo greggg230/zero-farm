@@ -156,6 +156,11 @@ pub struct State {
     /// rev 26 (PROTOCOL 18.2): per lease, the `fresh_s` its beat and extension answers carry (a number or null; absent:
     /// none, the answers of before - see [`MockCoord::set_fresh`]).
     pub fresh: HashMap<String, Value>,
+    /// rev 28 (PROTOCOL 20.2): per lease, the `poll_s` its beat, extension and poll answers carry (see
+    /// [`MockCoord::set_poll`]).
+    pub poll: HashMap<String, Value>,
+    /// rev 28: `POST /v1/lease/{id}/poll` bodies, in order.
+    pub polls: Vec<(String, Value)>,
 }
 
 pub struct MockCoord {
@@ -351,6 +356,12 @@ impl MockCoord {
     /// number, or null: no budget any more).
     pub fn set_fresh(&self, lease_id: &str, v: Value) {
         self.with(|s| s.fresh.insert(lease_id.to_string(), v));
+    }
+
+    /// rev 28 (PROTOCOL 20.2): from now on every 200 beat, extension and poll answer of `lease_id` carries `poll_s` = `v`
+    /// (a number, or null: no polling).
+    pub fn set_poll(&self, lease_id: &str, v: Value) {
+        self.with(|s| s.poll.insert(lease_id.to_string(), v));
     }
 
     /// rev 15: the run's current generation: a rolling lease's beats with an older `gen` answer with this checkpoint
@@ -705,6 +716,9 @@ fn handle(mut req: Request, st: &Arc<Mutex<State>>) {
                     if let Some(f) = s.fresh.get(&id) {
                         ans["fresh_s"] = f.clone();
                     }
+                    if let Some(p) = s.poll.get(&id) {
+                        ans["poll_s"] = p.clone();
+                    }
                     if ans["action"] == "cancel" {
                         s.leases.get_mut(&id).unwrap().cancelled = true;
                     }
@@ -767,9 +781,49 @@ fn handle(mut req: Request, st: &Arc<Mutex<State>>) {
                         if let Some(f) = s.fresh.get(&id) {
                             ans["fresh_s"] = f.clone();
                         }
+                        if let Some(p) = s.poll.get(&id) {
+                            ans["poll_s"] = p.clone();
+                        }
+                        // rev 28 (PROTOCOL 20.1): an extension that says its `gen` is offered the run's newer one
+                        if let Some(g) = json_body["gen"].as_u64() {
+                            let offer = ls.lease["run"].as_str().and_then(|r| s.run_current.get(r)).filter(|(c, _)| c["gen"].as_u64().is_some_and(|cur| cur > g));
+                            match offer {
+                                Some((c, d)) => {
+                                    ans["checkpoint"] = c.clone();
+                                    ans["definition"] = d.clone();
+                                }
+                                None => ans["checkpoint"] = Value::Null,
+                            }
+                        }
                         s.extend_answers.push((id.clone(), ans.clone()));
                         done!(reply(req, 200, ans))
                     }
+                }
+            }
+        }
+        // rev 28 (PROTOCOL 20.2): a rolling lease's generation poll
+        ("POST", ["lease", id, "poll"]) => {
+            let id = id.to_string();
+            s.polls.push((id.clone(), json_body.clone()));
+            match s.leases.get(&id).cloned() {
+                None => done!(err(req, 404, "not_found", "lease")),
+                Some(ls) if ls.cancelled || ls.expired || ls.done => done!(err(req, 410, "gone", "lease")),
+                Some(ls) if ls.lease["rolling"].is_null() => done!(err(req, 400, "bad_request", "not a rolling lease")),
+                Some(_) if json_body["gen"].as_u64().is_none() => done!(err(req, 400, "bad_request", "gen is required")),
+                Some(ls) => {
+                    let g = json_body["gen"].as_u64().unwrap_or(0);
+                    let mut ans = json!({"checkpoint": null});
+                    if let Some((c, d)) = ls.lease["run"].as_str().and_then(|r| s.run_current.get(r)).filter(|(c, _)| c["gen"].as_u64().is_some_and(|cur| cur > g)) {
+                        ans["checkpoint"] = c.clone();
+                        ans["definition"] = d.clone();
+                    }
+                    if let Some(f) = s.fresh.get(&id) {
+                        ans["fresh_s"] = f.clone();
+                    }
+                    if let Some(p) = s.poll.get(&id) {
+                        ans["poll_s"] = p.clone();
+                    }
+                    done!(reply(req, 200, ans))
                 }
             }
         }

@@ -183,6 +183,11 @@ pub struct Rolling {
     /// this (`fresh.rs`). Absent (or anything but a positive integer): none, the agent's choice as before.
     #[serde(default, deserialize_with = "fresh_value", skip_serializing_if = "Option::is_none")]
     pub fresh_s: Option<u64>,
+    /// rev 28 (PROTOCOL 20.2): poll for a new generation (`POST /v1/lease/{id}/poll`) every this many seconds - the owner's
+    /// setting for this machine. Absent (or anything but a positive integer): no polling; generations come with beats and
+    /// extensions.
+    #[serde(default, deserialize_with = "fresh_value", skip_serializing_if = "Option::is_none")]
+    pub poll_s: Option<u64>,
 }
 
 /// rev 26 (PROTOCOL 18): a freshness budget as given - a positive integer, else none (lenient: a value the agent can't use
@@ -211,6 +216,31 @@ pub struct RollingInflight {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct ExtendReq {
     pub games: u64,
+    /// rev 28 (PROTOCOL 20.1): the newest generation the lease's workers play: the answer then offers a newer one, as a
+    /// beat answer does.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gen: Option<u64>,
+}
+
+/// rev 28 (PROTOCOL 20.2): `POST /v1/lease/{id}/poll` - a rolling lease asks whether the run has a newer generation than
+/// `gen`, the newest its workers play.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct PollReq {
+    pub gen: u64,
+}
+
+/// The answer to a poll: a newer `checkpoint` with the run's current `definition` (as in a beat answer), and the lease's
+/// `fresh_s` and `poll_s` as now (absent: unchanged; null: none).
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
+pub struct PollResp {
+    #[serde(default)]
+    pub checkpoint: Option<CheckpointRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<DefinitionRef>,
+    #[serde(default, deserialize_with = "fresh_update", skip_serializing_if = "Option::is_none")]
+    pub fresh_s: Option<Option<u64>>,
+    #[serde(default, deserialize_with = "fresh_update", skip_serializing_if = "Option::is_none")]
+    pub poll_s: Option<Option<u64>>,
 }
 
 /// The answer to an extension: the lease's released ids are `[lo, lo + games)`; `wait_s`: nothing released now,
@@ -227,6 +257,15 @@ pub struct ExtendResp {
     /// rev 26 (PROTOCOL 18.2): the run's freshness budget now (`fresh_update`: absent - unchanged; null - none).
     #[serde(default, deserialize_with = "fresh_update", skip_serializing_if = "Option::is_none")]
     pub fresh_s: Option<Option<u64>>,
+    /// rev 28 (PROTOCOL 20.1): to an extension that said its `gen`, a newer generation with the run's current definition,
+    /// as in a beat answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<CheckpointRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub definition: Option<DefinitionRef>,
+    /// rev 28 (PROTOCOL 20.2): the poll interval now (absent - unchanged; null - no polling).
+    #[serde(default, deserialize_with = "fresh_update", skip_serializing_if = "Option::is_none")]
+    pub poll_s: Option<Option<u64>>,
 }
 
 /// rev 6 (PROTOCOL 7): where a lease's signed definition is (`defs/<kind>/<id>/<version>/
@@ -331,6 +370,9 @@ pub struct BeatResp {
     /// rev 26 (PROTOCOL 18.2): a rolling lease's freshness budget now (`fresh_update`: absent - unchanged; null - none).
     #[serde(default, deserialize_with = "fresh_update")]
     pub fresh_s: Option<Option<u64>>,
+    /// rev 28 (PROTOCOL 20.2): a rolling lease's poll interval now (absent - unchanged; null - no polling).
+    #[serde(default, deserialize_with = "fresh_update")]
+    pub poll_s: Option<Option<u64>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -511,6 +553,21 @@ mod tests {
         let rl: Rolling = serde_json::from_str(r#"{"block": [0, 10], "fresh_s": 292}"#).unwrap();
         assert_eq!(rl.fresh_s, Some(292));
         assert_eq!(serde_json::from_str::<Rolling>(r#"{"block": [0, 10], "fresh_s": "soon"}"#).unwrap().fresh_s, None);
+        // rev 28 (PROTOCOL 20): the generation in extensions, offers in their answers, poll_s, the poll
+        assert_eq!(serde_json::to_value(ExtendReq { games: 8, gen: None }).unwrap(), json!({"games": 8}));
+        assert_eq!(serde_json::to_value(ExtendReq { games: 8, gen: Some(3) }).unwrap(), json!({"games": 8, "gen": 3}));
+        let xo: ExtendResp = serde_json::from_str(
+            r#"{"games": 8, "checkpoint": {"gen": 4, "model": "ckpt/r/4/model.onnx", "sha256": "ab", "reference": null, "reference_sha256": null},
+                "definition": {"key": "defs/run/r/4/definition.json", "sha256": "cd"}, "poll_s": 5}"#,
+        )
+        .unwrap();
+        assert_eq!((xo.checkpoint.map(|c| c.gen), xo.definition.map(|d| d.sha256), xo.poll_s), (Some(4), Some("cd".to_string()), Some(Some(5))));
+        assert_eq!((x.checkpoint.is_none(), x.poll_s), (true, None));
+        let p: PollResp = serde_json::from_str(r#"{"checkpoint": null, "fresh_s": 67, "poll_s": null}"#).unwrap();
+        assert_eq!((p.checkpoint.is_none(), p.fresh_s, p.poll_s), (true, Some(Some(67)), Some(None)));
+        assert_eq!(serde_json::from_str::<Rolling>(r#"{"block": [0, 10], "poll_s": 5}"#).unwrap().poll_s, Some(5));
+        assert_eq!(serde_json::from_str::<Rolling>(r#"{"block": [0, 10]}"#).unwrap().poll_s, None);
+        assert_eq!(serde_json::from_str::<BeatResp>(r#"{"action": "continue", "poll_s": 5}"#).unwrap().poll_s, Some(Some(5)));
         let b = serde_json::to_value(BeatReq { state: "running".into(), progress: Progress::default(), stats: Stats::new(), gen: None }).unwrap();
         assert!(b.get("gen").is_none(), "classic beats are unchanged");
         let c = CrashReq { kind: "blocked".into(), os_error: Some(4551), ..Default::default() };
