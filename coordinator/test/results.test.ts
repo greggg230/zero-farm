@@ -148,7 +148,8 @@ describe("result uploads", () => {
     expect(ok(await admin("GET", "/v1/admin/run/s/results")).results).toHaveLength(3);
   });
 
-  it("acked result objects are deleted from R2 after 7 days", async () => {
+  it("acked result objects are deleted from R2 after RESULT_RETENTION_DAYS", async () => {
+    const KEEP = Number(env.RESULT_RETENTION_DAYS) * 86400;
     await makeRun("r");
     const a = await enroll("a");
     const l = await lease(a);
@@ -156,11 +157,11 @@ describe("result uploads", () => {
     const key = ok(await admin("GET", "/v1/admin/run/r/results")).results[0].key;
     const cur = ok(await admin("GET", "/v1/admin/run/r/results")).cursor;
     ok(await admin("POST", "/v1/admin/run/r/ack", { cursor: cur }));
-    expect((await runCron(env, clock.now + 6 * 86400)).deleted).toBe(0);
+    expect((await runCron(env, clock.now + KEEP - 86400)).deleted).toBe(0);
     expect(await env.BUCKET.head(key)).not.toBeNull();
-    expect((await runCron(env, clock.now + 7 * 86400 + 1)).deleted).toBe(1);
+    expect((await runCron(env, clock.now + KEEP + 1)).deleted).toBe(1);
     expect(await env.BUCKET.head(key)).toBeNull();
-    expect((await runCron(env, clock.now + 8 * 86400)).deleted).toBe(0);
+    expect((await runCron(env, clock.now + KEEP + 86400)).deleted).toBe(0);
   });
 
   it("deletes more acked results per sweep than D1's 100 bound parameters", async () => {
@@ -172,7 +173,7 @@ describe("result uploads", () => {
       ).bind(i, `results/r/l_x/${i}`, "0".repeat(64), clock.now, clock.now),
     );
     await env.DB.batch(stmts);
-    expect((await runCron(env, clock.now + 7 * 86400 + 1)).deleted).toBe(150);
+    expect((await runCron(env, clock.now + Number(env.RESULT_RETENTION_DAYS) * 86400 + 1)).deleted).toBe(150);
     expect((await env.DB.prepare(`SELECT COUNT(*) AS n FROM results WHERE deleted_at IS NULL`).first<any>()).n).toBe(0);
   });
 });

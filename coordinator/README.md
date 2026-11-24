@@ -210,6 +210,7 @@ plaintext-IP rate-limit rows. New vars (in `wrangler.jsonc`, so a deploy sets th
 | `MAX_LEASE_CHUNKS` / `MAX_LEASE_BYTES` | `2000` / `1073741824` | result chunks / bytes per lease |
 | `LATE_RESULTS_S` | `86400` | results are taken until this long after a lease closed |
 | `MAX_CRASHES_PER_DAY` | `100` | crash rows kept per machine per 24 h |
+| `RESULT_RETENTION_DAYS` | `7` (deployed: `45`) | the cron deletes an acknowledged result's stored object this many days after its ack (the row stays); raised while the single-game history is counted from the stored records |
 | `CRASH_RETENTION_DAYS` / `DIAG_RETENTION_DAYS` | `30` / `14` | the cron deletes older crash rows / diagnostics (objects and rows) |
 
 Secrets (`npx wrangler secret put NAME`; they stay out of this public repo, and a deploy doesn't

@@ -34,7 +34,7 @@ export async function runCron(env: Env, now: number): Promise<CronResult> {
   const old = await db.prepare(
     `SELECT id, key FROM results WHERE acked_at IS NOT NULL AND acked_at < ? AND deleted_at IS NULL AND scope != 'diag' ORDER BY id LIMIT ?`,
   )
-    .bind(now - 7 * 86400, BATCH)
+    .bind(now - cfg.resultRetentionDays * 86400, BATCH)
     .all<{ id: number; key: string }>();
   if (old.results.length) {
     await env.BUCKET.delete(old.results.map((r) => r.key));
