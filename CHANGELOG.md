@@ -4,6 +4,35 @@ Versions of the Zero Farm app (`farm-agent.exe` and the `ZeroFarm.exe` launcher)
 update themselves; see [README.md](README.md) for how updates, channels and rollback work. Each
 version is a GitHub Release tagged `agent-v<version>` (from 0.3.0 the Mac app's: `agent-macos-v<version>`).
 
+## Unreleased (0.3.22)
+
+Fixes for the farm owner's own computer playing practice games with the PyTorch program. Friends' computers are not
+affected, except for the first and third points, which help every computer a little.
+
+- **A job no longer loses its place on the server while Zero Farm is running.** When the server handed out new games
+  only a few at a time, Zero Farm asked for more every ten seconds - so often that the server started refusing its
+  once-a-minute check-ins too, and after three refused check-ins the server took the job away and all of its unfinished
+  games were dropped. Zero Farm now asks a little less often when that happens, always keeps room for its check-ins,
+  and repeats a refused check-in within seconds instead of a minute later.
+- **A new version of a run's job program starts with the right number of games.** Each release of a game gives its job
+  program a new name, and Zero Farm used to forget how much memory a game needs each time: it started with about 200
+  games at once on a computer that then worked its way up to 600-1,500. It now starts a new version from what the
+  previous version of the same run needed, and corrects it as before if the new version differs.
+- **"Graphics card out of memory" with most of the card free is now understood.** A job program is given a memory limit,
+  and on Windows the memory it uses on the graphics card counts toward that limit. When a program reached its limit, the
+  card refused it more memory although the card was mostly empty; Zero Farm blamed the card and planned less of the
+  card's memory for the run. It now sees that the program's own memory limit was the cause and restarts it with fewer
+  games. And a program that was already finishing its games near its limit is stopped just before the limit (its last
+  games go back to the server) instead of crashing into it.
+- **The memory plan for the PyTorch program is measured, not guessed.** That program needs several GB before it plays
+  a single game. Zero Farm assumed 1.8 GB and counted the rest as memory "per game", so the fewer games a job had, the
+  more each game seemed to need - and the number of games shrank through the day, with a restart each time. Zero Farm
+  now measures what the program needs before its games and counts the games' memory over that.
+- **On the owner's computer, `max_ram_mb` means what it says.** The memory limit of a job used to be that number or
+  the memory free at the second the job began, whichever was lower - on a computer whose training program comes and
+  goes, anything from 11 to 26 GB. With `owner on` and `max_ram_mb` set, the limit is now always that number. (Work
+  still stops when the computer runs low on memory.)
+
 ## Unreleased (0.3.21)
 
 - **Programs with empty files can be installed.** Zero Farm could not download a file of zero bytes: it skipped the

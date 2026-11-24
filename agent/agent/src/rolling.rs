@@ -133,6 +133,54 @@ pub fn cpu_cost() -> MemCost {
 /// A GPU job's cost until this PC measured the run's own: the GPU runtime commits more before any game.
 pub const GPU_COST: MemCost = MemCost { base_mb: 1800, per_game_mb: 45 };
 
+/// agent 0.3.22 (PROTOCOL 19.5): a torch job's worker (a Python with PyTorch and its CUDA libraries) commits several GB
+/// before any game - its base until this PC measured it (`Learned::set_base_measured`). The first torch leases of
+/// 2026-11-23 (the owner machine, one worker on a 32 GB card) were planned with `GPU_COST`'s 1,800 MB, so the rest of the base was charged
+/// to the games: 27 MB a game "measured" with 198 games in flight, 15 with 600-800, where the worker's own state is ~8 MB
+/// a game (measured on the CPU). Those readings put the base at 4-5.5 GB (commit less 8 MB a game); 4,096 MB until read.
+pub const TORCH_BASE_MB: u64 = 4096;
+
+/// agent 0.3.22: the kind of worker a memory plan is for - what its base is until measured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kind {
+    Cpu,
+    /// A native worker on a GPU provider (ONNX Runtime's CUDA or DirectML).
+    Gpu,
+    /// PROTOCOL 19: the torch worker (always on a GPU; its figures are the `gpu` ones of its own build ids).
+    Torch,
+}
+
+impl Kind {
+    pub fn of(gpu: bool, torch: bool) -> Kind {
+        match (gpu, torch) {
+            (_, true) => Kind::Torch,
+            (true, false) => Kind::Gpu,
+            (false, false) => Kind::Cpu,
+        }
+    }
+    pub fn gpu(self) -> bool {
+        self != Kind::Cpu
+    }
+    /// The platform's default cost of a job of this kind (a build not measured here).
+    pub fn default_cost(self) -> MemCost {
+        match self {
+            Kind::Cpu => cpu_cost(),
+            Kind::Gpu => GPU_COST,
+            Kind::Torch => MemCost { base_mb: TORCH_BASE_MB, ..GPU_COST },
+        }
+    }
+}
+
+/// agent 0.3.22: `cost` with a base of `base_mb` instead of its own, planning the same commit for `conc` games in flight
+/// (the cost per game rounded up, at least 1): what a figure counted over one base is over another. A stored cost per
+/// game was measured over the base planned then; when the base is read anew (`Learned::set_base_measured`) the same
+/// commit is split again between base and games, and the readings that follow are counted over the new base.
+pub fn rebased(cost: MemCost, conc: u64, base_mb: u64) -> MemCost {
+    let conc = conc.max(1);
+    let total = cost.base_mb + cost.per_game_mb * conc;
+    MemCost { base_mb, per_game_mb: total.saturating_sub(base_mb).div_ceil(conc).max(1) }
+}
+
 /// agent 0.3.4: the video memory a GPU job's worker holds (dedicated GPU memory, MB): `base_mb` before any batch (the
 /// CUDA context, the network, the runtime's workspaces) and `per_row_mb` for each row of its biggest batch (the
 /// activations). 0.2.13-0.3.3 didn't plan video memory: one worker of at most 512 games in flight never came near a
@@ -188,6 +236,102 @@ pub fn gpu_oom(text: &str) -> bool {
     ["cuda failure 2", "cuda_error_out_of_memory", "cudaerrormemoryallocation", "status_alloc_failed", "e_outofmemory"].iter().any(|k| m.contains(k))
         || (gpu && (m.contains("out of memory") || m.contains("failed to allocate")))
 }
+/// agent 0.3.22: a size a message gives after `before` ("Tried to allocate 26.00 MiB", "of which 25.65 GiB is free"), in
+/// MB (None: not said).
+fn size_after(text: &str, before: &str) -> Option<u64> {
+    let rest = text[text.find(before)? + before.len()..].trim_start();
+    let end = rest.find(|c: char| !(c.is_ascii_digit() || c == '.'))?;
+    let n: f64 = rest[..end].parse().ok()?;
+    let unit = rest[end..].trim_start();
+    let mb = if unit.starts_with("GiB") {
+        n * 1024.0
+    } else if unit.starts_with("MiB") {
+        n
+    } else if unit.starts_with("KiB") {
+        n / 1024.0
+    } else {
+        return None;
+    };
+    Some(mb as u64)
+}
+
+/// `oom_with_room`: the adapter's free memory counts as room from this much (MB).
+pub const VRAM_ROOM_MB: u64 = 1024;
+
+/// agent 0.3.22: an out-of-memory message that itself says the adapter had room (PyTorch's: "Tried to allocate 26.00 MiB.
+/// GPU 0 has a total capacity of 31.84 GiB of which 25.65 GiB is free"): at least `VRAM_ROOM_MB` free and eight times
+/// what was asked. The GPU's driver refused the allocation for another reason - on Windows a video memory allocation is
+/// charged to the process's commit, so a worker at its job's memory limit (or a PC at its commit limit) is refused
+/// video memory on an empty card. The owner machine of 2026-11-23/24: two workers died so, 22 s and 129 s after the agent
+/// read them at 92.7 % and 94.6 % of their job's limit (still rising), with 25 GB of 32 free; 0.3.4-0.3.21 took the first
+/// for the video memory running out and planned 13 MB of video memory per batch row for the run.
+pub fn oom_with_room(text: &str) -> bool {
+    let (Some(asked), Some(free)) = (size_after(text, "Tried to allocate"), size_after(text, "of which")) else { return false };
+    free >= VRAM_ROOM_MB && free >= 8 * asked
+}
+
+/// agent 0.3.22: a GPU job's worker failed with `text` (its fatal error and stderr), its job's memory peak `peak_mb` of
+/// `limit_mb` (0: none): did the **video memory** run out (0.3.4: `gpu_oom`)? Not when the message says the adapter had
+/// room (`oom_with_room`), and not when the job stood at its memory limit (`HIT_SHARE`): that worker ran into the
+/// job's memory, and is restarted with fewer games in flight for that (lease.rs `memory_failure`), its video memory
+/// plan untouched.
+pub fn vram_ran_out(text: &str, peak_mb: u64, limit_mb: u64) -> bool {
+    let at_limit = limit_mb > 0 && peak_mb as f64 >= limit_mb as f64 * HIT_SHARE;
+    gpu_oom(text) && !oom_with_room(text) && !at_limit
+}
+
+/// agent 0.3.22 (PROTOCOL 10.4): the agent's own count of the coordinator's `beat` bucket (ratelimit.ts: beats and
+/// extensions share it - one request per `Timings::beat_bucket` on average, `BEAT_BURST` at once), so that asking for game
+/// ids never uses up the requests the lease's beats need. A lease whose worker is always low on ids (the coordinator
+/// releases a few at a time under a run's quota) asked every 10 s - the bucket's whole refill - and beat on top: the
+/// burst was gone after ~12 minutes, beats were answered 429, the agent tried the next one a minute later, and after
+/// three the lease expired (twice on 2026-11-23/24 on a PC playing 650-800 games in flight; each time every game in
+/// flight was lost). An extension goes out only while more than `BEAT_RESERVE` requests are left; a refusal (429) empties
+/// the count for its `retry_after`.
+#[derive(Debug, Clone, Copy)]
+pub struct CallBudget {
+    tokens: f64,
+    at: std::time::Instant,
+}
+
+/// The coordinator's `beat` bucket holds this many requests at once ...
+pub const BEAT_BURST: f64 = 12.0;
+/// ... and extensions leave this many of them to the beats (three: a lease expires after three missed beats).
+pub const BEAT_RESERVE: f64 = 3.0;
+
+impl CallBudget {
+    /// A count that starts with the reserve and one extension: what an agent that just started can count on.
+    pub fn new(now: std::time::Instant) -> CallBudget {
+        CallBudget { tokens: BEAT_RESERVE + 1.0, at: now }
+    }
+
+    fn refill(&mut self, now: std::time::Instant, interval: std::time::Duration) {
+        if now > self.at {
+            let add = now.duration_since(self.at).as_secs_f64() / interval.as_secs_f64().max(1e-3);
+            self.tokens = (self.tokens + add).min(BEAT_BURST);
+            self.at = now;
+        }
+    }
+
+    /// An extension may go out: a request is left over the beats' reserve.
+    pub fn can_extend(&mut self, now: std::time::Instant, interval: std::time::Duration) -> bool {
+        self.refill(now, interval);
+        self.tokens >= BEAT_RESERVE + 1.0
+    }
+
+    /// A beat or an extension went out.
+    pub fn took(&mut self, now: std::time::Instant, interval: std::time::Duration) {
+        self.refill(now, interval);
+        self.tokens = (self.tokens - 1.0).max(0.0);
+    }
+
+    /// The coordinator refused a request of the bucket (429): nothing is left until `retry_after` from `now`.
+    pub fn refused(&mut self, now: std::time::Instant, retry_after: std::time::Duration) {
+        self.tokens = 0.0;
+        self.at = self.at.max(now + retry_after);
+    }
+}
+
 /// The games in flight are planned to commit at most this share of the memory cap (the job's limit): the rest is
 /// headroom for games that run long and for the runtime's buffers.
 pub const PLAN_SHARE: f64 = 0.85;
@@ -344,6 +488,24 @@ pub fn planned_base(reading_mb: u64, gpu: bool) -> u64 {
     reading_mb + if gpu { GPU_BASE_DRIFT_MB } else { 0 }
 }
 
+/// agent 0.3.22 (PROTOCOL 19.5): a torch worker's commit goes on growing after its first self-test whatever its games:
+/// CUDA graphs for the batch shapes as they come, pinned buffers, a second evaluator at each generation switch - and on
+/// Windows the video memory behind them, which counts in the commit. The owner machine's leases of 2026-11-24 with 14,
+/// 27 and 50 games in flight all committed about 6.0-6.15 GB (so about 5.9 GB without games), where workers were
+/// refused memory before their first game at limits of 2,974 and 3,056 MB and one ran 25 s at 3.9 GB: a drift of 2 GB or
+/// more. Planned with 1,024 MB over the reading - on the low side on purpose (a base planned too high makes the games
+/// look free and the next lease plan too many; too low only charges the rest to the games, which a steady reading
+/// corrects). To be measured properly: the lease's log line gives each reading.
+pub const TORCH_BASE_DRIFT_MB: u64 = 1024;
+
+/// agent 0.3.22: `planned_base` for a worker of `kind` (a torch worker's: plus `TORCH_BASE_DRIFT_MB`).
+pub fn planned_base_for(reading_mb: u64, kind: Kind) -> u64 {
+    match kind {
+        Kind::Torch => reading_mb + TORCH_BASE_DRIFT_MB,
+        k => planned_base(reading_mb, k.gpu()),
+    }
+}
+
 /// The memory a game in flight was measured to take on this PC, per run, worker build and provider class
 /// (`state\rolling_memory.json`, keys `<run>/<build_id>/cpu` and `.../gpu`, MB per game over the base; agent 0.3.3 -
 /// 0.2.14-0.3.2's `<run>/cpu` keys, measured with builds of before, are not read). The memory plan calibrates itself
@@ -364,16 +526,32 @@ pub fn planned_base(reading_mb: u64, gpu: bool) -> u64 {
 /// worker over its plan. The highest is the cautious pick (the file keeps no time, so "the newest" isn't known), and the
 /// run's own readings take over from it as before: a rise is remembered for the run at once, a steady reading below what
 /// it borrowed lowers it. Writes stay per run; existing entries are read as they are.
+///
+/// **agent 0.3.22: a new worker build of a run measured here starts from the run's last build** (`find`). Every release
+/// of a run's game gives its worker a new build id, and no run has measured that build: 0.3.14's rule found nothing, and
+/// each re-pin started the PC at the platform's default again (2026-11-23: 198-224 games in flight at 45 MB a game on a
+/// PC that then ran 600-1,500, the lease after every release). A figure neither the run nor the build has is now taken
+/// from the run's own other builds: the one written last (each write stamps its run and build, `<run>/<build>/t`, unix
+/// seconds; among builds without a stamp - written by agents of before - the highest figure). A release seldom changes
+/// what a game in flight costs, and when it does the usual rules correct it within the lease: a higher reading is
+/// remembered at once and planned with, a worker near its limit runs fewer games, a steady reading lowers the figure.
+/// The same build measured on another run still comes first (it is this very program). Still the default: a run and a
+/// build both new here.
 pub struct Learned;
 
 /// The video memory per batch row figure (`Learned::vram_plan`).
 const VRAM_FIGURE: &str = "vram";
 
-/// agent 0.3.14: a figure `Learned` plans with and, when it is another run's (`Learned::find`), that run's name.
+/// The figure name of a run and build's last write (unix seconds; agent 0.3.22, `Learned::find`).
+const STAMP_FIGURE: &str = "t";
+
+/// agent 0.3.14: a figure `Learned` plans with and, when it is another run's (`Learned::find`), that run's name; agent
+/// 0.3.22: when it is the run's own with another worker build, that build's id.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Found {
     pub value: u64,
     pub from: Option<String>,
+    pub build: Option<String>,
 }
 
 impl Learned {
@@ -399,21 +577,42 @@ impl Learned {
     }
 
     /// agent 0.3.14: `figure` of `run` with worker build `build`: the run's own entry, else the highest entry another run
-    /// has for that build and figure (ties: the first run name), else None.
+    /// has for that build and figure (ties: the first run name), else (agent 0.3.22) the run's entry for another build -
+    /// the build written last (`<run>/<build>/t`; without stamps the highest figure, ties: the first build id) -, else
+    /// None.
     pub fn find(m: &BTreeMap<String, u64>, run: &str, build: &str, figure: &str) -> Option<Found> {
         if let Some(&v) = m.get(&Self::entry_key(run, build, figure)) {
-            return Some(Found { value: v, from: None });
+            return Some(Found { value: v, from: None, build: None });
         }
         let tail = format!("/{build}/{figure}");
         let mut best: Option<Found> = None;
         for (k, &v) in m {
             if let Some(other) = k.strip_suffix(tail.as_str()) {
                 if best.as_ref().is_none_or(|b| v > b.value) {
-                    best = Some(Found { value: v, from: Some(other.to_string()) });
+                    best = Some(Found { value: v, from: Some(other.to_string()), build: None });
                 }
             }
         }
-        best
+        if best.is_some() || figure == STAMP_FIGURE {
+            return best;
+        }
+        // (the run's other builds: keys `<run>/<other build>/<figure>`, a build id holding no `/`)
+        let (head, tail) = (format!("{run}/"), format!("/{figure}"));
+        let mut last: Option<(u64, u64, &str)> = None;
+        for (k, &v) in m {
+            let Some(other) = k.strip_prefix(head.as_str()).and_then(|r| r.strip_suffix(tail.as_str())).filter(|b| !b.is_empty() && !b.contains('/')) else { continue };
+            let t = m.get(&Self::entry_key(run, other, STAMP_FIGURE)).copied().unwrap_or(0);
+            if last.is_none_or(|(bt, bv, _)| (t, v) > (bt, bv)) {
+                last = Some((t, v, other));
+            }
+        }
+        last.map(|(_, v, other)| Found { value: v, from: None, build: Some(other.to_string()) })
+    }
+
+    /// agent 0.3.22: the run's other worker build whose measurement a job of `run` with `build` plans its cost per game
+    /// with (None: its own build's, another run's, or none at all).
+    pub fn borrowed_build(layout: &Layout, run: &str, build: &str, gpu: bool) -> Option<String> {
+        Self::find(&Self::load(layout), run, build, Self::class(gpu)).and_then(|f| f.build)
     }
 
     /// The per-game cost `run` with worker build `build` is planned with on the CPU or a GPU - its own measurement, else
@@ -441,9 +640,16 @@ impl Learned {
     /// there is none) and the measured per-game cost (the default's when there is none), and whether the per-game cost was
     /// measured (agent 0.3.14: either may be another run's of the same build, `find`).
     pub fn plan(layout: &Layout, run: &str, build: &str, gpu: bool, ram_mb: u64) -> MemPlan {
-        let d = Self::default_cost(gpu);
+        Self::plan_for(layout, run, build, Kind::of(gpu, false), ram_mb)
+    }
+
+    /// agent 0.3.22: `plan` for a worker of `kind`: a torch worker's base, until measured here, is `TORCH_BASE_MB`
+    /// (`Kind::default_cost`).
+    pub fn plan_for(layout: &Layout, run: &str, build: &str, kind: Kind, ram_mb: u64) -> MemPlan {
+        let gpu = kind.gpu();
+        let d = kind.default_cost();
         let m = Self::get(layout, run, build, gpu);
-        let base = Self::base(layout, run, build, gpu).map(|b| planned_base(b, gpu)).unwrap_or(d.base_mb);
+        let base = Self::base(layout, run, build, gpu).map(|b| planned_base_for(b, kind)).unwrap_or(d.base_mb);
         MemPlan { ram_mb, cost: MemCost { base_mb: base, per_game_mb: m.unwrap_or(d.per_game_mb).max(1) }, measured: m.is_some() }
     }
 
@@ -470,8 +676,32 @@ impl Learned {
             return None;
         }
         m.insert(Self::entry_key(run, build, &figure), v);
-        Self::save(layout, &m);
+        Self::save(layout, &mut m, run, build);
         Some(v)
+    }
+
+    /// agent 0.3.22 (PROTOCOL 19.5): a **measured base** - a worker's commit when its job's first self-test arrives: its
+    /// runtime loaded and its network built and run once, no game begun (lease.rs; a torch worker's, whose base is
+    /// several GB and not the platform's constant). No game's memory is in it, so it is remembered whichever way it
+    /// differs from what is planned with (`planned_mb`: the base of the lease's plan, less its drift) by more than
+    /// `BASE_TOLERANCE` -> the value stored.
+    pub fn set_base_measured(layout: &Layout, run: &str, build: &str, gpu: bool, reading_mb: u64, planned_mb: u64) -> Option<u64> {
+        let v = reading_mb.max(MIN_BASE_MB);
+        if (v as f64 - planned_mb as f64).abs() <= planned_mb as f64 * BASE_TOLERANCE {
+            return None;
+        }
+        let mut m = Self::load(layout);
+        m.insert(Self::entry_key(run, build, &Self::base_figure(gpu)), v);
+        Self::save(layout, &mut m, run, build);
+        Some(v)
+    }
+
+    /// agent 0.3.22: the run and build's cost per game counted over a base read anew (`rebased`): stored as it is, lower
+    /// or higher - the same commit as before, split again.
+    pub fn set_rebased(layout: &Layout, run: &str, build: &str, gpu: bool, per_game_mb: u64) {
+        let mut m = Self::load(layout);
+        m.insert(Self::entry_key(run, build, Self::class(gpu)), per_game_mb.max(1));
+        Self::save(layout, &mut m, run, build);
     }
 
     /// Records `per_game_mb` for `run` / `build` when it is more than what is planned with now (the stored value - agent
@@ -508,7 +738,7 @@ impl Learned {
             return None;
         }
         m.insert(Self::entry_key(run, build, figure), v);
-        Self::save(layout, &m);
+        Self::save(layout, &mut m, run, build);
         Some(v)
     }
 
@@ -541,11 +771,14 @@ impl Learned {
             return false;
         }
         m.insert(Self::entry_key(run, build, figure), v);
-        Self::save(layout, &m);
+        Self::save(layout, &mut m, run, build);
         true
     }
 
-    fn save(layout: &Layout, m: &BTreeMap<String, u64>) {
+    /// Writes the figures, `run` and `build`'s last write stamped now (agent 0.3.22: `find` takes a new build's start
+    /// from the run's build written last).
+    fn save(layout: &Layout, m: &mut BTreeMap<String, u64>, run: &str, build: &str) {
+        m.insert(Self::entry_key(run, build, STAMP_FIGURE), zerofarm_common::now_unix().max(0) as u64);
         let _ = std::fs::create_dir_all(layout.state());
         if let Err(e) = zerofarm_common::fsutil::atomic_write(&Self::path(layout), &serde_json::to_vec(m).expect("json")) {
             log::warn!("could not record a rolling job's memory per game: {e}");
@@ -869,9 +1102,13 @@ mod tests {
         assert_eq!(Learned::borrowed(&layout, "r", "b1", true), None, "its own");
         let p = Learned::plan(&layout, "r", "b1", true, 10_000);
         assert_eq!((p.cost.per_game_mb, p.cost.base_mb, p.measured), (75, GPU_COST.base_mb, true));
-        // a new worker build starts fresh: the platform's default
-        assert_eq!(Learned::plan(&layout, "r", "b2", true, 10_000), MemPlan { ram_mb: 10_000, cost: GPU_COST, measured: false });
-        assert_eq!(Learned::get(&layout, "r", "b2", false), None);
+        // agent 0.3.22: a new worker build of the run starts from the run's last build (0.3.3-0.3.21: the platform's
+        // default); a run and a build both new here start from the default
+        let p2 = Learned::plan(&layout, "r", "b2", true, 10_000);
+        assert_eq!((p2.cost.per_game_mb, p2.measured), (75, true));
+        assert_eq!(Learned::borrowed_build(&layout, "r", "b2", true), Some("b1".to_string()));
+        assert_eq!(Learned::get(&layout, "r", "b2", false), Some(cpu_cost().per_game_mb + 2));
+        assert_eq!(Learned::plan(&layout, "other", "b2", true, 10_000), MemPlan { ram_mb: 10_000, cost: GPU_COST, measured: false });
         // 0.3.2's keys (no build: measured with builds of before) are not read
         std::fs::write(layout.state().join("rolling_memory.json"), r#"{"r/cpu": 99}"#).unwrap();
         assert_eq!(Learned::plan(&layout, "r", "b1", false, 10_000).cost, cpu_cost());
@@ -934,12 +1171,185 @@ mod tests {
     fn find_takes_the_runs_own_figure_else_the_builds_highest() {
         let m: BTreeMap<String, u64> =
             [("a/b/cpu", 5), ("c/b/cpu", 7), ("d/b/cpu", 7), ("e/b/cpu_base", 900), ("f/bb/cpu", 99), ("/b/cpu", 1), ("x/y/b/cpu", 2)].iter().map(|(k, v)| (k.to_string(), *v)).collect();
-        assert_eq!(Learned::find(&m, "a", "b", "cpu"), Some(Found { value: 5, from: None }), "its own, though lower");
-        assert_eq!(Learned::find(&m, "new", "b", "cpu"), Some(Found { value: 7, from: Some("c".into()) }), "the highest; a tie: the first name");
-        assert_eq!(Learned::find(&m, "new", "b", "cpu_base"), Some(Found { value: 900, from: Some("e".into()) }), "per figure");
+        assert_eq!(Learned::find(&m, "a", "b", "cpu"), Some(Found { value: 5, from: None, build: None }), "its own, though lower");
+        assert_eq!(Learned::find(&m, "new", "b", "cpu"), Some(Found { value: 7, from: Some("c".into()), build: None }), "the highest; a tie: the first name");
+        assert_eq!(Learned::find(&m, "new", "b", "cpu_base"), Some(Found { value: 900, from: Some("e".into()), build: None }), "per figure");
         assert_eq!(Learned::find(&m, "new", "b", "gpu"), None);
-        assert_eq!(Learned::find(&m, "new", "bb", "cpu"), Some(Found { value: 99, from: Some("f".into()) }), "another build is no match: whole names");
-        assert_eq!(Learned::find(&m, "", "b", "cpu"), Some(Found { value: 1, from: None }), "a lease without a run");
+        assert_eq!(Learned::find(&m, "new", "bb", "cpu"), Some(Found { value: 99, from: Some("f".into()), build: None }), "another build is no match: whole names");
+        assert_eq!(Learned::find(&m, "", "b", "cpu"), Some(Found { value: 1, from: None, build: None }), "a lease without a run");
+    }
+
+    /// agent 0.3.22: a run's new worker build (every release of its game has a new build id) plans with what the run's
+    /// last build measured - the build written last, by the stamps each write leaves; without stamps the highest figure -,
+    /// after the same build on another run, before the platform's default. Its own readings take over as ever.
+    #[test]
+    fn a_new_build_of_a_run_starts_from_the_runs_last_build() {
+        let m = |e: &[(&str, u64)]| -> BTreeMap<String, u64> { e.iter().map(|(k, v)| (k.to_string(), *v)).collect() };
+        let own = |v: u64, b: &str| Some(Found { value: v, from: None, build: Some(b.to_string()) });
+        // the file of 2026-11-24 (agents before 0.3.22: no stamps): the run's highest figure, per figure
+        let old = m(&[("sneak/b1/gpu", 16), ("sneak/b2/gpu", 15), ("sneak/b2/vram", 6), ("delver/b1/gpu", 11), ("delver/b1/vram", 8)]);
+        assert_eq!(Learned::find(&old, "sneak", "b3", "gpu"), own(16, "b1"));
+        assert_eq!(Learned::find(&old, "sneak", "b3", "vram"), own(6, "b2"));
+        assert_eq!(Learned::find(&old, "sneak", "b3", "gpu_base"), None, "no build of the run has that figure");
+        assert_eq!(Learned::find(&old, "delver", "b2", "gpu"), Some(Found { value: 15, from: Some("sneak".into()), build: None }), "the same build on another run comes first");
+        assert_eq!(Learned::find(&old, "doomsday", "b3", "gpu"), None, "a run and a build both new here: the default");
+        // stamped: the build written last, though its figure is lower; an unstamped build counts as the oldest
+        let new = m(&[("r/b1/gpu", 30), ("r/b1/t", 100), ("r/b2/gpu", 9), ("r/b2/t", 200), ("r/b0/gpu", 45), ("r/x/y/gpu", 99), ("rr/b9/gpu", 77), ("rr/b9/t", 999)]);
+        assert_eq!(Learned::find(&new, "r", "b3", "gpu"), own(9, "b2"));
+        assert_eq!(Learned::find(&new, "r", "b3", "t"), None, "the stamps themselves are never borrowed");
+        assert_eq!(Learned::find(&new, "r", "b2", "gpu"), Some(Found { value: 9, from: None, build: None }), "its own");
+        // on disk: each write stamps its run and build; the new build's own readings are its own from then on
+        let dir = std::env::temp_dir().join(format!("zf-rolling-newbuild-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let layout = Layout::new(&dir);
+        std::fs::create_dir_all(layout.state()).unwrap();
+        std::fs::write(layout.state().join("rolling_memory.json"), serde_json::to_vec(&old).unwrap()).unwrap();
+        let p = Learned::plan_for(&layout, "sneak", "b3", Kind::Torch, 20_000);
+        assert_eq!((p.cost.per_game_mb, p.cost.base_mb, p.measured), (16, TORCH_BASE_MB, true), "not the default 45");
+        assert!(ram_cap(20_000, p.cost) > 2 * ram_cap(20_000, Kind::Torch.default_cost()));
+        assert!(!Learned::raise(&layout, "sneak", "b3", true, 16) && Learned::raise(&layout, "sneak", "b3", true, 18), "a higher reading at once");
+        assert_eq!(Learned::steady(&layout, "sneak", "b3", true, 8 * 1024), Some(10), "a steady reading lowers it: 8 x 1.2");
+        let now = Learned::load(&layout);
+        assert!(now.get("sneak/b3/t").is_some_and(|&t| t > 1_700_000_000), "stamped");
+        assert_eq!(Learned::find(&now, "sneak", "b4", "gpu"), own(10, "b3"), "the next release starts from this build, the one written last");
+        assert_eq!(Learned::get(&layout, "sneak", "b1", true), Some(16), "the older builds' figures unchanged");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// agent 0.3.22 (PROTOCOL 19.5): a torch worker's base is measured (its commit at its job's first self-test), in either
+    /// direction, and the cost per game is counted over it: the figure no longer depends on how many games were in
+    /// flight when it was read.
+    #[test]
+    fn a_torch_workers_base_is_measured_and_the_cost_per_game_counted_over_it() {
+        assert_eq!(Kind::of(true, true), Kind::Torch);
+        assert_eq!((Kind::of(true, false), Kind::of(false, false)), (Kind::Gpu, Kind::Cpu));
+        assert_eq!(Kind::Torch.default_cost(), MemCost { base_mb: TORCH_BASE_MB, per_game_mb: GPU_COST.per_game_mb });
+        assert_eq!((Kind::Gpu.default_cost(), Kind::Cpu.default_cost()), (GPU_COST, cpu_cost()));
+        // a worker that commits 5 GB before its games and 8 MB a game (about the owner machine's of 2026-11-23/24). Over
+        // the constant 1,800 MB its games "cost" more the fewer there are: 25 MB with 198 in flight, 13 with 655, 11 with
+        // 1,536
+        let commit = |conc: u64| 5000 + 8 * conc;
+        let fixed = MemCost { base_mb: 1800, per_game_mb: 45 };
+        let read: Vec<u64> = [198, 655, 1536].iter().map(|&c| measured_per_game(commit(c), c, fixed)).collect();
+        assert_eq!(read, [25, 13, 11]);
+        // ... over the measured base, 8 at each
+        let real = MemCost { base_mb: 5000, per_game_mb: 8 };
+        assert!([198u64, 655, 1536].iter().all(|&c| measured_per_game(commit(c), c, real) == 8));
+        // a figure counted over the old base, counted over the new one: the same commit for the games in flight
+        let was = MemCost { base_mb: 1800, per_game_mb: 15 };
+        let now = rebased(was, 640, 5400);
+        assert_eq!(now, MemCost { base_mb: 5400, per_game_mb: 10 }, "1,800 + 15 x 640 = 11,400 = 5,400 + 9.4 x 640, rounded up");
+        assert!(now.base_mb + now.per_game_mb * 640 >= was.base_mb + was.per_game_mb * 640);
+        assert_eq!(rebased(was, 640, 20_000).per_game_mb, 1, "at least 1");
+        assert_eq!(rebased(MemCost { base_mb: 5400, per_game_mb: 10 }, 640, 1800).per_game_mb, 16, "and back: a lower base, more per game");
+        // the plan: a limit of 12,125 MB held 576 games at 1,800 + 14 (the last lease of that day); 26,000 MB (that
+        // owner's `max_ram_mb`) holds 1,824 at 5,400 + 9, where 1,800 + 14 planned 1,440
+        assert_eq!(ram_cap(12_125, MemCost { base_mb: 1800, per_game_mb: 14 }), 576);
+        assert_eq!(ram_cap(26_000, MemCost { base_mb: 1800, per_game_mb: 14 }), 1440);
+        assert_eq!(ram_cap(26_000, MemCost { base_mb: 5400, per_game_mb: 9 }), 1824);
+        // remembered whichever way it differs from the plan's base by more than 5 %
+        let dir = std::env::temp_dir().join(format!("zf-rolling-torchbase-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let layout = Layout::new(&dir);
+        let raw = TORCH_BASE_MB;
+        assert_eq!(Learned::set_base_measured(&layout, "r", "t1", true, raw + 100, raw), None, "within 5 %");
+        assert_eq!(Learned::set_base_measured(&layout, "r", "t1", true, 5000, raw), Some(5000), "higher: a first-status reading never raised it");
+        let p = Learned::plan_for(&layout, "r", "t1", Kind::Torch, 26_000);
+        assert_eq!(p.cost.base_mb, 5000 + TORCH_BASE_DRIFT_MB);
+        assert_eq!((planned_base_for(5000, Kind::Torch), planned_base_for(1659, Kind::Gpu), planned_base_for(600, Kind::Cpu)), (6024, 2059, 600));
+        assert_eq!(Learned::set_base_measured(&layout, "r", "t1", true, 3000, 5000), Some(3000), "and lower");
+        assert_eq!(Learned::set_base_measured(&layout, "r", "t1", true, 10, 3000), Some(MIN_BASE_MB));
+        // the cost per game counted again is stored as it is, lower than what was remembered too
+        assert!(Learned::raise(&layout, "r", "t1", true, 60));
+        Learned::set_rebased(&layout, "r", "t1", true, 10);
+        assert_eq!(Learned::get(&layout, "r", "t1", true), Some(10));
+        // the next build of the run starts from both
+        let next = Learned::plan_for(&layout, "r", "t2", Kind::Torch, 26_000);
+        assert_eq!((next.cost.base_mb, next.cost.per_game_mb, next.measured), (MIN_BASE_MB + TORCH_BASE_DRIFT_MB, 10, true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// agent 0.3.22: "CUDA out of memory" on a card with room is not the video memory running out.
+    #[test]
+    fn an_out_of_memory_with_room_on_the_card_is_the_jobs_memory() {
+        let torch = "OutOfMemoryError: CUDA out of memory. Tried to allocate 26.00 MiB. GPU 0 has a total capacity of 31.84 GiB of which 25.65 GiB is free. Of the allocated memory 3.71 GiB is allocated by PyTorch, with 716.55 MiB allocated in private pools (e.g., CUDA Graphs), and 546.84 MiB is reserved by PyTorch but unallocated.";
+        assert_eq!((size_after(torch, "Tried to allocate"), size_after(torch, "of which")), (Some(26), Some(26_265)));
+        assert!(gpu_oom(torch) && oom_with_room(torch));
+        assert!(!vram_ran_out(torch, 11_500, 11_543) && !vram_ran_out(torch, 5000, 11_543) && !vram_ran_out(torch, 5000, 0));
+        // a card that is full
+        let full = torch.replace("25.65 GiB is free", "12.00 MiB is free");
+        assert!(!oom_with_room(&full));
+        assert!(vram_ran_out(&full, 5000, 11_543) && vram_ran_out(&full, 5000, 0));
+        assert!(!vram_ran_out(&full, 11_400, 11_543), "the job at its own limit: its memory, whatever the card says");
+        // a big request the card's free memory doesn't hold eight times over
+        assert!(!oom_with_room(&torch.replace("26.00 MiB", "4.00 GiB")));
+        // ONNX Runtime's message says nothing of the card's free memory: as before, unless the job stood at its limit
+        let ort = "CUDA failure 2: out of memory ; GPU=0 ; hostname=PC ; file=cuda_allocator.cc ; expr=cudaMalloc((void**)&p, size);";
+        assert!(!oom_with_room(ort) && vram_ran_out(ort, 5000, 10_000) && !vram_ran_out(ort, 9_800, 10_000));
+        assert!(!vram_ran_out("bad allocation", 5000, 10_000));
+        assert_eq!(size_after("Tried to allocate lots", "Tried to allocate"), None);
+        assert_eq!(size_after("of which 512.5 KiB is free", "of which"), Some(0));
+    }
+
+    /// agent 0.3.22: asking for game ids never uses up the requests the beats need.
+    #[test]
+    fn extensions_leave_the_beat_bucket_its_beats() {
+        use std::time::{Duration, Instant};
+        let every = Duration::from_secs(10);
+        let t0 = Instant::now();
+        let at = |s: u64| t0 + Duration::from_secs(s);
+        // the lease of 2026-11-24: the worker low on ids all the time (an ask every 10 s when allowed), a beat a minute -
+        // against the coordinator's real bucket (10 s a request, 12 at once), which 0.3.21 emptied in ~13 minutes
+        let mut server = BEAT_BURST;
+        let mut b = CallBudget::new(t0);
+        let (mut refused, mut asks) = (0, 0);
+        for s in 1..=3600u64 {
+            server = (server + 0.1).min(BEAT_BURST);
+            let mut calls = 0;
+            if s % 60 == 0 {
+                b.took(at(s), every);
+                calls += 1;
+            }
+            if s % 10 == 5 && b.can_extend(at(s), every) {
+                b.took(at(s), every);
+                calls += 1;
+                asks += 1;
+            }
+            for _ in 0..calls {
+                if server >= 1.0 {
+                    server -= 1.0;
+                } else {
+                    refused += 1;
+                }
+            }
+        }
+        assert_eq!(refused, 0, "no request refused in an hour");
+        assert!((290..=305).contains(&asks), "about five asks a minute, the bucket's six less the beat: {asks}");
+        // 0.3.21's pacing against the same bucket: refusals from the 13th minute on
+        let (mut server, mut first) = (BEAT_BURST, None);
+        for s in 1..=3600u64 {
+            server = (server + 0.1).min(BEAT_BURST);
+            for due in [s % 60 == 0, s % 10 == 5] {
+                if due && server >= 1.0 {
+                    server -= 1.0;
+                } else if due && first.is_none() {
+                    first = Some(s);
+                }
+            }
+        }
+        assert!(first.is_some_and(|s| (600..900).contains(&s)), "{first:?}");
+        // a refusal empties the count for its retry_after: no ask until the reserve is back
+        let mut b = CallBudget::new(t0);
+        assert!(b.can_extend(t0, every));
+        b.refused(t0, Duration::from_secs(4));
+        assert!(!b.can_extend(at(4), every) && !b.can_extend(at(43), every));
+        assert!(b.can_extend(at(44), every), "4 s, then the reserve and one: 40 s");
+        // a count never holds more than the bucket
+        assert!(b.can_extend(at(100_000), every));
+        for _ in 0..9 {
+            b.took(at(100_000), every);
+        }
+        assert!(!b.can_extend(at(100_000), every), "12 at once: 9 for asks, 3 kept");
     }
 
     #[test]
@@ -958,8 +1368,8 @@ mod tests {
         assert!(Learned::raise(&layout, "r", "fixed", false, 7));
         assert_eq!(Learned::plan(&layout, "r", "fixed", false, 10_000).cost.per_game_mb, 7);
         // an old build at the default (no measurement): a steady reading near it changes nothing; one well under lowers it
-        assert_eq!(Learned::steady(&layout, "r", "old", false, d * 1024), None);
-        assert_eq!(Learned::steady(&layout, "r", "old", false, (d - d / 4) * 1024), Some(((d - d / 4) as f64 * 1.2).round() as u64).filter(|&v| v < d));
+        assert_eq!(Learned::steady(&layout, "r-old", "old", false, d * 1024), None);
+        assert_eq!(Learned::steady(&layout, "r-old", "old", false, (d - d / 4) * 1024), Some(((d - d / 4) as f64 * 1.2).round() as u64).filter(|&v| v < d));
         // steady: twice the games in flight finished, the games in flight full
         assert!(steady_reading(1764, 2646, 882));
         assert!(!steady_reading(1763, 2645, 882), "one turnover and a bit");
@@ -978,14 +1388,14 @@ mod tests {
         assert_eq!(measured_per_game(3540, 575, MemCost { base_mb: 2059, per_game_mb: 4 }), 3);
         // agent 0.3.6: the base, measured - only lower, by more than 5 %; planned with
         assert!(base_reading(true, 0, 139) && !base_reading(false, 0, 139) && !base_reading(true, 1, 139) && !base_reading(true, 0, 0));
-        assert_eq!(Learned::set_base(&layout, "r", "g", true, 1750), None, "within 5 % of the default 1,800");
-        assert_eq!(Learned::set_base(&layout, "r", "g", true, 1500), Some(1500));
-        assert_eq!(Learned::set_base(&layout, "r", "g", true, 1900), None, "never raised: a reading holds the games' first memory too");
-        assert_eq!(Learned::set_base(&layout, "r", "g", true, 100), Some(MIN_BASE_MB));
-        let p = Learned::plan(&layout, "r", "g", true, 9_300);
+        assert_eq!(Learned::set_base(&layout, "rg", "g", true, 1750), None, "within 5 % of the default 1,800");
+        assert_eq!(Learned::set_base(&layout, "rg", "g", true, 1500), Some(1500));
+        assert_eq!(Learned::set_base(&layout, "rg", "g", true, 1900), None, "never raised: a reading holds the games' first memory too");
+        assert_eq!(Learned::set_base(&layout, "rg", "g", true, 100), Some(MIN_BASE_MB));
+        let p = Learned::plan(&layout, "rg", "g", true, 9_300);
         assert_eq!((p.cost.base_mb, p.cost.per_game_mb), (MIN_BASE_MB + GPU_BASE_DRIFT_MB, GPU_COST.per_game_mb), "agent 0.3.9: a GPU base reading plans with its drift");
         assert_eq!((planned_base(1659, true), planned_base(1659, false)), (2059, 1659));
-        assert_eq!(Learned::base(&layout, "r", "g", false), None, "per provider class");
+        assert_eq!(Learned::base(&layout, "rg", "g", false), None, "per provider class");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1151,7 +1561,8 @@ mod tests {
         assert!(!Learned::vram_raise(&layout, "r", "b", 4), "only up");
         assert_eq!(Learned::vram_plan(&layout, "r", "b"), (VramCost { base_mb: 1024, per_row_mb: 5 }, true));
         assert_eq!(Learned::vram_steady(&layout, "r", "b", 1), Some(2), "1 x 1.2, rounded up");
-        assert_eq!(Learned::vram_plan(&layout, "r", "b2"), (GPU_VRAM, false), "per worker build");
+        assert_eq!(Learned::vram_plan(&layout, "r", "b2"), (VramCost { base_mb: 1024, per_row_mb: 2 }, true), "agent 0.3.22: the run's next build starts from it");
+        assert_eq!(Learned::vram_plan(&layout, "other", "b2"), (GPU_VRAM, false), "per worker build");
         // the memory per game keys are apart
         assert_eq!(Learned::get(&layout, "r", "b", true), None);
         let _ = std::fs::remove_dir_all(&dir);

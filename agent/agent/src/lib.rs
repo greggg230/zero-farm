@@ -105,6 +105,12 @@ pub struct Timings {
     pub presence: Duration,
     /// rev 15 (PROTOCOL 10.4): a rolling lease asks for more game ids at most this often (10 s).
     pub extend_every: Duration,
+    /// agent 0.3.22 (PROTOCOL 10.4): the coordinator's `beat` bucket refills one request per this long (10 s; beats and
+    /// extensions share it): the agent's own count of it (`rolling::CallBudget`) keeps requests for the beats.
+    pub beat_bucket: Duration,
+    /// agent 0.3.22: a beat that failed for a while (the network, a 5xx) is sent again after this long (a rate limit:
+    /// after its `retry_after`).
+    pub beat_retry: Duration,
     /// rev 19 (PROTOCOL 13): a trial's measurement starts this long after its games in flight refilled (the first
     /// measurement of a search; later ones start at the same game progress).
     pub tune_warm: Duration,
@@ -153,6 +159,8 @@ impl Default for Timings {
             crash_resend: Duration::from_secs(60),
             presence: Duration::from_secs(300),
             extend_every: Duration::from_secs(10),
+            beat_bucket: Duration::from_secs(10),
+            beat_retry: Duration::from_secs(10),
             tune_warm: Duration::from_secs(20),
             tune_window: Duration::from_secs(75),
             tune_ping: Duration::from_secs(2),

@@ -1420,6 +1420,19 @@ every answer then carries `checkpoint` / `definition` as a beat answer does). An
     picture before the new worker's first ask, not up to a beat interval later. The ask stays about 2 x the games in flight
     of the layout the lease runs or is handing over to (a crew's whole), which is how the coordinator learns a new
     layout's games in flight before its first beat.
+- **Extensions leave the beat bucket its beats (agents from 0.3.22).** Beats and extensions share one rate bucket per
+  machine (section 1: one request per 10 s on average, 12 at once), and a lease silent for three beat intervals expires.
+  An agent whose worker is low on ids all the time - a run's quota releasing a few ids per ask - asked every 10 s, the
+  bucket's whole refill, and beat once a minute on top: the burst was used up after ~12 minutes, beats were answered 429,
+  the agent tried the next beat a minute later, and after three the lease expired with `close_reason` `silent` although
+  the agent was running (2026-11-23/24, twice on one machine: 799 and 949 released ids not finished - every game in
+  flight, 655 and 804 of them, and the ids not yet started). The agent now keeps its own count of the bucket (per
+  machine, across leases; it starts with four requests, refills one per 10 s up to 12) and sends an extension only
+  while more than three requests are left over it - about five asks a minute when the worker is always low, the
+  bucket's six less the beat. A 429 on either call empties the count for its `retry_after`. **A failed beat is sent
+  again soon**: after the answer's `retry_after` plus a second (a rate limit), else after 10 s (the network, a 5xx), not
+  a beat interval later. Nothing changes on the wire; older agents are as before. (A coordinator-side complement, not
+  made: an accepted extension could renew `expires_at` as a beat does, or extensions could have a bucket of their own.)
 
 ### 10.5 The worker (aw/1, feature `rolling`)
 
@@ -1589,6 +1602,34 @@ every answer then carries `checkpoint` / `definition` as a beat answer does). An
     it failed to allocate below 90 % of its memory limit - raises the plan per row (to what it held, at least a quarter
     more, remembered) and is started again with fewer games in flight (its games in flight lost; a restart, at most 4; the
     memory per game untouched); a crew member's makes the next members smaller. Reported once per lease.
+- **Memory, agents from 0.3.22** (the first torch leases of an owner machine, 2026-11-23/24; 19.5 has the torch worker's
+  base):
+  - **A new worker build of a run measured here starts from the run's last build.** Figures are kept per run and worker
+    build, and (0.3.14) a run without one borrows its build's from another run. Every release of a run's game is a new
+    build id, which no run has measured: each re-pin started the PC at the platform's 45 MB a game again (198-224 games
+    in flight on a machine that then ran 600-1,500). A figure that neither the run nor the build has - the cost per game,
+    the base, the video memory per row - is now the run's own for another build: the build written last (every write
+    stamps its run and build, key `<run>/<build_id>/t`, unix seconds; among builds without a stamp, written by older
+    agents, the highest figure). Order: the run's own figure for the build; the same build on another run (the highest);
+    the run's last build; the platform's default. It is a start: a higher reading is remembered at once and planned
+    with, a worker near its limit runs fewer games, a steady reading lowers the figure - all for the new build's own
+    key. The lease's plan line says "measured here with the run's worker build <id> (this build not yet)".
+  - **"CUDA out of memory" on a card with room is the job's memory.** On Windows a video memory allocation is charged to
+    the process's commit, which the job's limit counts: a worker at its limit is refused video memory on an empty card
+    ("Tried to allocate 26.00 MiB. GPU 0 has a total capacity of 31.84 GiB of which 25.65 GiB is free", with the worker
+    read at 94.6 % of its limit 129 s before and over 98.9 % 79 s before; another at 92.7 % 22 s before). 0.3.4-0.3.21
+    took any GPU out-of-memory message for the video memory running out, restarted with the video memory plan raised
+    (13 MB per batch row remembered for the run) and left the job's memory plan alone. Now the video memory ran out only
+    when the message doesn't itself show room on the adapter (at least 1 GB free and eight times what was asked) and the
+    job's peak is under 97 % of its limit; otherwise the worker ran into the job's memory: restarted with fewer games
+    in flight under the rules above (the cost per game counted from the job's limit, or - room on the adapter and the
+    job short of its limit: the PC's own commit limit - from the worker's peak), the video memory plan untouched.
+  - **A worker finishing its games is still watched.** At 92 % a worker is told `finish` and replaced by one with fewer
+    games once it ended; so is a lease that ends. 0.2.14-0.3.21 stopped reading a worker's memory against the limit from
+    then on, while a drain goes on growing (its games grow older; a GPU worker's shrinking batches are new shapes with
+    memory of their own): both workers above died during that wait, one failing its whole lease. A finishing worker
+    that reaches 97 % of its limit is now told `quit`: its last games end, their ids go back with the lease (given up,
+    10.4), no result is lost and nothing crashes; the restart follows as after any `end`.
 - Stats add `inflight` (the chosen `conc`; after a restart the current worker's; agents from 0.3.13 add the games in flight
   of workers finishing theirs, 10.4) and `released` (the lease's released ids); a GPU job's (agents from 0.3.4)
   `vram_mb`: its workers' video memory as read.
@@ -2286,6 +2327,20 @@ machine; friends' defaults don't change.
   steps the reserve keeps its room. The 95 % rule (a worker gives way when the adapter's memory in use reaches 95 %)
   still applies. On a 32 GB GPU (32,607 MB) with 12,288 kept: 15,427 MB for the job's workers (at the default 1 GB + 2 MB
   a row, until the run's own cost is measured).
+- **The job's memory limit is the owner's number (agents from 0.3.22).** `caps.ram_mb` is the cap (`max_ram_mb`, else
+  three quarters of the RAM here) and, on every machine until now, no more than the memory free when the lease is asked
+  for, less the floor kept for the PC's user (an eighth of the RAM on an owner machine). The limit is taken once and
+  holds for the lease - hours, for a rolling lease - while an owner machine's free memory follows its trainer's phases:
+  with `max_ram_mb` 26000 on a 64 GB machine the 38 worker starts of one day had limits from 11,206 to 26,000
+  MB, whatever the trainer held in the second their lease began, and the games in flight followed (576 to 1,536). The
+  limit also counts commit, which for a torch worker is mostly not RAM (video memory and its libraries' reservations:
+  10.5 GB committed with 4.5 GB resident). On an owner machine whose owner set `max_ram_mb`, the limit is that number,
+  whatever is free at the moment; without the setting (three quarters of the RAM) and on every other machine the free
+  memory still bounds it. Low memory still stops work (the machine's free memory under its floor), as before. (What a
+  limit taken from a bad moment does: on 2026-11-24 that machine's trainer held most of the RAM for an hour, six leases
+  in a row began with limits of 1,840 to 3,056 MB - less than a torch worker commits before its first game - and failed
+  within seconds, and the 1 to 3 games of the next ones were read as 800 to 1,276 MB a game, remembered for the run:
+  the leases after it played 6, 13 and 26 games in flight under limits of 12 GB.)
 - **A fixed GPU layout** (any machine, `autotune` off; all optional): `workers` (1 to 8 - before, 1 to 3 -, the crew's
   size), `worker_inflight` (1 to 4,096 games in flight per worker; default: the crew rule's share), `worker_groups` (1
   or 2 per worker; default: the rule's - two once each holds 256 rows) and `worker_threads` (search threads per worker;
@@ -2832,6 +2887,32 @@ shim (it is a file of the worker build like any other, signed with it).
   else it started - not the started process's alone (agents from 0.3.19, every worker; the console host Windows puts
   in a console program's job, `conhost.exe`, is left out of the memory and suspend/resume: a native worker reads as
   before).
+- **The memory plan's base is measured (agents from 0.3.22).** The plan of a rolling job is a base (what the worker
+  commits before any game) plus a cost per game in flight (10.6). For a GPU worker the base was a constant, 1,800 MB,
+  lowered only by a first-status reading under it - right for the native workers, whose runtime commits about that. A
+  torch worker (a Python with PyTorch and its CUDA libraries, and on Windows the video memory it holds) commits several
+  GB before its first game, and all of it over 1,800 MB was charged to the games: the fewer games in flight, the more
+  each seemed to cost - 27 MB a game read with 198 in flight, 15 with 600-800, where the worker's own state is ~8 MB a
+  game. A higher reading is remembered at once and only a steady one lowers it, so the figure went up with every lease
+  that happened to hold few games, and the layout shrank through the day (1,536, 1,152, 801, 576 games in flight), each
+  step a restart. Now:
+  - until measured here, a torch worker's base is 4,096 MB;
+  - the worker's commit when its job's **first self-test** arrives (`selftest` without `gen`: its runtime loaded, its
+    network built and run once, no game begun) is its **measured base**. It is remembered for the run and worker build
+    (`<run>/<build_id>/gpu_base`) whichever way it differs from the plan's base by more than 5 %, and planned with at
+    once, plus 1,024 MB: a torch worker's commit goes on growing after its self-test whatever its games (CUDA graphs for
+    the batch shapes as they come, pinned buffers, a second evaluator at each generation switch, and the video memory
+    behind them). That is on the low side on purpose - leases of 2026-11-24 with 14, 27 and 50 games in flight each
+    committed about 6.0-6.15 GB, while workers ran into limits of 2,974 and 3,056 MB before their first game: 2 GB or
+    more of drift -, because a base planned too high makes the games look free and the next lease plan too many, while
+    one too low only charges the rest to the games, which a steady reading corrects;
+  - the cost per game is then counted over it: the lease's cost is re-split so that the plan holds the same commit for
+    its games in flight now ((old base + old cost x games - new base) / games, rounded up, at least 1; a cost that is
+    still the platform's default only ever goes down), stored, and every reading from then on - higher at once, steady
+    ones lower - is over the measured base. The figure no longer depends on how many games were in flight when it was
+    read: a worker of 5 GB + 8 MB a game reads 8 at 198, 655 and 1,536 games (25, 13 and 11 over the constant).
+  Native workers are planned as before (their base readings only lower the 1,800 MB). Not measured on a GPU yet: the
+  real base of the torch worker (the day's readings put it at 4-5.5 GB), and how much of its commit is video memory.
 - Owner-machine mode (13.6) applies unchanged otherwise (no busy gate, normal priority, the video memory reserve).
 - Everything else - leases, rolling, generation switches with the `torch` variant (14.4), uploads, yield / finish / quit
   - is aw/1 (section 5, 10.5) as for any worker.
@@ -3086,6 +3167,14 @@ left out (fewer games than ids, beyond the cursor, another scope, another count 
 the list's shape; the external report's keys.
 
 ## Changes
+- agent 0.3.22 (2026-11-24; agent only: no rev, no wire change, no migration; unreleased): **an owner machine's torch
+  leases** - what the first day of one showed. 10.4: extensions leave the beat bucket its beats (the agent's own count
+  of it) and a failed beat is sent again soon - two leases had expired `silent` with the agent running. 10.6: a new
+  worker build of a run starts from the run's last build's memory figures (stamps `<run>/<build_id>/t` in
+  `rolling_memory.json`); "CUDA out of memory" with room on the adapter, or with the job at its limit, is the job's
+  memory, not the video memory; a worker finishing its games that reaches 97 % of its limit is told `quit`. 13.6: an owner
+  machine's own `max_ram_mb` is its jobs' memory limit whatever is free when a lease starts. 19.5: a torch worker's base
+  is measured (its commit at its first self-test; 4,096 MB until then) and the cost per game counted over it.
 - v1 rev 30 (2026-11-23; coordinator migration 0019 `results.single_games`, `external_sources.single_*` /
   `uncounted_*`; no agent or worker change; unreleased): **single games** (section 22). `POST .../ack` takes an optional
   `single_games` list - the trainer's exact count of the single games in each result's credited ids -, `GET .../results`

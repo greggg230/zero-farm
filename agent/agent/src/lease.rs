@@ -96,6 +96,8 @@ struct Roll {
     mem: MemPlan,
     /// The job runs on a GPU (the measured cost is the run's GPU one).
     gpu: bool,
+    /// agent 0.3.22 (PROTOCOL 19.5): the job's worker is the torch one - its base is measured (`base_measured`).
+    torch: bool,
     /// The most the current worker committed (MB).
     peak_mb: u64,
     /// rev 19 (PROTOCOL 13.5): the most any worker of the lease committed per game in flight over the cost's base (MB),
@@ -1201,7 +1203,13 @@ impl Engine {
         // (agent 0.3.3: per run and worker build - a build not measured here starts from the platform's default; agent
         // 0.3.14: a run not measured here plans with another run's measurement of the same build, `Learned::find`)
         let build_id = lease.build.build_id.clone();
-        let mem = (Learned::plan(&self.cfg.layout, &run_name, &build_id, false, limit_mb), Learned::plan(&self.cfg.layout, &run_name, &build_id, true, limit_mb));
+        // (agent 0.3.22, PROTOCOL 19.5: a torch worker's base, until measured here, is its own kind's - several GB;
+        // a new build of a run measured here starts from the run's last build)
+        let torch_pack = prep.runtime.as_ref().is_some_and(|r| r.manifest.is_torch());
+        let mem = (
+            Learned::plan(&self.cfg.layout, &run_name, &build_id, false, limit_mb),
+            Learned::plan_for(&self.cfg.layout, &run_name, &build_id, crate::rolling::Kind::of(true, torch_pack), limit_mb),
+        );
         let choice = self.choose_providers(lease, &plan, &prep, d.gpu && !self.profile.gpus.is_empty(), caps.threads, mem, need.as_ref(), roll.as_ref().map(|(s, _)| s));
         // PROTOCOL 19: a torch job runs on the GPU its probe passed, or not at all (its worker has no CPU path); a pack whose
         // probe failed here is removed afterwards (not offered again for these adapters and drivers, 9.4 condition 4)
@@ -1227,10 +1235,12 @@ impl Engine {
         let gpu_choice = plan_providers.0 != ["cpu"];
         if roll.is_some() {
             let m = if gpu_choice { mem.1 } else { mem.0 };
-            let source = match (m.measured, Learned::borrowed(&self.cfg.layout, &run_name, &build_id, gpu_choice)) {
-                (true, Some(from)) => format!(", measured here with run {from} (the same worker build)"),
-                (true, None) => ", measured here".to_string(),
-                (false, _) => String::new(),
+            let other_build = Learned::borrowed_build(&self.cfg.layout, &run_name, &build_id, gpu_choice);
+            let source = match (m.measured, Learned::borrowed(&self.cfg.layout, &run_name, &build_id, gpu_choice), other_build) {
+                (true, Some(from), _) => format!(", measured here with run {from} (the same worker build)"),
+                (true, None, Some(b)) => format!(", measured here with the run's worker build {b} (this build not yet)"),
+                (true, None, None) => ", measured here".to_string(),
+                (false, _, _) => String::new(),
             };
             let line = format!(
                 "{} games in flight in {} groups (memory: {} MB limit, {} MB + {} MB per game{source})",
@@ -1389,6 +1399,7 @@ impl Engine {
                 update_inflight: false,
                 mem: if gpu_choice { mem.1 } else { mem.0 },
                 gpu: gpu_choice,
+                torch: gpu_choice && torch_pack,
                 peak_mb: 0,
                 per_game_max: 0,
                 steady_kb: 0,
@@ -2349,6 +2360,7 @@ impl Run {
         if !self.beat_inflight && Instant::now() >= self.beat_due && !matches!(self.after, Some(After::Cancel | After::Revoked)) {
             self.beat_inflight = true;
             self.beat_due = Instant::now() + Duration::from_secs(self.lease.beat_s.max(1));
+            eng.call_budget.lock().unwrap().took(Instant::now(), eng.cfg.timings.beat_bucket);
             let body = BeatReq {
                 state: if paused { "paused" } else { "running" }.into(),
                 progress: Progress { games_done: self.games_done_report(), games_total: games_total(&self.lease) },
@@ -2399,10 +2411,68 @@ impl Run {
                 log::info!("lease {}: the worker commits {per} MB per game in flight, more than planned: remembering it for this run and worker build", self.lease.lease_id);
             }
         }
+        // agent 0.3.22: a worker finishing its games (for a restart with fewer, or with the lease) that still grows to
+        // `HIT_SHARE` of its limit ends its last games now (`quit`: their ids go back) instead of running into the limit
+        // (a drain's games grow older, and its batches' new shapes take more video memory, which Windows counts in the
+        // job's commit: both workers that died on 2026-11-23/24 had been told to finish 22 s and 129 s before)
+        let draining = r.finishing || r.restart.is_some();
+        if draining && live && limit > 0 && !self.tail_quit && self.job_sent && self.end_ev.is_none() && now as f64 >= limit as f64 * crate::rolling::HIT_SHARE {
+            let in_flight = self.progress.map(|(g, st)| st.saturating_sub(g));
+            let line = format!(
+                "worker pid {} commits {now} MB of its {limit} MB limit while it finishes its games: ending its last {} games now (their ids go back with the lease)",
+                self.worker.pid,
+                in_flight.map_or("?".into(), |n| n.to_string())
+            );
+            log::warn!("lease {}: {line}", self.lease.lease_id);
+            eng.worker_log.write_line(&format!("memory [{}]: {line}", self.lease.lease_id));
+            self.tail_quit = true;
+            self.send(json!({"op": "quit"}));
+            return;
+        }
+        let Some(r) = self.roll.as_mut() else { return };
         if !live || r.finishing || r.restart.is_some() || limit == 0 || (now as f64) < limit as f64 * crate::rolling::HIGH_SHARE {
             return;
         }
         self.primary_memory_high(eng, now);
+    }
+
+    /// agent 0.3.22 (PROTOCOL 19.5): a torch worker's **measured base** - its commit at its job's first self-test, no game
+    /// begun. 0.3.6-0.3.21 planned every GPU worker over 1,800 MB (a base reading counted only when lower), so a torch
+    /// worker's several GB were charged to its games: the fewer games in flight, the more each seemed to cost (27 MB a
+    /// game with 198 in flight, 15 with 600-800), the figure only ever went up, and the layout shrank lease after lease.
+    /// The reading is remembered for the run and worker build whichever way it differs from the plan's base
+    /// (`Learned::set_base_measured`), and the lease plans with it at once: the cost per game is counted again over the new
+    /// base so that the plan holds the same commit for the games in flight now (`rolling::rebased`; a default's cost per
+    /// game only ever lower), and every reading from here on is counted over the measured base.
+    fn base_measured(&mut self, eng: &Engine) {
+        let Some(c) = self.worker.commit_mb() else { return };
+        let conc = self.conc.unwrap_or(1);
+        let id = self.lease.lease_id.clone();
+        let (run, build) = (self.lease.run.clone().unwrap_or_default(), self.lease.build.build_id.clone());
+        let Some(r) = self.roll.as_mut().filter(|r| r.active && r.torch && !r.finishing) else { return };
+        let was = r.mem.cost;
+        let drift = crate::rolling::planned_base_for(0, crate::rolling::Kind::Torch);
+        let Some(raw) = Learned::set_base_measured(&eng.cfg.layout, &run, &build, r.gpu, c, was.base_mb.saturating_sub(drift)) else { return };
+        let base = crate::rolling::planned_base_for(raw, crate::rolling::Kind::Torch);
+        let mut cost = crate::rolling::rebased(was, conc, base);
+        if !r.mem.measured {
+            cost.per_game_mb = cost.per_game_mb.min(was.per_game_mb);
+        }
+        Learned::set_rebased(&eng.cfg.layout, &run, &build, r.gpu, cost.per_game_mb);
+        r.mem.cost = cost;
+        // (the readings so far were counted over the old base)
+        (r.per_game_max, r.raised) = (0, 0);
+        let line = format!(
+            "the worker commits {c} MB before its games: planning a base of {base} MB (was {}) and {} MB per game in flight over it (was {})",
+            was.base_mb, cost.per_game_mb, was.per_game_mb
+        );
+        log::info!("lease {id}: {line}");
+        eng.worker_log.write_line(&format!("memory [{id}]: {line}"));
+        if let Some(t) = self.tuning.as_mut() {
+            if let Some((limit, _)) = t.space.mem {
+                t.space.mem = Some((limit, cost));
+            }
+        }
     }
 
     /// rev 15 (PROTOCOL 10.6): the main worker committed `now` MB, near its limit (or, rev 19, the crew's sum is near the
@@ -2442,7 +2512,10 @@ impl Run {
         let conc = self.conc.unwrap_or(1);
         let Some((base, peak_mb)) = self.roll.as_ref().filter(|r| r.active && !r.finishing && !stopping && hit).map(|r| (r.mem.cost, r.peak_mb)) else { return false };
         let id = self.lease.lease_id.clone();
-        let per = crate::rolling::measured_per_game(peak.max(peak_mb).max(limit), conc, base);
+        // (agent 0.3.22: a GPU's "out of memory" with room on the adapter and the job short of its limit - the PC's own
+        // commit limit refused it: the cost per game is what the worker committed, not the job's whole limit)
+        let below = limit > 0 && (peak as f64) < limit as f64 * crate::rolling::HIT_SHARE && crate::rolling::oom_with_room(&format!("{why}\n{}", self.worker.stderr_tail()));
+        let per = crate::rolling::measured_per_game(if below { peak.max(peak_mb) } else { peak.max(peak_mb).max(limit) }, conc, base);
         let cost = self.learn_cost(eng, per);
         let Some(r) = self.roll.as_mut() else { return false };
         let Some(n) = crate::rolling::restart_games(conc, limit, cost).filter(|_| r.restarts < crate::rolling::MAX_RESTARTS) else {
@@ -2649,7 +2722,9 @@ impl Run {
         let gen_now = self.prep.ckpt.as_ref().map(|(c, _)| c.gen);
         let Some(r) = self.roll.as_mut() else { return };
         let now = Instant::now();
-        if r.want_more && !r.extend_inflight && now >= r.next_extend {
+        // (agent 0.3.22: only while the coordinator's bucket keeps requests for the lease's beats, `rolling::CallBudget`)
+        if r.want_more && !r.extend_inflight && now >= r.next_extend && eng.call_budget.lock().unwrap().can_extend(now, eng.cfg.timings.beat_bucket) {
+            eng.call_budget.lock().unwrap().took(now, eng.cfg.timings.beat_bucket);
             r.extend_inflight = true;
             r.next_extend = now + eng.cfg.timings.extend_every;
             // agent 0.3.20 (PROTOCOL 20.1): with the newest generation the workers play, so the answer offers a newer one
@@ -2835,6 +2910,10 @@ impl Run {
                 log::warn!("lease {id}: asking for more game ids failed ({e}); again in {d:?}");
                 r.next_extend = Instant::now() + d;
                 r.refused = true;
+                // (agent 0.3.22: the bucket is empty - the beats come first)
+                if e.status() == Some(429) {
+                    eng.call_budget.lock().unwrap().refused(Instant::now(), d);
+                }
                 return;
             }
             Err(e) => {
@@ -3241,6 +3320,11 @@ impl Run {
                     self.selftest_failed = true;
                 }
                 self.note_provider(v.get("provider"));
+                // agent 0.3.22 (PROTOCOL 19.5): a torch worker's job's first self-test - its runtime loaded, its network
+                // built and run, no game begun: its commit now is its base
+                if v.get("gen").is_none() && self.progress.is_none_or(|(_, st)| st == 0) {
+                    self.base_measured(eng);
+                }
             }
             "status" => {
                 let s = match v.get("stats") {
@@ -3461,7 +3545,28 @@ impl Run {
                 self.after = Some(After::Revoked);
                 self.kill("machine revoked");
             }
-            Err(e) => log::warn!("lease {}: beat failed: {e}", self.id()),
+            Err(e) => {
+                // agent 0.3.22: a beat that failed for a while (the coordinator's rate limit, the network, a 5xx) is sent
+                // again as soon as that allows - `retry_after`, else `beat_retry` - not a whole beat interval later: three
+                // missed beats expire the lease, and 0.3.21 gave a refused beat only two more tries a minute apart
+                let mut again = None;
+                if e.is_retryable() {
+                    let wait = match &e {
+                        CallError::Http { retry_after: Some(s), .. } => Duration::from_secs(*s + 1),
+                        _ => eng.cfg.timings.beat_retry,
+                    };
+                    let now = Instant::now();
+                    if e.status() == Some(429) {
+                        eng.call_budget.lock().unwrap().refused(now, wait);
+                    }
+                    self.beat_due = self.beat_due.min(now + wait);
+                    again = Some(wait);
+                }
+                match again {
+                    Some(w) => log::warn!("lease {}: beat failed: {e}; again in {w:?}", self.id()),
+                    None => log::warn!("lease {}: beat failed: {e}", self.id()),
+                }
+            }
         }
     }
 
@@ -5177,7 +5282,13 @@ impl Run {
             return false;
         }
         let text = format!("{why}\n{tail}");
-        crate::rolling::gpu_oom(&text) || (alloc_failure(&text) && (limit == 0 || (peak as f64) < limit as f64 * 0.9))
+        // (agent 0.3.22: not when the message says the adapter had room, nor when the job stood at its memory limit - on
+        // Windows video memory is charged to the job's commit, so that worker ran into the job's memory:
+        // `rolling::vram_ran_out`)
+        if crate::rolling::oom_with_room(&text) {
+            return false;
+        }
+        crate::rolling::vram_ran_out(&text, peak, limit) || (alloc_failure(&text) && (limit == 0 || (peak as f64) < limit as f64 * 0.9))
     }
 
     /// agent 0.3.4: a worker batching `rows` rows (holding `held` MB when last read) ran out of video memory: the plan per

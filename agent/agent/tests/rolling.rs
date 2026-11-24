@@ -379,7 +379,7 @@ fn out_of_memory_lease(oom_abort: bool) {
     let u = done["unfinished"]["gids"].as_array().unwrap();
     assert_eq!(u[0], json!([0, 32]), "the dead worker's ids go back: {done}");
     assert_eq!(done["stats"]["inflight"], 12, "{done}");
-    assert_eq!(learned(&h), json!({mem_key(&h): 63}));
+    assert_eq!(learned(&h)[mem_key(&h)], 63, "{}", learned(&h));
     let crashes = h.crashes();
     assert_eq!(crashes.len(), 1, "reported once: {crashes:?}");
     assert!(crashes[0]["message"].as_str().unwrap().contains("memory limit"), "{crashes:?}");
@@ -447,7 +447,9 @@ fn the_remembered_cost_per_game_plans_the_games_in_flight() {
         ("this build, more", "own", 120u64, true),
         ("this build, less", "own", 2, true),
         ("another run, this build", "other run", 120, true),
-        ("another build", "other build", 120, false),
+        // (agent 0.3.22: the run's other build - its last release's - is where a new build starts; 0.3.3-0.3.21: the default)
+        ("the run's other build", "other build", 120, true),
+        ("another run's other build", "other run, other build", 120, false),
         ("0.3.2's key", "0.3.2", 120, false),
         ("nothing", "", 0, false),
     ] {
@@ -458,6 +460,7 @@ fn the_remembered_cost_per_game_plans_the_games_in_flight() {
                 "own" => mem_key(&h),
                 "other run" => format!("parent-run/{}/cpu", h.build_id),
                 "other build" => format!("{RUN}/0123456789abcdef01234567/cpu"),
+                "other run, other build" => "parent-run/0123456789abcdef01234567/cpu".to_string(),
                 _ => format!("{RUN}/cpu"),
             };
             std::fs::create_dir_all(h.layout.state()).unwrap();
@@ -476,6 +479,7 @@ fn the_remembered_cost_per_game_plans_the_games_in_flight() {
         match stored {
             "other run" => assert!(line.contains("measured here with run parent-run (the same worker build)"), "{name}: {line}"),
             "own" => assert!(line.ends_with(", measured here)"), "{name}: {line}"),
+            "other build" => assert!(line.contains("measured here with the run's worker build 0123456789abcdef01234567 (this build not yet)"), "{name}: {line}"),
             _ => assert!(!line.contains("measured here"), "{name}: {line}"),
         }
         h.stop();
@@ -483,6 +487,55 @@ fn the_remembered_cost_per_game_plans_the_games_in_flight() {
             assert_eq!(learned(&h)[format!("parent-run/{}/cpu", h.build_id)], per, "the parent's own entry stays: {}", learned(&h));
         }
     }
+}
+
+/// Agent 0.3.22: a worker told to finish its games near its memory limit (92 %) that goes on growing ends its last games
+/// at 97 % (`quit`: their ids go back) instead of running into the limit - no crash, no game played twice - and the lease
+/// goes on with fewer games in flight. (The owner machine of 2026-11-23/24: two torch workers died 22 s and 129 s after
+/// they were told to finish; 0.3.21 looked away from a worker once it was finishing.)
+#[test]
+fn a_finishing_worker_that_still_grows_ends_its_games_before_the_limit() {
+    let mut h = H::new();
+    h.machine.lock().unwrap().settings.max_ram_mb = Some(1600);
+    // 8 x 150 MB, then 60 MB more per finished game - also while it finishes its games: 92 % of the limit (1,472 MB) at the
+    // 5th game (1,500 MB), 97 % (1,552 MB) at the 6th (1,560 MB, where it stays: never the limit itself)
+    let g1 = generation_1_with(&h, settings_with(400, json!({"mem_per_game_mb": 150, "mem_grow_mb": 60, "mem_grow_until": 6, "status_ms": 100})));
+    h.push(rolling_lease(&h, "l_RQ", &g1, 0, 64, 200, json!(8)));
+    h.start();
+    assert!(wait(|| h.job_line_n(1).is_some()), "a second worker: {}", h.agent_log());
+    let log = h.agent_log();
+    assert!(log.contains("while it finishes its games: ending its last"), "{log}");
+    assert!(!log.contains("a commit failed"), "it never reached the limit: {log}");
+    let (j0, j1) = (h.job_line(), h.job_line_n(1).unwrap());
+    assert!(j1["conc"].as_u64().unwrap() < j0["conc"].as_u64().unwrap(), "{j1}");
+    assert!(h.crashes().is_empty(), "no crash: {:?}", h.crashes());
+    h.stop();
+    let done = h.wait_done("l_RQ");
+    let dup: u64 = h.mock.with(|s| s.credits.iter().filter(|(l, ..)| l == "l_RQ").map(|(.., a)| *a).sum());
+    assert_eq!(dup, 0, "an id credited twice: {done}");
+}
+
+/// Agent 0.3.22: a beat the coordinator refuses for a while (its rate limit, a 5xx) is sent again shortly - after the
+/// answer's `retry_after`, else `Timings::beat_retry` - not a whole beat interval later (three missed beats expire a
+/// lease: both expiries of 2026-11-23/24 followed two beats refused a minute apart).
+#[test]
+fn a_refused_beat_is_sent_again_soon() {
+    let mut h = H::new();
+    let g1 = generation_1(&h, 100);
+    let mut l = rolling_lease(&h, "l_RB", &g1, 0, 8, 100_000, json!(8));
+    // (a beat every 5 s: the retries below come well inside it)
+    l["beat_s"] = json!(5);
+    h.push(l);
+    h.mock.fail_next("POST", "/v1/lease/l_RB/beat", 2, 429);
+    let t0 = std::time::Instant::now();
+    h.start();
+    assert!(wait(|| !beats(&h, "l_RB").is_empty()), "a beat got through: {}", h.agent_log());
+    // the first beat after 5 s is refused, and the next one: 0.3.21 sent the third 10 s later; now 300 ms apart
+    assert!(t0.elapsed() < std::time::Duration::from_secs(10), "{:?}", t0.elapsed());
+    assert!(h.mock.count("POST", "/v1/lease/l_RB/beat") >= 3);
+    h.stop();
+    let done = h.wait_done("l_RB");
+    assert!(done.get("refused").is_none_or(Value::is_null), "{done}");
 }
 
 /// Agent 0.3.3: a worker that commits more per game than its plan - here 80 MB a game against the platform's default,

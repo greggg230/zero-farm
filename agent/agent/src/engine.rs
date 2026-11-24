@@ -93,6 +93,9 @@ pub struct Engine {
     pub(crate) evict_after: Vec<String>,
     pub(crate) last_update_check: Option<Instant>,
     pub pending_update: Option<String>,
+    /// agent 0.3.22 (PROTOCOL 10.4): this machine's requests left in the coordinator's `beat` bucket, as the agent counts
+    /// them (`rolling::CallBudget`; the bucket is per machine, so the count outlives a lease).
+    pub(crate) call_budget: std::sync::Mutex<crate::rolling::CallBudget>,
     /// The launcher replacement check ran this run (launcher_update.rs).
     pub(crate) launcher_checked: bool,
     /// Hours on / allowed to work per day (availability.rs).
@@ -168,6 +171,7 @@ impl Engine {
             evict_after: Vec::new(),
             last_update_check: None,
             pending_update: None,
+            call_budget: std::sync::Mutex::new(crate::rolling::CallBudget::new(Instant::now())),
             launcher_checked: false,
             avail,
             backoff: Backoff::default(),
@@ -437,7 +441,8 @@ impl Engine {
         let ram_free = avail.saturating_sub(floor);
         Caps {
             threads: s.threads(self.profile.cores, self.profile.threads),
-            ram_mb: s.ram_cap_mb(self.profile.ram_mb).min(if total > 0 { ram_free } else { u64::MAX }),
+            // (agent 0.3.22, PROTOCOL 13.6: an owner machine's own `max_ram_mb` as set, `Settings::job_limit_mb`)
+            ram_mb: s.job_limit_mb(self.profile.ram_mb, (total > 0).then_some(ram_free)),
             // rev 7 (PROTOCOL 8): only when a GPU provider passed this PC's probe
             gpu: d.gpu && !self.profile.gpus.is_empty() && crate::probe::has_gpu_provider(&self.profile.providers),
             disk_mb: self.disk_budget_mb(&s),

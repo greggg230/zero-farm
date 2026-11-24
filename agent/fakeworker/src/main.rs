@@ -18,6 +18,8 @@
 //!  "chunk": 1000,              // fuzz: seeds per step
 //!  "selftest_fail_gen": null,  // eval: this network fails its self-test (then a fatal error)
 //!  "mem_base_mb": 0,           // rolling: memory committed at the start, before any game (a real worker's runtime)
+//!  "mem_base_first": false,    // rolling: ... committed before the job's first `selftest`, as a real worker's runtime
+//!                              //   and network are (agent 0.3.22 reads a torch worker's base there)
 //!  "mem_per_game_mb": 0,       // rolling: memory committed per game in flight (the job's conc), at the start ...
 //!  "mem_ramp_ms": 0,           // ... or, when > 0, in ten steps over this long (a real worker's games grow)
 //!  "mem_grow_mb": 0,           // rolling: memory committed per finished game on top (a creep)
@@ -308,6 +310,7 @@ struct Cfg {
     /// Rolling jobs: overrides the job's `flush_s`.
     flush_ms: Option<u64>,
     mem_base_mb: u64,
+    mem_base_first: bool,
     mem_per_game_mb: u64,
     mem_ramp_ms: u64,
     mem_grow_mb: u64,
@@ -357,6 +360,7 @@ impl Cfg {
             selftest_fail_gen: o("selftest_fail_gen"),
             flush_ms: o("flush_ms"),
             mem_base_mb: u("mem_base_mb", 0),
+            mem_base_first: f.get("mem_base_first").and_then(Value::as_bool).unwrap_or(false),
             mem_per_game_mb: u("mem_per_game_mb", 0),
             mem_ramp_ms: u("mem_ramp_ms", 0),
             mem_grow_mb: u("mem_grow_mb", 0),
@@ -768,11 +772,13 @@ fake crash at game {gid:?}");
         eprintln!("fakeworker: rolling job, {} ids released, {conc} in flight, flush {flush:?}", self.games);
         // the runtime's and the games in flight's memory (or the latter in steps, `ramp_mem`)
         let games_mb = conc * self.cfg.mem_per_game_mb;
+        // (`mem_base_first`: the base was committed before the self-test)
+        let base_mb = if self.cfg.mem_base_first { 0 } else { self.cfg.mem_base_mb };
         if self.cfg.mem_ramp_ms > 0 && games_mb > 0 {
-            self.mem.commit(self.cfg.mem_base_mb, &self.out, self.cfg.oom_abort);
+            self.mem.commit(base_mb, &self.out, self.cfg.oom_abort);
             self.ramp = Some((Instant::now(), games_mb, 0));
         } else {
-            self.mem.commit(self.cfg.mem_base_mb + games_mb, &self.out, self.cfg.oom_abort);
+            self.mem.commit(base_mb + games_mb, &self.out, self.cfg.oom_abort);
         }
         self.note_mem();
         let mut unflushed = Vec::new();
@@ -1084,8 +1090,19 @@ fn main() {
         w.building = false;
         eprintln!("fakeworker: sessions built ({})", w.cfg.provider);
     }
+    if w.rolling && w.cfg.mem_base_first && w.cfg.mem_base_mb > 0 {
+        let (mb, abort) = (w.cfg.mem_base_mb, w.cfg.oom_abort);
+        w.mem.commit(mb, &w.out, abort);
+        w.note_mem();
+        // (the agent reads the job's memory when the self-test arrives: let the commit be counted first)
+        std::thread::sleep(Duration::from_millis(50));
+    }
     if job.get("model").and_then(Value::as_str).is_some() {
         w.out.send(json!({"ev": "selftest", "provider": w.cfg.provider, "max_abs": 0.0, "ok": true}));
+        if w.rolling && w.cfg.mem_base_first {
+            // (a real worker's games take their memory as they are played; this one's at once: after the agent's reading)
+            std::thread::sleep(Duration::from_millis(2000));
+        }
     }
     // (a batch the GPU's memory doesn't hold: the CUDA allocator's error at the first batch)
     if w.cfg.vram_oom_rows.is_some_and(|n| w.batch > n) {

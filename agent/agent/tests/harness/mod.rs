@@ -95,6 +95,9 @@ pub fn fast_timings() -> Timings {
         crash_resend: Duration::from_millis(500),
         presence: Duration::from_millis(300),
         extend_every: Duration::from_millis(200),
+        // (the mock coordinator has no rate limit: the agent's own count of the beat bucket never holds a test's asks back)
+        beat_bucket: Duration::from_millis(1),
+        beat_retry: Duration::from_millis(300),
         tune_warm: Duration::from_millis(300),
         tune_window: Duration::from_millis(1200),
         tune_ping: Duration::from_millis(100),

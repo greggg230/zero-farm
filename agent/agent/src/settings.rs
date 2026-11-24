@@ -162,6 +162,22 @@ impl Settings {
         self.max_ram_mb.unwrap_or(if self.owner { total_mb / 4 * 3 } else { total_mb / 2 })
     }
 
+    /// The memory limit of a lease's job (`caps.ram_mb`): the cap (`ram_cap_mb`), and no more than the memory free now
+    /// above the floor kept for the PC's user (`free_mb`; None: not known). agent 0.3.22 (PROTOCOL 13.6): **an owner
+    /// machine whose owner set `max_ram_mb` gets that number** whatever is free at the moment. The limit is taken once,
+    /// when the lease starts, and holds for the lease's hours, while the free memory of an owner machine follows its
+    /// trainer's phases: with `max_ram_mb` 26000 on a 64 GB PC the leases of 2026-11-23/24 got limits from 11,206 to
+    /// 26,000 MB - whatever the trainer held in the second they began. And the limit counts commit, of which a torch
+    /// worker's is mostly not RAM (video memory and its libraries' reservations: 10.5 GB committed with 4.5 GB resident).
+    /// The work rules still stop the workers when the PC's free memory falls under its floor (`policy::decide`).
+    pub fn job_limit_mb(&self, total_mb: u64, free_mb: Option<u64>) -> u64 {
+        let cap = self.ram_cap_mb(total_mb);
+        match (self.owner && self.max_ram_mb.is_some(), free_mb) {
+            (true, _) | (false, None) => cap,
+            (false, Some(free)) => cap.min(free),
+        }
+    }
+
     /// PROTOCOL 13.6: the settings the work rules see - an owner machine works whenever it is not paused (`Mode::Always`)
     /// and fullscreen apps don't hold it back; everything else as set.
     pub fn effective(&self) -> Settings {
@@ -658,6 +674,15 @@ mod tests {
         assert_eq!(s.ram_cap_mb(65_536), 49_152, "three quarters of the RAM");
         assert_eq!(s.set_by_name("max_ram_mb", "40000").unwrap(), "max_ram_mb 40000");
         assert_eq!(s.ram_cap_mb(65_536), 40_000, "max_ram_mb still wins");
+        // agent 0.3.22: the owner's own number is the job's limit whatever is free when the lease starts; without a
+        // number (three quarters of the RAM), and on a friend's PC, the free memory above the floor still bounds it
+        assert_eq!(s.job_limit_mb(65_536, Some(11_543)), 40_000);
+        assert_eq!(s.job_limit_mb(65_536, None), 40_000);
+        let mut auto = s.clone();
+        auto.max_ram_mb = None;
+        assert_eq!((auto.job_limit_mb(65_536, Some(11_543)), auto.job_limit_mb(65_536, Some(60_000)), auto.job_limit_mb(65_536, None)), (11_543, 49_152, 49_152));
+        let friend = Settings { owner: false, ..s.clone() };
+        assert_eq!((friend.job_limit_mb(65_536, Some(11_543)), friend.job_limit_mb(65_536, Some(60_000))), (11_543, 40_000));
         assert_eq!(s.set_by_name("gpu_reserve_mb", "8000").unwrap(), "gpu_reserve_mb 8000");
         assert_eq!(s.gpu_reserve(), 8000);
         assert_eq!(s.set_by_name("gpu_reserve_mb", "0").unwrap(), "gpu_reserve_mb 0");

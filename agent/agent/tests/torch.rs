@@ -198,6 +198,52 @@ fn a_torch_job_is_one_worker_process_behind_the_shim_on_the_packs_python() {
     }
 }
 
+/// Agent 0.3.22 (PROTOCOL 19.5): a torch worker's base is measured - its commit at its job's first self-test, before any
+/// game - and remembered for the run and worker build although it is far from the plan's (0.3.6-0.3.21 kept the
+/// constant 1,800 MB unless a reading was lower, and charged a torch worker's GBs to its games); the cost per game is
+/// counted over it from then on.
+#[test]
+fn a_torch_workers_base_is_measured_at_its_first_selftest() {
+    let mut h = H::new();
+    h.version = OPT_IN_MIN_AGENT.into();
+    h.signals.real_starvation = false;
+    h.gpus = vec![nvidia()];
+    owner_machine(&h);
+    h.signals.set(|s| s.gpu = Some(GpuSignal { other_util_pct: 0, temp_c: Some(60) }));
+    let t = setup(&h, &probe_passes());
+    let (gpu_key, base_key) = (format!("{RUN}/{}/gpu", t.worker), format!("{RUN}/{}/gpu_base", t.worker));
+    // the run's last build measured 3 MB a game here (over the base of then); this build is new
+    std::fs::create_dir_all(h.layout.state()).unwrap();
+    std::fs::write(h.layout.state().join("rolling_memory.json"), json!({format!("{RUN}/0123456789abcdef01234567/gpu"): 3}).to_string()).unwrap();
+    // 700 MB before its games (committed before its self-test, as a real worker's runtime and network), 1 MB a game
+    let fake = json!({"game_ms": 40, "shard_every": 4, "flush_ms": 300, "status_ms": 100, "provider": TORCH_PROVIDER,
+                      "mem_base_mb": 700, "mem_base_first": true, "mem_per_game_mb": 1});
+    h.push(torch_lease(&h, &t, "l_TB", &fake));
+    h.start();
+    let learned = || -> Value { std::fs::read(h.layout.state().join("rolling_memory.json")).map(|b| serde_json::from_slice(&b).unwrap()).unwrap_or(json!(null)) };
+    assert!(wait(|| learned()[&base_key].is_u64()), "a base remembered: {} {}", learned(), h.agent_log());
+    let m = learned();
+    let base = m[&base_key].as_u64().unwrap();
+    assert!((700..=800).contains(&base), "the worker's 700 MB and its own few: {m} {}", h.agent_log());
+    let log = h.agent_log();
+    let line = log.lines().find(|l| l.contains("games in flight in") && l.contains("MB per game")).unwrap().to_string();
+    let torch_base = farm_agent::rolling::TORCH_BASE_MB;
+    assert!(line.contains(&format!("{torch_base} MB + 3 MB per game, measured here with the run's worker build 0123456789abcdef01234567")), "{line}");
+    assert!(log.contains("before its games: planning a base of"), "{log}");
+    // counted over the measured base: the same commit for the 512 games in flight, split again - (4,096 + 3 x 512 -
+    // (base + 1,024)) / 512, rounded up
+    let planned = base + farm_agent::rolling::TORCH_BASE_DRIFT_MB;
+    let per = (torch_base + 3 * 512 - planned).div_ceil(512);
+    assert!(wait(|| learned()[&gpu_key].is_u64()), "{}", learned());
+    assert!(learned()[&gpu_key].as_u64().unwrap() <= per, "at most {per} (a steady reading lowers it): {}", learned());
+    assert!(learned()[format!("{RUN}/{}/t", t.worker)].is_u64(), "stamped: {}", learned());
+    assert_eq!(job_lines(&h)[0]["conc"].as_u64(), Some(512));
+    h.stop();
+    let done = h.wait_done("l_TB");
+    assert!(done.get("refused").is_none_or(Value::is_null), "{done}");
+    assert!(h.crashes().is_empty(), "{:?}", h.crashes());
+}
+
 /// A torch pack whose probe finds no usable CUDA refuses the lease (`refused: "runtime"`: a torch worker never runs on
 /// the CPU), is removed after it, and the next lease is refused before anything is downloaded.
 #[test]
